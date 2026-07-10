@@ -1,26 +1,182 @@
 @import "tailwindcss";
 
 :root {
-  --background: #ffffff;
-  --foreground: #171717;
+  --night-deep: #04050c;
+  --night: #0a0d1d;
+  --night-raise: #12162b;
+  --ink: #f4eede;
+  --muted: #9d97ad;
+  --gold: #e8c48b;
+  --gold-strong: #f7dca6;
+  --gold-faint: rgba(232, 196, 139, 0.16);
+  --p1: #ffb958;
+  --p1-soft: rgba(255, 185, 88, 0.18);
+  --p2: #62c6ff;
+  --p2-soft: rgba(98, 198, 255, 0.18);
+  --danger: #ff7d68;
 }
 
 @theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
+  --color-night-deep: var(--night-deep);
+  --color-night: var(--night);
+  --color-night-raise: var(--night-raise);
+  --color-ink: var(--ink);
+  --color-muted: var(--muted);
+  --color-gold: var(--gold);
+  --color-gold-strong: var(--gold-strong);
+  --color-gold-faint: var(--gold-faint);
+  --color-p1: var(--p1);
+  --color-p1-soft: var(--p1-soft);
+  --color-p2: var(--p2);
+  --color-p2-soft: var(--p2-soft);
+  --color-danger: var(--danger);
   --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
+  --font-display: var(--font-fraunces);
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
-  }
+html {
+  color-scheme: dark;
 }
 
 body {
-  background: var(--background);
-  color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+  background:
+    radial-gradient(1200px 800px at 70% -10%, rgba(84, 66, 132, 0.35), transparent 60%),
+    radial-gradient(900px 700px at 12% 110%, rgba(32, 68, 116, 0.30), transparent 60%),
+    linear-gradient(180deg, var(--night) 0%, var(--night-deep) 100%);
+  color: var(--ink);
+  font-family: var(--font-geist-sans), ui-sans-serif, system-ui, sans-serif;
+  min-height: 100dvh;
+}
+
+::selection {
+  background: rgba(232, 196, 139, 0.35);
+}
+
+.font-display {
+  font-family: var(--font-fraunces), Georgia, serif;
+}
+
+.text-shimmer {
+  background: linear-gradient(
+    100deg,
+    var(--gold) 20%,
+    #fff6e0 40%,
+    var(--gold-strong) 55%,
+    var(--gold) 80%
+  );
+  background-size: 200% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  animation: shimmer 6s linear infinite;
+}
+
+@keyframes shimmer {
+  to {
+    background-position: -200% 0;
+  }
+}
+
+/* Stone placement pop. Even if animations are paused or throttled, the
+   stone stays visible: keyframes only shrink it transiently. */
+.stone-pop {
+  transform-box: fill-box;
+  transform-origin: center;
+  animation: stone-pop 0.22s cubic-bezier(0.2, 1.4, 0.4, 1);
+}
+
+@keyframes stone-pop {
+  from {
+    transform: scale(0.45);
+  }
+  to {
+    transform: scale(1);
+  }
+}
+
+/*
+ * Entrance animations are pure CSS (not JS/rAF-driven) so they always settle
+ * even in throttled or background tabs. `both` fill keeps the final state.
+ */
+.fade-up {
+  animation: fade-up 0.5s cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+.fade-in {
+  animation: fade-in 0.4s ease-out both;
+}
+
+.pop-in {
+  animation: pop-in 0.45s cubic-bezier(0.2, 1.25, 0.4, 1) both;
+}
+
+@keyframes fade-up {
+  from {
+    opacity: 0;
+    transform: translateY(14px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes fade-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes pop-in {
+  from {
+    opacity: 0;
+    transform: scale(0.82);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+@keyframes twinkle {
+  0%,
+  100% {
+    opacity: 0.9;
+  }
+  50% {
+    opacity: 0.25;
+  }
+}
+
+.star-layer-a,
+.star-layer-b {
+  animation: twinkle 7s ease-in-out infinite;
+}
+
+.star-layer-b {
+  animation-duration: 11s;
+  animation-delay: -3.5s;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .text-shimmer,
+  .star-layer-a,
+  .star-layer-b,
+  .stone-pop {
+    animation: none;
+  }
+  .fade-up,
+  .fade-in,
+  .pop-in {
+    animation-duration: 0.01s;
+  }
+}
+
+/* Panel scrollbars */
+.thin-scroll {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(232, 196, 139, 0.25) transparent;
 }
