@@ -1,0 +1,64 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "startrain"
+version = "0.3.0"
+description = "PyTorch training foundation for Double *Star"
+requires-python = ">=3.11"
+dependencies = [
+  "numpy>=1.26",
+  "PyYAML>=6.0.2",
+  "torch>=2.4",
+]
+
+[project.scripts]
+startrain-selfplay = "startrain.cli:selfplay_main"
+startrain-train = "startrain.cli:train_main"
+startrain-actor = "startrain.cli:actor_main"
+startrain-orchestrate = "startrain.orchestration:orchestrate_main"
+startrain-arena = "startrain.cli:arena_main"
+startrain-distill = "startrain.distill:distill_main"
+startrain-publish-browser = "startrain.publish:publish_browser_main"
+startrain-promote = "startrain.promotion:promotion_main"
+starserve = "starserve.cli:main"
+
+[project.optional-dependencies]
+serve = [
+  "fastapi>=0.115",
+  "uvicorn[standard]>=0.34",
+]
+test = [
+  "fastapi>=0.115",
+  "httpx>=0.28",
+  "onnx>=1.17",
+  "onnxruntime>=1.20",
+  "onnxscript>=0.4",
+  "pytest>=8.3",
+  "ruff",
+]
+onnx = ["onnx>=1.17", "onnxruntime>=1.20", "onnxscript>=0.4"]
+
+[tool.hatch.build]
+exclude = [
+  "/.pytest_cache",
+  "/.ruff_cache",
+  "/.venv",
+  "/dist",
+  "/runs",
+  "/target",
+  "**/__pycache__",
+  "**/*.pyc",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["startrain", "starserve"]
+
+[tool.pytest.ini_options]
+addopts = "-q -p no:cacheprovider"
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 88

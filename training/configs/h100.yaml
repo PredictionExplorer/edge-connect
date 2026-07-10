@@ -1,0 +1,92 @@
+schema_version: 2
+profile: standalone-smoke
+game:
+  mode: double
+  pie_rule: false
+  min_rings: 3
+  max_rings: 12
+
+model:
+  width: 384
+  rrt_groups: 5
+  attention_heads: 12
+  kv_heads: 3
+  bottleneck_ratio: 0.5
+  ff_multiplier: 2.5
+  dropout: 0.0
+  rms_norm_eps: 0.000001
+  score_margin_min: -181
+  score_margin_max: 181
+  soft_policy_temperature: 4.0
+
+loss:
+  policy: 1.0
+  wdl: 1.0
+  score_margin: 0.25
+  ownership: 0.25
+  alive: 0.1
+  soft_policy: 0.25
+
+optimizer:
+  kind: muon_adamw
+  adamw_lr: 0.0003
+  muon_lr: 0.02
+  weight_decay: 0.01
+  betas: [0.9, 0.95]
+  muon_momentum: 0.95
+  muon_nesterov: true
+  muon_ns_steps: 5
+  fallback_to_adamw: true
+
+train:
+  per_rank_batch_size: 64
+  precision: bf16
+  compile: false
+  seed: 17
+  ema_decay: 0.9999
+  gradient_clip_norm: 1.0
+  scheduler:
+    warmup_steps: 10
+    total_steps: 100
+    min_lr_ratio: 0.05
+
+data:
+  schema_version: 3
+  ring_stratified: false
+  d5_augmentation: true
+  workers: 16
+  prefetch_factor: 4
+  pin_memory: true
+  shard_cache_size: 2
+
+selfplay:
+  rings: 10
+  batch_size: 64
+  games: 64
+  fast_probability: 0.75
+  full_probability: 0.25
+  fast_simulations: 32
+  full_simulations: 256
+  simulation_reference_rings: 6
+  simulation_ring_exponent: 1.0
+  max_considered: 16
+  c_visit: 50.0
+  c_scale: 1.0
+  initial_pass_logit_penalty: 1.5
+  score_utility_weight: 0.05
+  shard_size: 4096
+  seed: 17
+
+learner:
+  steps: 100
+  minimum_replay_samples: 64
+  recent_samples_per_ring: 50000
+  minimum_unique_samples_per_ring: 1
+  max_replay_lag_steps: 5000
+  steps_per_window: 10
+  candidate_interval: 25
+  metrics_interval: 1
+  replay_poll_seconds: 2.0
+  replay_wait_timeout_seconds: 0.0
+  resume_latest: true
+  device: cuda

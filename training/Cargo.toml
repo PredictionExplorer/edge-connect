@@ -1,0 +1,30 @@
+[workspace]
+members = [
+    "crates/star-engine",
+    "crates/star-search",
+    "crates/star-py",
+    "crates/star-wasm",
+]
+default-members = [
+    "crates/star-engine",
+    "crates/star-search",
+]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.93"
+license = "MIT"
+
+[workspace.lints.rust]
+missing_docs = "warn"
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = "warn"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+

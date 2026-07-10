@@ -22,6 +22,7 @@ export interface RefPlayer {
 export interface RefResult {
   players: [RefPlayer, RefPlayer];
   nodeOwner: number[];
+  aliveStone: number[];
   contestedPeries: number;
 }
 
@@ -56,16 +57,19 @@ export function referenceScore(board: Board, stones: ArrayLike<number>): RefResu
     groups.push({ color, cells });
   }
 
-  const alive = groups.map(() => true);
+  // Official static star test: survival depends only on perimeter nodes the
+  // group directly occupies. Territory is scored after dead groups are
+  // removed and must never bootstrap a group's survival.
+  const alive = groups.map(
+    (group) => group.cells.filter((u) => board.isPeri[u]).length >= 2,
+  );
 
   interface Region {
     cells: number[];
-    periCount: number;
-    boundaryGroups: Set<number>;
     boundaryColors: Set<number>;
   }
 
-  const computeRegions = (): { regions: Region[]; regionOf: number[] } => {
+  const computeRegions = (): Region[] => {
     const regionOf = new Array<number>(n).fill(-1);
     const regions: Region[] = [];
     const isTerritory = (u: number) => stones[u] === EMPTY || !alive[groupOf[u]];
@@ -73,8 +77,6 @@ export function referenceScore(board: Board, stones: ArrayLike<number>): RefResu
       if (!isTerritory(start) || regionOf[start] !== -1) continue;
       const region: Region = {
         cells: [],
-        periCount: 0,
-        boundaryGroups: new Set(),
         boundaryColors: new Set(),
       };
       const queue = [start];
@@ -82,7 +84,6 @@ export function referenceScore(board: Board, stones: ArrayLike<number>): RefResu
       while (queue.length) {
         const u = queue.shift()!;
         region.cells.push(u);
-        if (board.isPeri[u]) region.periCount++;
         for (const v of neighbors(board, u)) {
           if (isTerritory(v)) {
             if (regionOf[v] === -1) {
@@ -90,43 +91,19 @@ export function referenceScore(board: Board, stones: ArrayLike<number>): RefResu
               queue.push(v);
             }
           } else {
-            region.boundaryGroups.add(groupOf[v]);
             region.boundaryColors.add(stones[v] as number);
           }
         }
       }
       regions.push(region);
     }
-    return { regions, regionOf };
+    return regions;
   };
 
-  // Fixed point: demote all groups owning < 2 peries, simultaneously per
-  // round, no revival. Ownership credit for survival: occupied peries plus
-  // peries of regions bounded by that single group alone.
-  for (;;) {
-    const { regions } = computeRegions();
-    const owned = groups.map((g, gi) =>
-      alive[gi] ? g.cells.filter((u) => board.isPeri[u]).length : 0,
-    );
-    for (const region of regions) {
-      if (region.boundaryGroups.size === 1) {
-        const [gi] = [...region.boundaryGroups];
-        owned[gi] += region.periCount;
-      }
-    }
-    let changed = false;
-    for (let gi = 0; gi < groups.length; gi++) {
-      if (alive[gi] && owned[gi] < 2) {
-        alive[gi] = false;
-        changed = true;
-      }
-    }
-    if (!changed) break;
-  }
-
   // Player-level ownership.
-  const { regions, regionOf } = computeRegions();
+  const regions = computeRegions();
   const nodeOwner = new Array<number>(n).fill(-1);
+  const aliveStone = new Array<number>(n).fill(0);
   const peries = [0, 0];
   const quarks = [0, 0];
   const stars = [0, 0];
@@ -136,6 +113,7 @@ export function referenceScore(board: Board, stones: ArrayLike<number>): RefResu
     if (!alive[gi]) continue;
     stars[groups[gi].color]++;
     for (const u of groups[gi].cells) {
+      aliveStone[u] = 1;
       nodeOwner[u] = groups[gi].color;
       if (board.isPeri[u]) {
         peries[groups[gi].color]++;
@@ -157,8 +135,6 @@ export function referenceScore(board: Board, stones: ArrayLike<number>): RefResu
       }
     }
   }
-  void regionOf;
-
   const players = [0, 1].map((p) => {
     const quarkPeri: 0 | 1 = quarks[p] >= 3 ? 1 : 0;
     const award = 2 * (stars[1 - p] - stars[p]);
@@ -172,5 +148,5 @@ export function referenceScore(board: Board, stones: ArrayLike<number>): RefResu
     };
   }) as [RefPlayer, RefPlayer];
 
-  return { players, nodeOwner, contestedPeries };
+  return { players, nodeOwner, aliveStone, contestedPeries };
 }

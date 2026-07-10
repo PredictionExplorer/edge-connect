@@ -1,5 +1,12 @@
 import { describe, expect, it } from 'vitest';
-import { getBoard, parseLabel, type Board } from '../board';
+import {
+  getBoard,
+  MAX_RINGS,
+  MIN_RINGS,
+  parseLabel,
+  type Board,
+} from '../board';
+import { replay, type GameAction } from '../game';
 import { EMPTY, scorePosition } from '../scoring';
 import { referenceScore } from './reference';
 
@@ -154,15 +161,73 @@ describe('scorePosition: hand-built fixtures', () => {
     expect(r.contestedPeries).toBe(30);
     expect(r.leader).toBe(-1);
   });
+
+  it('does not let territory bootstrap a lone perimeter stone', () => {
+    const b = getBoard(6);
+    const stones = new Int8Array(b.n).fill(EMPTY);
+    const lone = b.idx(0, 6, 0);
+    stones[lone] = 0;
+
+    const got = scorePosition(b, stones);
+    const want = referenceScore(b, stones);
+    expect(got.players).toEqual([
+      { peries: 0, quarks: 0, stars: 0, quarkPeri: 0, award: 0, total: 0 },
+      { peries: 0, quarks: 0, stars: 0, quarkPeri: 0, award: 0, total: 0 },
+    ]);
+    expect(got.aliveStone[lone]).toBe(0);
+    expect(got.nodeOwner[lone]).toBe(-1);
+    expect(got.contestedPeries).toBe(b.periCount);
+    expect(got.players).toEqual(want.players);
+    expect(Array.from(got.aliveStone)).toEqual(want.aliveStone);
+    expect(Array.from(got.nodeOwner)).toEqual(want.nodeOwner);
+  });
+
+  it('scores a sparse position ended by consecutive passes', () => {
+    const b = getBoard(6);
+    const blue = [b.idx(0, 6, 0), b.idx(0, 6, 1)];
+    const red = [b.idx(2, 6, 0), b.idx(2, 6, 1)];
+    const dead = b.idx(4, 6, 3);
+    const log: GameAction[] = [
+      { type: 'place', node: blue[0] },
+      { type: 'place', node: red[0] },
+      { type: 'place', node: red[1] },
+      { type: 'place', node: blue[1] },
+      { type: 'place', node: dead },
+      { type: 'pass' },
+      { type: 'pass' },
+    ];
+    const terminal = replay(
+      {
+        rings: 6,
+        mode: 'double',
+        pieRule: false,
+        playerNames: ['Blue', 'Red'],
+      },
+      log,
+    );
+    expect(terminal.over).toBe(true);
+    expect(terminal.stonesPlaced).toBe(5);
+
+    const got = scorePosition(b, terminal.stones);
+    const want = referenceScore(b, terminal.stones);
+    expect(got.players[0].stars).toBe(1);
+    expect(got.players[1].stars).toBe(1);
+    for (const node of [...blue, ...red]) expect(got.aliveStone[node]).toBe(1);
+    expect(got.aliveStone[dead]).toBe(0);
+    expect(got.players).toEqual(want.players);
+    expect(got.contestedPeries).toBe(want.contestedPeries);
+    expect(Array.from(got.aliveStone)).toEqual(want.aliveStone);
+    expect(Array.from(got.nodeOwner)).toEqual(want.nodeOwner);
+  });
 });
 
 describe('scorePosition: cross-validation and invariants', () => {
-  it('matches the naive reference scorer on random positions', () => {
+  it('matches the naive reference scorer on random positions for rings 3..12', () => {
     const rng = mulberry32(0xdecafbad);
-    for (const rings of [3, 4, 5, 6]) {
+    for (let rings = MIN_RINGS; rings <= MAX_RINGS; rings++) {
       const b = getBoard(rings);
-      for (const density of [0.25, 0.55, 0.8, 1]) {
-        for (let trial = 0; trial < 60; trial++) {
+      for (const density of [0.02, 0.1, 0.25, 0.55, 0.8, 1]) {
+        for (let trial = 0; trial < 30; trial++) {
           const stones = new Int8Array(b.n).fill(EMPTY);
           for (let u = 0; u < b.n; u++) {
             if (rng() < density) stones[u] = rng() < 0.5 ? 0 : 1;
@@ -171,6 +236,7 @@ describe('scorePosition: cross-validation and invariants', () => {
           const want = referenceScore(b, stones);
           expect(got.players).toEqual(want.players);
           expect(got.contestedPeries).toBe(want.contestedPeries);
+          expect(Array.from(got.aliveStone)).toEqual(want.aliveStone);
           expect(Array.from(got.nodeOwner)).toEqual(want.nodeOwner);
         }
       }

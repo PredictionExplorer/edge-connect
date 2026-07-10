@@ -1,0 +1,60 @@
+schema_version: 1
+
+replay:
+  sources:
+    - ../runs/h100-8gpu/replay/shards
+  maximum_samples: 2000000
+
+teacher:
+  experiment_config: h100.yaml
+  model_manifest: ../runs/h100-8gpu/learner/champion.json
+
+student:
+  node_feature_dim: 15
+  global_feature_dim: 18
+  width: 96
+  rrt_groups: 3
+  attention_heads: 6
+  kv_heads: 2
+  bottleneck_ratio: 0.5
+  ff_multiplier: 2.0
+  dropout: 0.0
+  rms_norm_eps: 0.000001
+  score_margin_min: -181
+  score_margin_max: 181
+  soft_policy_temperature: 4.0
+
+train:
+  steps: 100000
+  batch_size: 256
+  learning_rate: 0.0003
+  weight_decay: 0.01
+  precision: bf16
+  device: cuda:0
+  seed: 17
+  ema_decay: 0.9999
+  gradient_clip_norm: 1.0
+  d5_augmentation: true
+
+loss:
+  policy: 1.0
+  wdl: 1.0
+  score_margin: 0.25
+  ownership: 0.25
+  alive: 0.1
+  teacher_policy_kl: 0.5
+  teacher_wdl_kl: 0.25
+  teacher_score_margin_kl: 0.1
+  teacher_ownership_kl: 0.1
+  teacher_alive_kl: 0.05
+  teacher_temperature: 2.0
+
+export:
+  output_directory: ../runs/browser
+  model_version: star-browser-v1
+  onnx_opset: 18
+  recommended_search:
+    simulations: 64
+    max_considered: 16
+    c_visit: 50.0
+    c_scale: 1.0

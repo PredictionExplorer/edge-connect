@@ -1,0 +1,17 @@
+[package]
+name = "star-search"
+description = "Batch-friendly Gumbel MCTS for atomic Double *Star actions"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+star-engine = { path = "../star-engine" }
+
+[lints]
+workspace = true
+

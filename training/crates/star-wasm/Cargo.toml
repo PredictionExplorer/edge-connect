@@ -1,0 +1,22 @@
+[package]
+name = "star-wasm"
+description = "WASM bindings for the Double *Star engine and search primitives"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+path = "src/lib.rs"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+star-engine = { path = "../star-engine" }
+star-search = { path = "../star-search" }
+
+[lints]
+workspace = true
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2.126"
+

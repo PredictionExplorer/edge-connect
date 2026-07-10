@@ -1,8 +1,23 @@
 'use client';
 
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { Sparkles, Star, Users } from 'lucide-react';
 import { getBoard, MAX_RINGS, MIN_RINGS } from '@/lib/star/board';
+import {
+  INITIAL_AI_CAPABILITIES,
+  capabilityForController,
+  checkAiCapabilities,
+  type AiCapabilities,
+} from '@/lib/star/ai/capabilities';
+import {
+  CONTROLLER_TYPES,
+  HUMAN_CONTROLLERS,
+  controllerLabel,
+  normalizeControllers,
+  supportsAiControllers,
+  type ControllerType,
+  type PlayerControllers,
+} from '@/lib/star/ai/controllers';
 import { EMPTY } from '@/lib/star/scoring';
 import type { GameConfig, Mode } from '@/lib/star/game';
 import { useAppStore } from '@/lib/store';
@@ -12,14 +27,50 @@ import { BOARD_PRESETS, PLAYER_COLORS } from './theme';
 export function SetupScreen() {
   const startGame = useAppStore((s) => s.startGame);
   const lastConfig = useAppStore((s) => s.config);
+  const lastControllers = useAppStore((s) => s.controllers);
 
   const [mode, setMode] = useState<Mode>(lastConfig.mode);
   const [rings, setRings] = useState(lastConfig.rings);
   const [pieRule, setPieRule] = useState(lastConfig.pieRule);
   const [names, setNames] = useState<[string, string]>([...lastConfig.playerNames]);
+  const [controllers, setControllers] = useState<PlayerControllers>(() =>
+    normalizeControllers(lastConfig, lastControllers),
+  );
+  const [capabilities, setCapabilities] = useState<AiCapabilities>(
+    INITIAL_AI_CAPABILITIES,
+  );
+  const [capabilityCheck, setCapabilityCheck] = useState(0);
 
   const board = useMemo(() => getBoard(rings), [rings]);
   const emptyStones = useMemo(() => new Int8Array(board.n).fill(EMPTY), [board]);
+  const aiAllowed = supportsAiControllers({ mode, pieRule });
+  const selectedCapabilities = controllers.map((controller) =>
+    capabilityForController(capabilities, controller),
+  );
+  const controllersReady = selectedCapabilities.every(
+    (capability) => capability.status === 'available',
+  );
+
+  useEffect(() => {
+    const controller = new AbortController();
+    void checkAiCapabilities(controller.signal).then((result) => {
+      if (!controller.signal.aborted) setCapabilities(result);
+    });
+    return () => controller.abort();
+  }, [capabilityCheck]);
+
+  const chooseMode = (nextMode: Mode) => {
+    setMode(nextMode);
+    if (nextMode !== 'double') setControllers([...HUMAN_CONTROLLERS]);
+  };
+
+  const chooseController = (player: number, controller: ControllerType) => {
+    setControllers((previous) => {
+      const next: PlayerControllers = [...previous];
+      next[player] = controller;
+      return next;
+    });
+  };
 
   const start = () => {
     const config: GameConfig = {
@@ -28,7 +79,16 @@ export function SetupScreen() {
       pieRule,
       playerNames: [names[0].trim() || 'Player 1', names[1].trim() || 'Player 2'],
     };
-    startGame(config);
+    const validControllers = normalizeControllers(config, controllers);
+    if (
+      validControllers.some(
+        (controller) =>
+          capabilityForController(capabilities, controller).status !== 'available',
+      )
+    ) {
+      return;
+    }
+    startGame(config, validControllers);
   };
 
   const preset = BOARD_PRESETS.find((p) => p.rings === rings);
@@ -79,7 +139,7 @@ export function SetupScreen() {
                 <button
                   key={m.id}
                   type="button"
-                  onClick={() => setMode(m.id)}
+                  onClick={() => chooseMode(m.id)}
                   aria-pressed={mode === m.id}
                   className={`rounded-2xl border px-4 py-4 text-left transition-all ${
                     mode === m.id
@@ -155,20 +215,56 @@ export function SetupScreen() {
                       background: `radial-gradient(circle at 35% 30%, ${PLAYER_COLORS[i].bright}, ${PLAYER_COLORS[i].base} 55%, ${PLAYER_COLORS[i].deep})`,
                     }}
                   />
-                  <input
-                    value={names[i]}
-                    maxLength={18}
-                    aria-label={`Player ${i + 1} name`}
-                    onChange={(e) =>
-                      setNames((prev) => {
-                        const next: [string, string] = [...prev];
-                        next[i] = e.target.value;
-                        return next;
-                      })
-                    }
-                    className="w-full bg-transparent text-sm text-ink outline-none placeholder:text-muted"
-                    placeholder={`Player ${i + 1}`}
-                  />
+                  <div className="min-w-0 flex-1">
+                    <input
+                      value={names[i]}
+                      maxLength={18}
+                      aria-label={`Player ${i + 1} name`}
+                      onChange={(e) =>
+                        setNames((prev) => {
+                          const next: [string, string] = [...prev];
+                          next[i] = e.target.value;
+                          return next;
+                        })
+                      }
+                      className="w-full bg-transparent text-sm text-ink outline-none placeholder:text-muted"
+                      placeholder={`Player ${i + 1}`}
+                    />
+                    {aiAllowed && (
+                      <select
+                        value={controllers[i]}
+                        aria-label={`Player ${i + 1} controller`}
+                        onChange={(event) =>
+                          chooseController(i, event.target.value as ControllerType)
+                        }
+                        className="mt-1 w-full bg-transparent text-xs text-muted outline-none"
+                      >
+                        {CONTROLLER_TYPES.map((controller) => {
+                          const capability = capabilityForController(
+                            capabilities,
+                            controller,
+                          );
+                          const suffix =
+                            capability.status === 'checking'
+                              ? ' (checking…)'
+                              : capability.status === 'unavailable'
+                                ? ' (unavailable)'
+                                : '';
+                          return (
+                            <option
+                              key={controller}
+                              value={controller}
+                              disabled={capability.status !== 'available'}
+                              className="bg-[#17130f]"
+                            >
+                              {controllerLabel(controller)}
+                              {suffix}
+                            </option>
+                          );
+                        })}
+                      </select>
+                    )}
+                  </div>
                   <span className="text-[10px] uppercase tracking-wider text-muted">
                     {i === 0 ? 'first' : 'second'}
                   </span>
@@ -185,16 +281,53 @@ export function SetupScreen() {
               <input
                 type="checkbox"
                 checked={pieRule}
-                onChange={(e) => setPieRule(e.target.checked)}
+                onChange={(e) => {
+                  setPieRule(e.target.checked);
+                  if (e.target.checked) setControllers([...HUMAN_CONTROLLERS]);
+                }}
                 className="h-4 w-4 accent-[#e8c48b]"
               />
             </label>
+            {!aiAllowed && (
+              <p className="mt-2 px-1 text-[11px] text-muted">
+                AI controllers require Double *Star with the pie rule off.
+              </p>
+            )}
+            {aiAllowed &&
+              selectedCapabilities.map(
+                (capability, player) =>
+                  capability.status === 'unavailable' &&
+                  controllers[player] !== 'human' && (
+                    <p
+                      key={`${player}-${capability.code}`}
+                      role="alert"
+                      className="mt-2 px-1 text-[11px] text-danger"
+                    >
+                      {controllerLabel(controllers[player])}: {capability.reason}
+                    </p>
+                  ),
+              )}
+            {aiAllowed &&
+              (capabilities.server.status !== 'available' ||
+                capabilities.local.status !== 'available') && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setCapabilities(INITIAL_AI_CAPABILITIES);
+                    setCapabilityCheck((value) => value + 1);
+                  }}
+                  className="mt-2 px-1 text-left text-[11px] text-gold-strong underline decoration-gold/40 underline-offset-2"
+                >
+                  Check AI availability again
+                </button>
+              )}
           </section>
 
           <button
             type="button"
             onClick={start}
-            className="font-display group mt-1 flex items-center justify-center gap-2.5 rounded-2xl border border-gold/60 bg-gradient-to-b from-[#e8c48b] to-[#c99d5f] px-6 py-4 text-xl font-medium text-[#241703] shadow-[0_8px_40px_rgba(232,196,139,0.25)] transition-[transform,box-shadow] duration-200 hover:scale-[1.015] hover:shadow-[0_8px_54px_rgba(232,196,139,0.4)] active:scale-[0.985]"
+            disabled={!controllersReady}
+            className="font-display group mt-1 flex items-center justify-center gap-2.5 rounded-2xl border border-gold/60 bg-gradient-to-b from-[#e8c48b] to-[#c99d5f] px-6 py-4 text-xl font-medium text-[#241703] shadow-[0_8px_40px_rgba(232,196,139,0.25)] transition-[transform,box-shadow] duration-200 hover:scale-[1.015] hover:shadow-[0_8px_54px_rgba(232,196,139,0.4)] active:scale-[0.985] disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:scale-100"
           >
             <Star className="h-5 w-5 transition-transform group-hover:rotate-[72deg]" aria-hidden />
             Begin the game

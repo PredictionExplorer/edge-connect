@@ -92,6 +92,19 @@ describe('Double *Star protocol', () => {
     for (let u = 0; u < n; u++) s = play(s, u);
     expect(s.over).toBe(true);
     expect(s.stonesPlaced).toBe(n);
+    expect(s.movesLeft).toBe(1);
+    expect(s.midTurn).toBe(true);
+    expect(s.passStreak).toBe(0);
+  });
+
+  it('preserves zero residual moves when a full board ends on a pair', () => {
+    let s = initialState({ ...dbl, rings: 5 });
+    for (let u = 0; u < s.board.n; u++) s = play(s, u);
+    expect(s.over).toBe(true);
+    expect(s.stonesPlaced).toBe(s.board.n);
+    expect(s.movesLeft).toBe(0);
+    expect(s.midTurn).toBe(false);
+    expect(s.passStreak).toBe(0);
   });
 
   it('a pass forfeits the remainder of the turn', () => {
@@ -102,6 +115,18 @@ describe('Double *Star protocol', () => {
     expect(s.toMove).toBe(0);
     expect(s.movesLeft).toBe(2);
     expect(s.over).toBe(false);
+  });
+
+  it('retains passStreak 2 and movesLeft 2 after a terminal double pass', () => {
+    let s = initialState(dbl);
+    s = applyAction(s, { type: 'pass' });
+    expect(s.passStreak).toBe(1);
+    expect(s.movesLeft).toBe(2);
+    s = applyAction(s, { type: 'pass' });
+    expect(s.over).toBe(true);
+    expect(s.passStreak).toBe(2);
+    expect(s.movesLeft).toBe(2);
+    expect(s.toMove).toBe(1);
   });
 });
 
