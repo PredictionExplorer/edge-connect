@@ -43,22 +43,29 @@ Completed game IDs are unique in SQLite, so a restarted actor cannot commit the
 same game twice.
 
 The learner writes immutable `sha256-<digest>.pt` checkpoints, immutable
-content-hashed manifests, and an atomic `candidate.json` pointer. Actors and
-`starserve` never read that pointer. The coordinator-managed arena supervisor
+content-hashed manifests, and an atomic `candidate.json` pointer. `starserve`
+never reads that pointer. Shipped profiles keep actors on `champion.json`;
+research runs may explicitly select the latest candidate or a seeded
+candidate/champion mixture through `model_refresh.selfplay_source`. Pointer
+roles and run identities remain mandatory, and actors switch only between
+complete game batches. The coordinator-managed arena supervisor
 bootstraps the first `champion.json` only when
 `promotion.bootstrap_initial_champion` is explicitly enabled. Every later
 candidate is compared with the immutable champion using role-paired games,
-pentanomial summaries, pair-level bootstrap ring floors, and both forced and
-unforced openings. Promotion uses an anytime-valid Hoeffding confidence
-sequence whose observation unit is the complete role-reversed pair; arbitrary
-correlation inside the pair is retained. Its `6/(pi² n²)` error-spending
-schedule controls false promotion across repeated looks. A `continue` decision
-is nonterminal: pair IDs and outcomes are persisted, and new non-overlapping
-pairs are added until a terminal boundary or `arena.max_pairs_per_ring`.
+pentanomial summaries, diagnostic paired bootstrap intervals, anytime-valid
+ring floors, and both forced and unforced openings. Promotion uses a
+pair-level mixture-betting e-process with Ville thresholds. Its observation
+unit is the complete role-reversed pair, so arbitrary correlation inside each
+pair is retained; validity assumes the sequence satisfies the documented
+conditional-mean/martingale condition. A `continue` decision is nonterminal:
+pair IDs and outcomes are persisted, and new non-overlapping pairs are added
+until a terminal boundary or `arena.max_pairs_per_ring`.
 
 Only an arena `promote` result atomically replaces the champion pointer;
-rejected candidates cannot generate replay. Newer candidates supersede older
-unfinished candidates explicitly. The 4-GPU and 8-GPU presets reserve GPU 3
+under the shipped champion-only policy, rejected candidates never generate
+replay. Candidate or mixture self-play is an explicit ablation and is recorded
+in actor metrics. Newer candidates supersede older unfinished candidates
+explicitly. The 4-GPU and 8-GPU presets reserve GPU 3
 and GPU 7 respectively for arena work, so learner and arena CUDA allocations
 do not overlap.
 Custom layouts that intentionally share a learner GPU must set

@@ -12,7 +12,7 @@ from startrain.checkpoint import (
     collect_model_garbage,
     load_model_manifest,
 )
-from startrain.arena import ArenaPair
+from startrain.arena import ARENA_RESULT_SCHEMA_VERSION, ArenaPair
 from startrain.config import (
     ArenaConfig,
     PromotionConfig,
@@ -294,8 +294,14 @@ def test_inconclusive_candidate_persists_nonoverlapping_pairs_until_max(
     for expected_pairs in (2, 4):
         assert supervisor.run(stop_requested=lambda: False, once=True) == 1
         progress = json.loads(result_path.read_text())
+        assert progress["schema_version"] == ARENA_RESULT_SCHEMA_VERSION
         assert progress["terminal"] is False
         assert len(progress["pairs"]) == expected_pairs
+        if expected_pairs == 2:
+            # Schema 1 stored the same pair records under the Hoeffding gate.
+            # A resumed evaluation must consume them and rewrite schema 2.
+            progress["schema_version"] = 1
+            result_path.write_text(json.dumps(progress))
     assert supervisor.run(stop_requested=lambda: False, once=True) == 1
     terminal = json.loads(result_path.read_text())
     assert terminal["terminal"] is True

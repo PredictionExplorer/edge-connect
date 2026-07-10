@@ -356,9 +356,27 @@ def create_app(
         )
         result = dict(result)
         result["request_id"] = request.state.request_id
-        timing = dict(result["timing_ms"])
+        raw_timing = result.get("timing_ms")
+        if not isinstance(raw_timing, dict):
+            raise AnalysisError(
+                "native_search_error",
+                "analysis service returned malformed timing metrics",
+            )
+        timing: dict[str, float] = {}
+        for name, value in raw_timing.items():
+            if not isinstance(name, str) or not isinstance(value, (int, float)):
+                raise AnalysisError(
+                    "native_search_error",
+                    "analysis service returned malformed timing metrics",
+                )
+            timing[name] = float(value)
+        if "total" not in timing:
+            raise AnalysisError(
+                "native_search_error",
+                "analysis service omitted total timing",
+            )
         timing["queue"] = queue_ms
-        timing["total"] = float(timing["total"]) + queue_ms
+        timing["total"] += queue_ms
         result["timing_ms"] = timing
         return AnalyzeResponse.model_validate(result)
 

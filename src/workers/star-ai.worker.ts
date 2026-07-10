@@ -34,7 +34,7 @@ interface WorkerScope {
   postMessage(message: StarAiWorkerEvent): void;
 }
 
-interface WasmState {
+export interface WasmState {
   readonly to_move: number;
   readonly moves_left: number;
   readonly pass_streak: number;
@@ -117,7 +117,7 @@ const taskControllers = new Map<string, AbortController>();
 let runtimePromise: Promise<LocalRuntime> | null = null;
 let queue = Promise.resolve();
 
-function arraysEqual(left: ArrayLike<number>, right: ArrayLike<number>): boolean {
+export function arraysEqual(left: ArrayLike<number>, right: ArrayLike<number>): boolean {
   if (left.length !== right.length) return false;
   for (let index = 0; index < left.length; index++) {
     if (left[index] !== right[index]) return false;
@@ -225,7 +225,7 @@ function sameNames(actual: readonly string[], expected: readonly string[]): bool
   );
 }
 
-function tensorMetadataMatches(
+export function tensorMetadataMatches(
   metadata: Ort.InferenceSession.ValueMetadata,
   type: Ort.Tensor.Type,
   rank: number,
@@ -239,7 +239,7 @@ function tensorMetadataMatches(
   );
 }
 
-function hasExpectedOnnxSchema(session: Ort.InferenceSession): boolean {
+export function hasExpectedOnnxSchema(session: Ort.InferenceSession): boolean {
   const inputSchema = [
     ['float16', 3, STAR_NODE_FEATURE_DIM],
     ['float16', 2, STAR_GLOBAL_FEATURE_DIM],
@@ -338,7 +338,7 @@ function getRuntime(signal: AbortSignal): Promise<LocalRuntime> {
   return runtimePromise;
 }
 
-function stonesFromWasm(state: WasmState, nodeCount: number): number[] {
+export function stonesFromWasm(state: WasmState, nodeCount: number): number[] {
   const stones = new Array<number>(nodeCount).fill(-1);
   const players = [state.zero_bits(), state.one_bits()];
   for (let player = 0; player < 2; player++) {
@@ -364,7 +364,7 @@ function stonesFromWasm(state: WasmState, nodeCount: number): number[] {
   return stones;
 }
 
-function semanticFromWasm(rings: number, state: WasmState): StarAiSemanticState {
+export function semanticFromWasm(rings: number, state: WasmState): StarAiSemanticState {
   const nodeCount = (5 * rings * (rings + 1)) / 2;
   const stones = stonesFromWasm(state, nodeCount);
   const occupied = stones.reduce((count, stone) => count + Number(stone !== -1), 0);
@@ -384,7 +384,7 @@ function semanticFromWasm(rings: number, state: WasmState): StarAiSemanticState 
   };
 }
 
-function replayAndVerify(request: StarAiRequest, wasm: StarWasmModule): WasmState {
+export function replayAndVerify(request: StarAiRequest, wasm: StarWasmModule): WasmState {
   const state = new wasm.WasmState(request.state.rings);
   try {
     for (const action of request.actionLog) state.apply(action);
@@ -446,7 +446,10 @@ function tensorFeeds(runtime: LocalRuntime, semantic: StarAiSemanticState) {
   };
 }
 
-function finiteFloatData(value: Ort.OnnxValue | undefined, name: string): Float32Array {
+export function finiteFloatData(
+  value: Ort.OnnxValue | undefined,
+  name: string,
+): Float32Array {
   if (!value || !('data' in value)) {
     throw new StarAiError('protocol', `ONNX output ${name} is invalid.`);
   }
@@ -475,7 +478,7 @@ function finiteFloatData(value: Ort.OnnxValue | undefined, name: string): Float3
   return decoded;
 }
 
-function wdlValue(logits: Float32Array): number {
+export function wdlValue(logits: Float32Array): number {
   if (logits.length !== 3) {
     throw new StarAiError('protocol', 'ONNX WDL output must contain three logits.');
   }

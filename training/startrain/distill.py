@@ -11,7 +11,7 @@ import tempfile
 import time
 from dataclasses import asdict, dataclass, fields, replace
 from pathlib import Path
-from typing import Any, TypeVar
+from typing import Any, TypeVar, cast
 
 import torch
 import torch.nn.functional as functional
@@ -268,7 +268,7 @@ def _mapping(name: str, value: object) -> dict[str, Any]:
 
 def _construct(cls: type[_T], value: object) -> _T:
     values = _mapping(cls.__name__, value)
-    allowed = {field.name for field in fields(cls)}
+    allowed = {field.name for field in fields(cast(Any, cls))}
     unknown = set(values) - allowed
     if unknown:
         raise DistillationConfigError(f"unknown {cls.__name__} keys: {sorted(unknown)}")

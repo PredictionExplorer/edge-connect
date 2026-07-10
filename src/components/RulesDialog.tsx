@@ -1,5 +1,6 @@
 'use client';
 
+import { useEffect, useRef } from 'react';
 import { X } from 'lucide-react';
 
 interface RulesDialogProps {
@@ -8,6 +9,16 @@ interface RulesDialogProps {
 }
 
 export function RulesDialog({ open, onClose }: RulesDialogProps) {
+  const closeButton = useRef<HTMLButtonElement>(null);
+  useEffect(() => {
+    if (!open) return;
+    closeButton.current?.focus();
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') onClose();
+    };
+    document.addEventListener('keydown', closeOnEscape);
+    return () => document.removeEventListener('keydown', closeOnEscape);
+  }, [onClose, open]);
   if (!open) return null;
   return (
     <div
@@ -22,6 +33,7 @@ export function RulesDialog({ open, onClose }: RulesDialogProps) {
         className="fade-up thin-scroll relative max-h-[85dvh] w-full max-w-2xl overflow-y-auto rounded-3xl border border-gold/30 bg-night-raise p-8 shadow-2xl"
       >
         <button
+          ref={closeButton}
           type="button"
           onClick={onClose}
           aria-label="Close rules"

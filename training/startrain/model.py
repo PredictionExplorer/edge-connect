@@ -146,7 +146,6 @@ class GlobalGQABlock(nn.Module):
         self.query_heads = query_heads
         self.kv_heads = kv_heads
         self.head_width = width // query_heads
-        self.kv_repeat = query_heads // kv_heads
         self.dropout = dropout
         self.attention_norm = nn.RMSNorm(width, eps=norm_eps)
         self.query = nn.Linear(width, query_heads * self.head_width, bias=False)
@@ -182,8 +181,8 @@ class GlobalGQABlock(nn.Module):
             batch, length, self.kv_heads, self.head_width
         )
         query = query.transpose(1, 2)
-        key = key.transpose(1, 2).repeat_interleave(self.kv_repeat, dim=1)
-        value = value.transpose(1, 2).repeat_interleave(self.kv_repeat, dim=1)
+        key = key.transpose(1, 2)
+        value = value.transpose(1, 2)
         attended = functional.scaled_dot_product_attention(
             query,
             key,
@@ -191,6 +190,7 @@ class GlobalGQABlock(nn.Module):
             attn_mask=sequence_mask[:, None, None, :],
             dropout_p=self.dropout if self.training else 0.0,
             is_causal=False,
+            enable_gqa=self.query_heads != self.kv_heads,
         )
         attended = attended.transpose(1, 2).reshape(batch, length, width)
         sequence = sequence + self.attention_output(attended) * self.attention_scale

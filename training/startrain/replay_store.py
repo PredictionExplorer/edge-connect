@@ -536,6 +536,8 @@ class ReplayStore:
                     checksum,
                 ),
             )
+            if cursor.lastrowid is None:
+                raise RuntimeError("replay shard insert did not return an identifier")
             shard_id = int(cursor.lastrowid)
             try:
                 self.connection.executemany(

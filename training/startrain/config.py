@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
-from typing import Any, Literal, TypeVar
+from typing import Any, Literal, TypeVar, cast
 
 import yaml
 
@@ -223,12 +223,24 @@ class ModelRefreshConfig:
     manifest_poll_seconds: float = 2.0
     startup_timeout_seconds: float = 600.0
     refresh_only_between_batches: bool = True
+    selfplay_source: Literal["champion", "candidate", "candidate_champion_mix"] = (
+        "champion"
+    )
+    candidate_probability: float = 0.8
 
     def __post_init__(self) -> None:
         if type(self.refresh_only_between_batches) is not bool:
             raise ConfigError("refresh_only_between_batches must be boolean")
         if self.manifest_poll_seconds <= 0 or self.startup_timeout_seconds <= 0:
             raise ConfigError("model refresh intervals must be positive")
+        if self.selfplay_source not in (
+            "champion",
+            "candidate",
+            "candidate_champion_mix",
+        ):
+            raise ConfigError("selfplay_source is invalid")
+        if not 0.0 <= self.candidate_probability <= 1.0:
+            raise ConfigError("candidate_probability must be in [0, 1]")
         if not self.refresh_only_between_batches:
             raise ConfigError(
                 "actors may refresh models only between complete game batches"
@@ -566,7 +578,7 @@ class ExperimentConfig:
 def _construct(cls: type[_T], values: object) -> _T:
     if not isinstance(values, dict):
         raise ConfigError(f"{cls.__name__} must be a mapping")
-    allowed = {field.name for field in fields(cls)}
+    allowed = {field.name for field in fields(cast(Any, cls))}
     unknown = set(values) - allowed
     if unknown:
         raise ConfigError(f"unknown {cls.__name__} keys: {sorted(unknown)}")

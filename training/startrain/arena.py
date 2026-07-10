@@ -8,7 +8,7 @@ import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from statistics import NormalDist
-from typing import Protocol
+from typing import Any, Literal, Protocol, cast
 
 from .config import ArenaConfig
 from .inference import InferenceResponse, NativeEvalBatchProtocol
@@ -16,10 +16,33 @@ from .native import BITBOARD_WORDS
 from .topology import get_topology
 
 
+ARENA_RESULT_SCHEMA_VERSION = 2
+
+
 class ArenaEvaluatorProtocol(Protocol):
     model_version: str
 
     def evaluate(self, requests: NativeEvalBatchProtocol) -> InferenceResponse: ...
+
+
+# A complete role-reversed pair has 0, 0.5, 1, 1.5, or 2 candidate points.
+# The sequential test works on the corresponding [0, 1] score rates. Each
+# betting fraction is mixed with equal initial capital, so no data-dependent
+# tuning or multiplicity correction is needed.
+_PAIR_SCORE_RATES = (0.0, 0.25, 0.5, 0.75, 1.0)
+_PAIR_BETTING_FRACTIONS = (
+    1.0 / 32.0,
+    1.0 / 16.0,
+    1.0 / 10.0,
+    1.0 / 8.0,
+    3.0 / 16.0,
+    1.0 / 4.0,
+    3.0 / 8.0,
+    1.0 / 2.0,
+    5.0 / 8.0,
+    3.0 / 4.0,
+    7.0 / 8.0,
+)
 
 
 @dataclass(slots=True)
@@ -172,25 +195,34 @@ def promotion_assessment(
     config: ArenaConfig,
 ) -> dict[str, object]:
     if not aggregate:
-        raise ValueError("SPRT assessment requires paired games")
+        raise ValueError("promotion assessment requires paired games")
     score_rate = sum(pair.score_rate for pair in aggregate) / len(aggregate)
     lower, _ = pair_confidence_sequence(aggregate, error_probability=config.alpha)
     _, upper = pair_confidence_sequence(aggregate, error_probability=config.beta)
     probability_null = _expected_score(config.null_elo)
     probability_alternative = _expected_score(config.alternative_elo)
+    counts = _pentanomial_counts(aggregate)
+    (
+        sequential_state,
+        promotion_log_e_value,
+        rejection_log_e_value,
+    ) = _pair_sequential_state(
+        counts,
+        null_score_rate=probability_null,
+        alternative_score_rate=probability_alternative,
+        alpha=config.alpha,
+        beta=config.beta,
+    )
     minimum_ready = all(
         len(per_ring[ring]) >= config.minimum_pairs_per_ring for ring in config.rings
     )
-    if minimum_ready and lower > probability_null:
-        sprt_state = "accept_alternative"
-    elif minimum_ready and upper < probability_alternative:
-        sprt_state = "accept_null"
-    else:
-        sprt_state = "continue"
+    if not minimum_ready:
+        sequential_state = "continue"
 
     ring_floors: dict[str, object] = {}
     floors_pass = True
     floors_ready = True
+    floor_error_probability = (1.0 - config.confidence) / 2.0
     for ring in config.rings:
         result = per_ring[ring]
         floor = config.per_ring_regression_floor_elo.get(
@@ -202,29 +234,42 @@ def promotion_assessment(
             ring_floors[str(ring)] = {
                 "floor_elo": floor,
                 "paired_bootstrap_lower_elo": None,
+                "anytime_lower_elo": None,
+                "error_probability": floor_error_probability,
                 "pairs": len(result),
                 "passed": None,
             }
             continue
-        lower_score, _ = _paired_bootstrap_interval(
+        bootstrap_lower_score, _ = _paired_bootstrap_interval(
             result,
             confidence=config.confidence,
             samples=config.bootstrap_samples,
             seed=config.seed + ring * 1_000_003,
         )
-        lower_elo = elo_from_probability(lower_score)
-        passed = lower_elo >= floor
+        anytime_lower_score, _ = pair_confidence_sequence(
+            result,
+            error_probability=floor_error_probability,
+        )
+        floor_score_rate = _expected_score(floor)
+        passed = _pair_mean_exceeds(
+            _pentanomial_counts(result),
+            null_score_rate=floor_score_rate,
+            error_probability=floor_error_probability,
+        )
         floors_pass = floors_pass and passed
         ring_floors[str(ring)] = {
             "floor_elo": floor,
-            "paired_bootstrap_lower_elo": lower_elo,
+            "paired_bootstrap_lower_elo": elo_from_probability(bootstrap_lower_score),
+            "anytime_lower_elo": elo_from_probability(anytime_lower_score),
+            "error_probability": floor_error_probability,
+            "test": "pair-level-mixture-betting-confidence-sequence-v1",
             "pairs": len(result),
             "passed": passed,
         }
 
-    if sprt_state == "accept_alternative" and floors_ready and floors_pass:
+    if sequential_state == "accept_alternative" and floors_ready and floors_pass:
         decision = "promote"
-    elif sprt_state == "accept_null":
+    elif sequential_state == "accept_null":
         decision = "reject"
     elif floors_ready and not floors_pass:
         decision = "reject_ring_regression"
@@ -232,37 +277,202 @@ def promotion_assessment(
         decision = "continue"
     return {
         "decision": decision,
-        "sequential_state": sprt_state,
+        "sequential_state": sequential_state,
         "pair_score_rate": score_rate,
         "confidence_sequence": [lower, upper],
         "null_elo": config.null_elo,
         "alternative_elo": config.alternative_elo,
-        "pair_model": "pair-level-anytime-hoeffding-confidence-sequence",
-        "error_spending": "delta_n=delta*6/(pi^2*n^2)",
+        "pair_model": "pair-level-mixture-betting-e-process-v1",
+        "statistical_test": {
+            "schema_version": 1,
+            "name": "bounded-mean-mixture-betting-e-process",
+            "observation_unit": "complete-role-reversed-pair",
+            "betting_fractions": list(_PAIR_BETTING_FRACTIONS),
+            "promotion": {
+                "null_score_rate": probability_null,
+                "e_value": _reported_e_value(promotion_log_e_value),
+                "log_e_value": promotion_log_e_value,
+                "threshold": 1.0 / config.alpha,
+            },
+            "rejection": {
+                "null_score_rate": probability_alternative,
+                "e_value": _reported_e_value(rejection_log_e_value),
+                "log_e_value": rejection_log_e_value,
+                "threshold": 1.0 / config.beta,
+            },
+            "anytime_error_control": "Ville inequality",
+        },
         "ring_floors": ring_floors,
     }
 
 
+# Retained only as an import-compatibility alias. The implemented method is an
+# e-process, not a sequential probability ratio test.
 sprt_assessment = promotion_assessment
 
 
 def pair_confidence_sequence(
     pairs: Sequence[ArenaPair], *, error_probability: float
 ) -> tuple[float, float]:
-    """Anytime-valid bounds over independent opening-pair observations.
+    """Invert paired betting e-processes into one-sided anytime-valid bounds.
 
-    A pair contributes its role-reversed average score in ``[0, 1]``. This
-    retains arbitrary correlation between the two games. Hoeffding bounds with
-    a ``6/(pi² n²)`` error-spending schedule remain valid over repeated looks.
+    A complete role-reversed pair is one bounded observation, so the two games
+    may be arbitrarily correlated. For a candidate null mean ``mu`` and fixed
+    fraction ``f``, ``prod(1 - f + f * X / mu)`` is a nonnegative
+    supermartingale whenever the pair-score conditional mean is at most
+    ``mu``. The equal-weight mixture remains an e-process, and Ville's
+    inequality makes each returned endpoint valid under continuous monitoring.
     """
-
     if not pairs or not 0 < error_probability < 1:
         raise ValueError("pair confidence sequence inputs are invalid")
-    count = len(pairs)
-    mean = sum(pair.score_rate for pair in pairs) / count
-    allocated = error_probability * 6.0 / (math.pi * math.pi * count * count)
-    radius = math.sqrt(math.log(1.0 / allocated) / (2.0 * count))
-    return max(0.0, mean - radius), min(1.0, mean + radius)
+    counts = _pentanomial_counts(pairs)
+    log_threshold = math.log(1.0 / error_probability)
+    epsilon = 1e-12
+
+    if (
+        _pair_log_e_value_from_counts(
+            counts, null_score_rate=epsilon, direction="greater"
+        )
+        < log_threshold
+    ):
+        lower = 0.0
+    else:
+        low, high = epsilon, 1.0 - epsilon
+        for _ in range(52):
+            middle = (low + high) / 2.0
+            evidence = _pair_log_e_value_from_counts(
+                counts,
+                null_score_rate=middle,
+                direction="greater",
+            )
+            if evidence >= log_threshold:
+                low = middle
+            else:
+                high = middle
+        lower = low
+
+    if (
+        _pair_log_e_value_from_counts(
+            counts,
+            null_score_rate=1.0 - epsilon,
+            direction="less",
+        )
+        < log_threshold
+    ):
+        upper = 1.0
+    else:
+        low, high = epsilon, 1.0 - epsilon
+        for _ in range(52):
+            middle = (low + high) / 2.0
+            evidence = _pair_log_e_value_from_counts(
+                counts,
+                null_score_rate=middle,
+                direction="less",
+            )
+            if evidence >= log_threshold:
+                high = middle
+            else:
+                low = middle
+        upper = high
+    return lower, upper
+
+
+def _pair_sequential_state(
+    counts: Sequence[int],
+    *,
+    null_score_rate: float,
+    alternative_score_rate: float,
+    alpha: float,
+    beta: float,
+) -> tuple[str, float, float]:
+    """Return the dual one-sided e-process decision and log evidence."""
+
+    if (
+        not 0 < null_score_rate < alternative_score_rate < 1
+        or not 0 < alpha < 1
+        or not 0 < beta < 1
+    ):
+        raise ValueError("paired sequential test inputs are invalid")
+    promotion_log_e_value = _pair_log_e_value_from_counts(
+        counts,
+        null_score_rate=null_score_rate,
+        direction="greater",
+    )
+    rejection_log_e_value = _pair_log_e_value_from_counts(
+        counts,
+        null_score_rate=alternative_score_rate,
+        direction="less",
+    )
+    if promotion_log_e_value >= math.log(1.0 / alpha):
+        state = "accept_alternative"
+    elif rejection_log_e_value >= math.log(1.0 / beta):
+        state = "accept_null"
+    else:
+        state = "continue"
+    return state, promotion_log_e_value, rejection_log_e_value
+
+
+def _pair_mean_exceeds(
+    counts: Sequence[int],
+    *,
+    null_score_rate: float,
+    error_probability: float,
+) -> bool:
+    if not 0 < error_probability < 1:
+        raise ValueError("pair mean test error probability is invalid")
+    return _pair_log_e_value_from_counts(
+        counts,
+        null_score_rate=null_score_rate,
+        direction="greater",
+    ) >= math.log(1.0 / error_probability)
+
+
+def _pair_log_e_value_from_counts(
+    counts: Sequence[int],
+    *,
+    null_score_rate: float,
+    direction: Literal["greater", "less"],
+) -> float:
+    if (
+        len(counts) != len(_PAIR_SCORE_RATES)
+        or any(
+            isinstance(count, bool) or int(count) != count or count < 0
+            for count in counts
+        )
+        or sum(counts) <= 0
+        or not 0 < null_score_rate < 1
+        or direction not in ("greater", "less")
+    ):
+        raise ValueError("pair e-process inputs are invalid")
+    denominator = null_score_rate if direction == "greater" else 1.0 - null_score_rate
+    transformed_scores = (
+        _PAIR_SCORE_RATES
+        if direction == "greater"
+        else tuple(1.0 - score for score in _PAIR_SCORE_RATES)
+    )
+    log_wealths = []
+    for fraction in _PAIR_BETTING_FRACTIONS:
+        log_wealths.append(
+            sum(
+                int(count)
+                * math.log(1.0 - fraction + fraction * transformed_score / denominator)
+                for count, transformed_score in zip(
+                    counts, transformed_scores, strict=True
+                )
+                if count
+            )
+        )
+    maximum = max(log_wealths)
+    return (
+        maximum
+        + math.log(sum(math.exp(value - maximum) for value in log_wealths))
+        - math.log(len(log_wealths))
+    )
+
+
+def _reported_e_value(log_e_value: float) -> float:
+    # Keep persisted JSON finite while retaining the uncapped log evidence.
+    return math.exp(min(log_e_value, math.log(1e300)))
 
 
 def _pentanomial_counts(pairs: Sequence[ArenaPair]) -> tuple[int, ...]:
@@ -331,7 +541,7 @@ class ArenaRunner:
     def __init__(
         self,
         *,
-        native_module: object,
+        native_module: Any,
         candidate: ArenaEvaluatorProtocol,
         baseline: ArenaEvaluatorProtocol,
         config: ArenaConfig,
@@ -400,7 +610,7 @@ class ArenaRunner:
                     )
         statistical = summarize_arena_pairs(pairs, self.config)
         return {
-            "schema_version": 1,
+            "schema_version": ARENA_RESULT_SCHEMA_VERSION,
             "candidate": self.candidate.model_version,
             "baseline": self.baseline.model_version,
             "started_ns": started_ns,
@@ -446,7 +656,7 @@ class ArenaRunner:
         if forced_rows:
             states.apply_many(
                 forced_rows,
-                [int(specifications[index][3]) for index in forced_rows],
+                [cast(int, specifications[index][3]) for index in forced_rows],
             )
         searched_moves = [0] * len(specifications)
         wave = 0
@@ -532,7 +742,7 @@ class ArenaRunner:
             )
         return output
 
-    def _semantic_subset(self, data: object, rows: Sequence[int]) -> object:
+    def _semantic_subset(self, data: Any, rows: Sequence[int]) -> Any:
         def words(name: str) -> list[int]:
             source = list(getattr(data, name))
             output = []

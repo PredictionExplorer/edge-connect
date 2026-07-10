@@ -4,19 +4,34 @@ from __future__ import annotations
 
 import importlib
 import numbers
+from collections import Counter
 from dataclasses import dataclass
 from collections.abc import Sequence
 from types import ModuleType
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, cast, runtime_checkable
 
+import numpy as np
 import torch
 
-from .contracts import RULES_HASH, RULES_HASH_WIRE, RULES_SCHEMA_ID
-from .features import DoubleStarPosition, EncodedBatch, encode_batch
+from .contracts import (
+    FEATURE_SCHEMA_HASH,
+    FEATURE_SCHEMA_VERSION,
+    RULES_HASH,
+    RULES_HASH_WIRE,
+    RULES_SCHEMA_ID,
+)
+from .features import (
+    GLOBAL_FEATURE_DIM,
+    NODE_FEATURE_DIM,
+    DoubleStarPosition,
+    EncodedBatch,
+    encode_batch,
+)
 from .scoring import PlayerScore, ScoreResult
 from .topology import get_topology
 
 BITBOARD_WORDS = 7
+_NATIVE_FEATURE_PATH_COUNTS: Counter[str] = Counter()
 
 
 class NativeCompatibilityError(ValueError):
@@ -59,6 +74,27 @@ class NativeScoreDataProtocol(Protocol):
 
 
 @runtime_checkable
+class NativeFeatureDataProtocol(Protocol):
+    """Contiguous buffers exported by ``star_native.FeatureData``."""
+
+    batch_size: int
+    max_nodes: int
+    node_feature_dim: int
+    global_feature_dim: int
+    score_component_dim: int
+    feature_schema_version: int
+    feature_schema_hash: int
+    rings: Any
+    node_features: Any
+    global_features: Any
+    node_mask: Any
+    legal_action_mask: Any
+    score_components: Any
+    node_owner: Any
+    alive_stones: Any
+
+
+@runtime_checkable
 class NativeTrajectoryDataProtocol(Protocol):
     batch_size: int
     last_move: Sequence[int]
@@ -72,6 +108,30 @@ class NativeTrajectoryRow:
     last_move: int
     current_turn_moves: tuple[int, ...]
     turn_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class NativeFeatureScores:
+    components: torch.Tensor
+    node_owner: torch.Tensor
+    alive_stones: torch.Tensor
+
+
+def reset_native_feature_path_stats() -> None:
+    """Reset process-local fast/fallback-path instrumentation."""
+
+    _NATIVE_FEATURE_PATH_COUNTS.clear()
+
+
+def native_feature_path_stats() -> dict[str, int]:
+    """Return process-local feature path batch and row counters."""
+
+    return dict(_NATIVE_FEATURE_PATH_COUNTS)
+
+
+def _record_feature_path(source: str, rows: int) -> None:
+    _NATIVE_FEATURE_PATH_COUNTS[f"{source}_batches"] += 1
+    _NATIVE_FEATURE_PATH_COUNTS[f"{source}_rows"] += rows
 
 
 def load_star_native(*, required: bool = False) -> ModuleType | None:
@@ -220,6 +280,159 @@ def positions_from_native(
     return positions
 
 
+def _buffer_tensor(
+    name: str,
+    buffer: Any,
+    *,
+    dtype: np.dtype[Any] | type[np.generic],
+    shape: tuple[int, ...],
+) -> torch.Tensor:
+    expected = 1
+    for dimension in shape:
+        expected *= dimension
+    try:
+        array = np.frombuffer(buffer, dtype=dtype)
+    except (TypeError, ValueError) as exc:
+        raise NativeCompatibilityError(
+            f"{name} is not a compatible contiguous buffer"
+        ) from exc
+    if array.size != expected:
+        raise NativeCompatibilityError(
+            f"{name} must contain {expected} values, got {array.size}"
+        )
+    if not array.flags.writeable:
+        raise NativeCompatibilityError(f"{name} must expose writable storage")
+    return torch.from_numpy(array.reshape(shape))
+
+
+def encode_native_feature_data(
+    data: NativeFeatureDataProtocol,
+    *,
+    dtype: torch.dtype = torch.float32,
+    device: torch.device | str | None = None,
+    source: str = "native_feature",
+) -> EncodedBatch:
+    """Wrap one Rust feature export and add cached graph topology tensors."""
+
+    batch_size = _integer("batch_size", data.batch_size)
+    max_nodes = _integer("max_nodes", data.max_nodes)
+    if batch_size <= 0 or max_nodes <= 0:
+        raise NativeCompatibilityError("native feature dimensions must be positive")
+    if _integer("node_feature_dim", data.node_feature_dim) != NODE_FEATURE_DIM:
+        raise NativeCompatibilityError("native node feature dimension is incompatible")
+    if _integer("global_feature_dim", data.global_feature_dim) != GLOBAL_FEATURE_DIM:
+        raise NativeCompatibilityError(
+            "native global feature dimension is incompatible"
+        )
+    if _integer("score_component_dim", data.score_component_dim) != 14:
+        raise NativeCompatibilityError(
+            "native score component dimension is incompatible"
+        )
+    if (
+        _integer("feature_schema_version", data.feature_schema_version)
+        != FEATURE_SCHEMA_VERSION
+        or _integer("feature_schema_hash", data.feature_schema_hash)
+        != FEATURE_SCHEMA_HASH
+    ):
+        raise NativeCompatibilityError("native feature schema is incompatible")
+
+    rings_u8 = _buffer_tensor("rings", data.rings, dtype=np.uint8, shape=(batch_size,))
+    ring_values = [int(value) for value in rings_u8]
+    topologies = {rings: get_topology(rings) for rings in set(ring_values)}
+    if max(topology.n for topology in topologies.values()) != max_nodes:
+        raise NativeCompatibilityError("native max_nodes disagrees with ring metadata")
+
+    node_features = _buffer_tensor(
+        "node_features",
+        data.node_features,
+        dtype=np.float32,
+        shape=(batch_size, max_nodes, NODE_FEATURE_DIM),
+    )
+    global_features = _buffer_tensor(
+        "global_features",
+        data.global_features,
+        dtype=np.float32,
+        shape=(batch_size, GLOBAL_FEATURE_DIM),
+    )
+    node_mask = _buffer_tensor(
+        "node_mask",
+        data.node_mask,
+        dtype=np.bool_,
+        shape=(batch_size, max_nodes),
+    )
+    legal_action_mask = _buffer_tensor(
+        "legal_action_mask",
+        data.legal_action_mask,
+        dtype=np.bool_,
+        shape=(batch_size, max_nodes + 1),
+    )
+    rings = rings_u8.to(dtype=torch.long)
+
+    max_degree = max(topology.max_degree for topology in topologies.values())
+    neighbor_index = torch.zeros((batch_size, max_nodes, max_degree), dtype=torch.long)
+    neighbor_mask = torch.zeros((batch_size, max_nodes, max_degree), dtype=torch.bool)
+    neighbor_edge_type = torch.zeros(
+        (batch_size, max_nodes, max_degree), dtype=torch.long
+    )
+    for ring_count, topology in topologies.items():
+        rows = rings == ring_count
+        nodes = topology.n
+        degree = topology.max_degree
+        neighbor_index[rows, :nodes, :degree] = topology.neighbor_index
+        neighbor_mask[rows, :nodes, :degree] = topology.neighbor_mask
+        neighbor_edge_type[rows, :nodes, :degree] = topology.neighbor_edge_type
+
+    encoded = EncodedBatch(
+        node_features=node_features,
+        global_features=global_features,
+        neighbor_index=neighbor_index,
+        neighbor_mask=neighbor_mask,
+        neighbor_edge_type=neighbor_edge_type,
+        node_mask=node_mask,
+        legal_action_mask=legal_action_mask,
+        rings=rings,
+    )
+    _record_feature_path(source, batch_size)
+    if device is not None or dtype != torch.float32:
+        target = torch.device(device) if device is not None else torch.device("cpu")
+        encoded = encoded.to(target, feature_dtype=dtype)
+    return encoded
+
+
+def score_tensors_from_native_features(
+    data: NativeFeatureDataProtocol,
+) -> NativeFeatureScores:
+    """Wrap the score buffers paired with a native feature export."""
+
+    batch_size = _integer("batch_size", data.batch_size)
+    max_nodes = _integer("max_nodes", data.max_nodes)
+    component_dim = _integer("score_component_dim", data.score_component_dim)
+    if component_dim != 14:
+        raise NativeCompatibilityError(
+            "native score component dimension is incompatible"
+        )
+    return NativeFeatureScores(
+        components=_buffer_tensor(
+            "score_components",
+            data.score_components,
+            dtype=np.int32,
+            shape=(batch_size, component_dim),
+        ),
+        node_owner=_buffer_tensor(
+            "node_owner",
+            data.node_owner,
+            dtype=np.int8,
+            shape=(batch_size, max_nodes),
+        ),
+        alive_stones=_buffer_tensor(
+            "alive_stones",
+            data.alive_stones,
+            dtype=np.bool_,
+            shape=(batch_size, max_nodes),
+        ),
+    )
+
+
 def encode_native_state_data(
     data: NativeStateDataProtocol,
     *,
@@ -227,10 +440,104 @@ def encode_native_state_data(
     device: torch.device | str | None = None,
     verify_legal_buffers: bool = True,
 ) -> EncodedBatch:
+    feature_export = getattr(data, "feature_data", None)
+    if callable(feature_export):
+        return encode_native_feature_data(
+            cast(NativeFeatureDataProtocol, feature_export()),
+            dtype=dtype,
+            device=device,
+            source="native_state",
+        )
+    _record_feature_path("python_state", _integer("batch_size", data.batch_size))
     return encode_batch(
         positions_from_native(data, verify_legal_buffers=verify_legal_buffers),
         dtype=dtype,
         device=device,
+    )
+
+
+def encode_native_semantic_batch(
+    *,
+    rings: Sequence[int],
+    stones: Sequence[np.ndarray],
+    to_move: Sequence[int],
+    moves_left: Sequence[int],
+    opening: Sequence[bool],
+    pass_streak: Sequence[int],
+    terminal: Sequence[bool],
+    dtype: torch.dtype = torch.float32,
+    device: torch.device | str | None = None,
+) -> EncodedBatch | None:
+    """Encode heterogeneous semantic keys through Rust when the export exists."""
+
+    rows = len(rings)
+    if rows == 0:
+        raise NativeCompatibilityError("semantic feature batch cannot be empty")
+    if not (
+        len(stones)
+        == len(to_move)
+        == len(moves_left)
+        == len(opening)
+        == len(pass_streak)
+        == len(terminal)
+        == rows
+    ):
+        raise NativeCompatibilityError("semantic feature fields disagree on row count")
+    module = load_star_native()
+    encoder = getattr(module, "encode_semantic_features", None) if module else None
+    if not callable(encoder):
+        _record_feature_path("python_semantic", rows)
+        return None
+
+    ring_values = _integers("rings", rings, rows)
+    to_move_values = _integers("to_move", to_move, rows)
+    moves_left_values = _integers("moves_left", moves_left, rows)
+    pass_streak_values = _integers("pass_streak", pass_streak, rows)
+    opening_values = _booleans("opening", opening, rows)
+    terminal_values = _booleans("terminal", terminal, rows)
+    topologies = [get_topology(ring_count) for ring_count in ring_values]
+    for row in range(rows):
+        if to_move_values[row] not in (0, 1):
+            raise NativeCompatibilityError(f"row {row} has invalid to_move")
+        if moves_left_values[row] not in (0, 1, 2):
+            raise NativeCompatibilityError(f"row {row} has invalid moves_left")
+        if pass_streak_values[row] not in (0, 1, 2):
+            raise NativeCompatibilityError(f"row {row} has invalid pass_streak")
+    ring_array = np.asarray(ring_values, dtype=np.uint8)
+    metadata = np.empty((rows, 5), dtype=np.uint8)
+    metadata[:, 0] = to_move_values
+    metadata[:, 1] = moves_left_values
+    metadata[:, 2] = opening_values
+    metadata[:, 3] = pass_streak_values
+    metadata[:, 4] = terminal_values
+    stone_arrays: list[np.ndarray] = []
+    for row, (topology, values) in enumerate(zip(topologies, stones, strict=True)):
+        array = np.asarray(values)
+        if not np.issubdtype(array.dtype, np.integer):
+            raise NativeCompatibilityError(f"stones row {row} must contain integers")
+        if array.shape != (topology.n,):
+            raise NativeCompatibilityError(
+                f"stones row {row} must have shape ({topology.n},)"
+            )
+        if not np.isin(array, (-1, 0, 1)).all():
+            raise NativeCompatibilityError(
+                f"stones row {row} must contain only -1, 0, or 1"
+            )
+        stone_arrays.append(np.ascontiguousarray(array, dtype=np.int8))
+    stone_array = np.concatenate(stone_arrays)
+    feature_data = cast(
+        NativeFeatureDataProtocol,
+        encoder(
+            ring_array.tobytes(),
+            metadata.tobytes(),
+            stone_array.tobytes(),
+        ),
+    )
+    return encode_native_feature_data(
+        feature_data,
+        dtype=dtype,
+        device=device,
+        source="native_semantic",
     )
 
 

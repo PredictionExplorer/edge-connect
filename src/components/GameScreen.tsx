@@ -276,6 +276,7 @@ export function GameScreen() {
 
   return (
     <main className="relative z-10 mx-auto flex w-full max-w-7xl flex-1 flex-col px-4 py-5 sm:px-6">
+      <h1 className="sr-only">*Star game</h1>
       <header className="mb-4 flex items-center justify-between gap-3">
         <button type="button" onClick={leaveGame} className="group flex items-baseline gap-3 text-left">
           <span className="font-display text-shimmer text-3xl font-semibold leading-none">
@@ -328,6 +329,7 @@ export function GameScreen() {
             currentTurnMoves={game.currentTurnMoves}
             toMove={game.toMove}
             interactive={!game.over && humanCanAct}
+            playerNames={config.playerNames}
             onPlace={(node) => {
               if (humanCanAct) act({ type: 'place', node });
             }}

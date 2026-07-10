@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from typing import Sequence
 
+import numpy as np
 import torch
 from torch import Tensor
 
@@ -133,7 +134,7 @@ class DoubleStarPosition:
         cls,
         *,
         rings: int,
-        stones: Sequence[int],
+        stones: Sequence[int] | Tensor | np.ndarray,
         to_move: int,
         moves_left: int,
         opening: bool,

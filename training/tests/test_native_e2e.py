@@ -50,6 +50,9 @@ def test_true_native_tiny_game_replay_and_train_step_when_available(tmp_path) ->
             ),
         ).run()
         assert summaries
+        assert evaluator.last_feature_path == "rust"
+        assert evaluator.feature_path_counts["rust"] > 0
+        assert evaluator.feature_path_counts["python"] == 0
         samples = store.load_recent_samples(
             sample_window=128,
             run_id=identity.run_id,

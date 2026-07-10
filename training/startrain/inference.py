@@ -10,7 +10,11 @@ import torch
 from torch import nn
 
 from .contracts import SCORE_MARGIN_MAX, SCORE_MARGIN_MIN
-from .native import NativeStateDataProtocol, encode_native_state_data
+from .native import (
+    NativeStateDataProtocol,
+    encode_native_feature_data,
+    encode_native_state_data,
+)
 
 
 @runtime_checkable
@@ -86,6 +90,8 @@ class GraphInferenceAdapter:
         self.model_version = model_version
         self.model_step = int(model_step)
         self.model_identity = model_identity or model_version
+        self.last_feature_path: str | None = None
+        self.feature_path_counts = {"rust": 0, "python": 0}
 
     def evaluate(self, requests: NativeEvalBatchProtocol) -> InferenceResponse:
         response, _ = self._evaluate(requests, include_details=False)
@@ -133,7 +139,18 @@ class GraphInferenceAdapter:
         ):
             raise ValueError("legal action CSR offsets are invalid")
 
-        encoded = encode_native_state_data(requests.states).to(self.device)
+        native_features = getattr(requests, "features", None)
+        if native_features is not None:
+            encoded = encode_native_feature_data(
+                native_features, source="native_request"
+            ).to(self.device)
+            feature_path = "rust"
+        else:
+            has_state_export = callable(getattr(requests.states, "feature_data", None))
+            encoded = encode_native_state_data(requests.states).to(self.device)
+            feature_path = "rust" if has_state_export else "python"
+        self.last_feature_path = feature_path
+        self.feature_path_counts[feature_path] += 1
         if encoded.batch_size != rows:
             raise ValueError("state row count and tokens disagree")
         was_training = self.model.training

@@ -1,0 +1,57 @@
+name: H100 validation
+
+on:
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: Training profile to validate
+        type: choice
+        options:
+          - h100-4gpu
+          - h100-8gpu
+        default: h100-8gpu
+      run_soak:
+        description: Include tests marked soak
+        type: boolean
+        default: false
+  schedule:
+    - cron: "0 5 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: h100-validation
+  cancel-in-progress: false
+
+jobs:
+  h100:
+    runs-on: [self-hosted, linux, x64, h100]
+    timeout-minutes: 180
+    defaults:
+      run:
+        working-directory: training
+    env:
+      PROFILE: ${{ inputs.profile || 'h100-8gpu' }}
+      TORCH_NCCL_ASYNC_ERROR_HANDLING: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.93.0
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - run: nvidia-smi -L
+      - run: uv sync --extra test --extra serve --extra onnx --locked
+      - run: uv run maturin develop --release --locked --manifest-path crates/star-py/Cargo.toml
+      - run: uv run pytest --require-native -m "cuda and not multi_gpu and not soak"
+      - run: uv run python scripts/hardware_preflight.py --config "configs/${PROFILE}.yaml" --rings 6
+      - run: uv run python scripts/hardware_preflight.py --config "configs/${PROFILE}.yaml" --rings 12
+      - run: uv run torchrun --standalone --nproc-per-node 2 scripts/nccl_smoke.py --config "configs/${PROFILE}.yaml"
+      - if: ${{ inputs.run_soak }}
+        run: uv run pytest --require-native --run-soak -m soak
+

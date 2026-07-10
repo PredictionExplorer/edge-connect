@@ -716,6 +716,7 @@ class ReplayDataset(Dataset[ReplaySample]):
 class ReplayBatch:
     inputs: EncodedBatch
     targets: TrainingTargets
+    feature_path: str = "python"
 
     def to(
         self,
@@ -726,15 +727,38 @@ class ReplayBatch:
         return ReplayBatch(
             inputs=self.inputs.to(device, feature_dtype=feature_dtype),
             targets=self.targets.to(device),
+            feature_path=self.feature_path,
         )
 
 
-def collate_replay_samples(samples: Sequence[ReplaySample]) -> ReplayBatch:
+def collate_replay_samples(
+    samples: Sequence[ReplaySample],
+    *,
+    prefer_native: bool = True,
+) -> ReplayBatch:
     if not samples:
         raise ValueError("cannot collate an empty replay batch")
-    inputs = collate_encoded(
-        [encode_position(sample.to_position()) for sample in samples]
-    )
+    inputs: EncodedBatch | None = None
+    feature_path = "python"
+    if prefer_native:
+        # Keep this local to avoid a features -> native -> replay import cycle.
+        from .native import encode_native_semantic_batch
+
+        inputs = encode_native_semantic_batch(
+            rings=[sample.rings for sample in samples],
+            stones=[sample.stones for sample in samples],
+            to_move=[sample.to_move for sample in samples],
+            moves_left=[sample.moves_left for sample in samples],
+            opening=[sample.opening for sample in samples],
+            pass_streak=[sample.pass_streak for sample in samples],
+            terminal=[sample.terminal for sample in samples],
+        )
+        if inputs is not None:
+            feature_path = "rust"
+    if inputs is None:
+        inputs = collate_encoded(
+            [encode_position(sample.to_position()) for sample in samples]
+        )
     batch_size = len(samples)
     max_nodes = inputs.max_nodes
     policy = torch.zeros((batch_size, max_nodes + 1), dtype=torch.float32)
@@ -809,4 +833,5 @@ def collate_replay_samples(samples: Sequence[ReplaySample]) -> ReplayBatch:
                 [sample.weight for sample in samples], dtype=torch.float32
             ),
         ),
+        feature_path=feature_path,
     )

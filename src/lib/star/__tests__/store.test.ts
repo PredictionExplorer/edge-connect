@@ -117,3 +117,61 @@ describe('history navigation AI pause', () => {
     });
   });
 });
+
+describe('gameplay store actions', () => {
+  it('starts, acts, redoes, reviews, rematches, and leaves without stale state', () => {
+    const store = useAppStore.getState();
+    store.startGame(double, ['server', 'local']);
+    expect(useAppStore.getState()).toMatchObject({
+      phase: 'playing',
+      config: double,
+      controllers: ['server', 'local'],
+      log: [],
+      reviewing: false,
+    });
+
+    useAppStore.getState().act({ type: 'place', node: 0 });
+    useAppStore.getState().act({ type: 'place', node: 1 });
+    useAppStore.getState().undo();
+    useAppStore.getState().redo();
+    expect(useAppStore.getState()).toMatchObject({
+      log: [
+        { type: 'place', node: 0 },
+        { type: 'place', node: 1 },
+      ],
+      redoStack: [],
+      aiPaused: true,
+    });
+
+    useAppStore.getState().setReviewing(true);
+    expect(useAppStore.getState().reviewing).toBe(true);
+    useAppStore.getState().rematch();
+    expect(useAppStore.getState()).toMatchObject({
+      phase: 'playing',
+      log: [],
+      redoStack: [],
+      aiPaused: false,
+      reviewing: false,
+    });
+
+    useAppStore.getState().toSetup();
+    expect(useAppStore.getState()).toMatchObject({
+      phase: 'setup',
+      log: [],
+      redoStack: [],
+      aiPaused: false,
+      reviewing: false,
+    });
+  });
+
+  it('normalizes unsupported AI controllers and ignores invalid controller slots', () => {
+    const classic: GameConfig = { ...double, mode: 'classic' };
+    useAppStore.getState().startGame(classic, ['server', 'local']);
+    expect(useAppStore.getState().controllers).toEqual(['human', 'human']);
+    const before = useAppStore.getState();
+    before.setPlayerController(2 as 0, 'server');
+    expect(useAppStore.getState().controllers).toEqual(['human', 'human']);
+    useAppStore.getState().resumeAi();
+    expect(useAppStore.getState().aiPaused).toBe(false);
+  });
+});

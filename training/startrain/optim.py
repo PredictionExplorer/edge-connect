@@ -190,6 +190,10 @@ def _native_adamw(
     no_decay_parameters: list[nn.Parameter],
     config: OptimizerConfig,
 ) -> torch.optim.AdamW:
+    all_parameters = [*decay_parameters, *no_decay_parameters]
+    fused = bool(all_parameters) and all(
+        parameter.is_cuda for parameter in all_parameters
+    )
     groups = []
     if decay_parameters:
         groups.append(
@@ -206,6 +210,7 @@ def _native_adamw(
         betas=config.betas,
         eps=config.eps,
         weight_decay=0.0,
+        fused=fused,
     )
 
 

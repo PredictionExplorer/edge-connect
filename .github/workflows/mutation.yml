@@ -1,0 +1,71 @@
+name: Mutation testing
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 7 * * 0"
+
+permissions:
+  contents: read
+
+jobs:
+  typescript:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run test:mutation
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: stryker-report
+          path: reports/mutation/
+          if-no-files-found: ignore
+
+  python:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    defaults:
+      run:
+        working-directory: training
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync --extra test --locked
+      - run: uv run mutmut run --max-children 4
+      - run: uv run mutmut results
+      - run: uv run mutmut export-cicd-stats
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mutmut-results
+          path: |
+            training/.mutmut-cache
+            training/mutmut-cicd-stats.json
+          if-no-files-found: ignore
+
+  rust:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    defaults:
+      run:
+        working-directory: training
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.93.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: training
+      - run: cargo install cargo-mutants --locked
+      - run: cargo mutants --package star-engine --package star-search --timeout 60
+

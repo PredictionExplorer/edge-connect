@@ -635,6 +635,7 @@ class LearnerLoop:
                     break
                 if self._collective_stop(stop_requested()):
                     break
+                step_started = time.perf_counter()
                 result = train_step(
                     self.compiled_model,
                     batch,
@@ -645,6 +646,7 @@ class LearnerLoop:
                     scheduler=self.scheduler,
                     ema=self.ema,
                 )
+                step_seconds = time.perf_counter() - step_started
                 self.step += 1
                 if (
                     self.rank == 0
@@ -661,6 +663,12 @@ class LearnerLoop:
                             "losses": result.losses,
                             "gradient_norm": result.gradient_norm,
                             "learning_rates": result.learning_rates,
+                            "step_seconds": step_seconds,
+                            "examples_per_second": (
+                                self.train_config.global_batch_size(self.world_size)
+                                / step_seconds
+                            ),
+                            "feature_path": batch.feature_path,
                             "replay_samples": selection.sample_count,
                             "replay_samples_by_ring": selection.samples_by_ring,
                             "replay_max_shard_id": selection.max_shard_id,
@@ -722,18 +730,24 @@ class LearnerLoop:
             rank=self.rank,
             world_size=self.world_size,
         )
-        options: dict[str, object] = {
-            "dataset": dataset,
-            "batch_sampler": batch_sampler,
-            "collate_fn": collate_replay_samples,
-            "num_workers": self.data_config.workers,
-            "pin_memory": self.data_config.pin_memory,
-        }
         if self.data_config.workers:
-            options["prefetch_factor"] = self.data_config.prefetch_factor
-            options["persistent_workers"] = True
-            options["multiprocessing_context"] = "spawn"
-        return DataLoader(**options)
+            return DataLoader(
+                dataset=dataset,
+                batch_sampler=batch_sampler,
+                collate_fn=collate_replay_samples,
+                num_workers=self.data_config.workers,
+                pin_memory=self.data_config.pin_memory,
+                prefetch_factor=self.data_config.prefetch_factor,
+                persistent_workers=True,
+                multiprocessing_context="spawn",
+            )
+        return DataLoader(
+            dataset=dataset,
+            batch_sampler=batch_sampler,
+            collate_fn=collate_replay_samples,
+            num_workers=0,
+            pin_memory=self.data_config.pin_memory,
+        )
 
     def _publish(self) -> ModelManifest:
         return self.publisher.publish(
@@ -1010,7 +1024,12 @@ class LearnerLoop:
         terminal_rejection = bool(status.get("terminal")) and status.get(
             "decision"
         ) in ("reject", "reject_ring_regression", "reject_max_pairs")
-        streak = int(status.get("consecutive_terminal_rejections", 0))
+        raw_streak = status.get("consecutive_terminal_rejections", 0)
+        streak = (
+            raw_streak
+            if isinstance(raw_streak, int) and not isinstance(raw_streak, bool)
+            else 0
+        )
         reset_token = (
             champion.model_identity,
             candidate.model_identity if candidate is not None else "",

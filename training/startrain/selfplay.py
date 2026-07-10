@@ -56,6 +56,9 @@ class SelfPlayConfig:
     simulation_reference_rings: int = 6
     simulation_ring_exponent: float = 1.0
     max_considered: int = 16
+    max_considered_ring_exponent: float = 0.0
+    max_considered_cap: int = 64
+    record_fast_policy_targets: bool = False
     c_visit: float = 50.0
     c_scale: float = 1.0
     initial_pass_logit_penalty: float = 1.5
@@ -78,8 +81,15 @@ class SelfPlayConfig:
             raise ValueError("playout caps must be positive")
         if self.simulation_reference_rings <= 0 or self.simulation_ring_exponent < 0:
             raise ValueError("ring-count simulation scaling is invalid")
-        if self.max_considered <= 0 or self.shard_size <= 0:
-            raise ValueError("max_considered and shard_size must be positive")
+        if (
+            self.max_considered <= 0
+            or self.max_considered_cap < self.max_considered
+            or self.max_considered_ring_exponent < 0
+            or self.shard_size <= 0
+        ):
+            raise ValueError("candidate scaling and shard_size are invalid")
+        if type(self.record_fast_policy_targets) is not bool:
+            raise ValueError("record_fast_policy_targets must be boolean")
         if self.initial_pass_logit_penalty < 0:
             raise ValueError("initial pass logit penalty must be non-negative")
         if not 0 <= self.score_utility_weight <= 1:
@@ -107,11 +117,22 @@ class SelfPlayConfig:
         ) ** self.simulation_ring_exponent
         return max(1, int(round(base * scale)))
 
+    def considered_actions(self) -> int:
+        scale = (
+            self.rings / self.simulation_reference_rings
+        ) ** self.max_considered_ring_exponent
+        return min(
+            self.max_considered_cap,
+            max(1, int(round(self.max_considered * scale))),
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class GameSummary:
     row: int
     samples: int
+    policy_samples: int
+    search_simulations: int
     winner: int
     terminal_value: float
     score_margin: int
@@ -159,7 +180,7 @@ class SelfPlayActor:
 
     def __init__(
         self,
-        native_module: object,
+        native_module: Any,
         evaluator: EvaluatorProtocol,
         replay_sink: ReplaySinkProtocol,
         config: SelfPlayConfig,
@@ -260,7 +281,7 @@ class SelfPlayActor:
             search = self.native.SearchBatch(
                 states,
                 simulations=simulations,
-                max_considered=self.config.max_considered,
+                max_considered=self.config.considered_actions(),
                 c_visit=self.config.c_visit,
                 c_scale=self.config.c_scale,
                 deterministic_seed=search_seed,
@@ -316,8 +337,8 @@ class SelfPlayActor:
         self,
         trajectories: list[list[_Decision]],
         positions: Sequence[Any],
-        state_data: object,
-        results: object,
+        state_data: Any,
+        results: Any,
         *,
         full_search: bool,
         simulations: int,
@@ -334,7 +355,7 @@ class SelfPlayActor:
             if terminal[row]:
                 continue
             policy = None
-            if full_search:
+            if full_search or self.config.record_fast_policy_targets:
                 start, end = offsets[row], offsets[row + 1]
                 if end <= start or end > probabilities.size:
                     raise RuntimeError("full-search policy target is missing")
@@ -364,8 +385,8 @@ class SelfPlayActor:
 
     def _finalize_rows(
         self,
-        states: object,
-        state_data: object,
+        states: Any,
+        state_data: Any,
         trajectories: list[list[_Decision]],
         pinned_versions: list[tuple[str, int, str]],
         rows: Sequence[int],
@@ -400,7 +421,13 @@ class SelfPlayActor:
                             f"game={game_id}:ply={decision.ply}"
                         ),
                         policy_provenance=(
-                            "completed-q" if decision.policy is not None else "none"
+                            (
+                                "completed-q-full"
+                                if decision.full_search
+                                else "completed-q-fast"
+                            )
+                            if decision.policy is not None
+                            else "none"
                         ),
                         run_id=self.identity.run_id,
                         generation_family=self.identity.generation_family,
@@ -417,6 +444,12 @@ class SelfPlayActor:
                 GameSummary(
                     row=row,
                     samples=len(decisions),
+                    policy_samples=sum(
+                        decision.policy is not None for decision in decisions
+                    ),
+                    search_simulations=sum(
+                        decision.simulations for decision in decisions
+                    ),
                     winner=int(winner[row]),
                     terminal_value=float(terminal_value[row]),
                     score_margin=int(score_margin[row]),

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Annotated, Literal
 
 import torch
@@ -16,6 +17,18 @@ StrictPlayer = Annotated[int, Field(strict=True, ge=0, le=1)]
 StrictMoves = Annotated[int, Field(strict=True, ge=0, le=2)]
 StrictSeed = Annotated[int, Field(strict=True, ge=0, le=(1 << 64) - 1)]
 PositiveInt = Annotated[int, Field(strict=True, gt=0)]
+RulesHash = Annotated[
+    str,
+    Field(strict=True, pattern=f"^{re.escape(RULES_HASH_WIRE)}$"),
+]
+ScoreSupportMin = Annotated[
+    int,
+    Field(strict=True, ge=SCORE_MARGIN_MIN, le=SCORE_MARGIN_MIN),
+]
+ScoreSupportMax = Annotated[
+    int,
+    Field(strict=True, ge=SCORE_MARGIN_MAX, le=SCORE_MARGIN_MAX),
+]
 
 
 class SearchBudget(BaseModel):
@@ -30,7 +43,7 @@ class AnalyzeRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
     schema_version: Literal[1]
-    rules_hash: Literal[RULES_HASH_WIRE]
+    rules_hash: RulesHash
     rings: StrictRing
     stones: list[Literal[-1, 0, 1]]
     to_move: StrictPlayer
@@ -81,8 +94,8 @@ class WDLBelief(BaseModel):
 class ScoreBelief(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    support_min: Literal[SCORE_MARGIN_MIN]
-    support_max: Literal[SCORE_MARGIN_MAX]
+    support_min: ScoreSupportMin
+    support_max: ScoreSupportMax
     expected_margin: float
     probabilities: list[float]
 

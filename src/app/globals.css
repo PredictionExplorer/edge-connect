@@ -165,8 +165,12 @@ body {
   .text-shimmer,
   .star-layer-a,
   .star-layer-b,
-  .stone-pop {
+  .stone-pop,
+  .last-move-pulse {
     animation: none;
+  }
+  .last-move-pulse {
+    display: none;
   }
   .fade-up,
   .fade-in,

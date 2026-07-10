@@ -70,6 +70,9 @@ selfplay:
   simulation_reference_rings: 6
   simulation_ring_exponent: 1.0
   max_considered: 16
+  max_considered_ring_exponent: 0.0
+  max_considered_cap: 64
+  record_fast_policy_targets: false
   c_visit: 50.0
   c_scale: 1.0
   initial_pass_logit_penalty: 1.5
@@ -113,6 +116,8 @@ orchestration:
     manifest_poll_seconds: 2.0
     startup_timeout_seconds: 900.0
     refresh_only_between_batches: true
+    selfplay_source: champion
+    candidate_probability: 0.8
   restart:
     max_restarts: 8
     initial_backoff_seconds: 2.0

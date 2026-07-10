@@ -11,16 +11,24 @@ use std::sync::Arc;
 
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
+use pyo3::types::{PyByteArray, PyBytes, PyBytesMethods};
 use rayon::ThreadPoolBuilder;
 use rayon::prelude::*;
 use star_engine::{
     Action, BITBOARD_WORDS, BitBoard, Board, D5Maps, GameState, Player, RULES_HASH, RULES_SCHEMA,
-    ScoringScratch, Symmetry, rules_hash,
+    ScoreResult, ScoringScratch, Symmetry, rules_hash,
 };
 use star_search::{
     Evaluation, EvaluationRequest, GumbelParameters, GumbelSequentialHalving, RootSearchConfig,
     SearchTree, SimulationStart,
 };
+
+const NODE_FEATURE_DIM: usize = 15;
+const GLOBAL_FEATURE_DIM: usize = 18;
+const SCORE_COMPONENT_DIM: usize = 14;
+const SEMANTIC_METADATA_DIM: usize = 5;
+const FEATURE_SCHEMA_VERSION: u8 = 2;
+const FEATURE_SCHEMA_HASH: u64 = 0x59a7_da1c_00ba_c4d2;
 
 #[pyclass(name = "StateData", frozen, skip_from_py_object)]
 #[derive(Clone)]
@@ -132,6 +140,30 @@ impl PyStateData {
     #[getter]
     fn pass_legal(&self) -> Vec<bool> {
         self.pass_legal.clone()
+    }
+
+    /// Builds the schema-v2 features and score buffers without Python unpacking.
+    fn feature_data(&self, py: Python<'_>) -> PyResult<PyFeatureData> {
+        let board = Arc::new(Board::new(self.rings).map_err(value_error)?);
+        let zero_bits = self.zero_bits.clone();
+        let one_bits = self.one_bits.clone();
+        let to_move = self.to_move.clone();
+        let moves_left = self.moves_left.clone();
+        let opening = self.opening.clone();
+        let pass_streak = self.pass_streak.clone();
+        py.detach(move || {
+            let states = decode_semantic_states(
+                board,
+                zero_bits,
+                one_bits,
+                to_move,
+                moves_left,
+                opening,
+                pass_streak,
+            )
+            .map_err(PyValueError::new_err)?;
+            Ok(pack_feature_states(&states))
+        })
     }
 }
 
@@ -248,6 +280,134 @@ impl PyScoreData {
     fn terminal_reason(&self) -> Vec<u8> {
         self.terminal_reason.clone()
     }
+}
+
+struct FeatureBuffers {
+    rings: Vec<u8>,
+    node_features: Vec<u8>,
+    global_features: Vec<u8>,
+    node_mask: Vec<u8>,
+    legal_action_mask: Vec<u8>,
+    score_components: Vec<u8>,
+    node_owner: Vec<u8>,
+    alive_stones: Vec<u8>,
+}
+
+/// Contiguous schema-v2 model features plus the exact native score annotations.
+#[pyclass(name = "FeatureData", frozen, skip_from_py_object)]
+#[derive(Clone)]
+struct PyFeatureData {
+    batch_size: usize,
+    max_nodes: usize,
+    buffers: Arc<FeatureBuffers>,
+}
+
+#[pymethods]
+impl PyFeatureData {
+    #[getter]
+    const fn batch_size(&self) -> usize {
+        self.batch_size
+    }
+
+    #[getter]
+    const fn max_nodes(&self) -> usize {
+        self.max_nodes
+    }
+
+    #[getter]
+    const fn node_feature_dim(&self) -> usize {
+        NODE_FEATURE_DIM
+    }
+
+    #[getter]
+    const fn global_feature_dim(&self) -> usize {
+        GLOBAL_FEATURE_DIM
+    }
+
+    #[getter]
+    const fn score_component_dim(&self) -> usize {
+        SCORE_COMPONENT_DIM
+    }
+
+    #[getter]
+    const fn feature_schema_version(&self) -> u8 {
+        FEATURE_SCHEMA_VERSION
+    }
+
+    #[getter]
+    const fn feature_schema_hash(&self) -> u64 {
+        FEATURE_SCHEMA_HASH
+    }
+
+    /// Native-endian `u8[batch_size]`.
+    #[getter]
+    fn rings<'py>(&self, py: Python<'py>) -> Bound<'py, PyByteArray> {
+        PyByteArray::new(py, &self.buffers.rings)
+    }
+
+    /// Native-endian `float32[batch_size, max_nodes, 15]`.
+    #[getter]
+    fn node_features<'py>(&self, py: Python<'py>) -> Bound<'py, PyByteArray> {
+        PyByteArray::new(py, &self.buffers.node_features)
+    }
+
+    /// Native-endian `float32[batch_size, 18]`.
+    #[getter]
+    fn global_features<'py>(&self, py: Python<'py>) -> Bound<'py, PyByteArray> {
+        PyByteArray::new(py, &self.buffers.global_features)
+    }
+
+    /// `uint8[batch_size, max_nodes]`, containing only zero and one.
+    #[getter]
+    fn node_mask<'py>(&self, py: Python<'py>) -> Bound<'py, PyByteArray> {
+        PyByteArray::new(py, &self.buffers.node_mask)
+    }
+
+    /// `uint8[batch_size, max_nodes + 1]` in nodes-then-pass layout.
+    #[getter]
+    fn legal_action_mask<'py>(&self, py: Python<'py>) -> Bound<'py, PyByteArray> {
+        PyByteArray::new(py, &self.buffers.legal_action_mask)
+    }
+
+    /// Native-endian `int32[batch_size, 14]` in `ScoreData.components` order.
+    #[getter]
+    fn score_components<'py>(&self, py: Python<'py>) -> Bound<'py, PyByteArray> {
+        PyByteArray::new(py, &self.buffers.score_components)
+    }
+
+    /// `int8[batch_size, max_nodes]`; padded nodes and unowned nodes are `-1`.
+    #[getter]
+    fn node_owner<'py>(&self, py: Python<'py>) -> Bound<'py, PyByteArray> {
+        PyByteArray::new(py, &self.buffers.node_owner)
+    }
+
+    /// `uint8[batch_size, max_nodes]`, containing only zero and one.
+    #[getter]
+    fn alive_stones<'py>(&self, py: Python<'py>) -> Bound<'py, PyByteArray> {
+        PyByteArray::new(py, &self.buffers.alive_stones)
+    }
+}
+
+struct FeatureState {
+    board: Arc<Board>,
+    stones: [BitBoard; 2],
+    to_move: Player,
+    moves_left: u8,
+    opening: bool,
+    pass_streak: u8,
+    terminal: bool,
+}
+
+struct PackedFeatureRow {
+    rings: u8,
+    node_count: usize,
+    node_features: Vec<f32>,
+    global_features: [f32; GLOBAL_FEATURE_DIM],
+    legal_nodes: Vec<u8>,
+    pass_legal: bool,
+    score_components: [i32; SCORE_COMPONENT_DIM],
+    node_owner: Vec<i8>,
+    alive_stones: Vec<u8>,
 }
 
 /// Mutable homogeneous environment batch.
@@ -410,6 +570,11 @@ impl PyStateBatch {
         py.detach(|| score_states(&self.states, self.board.node_count()))
     }
 
+    /// Contiguous schema-v2 model features and exact score annotations.
+    fn feature_data(&self, py: Python<'_>) -> PyFeatureData {
+        py.detach(|| pack_feature_states(&self.states))
+    }
+
     /// Applies one D5 augmentation to every row.
     fn transformed(&self, py: Python<'_>, symmetry: u8) -> PyResult<Self> {
         let symmetry = Symmetry::from_index(symmetry)
@@ -432,6 +597,7 @@ struct PyEvalBatch {
     tree_indices: Vec<usize>,
     tokens: Vec<u64>,
     states: PyStateData,
+    features: PyFeatureData,
     legal_offsets: Vec<usize>,
     legal_actions: Vec<i32>,
 }
@@ -455,6 +621,12 @@ impl PyEvalBatch {
     #[getter]
     fn states(&self) -> PyStateData {
         self.states.clone()
+    }
+
+    /// Precomputed contiguous features for the request states.
+    #[getter]
+    fn features(&self) -> PyFeatureData {
+        self.features.clone()
     }
 
     /// CSR offsets into `legal_actions`.
@@ -966,6 +1138,231 @@ fn score_states(states: &[GameState], node_count: u16) -> PyScoreData {
     }
 }
 
+fn pack_feature_states(states: &[GameState]) -> PyFeatureData {
+    let rows = states
+        .par_iter()
+        .map_init(ScoringScratch::default, |scratch, state| {
+            let score = scratch.score_state(state);
+            pack_feature_row(
+                state.board(),
+                state.stones(),
+                state.to_move(),
+                state.moves_left(),
+                state.is_opening(),
+                state.pass_streak(),
+                state.is_terminal(),
+                score,
+            )
+        })
+        .collect();
+    pack_feature_rows(rows)
+}
+
+fn pack_semantic_feature_states(states: &[FeatureState]) -> PyFeatureData {
+    let rows = states
+        .par_iter()
+        .map_init(ScoringScratch::default, |scratch, state| {
+            let score = scratch.score(&state.board, state.stones);
+            pack_feature_row(
+                &state.board,
+                state.stones,
+                state.to_move,
+                state.moves_left,
+                state.opening,
+                state.pass_streak,
+                state.terminal,
+                score,
+            )
+        })
+        .collect();
+    pack_feature_rows(rows)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn pack_feature_row(
+    board: &Board,
+    stones: [BitBoard; 2],
+    to_move: Player,
+    moves_left: u8,
+    opening: bool,
+    pass_streak: u8,
+    terminal: bool,
+    score: ScoreResult,
+) -> PackedFeatureRow {
+    let node_count = usize::from(board.node_count());
+    let max_degree = (0..board.node_count())
+        .map(|node| board.neighbors(node).len())
+        .max()
+        .expect("supported boards are nonempty");
+    let current = to_move.index();
+    let opponent = 1 - current;
+    let mut node_features = Vec::with_capacity(node_count * NODE_FEATURE_DIM);
+    let mut legal_nodes = Vec::with_capacity(node_count);
+    let mut node_owner = Vec::with_capacity(node_count);
+    let mut alive_stones = Vec::with_capacity(node_count);
+    for node_index in 0..node_count {
+        let node = u16::try_from(node_index).expect("board nodes fit in u16");
+        let current_stone = stones[current].contains(node);
+        let opponent_stone = stones[opponent].contains(node);
+        let empty = !current_stone && !opponent_stone;
+        let owner = score.node_owner[node_index];
+        let alive = score.alive_stones.contains(node);
+        let ring = board.ring(node);
+        let position = board.position(node);
+        let arm_distance = position.min(ring - position);
+        let legal = empty && !terminal;
+        node_features.extend([
+            binary_feature(empty),
+            binary_feature(current_stone),
+            binary_feature(opponent_stone),
+            binary_feature(owner == current as i8),
+            binary_feature(owner == opponent as i8),
+            binary_feature(owner == -1),
+            binary_feature(alive && current_stone),
+            binary_feature(alive && opponent_stone),
+            binary_feature(board.is_peri(node)),
+            binary_feature(board.is_quark(node)),
+            f32::from(ring) / f32::from(board.rings()),
+            f32::from(arm_distance) / f32::from(ring),
+            board.neighbors(node).len() as f32 / max_degree as f32,
+            binary_feature(ring == 1),
+            binary_feature(legal),
+        ]);
+        legal_nodes.push(u8::from(legal));
+        node_owner.push(owner);
+        alive_stones.push(u8::from(alive));
+    }
+
+    let occupied = stones[0].count() + stones[1].count();
+    let current_count = stones[current].count();
+    let opponent_count = stones[opponent].count();
+    let current_score = score.players[current];
+    let opponent_score = score.players[opponent];
+    let score_scale = 181.0_f64;
+    let star_scale = (f64::from(board.peri_count()) / 2.0).max(1.0);
+    let global_features = [
+        (f64::from(board.rings()) / 12.0) as f32,
+        (f64::from(occupied) / f64::from(board.node_count())) as f32,
+        (f64::from(current_count) / f64::from(board.node_count())) as f32,
+        (f64::from(opponent_count) / f64::from(board.node_count())) as f32,
+        (f64::from(moves_left) / 2.0) as f32,
+        binary_feature(opening),
+        (f64::from(pass_streak) / 2.0) as f32,
+        binary_feature(terminal),
+        (f64::from(current_score.total) / score_scale) as f32,
+        (f64::from(opponent_score.total) / score_scale) as f32,
+        (f64::from(current_score.total - opponent_score.total) / score_scale) as f32,
+        (f64::from(current_score.peries) / f64::from(board.peri_count())) as f32,
+        (f64::from(opponent_score.peries) / f64::from(board.peri_count())) as f32,
+        (f64::from(current_score.quarks) / 5.0) as f32,
+        (f64::from(opponent_score.quarks) / 5.0) as f32,
+        (f64::from(current_score.stars) / star_scale) as f32,
+        (f64::from(opponent_score.stars) / star_scale) as f32,
+        (f64::from(score.contested_peries) / f64::from(board.peri_count())) as f32,
+    ];
+    let score_components = packed_score_components(&score);
+    PackedFeatureRow {
+        rings: board.rings(),
+        node_count,
+        node_features,
+        global_features,
+        legal_nodes,
+        pass_legal: !terminal,
+        score_components,
+        node_owner,
+        alive_stones,
+    }
+}
+
+fn pack_feature_rows(rows: Vec<PackedFeatureRow>) -> PyFeatureData {
+    let batch_size = rows.len();
+    let max_nodes = rows.iter().map(|row| row.node_count).max().unwrap_or(0);
+    let mut rings = Vec::with_capacity(batch_size);
+    let mut node_features = vec![0.0_f32; batch_size * max_nodes * NODE_FEATURE_DIM];
+    let mut global_features = Vec::with_capacity(batch_size * GLOBAL_FEATURE_DIM);
+    let mut node_mask = vec![0_u8; batch_size * max_nodes];
+    let mut legal_action_mask = vec![0_u8; batch_size * (max_nodes + 1)];
+    let mut score_components = Vec::with_capacity(batch_size * SCORE_COMPONENT_DIM);
+    let mut node_owner = vec![-1_i8; batch_size * max_nodes];
+    let mut alive_stones = vec![0_u8; batch_size * max_nodes];
+    for (row_index, row) in rows.into_iter().enumerate() {
+        rings.push(row.rings);
+        let feature_start = row_index * max_nodes * NODE_FEATURE_DIM;
+        let feature_end = feature_start + row.node_count * NODE_FEATURE_DIM;
+        node_features[feature_start..feature_end].copy_from_slice(&row.node_features);
+        global_features.extend_from_slice(&row.global_features);
+        let node_start = row_index * max_nodes;
+        let node_end = node_start + row.node_count;
+        node_mask[node_start..node_end].fill(1);
+        node_owner[node_start..node_end].copy_from_slice(&row.node_owner);
+        alive_stones[node_start..node_end].copy_from_slice(&row.alive_stones);
+        let action_start = row_index * (max_nodes + 1);
+        legal_action_mask[action_start..action_start + row.node_count]
+            .copy_from_slice(&row.legal_nodes);
+        legal_action_mask[action_start + max_nodes] = u8::from(row.pass_legal);
+        score_components.extend_from_slice(&row.score_components);
+    }
+    PyFeatureData {
+        batch_size,
+        max_nodes,
+        buffers: Arc::new(FeatureBuffers {
+            rings,
+            node_features: f32_buffer(&node_features),
+            global_features: f32_buffer(&global_features),
+            node_mask,
+            legal_action_mask,
+            score_components: i32_buffer(&score_components),
+            node_owner: i8_buffer(&node_owner),
+            alive_stones,
+        }),
+    }
+}
+
+const fn binary_feature(value: bool) -> f32 {
+    if value { 1.0 } else { 0.0 }
+}
+
+fn packed_score_components(score: &ScoreResult) -> [i32; SCORE_COMPONENT_DIM] {
+    let zero = score.players[0];
+    let one = score.players[1];
+    [
+        i32::from(zero.peries),
+        i32::from(zero.quarks),
+        i32::from(zero.stars),
+        i32::from(zero.quark_peri),
+        i32::from(zero.award),
+        i32::from(zero.total),
+        i32::from(one.peries),
+        i32::from(one.quarks),
+        i32::from(one.stars),
+        i32::from(one.quark_peri),
+        i32::from(one.award),
+        i32::from(one.total),
+        i32::from(score.contested_peries),
+        score.leader.map_or(-1, |player| player as i32),
+    ]
+}
+
+fn f32_buffer(values: &[f32]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(std::mem::size_of_val(values));
+    for value in values {
+        bytes.extend_from_slice(&value.to_ne_bytes());
+    }
+    bytes
+}
+
+fn i32_buffer(values: &[i32]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(std::mem::size_of_val(values));
+    for value in values {
+        bytes.extend_from_slice(&value.to_ne_bytes());
+    }
+    bytes
+}
+
+fn i8_buffer(values: &[i8]) -> Vec<u8> {
+    values.iter().map(|value| value.to_ne_bytes()[0]).collect()
+}
+
 fn wdl_class(value: f32) -> u8 {
     if value > 0.0 {
         2
@@ -1117,6 +1514,154 @@ fn decode_semantic_states(
         .collect()
 }
 
+fn decode_semantic_feature_states(
+    rings: &[u8],
+    metadata: &[u8],
+    stone_values: &[u8],
+) -> Result<Vec<FeatureState>, String> {
+    let rows = rings.len();
+    if rows == 0 {
+        return Err("semantic feature batch must contain at least one row".to_owned());
+    }
+    if metadata.len() != rows * SEMANTIC_METADATA_DIM {
+        return Err(format!(
+            "semantic metadata must contain {} bytes for {rows} rows",
+            rows * SEMANTIC_METADATA_DIM
+        ));
+    }
+    let mut boards: HashMap<u8, Arc<Board>> = HashMap::new();
+    let mut states = Vec::with_capacity(rows);
+    let mut stone_offset = 0;
+    for (row, &ring_count) in rings.iter().enumerate() {
+        let board = if let Some(board) = boards.get(&ring_count) {
+            Arc::clone(board)
+        } else {
+            let board = Arc::new(Board::new(ring_count).map_err(|error| {
+                format!("row {row} has invalid ring count {ring_count}: {error}")
+            })?);
+            boards.insert(ring_count, Arc::clone(&board));
+            board
+        };
+        let node_count = usize::from(board.node_count());
+        let stone_end = stone_offset + node_count;
+        if stone_end > stone_values.len() {
+            return Err(format!(
+                "semantic stones end inside row {row}: expected {node_count} node values"
+            ));
+        }
+        let mut stones = [BitBoard::empty(); 2];
+        for (node_index, &value) in stone_values[stone_offset..stone_end].iter().enumerate() {
+            let node = u16::try_from(node_index).expect("board nodes fit in u16");
+            match i8::from_ne_bytes([value]) {
+                -1 => {}
+                0 => {
+                    stones[0].insert(node);
+                }
+                1 => {
+                    stones[1].insert(node);
+                }
+                invalid => {
+                    return Err(format!(
+                        "row {row} node {node_index} has invalid stone value {invalid}"
+                    ));
+                }
+            }
+        }
+        stone_offset = stone_end;
+
+        let base = row * SEMANTIC_METADATA_DIM;
+        let to_move = match metadata[base] {
+            0 => Player::Zero,
+            1 => Player::One,
+            value => return Err(format!("row {row} has invalid to_move value {value}")),
+        };
+        let moves_left = metadata[base + 1];
+        let opening = semantic_bool("opening", row, metadata[base + 2])?;
+        let pass_streak = metadata[base + 3];
+        let terminal = semantic_bool("terminal", row, metadata[base + 4])?;
+        validate_feature_semantics(
+            row,
+            &board,
+            stones,
+            to_move,
+            moves_left,
+            opening,
+            pass_streak,
+            terminal,
+        )?;
+        states.push(FeatureState {
+            board,
+            stones,
+            to_move,
+            moves_left,
+            opening,
+            pass_streak,
+            terminal,
+        });
+    }
+    if stone_offset != stone_values.len() {
+        return Err(format!(
+            "semantic stones contain {} trailing node values",
+            stone_values.len() - stone_offset
+        ));
+    }
+    Ok(states)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_feature_semantics(
+    row: usize,
+    board: &Board,
+    stones: [BitBoard; 2],
+    to_move: Player,
+    moves_left: u8,
+    opening: bool,
+    pass_streak: u8,
+    terminal: bool,
+) -> Result<(), String> {
+    let occupied = stones[0].count() + stones[1].count();
+    let board_full = occupied == board.node_count();
+    if moves_left > 2 {
+        return Err(format!("row {row} has moves_left outside 0..2"));
+    }
+    if pass_streak > 2 {
+        return Err(format!("row {row} has pass_streak outside 0..2"));
+    }
+    if terminal != (board_full || pass_streak == 2) {
+        return Err(format!(
+            "row {row} terminal must equal board-full or pass_streak == 2"
+        ));
+    }
+    if moves_left == 0 && !board_full {
+        return Err(format!(
+            "row {row} uses moves_left == 0 on a non-full board"
+        ));
+    }
+    if board_full && moves_left > 1 {
+        return Err(format!(
+            "row {row} full board retains more than one placement"
+        ));
+    }
+    if opening
+        && (to_move != Player::Zero
+            || moves_left != 1
+            || pass_streak != 0
+            || occupied != 0
+            || terminal)
+    {
+        return Err(format!("row {row} has invalid opening metadata"));
+    }
+    Ok(())
+}
+
+fn semantic_bool(name: &str, row: usize, value: u8) -> Result<bool, String> {
+    match value {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => Err(format!("row {row} has invalid {name} value {value}")),
+    }
+}
+
 fn prepare_terminal_resets(
     board: &Arc<Board>,
     states: &[GameState],
@@ -1218,12 +1763,12 @@ fn active_root_requests(trees: &[SearchTree]) -> Result<Vec<(usize, EvaluationRe
 
 fn pack_requests(tree_indices: Vec<usize>, requests: Vec<EvaluationRequest>) -> PyEvalBatch {
     let tokens = requests.iter().map(|request| request.token).collect();
-    let states = pack_states(
-        &requests
-            .iter()
-            .map(|request| request.state.clone())
-            .collect::<Vec<_>>(),
-    );
+    let request_states = requests
+        .iter()
+        .map(|request| request.state.clone())
+        .collect::<Vec<_>>();
+    let states = pack_states(&request_states);
+    let features = pack_feature_states(&request_states);
     let mut legal_offsets = Vec::with_capacity(requests.len() + 1);
     let mut legal_actions = Vec::new();
     legal_offsets.push(0);
@@ -1235,6 +1780,7 @@ fn pack_requests(tree_indices: Vec<usize>, requests: Vec<EvaluationRequest>) -> 
         tree_indices,
         tokens,
         states,
+        features,
         legal_offsets,
         legal_actions,
     }
@@ -1357,6 +1903,28 @@ fn value_error(error: impl std::fmt::Display) -> PyErr {
     PyValueError::new_err(error.to_string())
 }
 
+/// Encodes a heterogeneous semantic-key batch from three contiguous byte buffers.
+///
+/// `rings` is `uint8[B]`; `metadata` is `uint8[B, 5]` in
+/// `(to_move, moves_left, opening, pass_streak, terminal)` order; and `stones`
+/// is the concatenation of each row's native node-order `int8` stones.
+#[pyfunction]
+fn encode_semantic_features(
+    py: Python<'_>,
+    rings: &Bound<'_, PyBytes>,
+    metadata: &Bound<'_, PyBytes>,
+    stones: &Bound<'_, PyBytes>,
+) -> PyResult<PyFeatureData> {
+    let rings = rings.as_bytes().to_vec();
+    let metadata = metadata.as_bytes().to_vec();
+    let stones = stones.as_bytes().to_vec();
+    py.detach(move || {
+        let states = decode_semantic_feature_states(&rings, &metadata, &stones)
+            .map_err(PyValueError::new_err)?;
+        Ok(pack_semantic_feature_states(&states))
+    })
+}
+
 #[pyfunction]
 fn native_rules_hash() -> u64 {
     rules_hash()
@@ -1400,6 +1968,7 @@ fn star_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyStateData>()?;
     module.add_class::<PyTrajectoryData>()?;
     module.add_class::<PyScoreData>()?;
+    module.add_class::<PyFeatureData>()?;
     module.add_class::<PyStateBatch>()?;
     module.add_class::<PyEvalBatch>()?;
     module.add_class::<PySearchResults>()?;
@@ -1407,6 +1976,7 @@ fn star_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(native_rules_hash, module)?)?;
     module.add_function(wrap_pyfunction!(native_rules_hash_tag, module)?)?;
     module.add_function(wrap_pyfunction!(native_rules_schema, module)?)?;
+    module.add_function(wrap_pyfunction!(encode_semantic_features, module)?)?;
     module.add_function(wrap_pyfunction!(configure_rayon_threads, module)?)?;
     module.add_function(wrap_pyfunction!(rayon_num_threads, module)?)?;
     Ok(())

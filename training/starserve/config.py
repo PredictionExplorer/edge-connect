@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, fields
 from pathlib import Path
-from typing import Any, TypeVar
+from typing import Any, TypeVar, cast
 from urllib.parse import urlsplit
 
 import yaml
@@ -167,7 +167,7 @@ def _mapping(name: str, value: object) -> dict[str, Any]:
 
 def _construct(cls: type[_T], values: object) -> _T:
     mapping = _mapping(cls.__name__, values)
-    allowed = {field.name for field in fields(cls)}
+    allowed = {field.name for field in fields(cast(Any, cls))}
     unknown = set(mapping) - allowed
     if unknown:
         raise ServerConfigError(f"unknown {cls.__name__} keys: {sorted(unknown)}")

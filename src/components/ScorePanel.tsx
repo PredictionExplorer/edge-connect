@@ -44,9 +44,9 @@ export function ScorePanel({ game, score }: ScorePanelProps) {
                   background: `radial-gradient(circle at 35% 30%, ${c.bright}, ${c.base} 55%, ${c.deep})`,
                 }}
               />
-              <h3 className="min-w-0 flex-1 truncate text-sm font-medium text-ink">
+              <h2 className="min-w-0 flex-1 truncate text-sm font-medium text-ink">
                 {config.playerNames[p]}
-              </h3>
+              </h2>
               {active && (
                 <span
                   className="rounded-full px-2 py-0.5 text-[10px] font-semibold uppercase tracking-widest"

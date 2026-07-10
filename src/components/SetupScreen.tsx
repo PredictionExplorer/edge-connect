@@ -141,6 +141,7 @@ export function SetupScreen() {
                   type="button"
                   onClick={() => chooseMode(m.id)}
                   aria-pressed={mode === m.id}
+                  aria-label={`${m.title}, ${m.sub}`}
                   className={`rounded-2xl border px-4 py-4 text-left transition-all ${
                     mode === m.id
                       ? 'border-gold/70 bg-gold-faint shadow-[0_0_28px_rgba(232,196,139,0.15)]'
@@ -166,6 +167,7 @@ export function SetupScreen() {
                   type="button"
                   onClick={() => setRings(p.rings)}
                   aria-pressed={rings === p.rings}
+                  aria-label={`${p.label}, ${p.rings} rings`}
                   className={`rounded-xl border px-2 py-2.5 text-center transition-all ${
                     rings === p.rings
                       ? 'border-gold/70 bg-gold-faint'
@@ -281,6 +283,7 @@ export function SetupScreen() {
               <input
                 type="checkbox"
                 checked={pieRule}
+                aria-label="Pie rule"
                 onChange={(e) => {
                   setPieRule(e.target.checked);
                   if (e.target.checked) setControllers([...HUMAN_CONTROLLERS]);

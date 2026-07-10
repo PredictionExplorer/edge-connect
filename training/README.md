@@ -37,6 +37,10 @@ Research inspirations:
 - [Regret-Guided Search Control](https://arxiv.org/abs/2602.20809) as an experimental
   future ablation only. RGSC is not implemented or enabled in this pipeline.
 
+Use the [training ablation protocol](docs/training-ablation-protocol.md) before
+changing shipped self-play sources, target retention, candidate scaling, precision or
+search settings.
+
 ## Prerequisites
 
 The documented baseline is:
@@ -110,7 +114,9 @@ npm run build
 
 These tests cover CPU behavior, conformance, replay, orchestration command construction,
 promotion, serving and browser export. They do **not** replace a real H100, CUDA or NCCL
-soak.
+soak. See [testing and H100 validation](docs/testing-and-h100-validation.md) for the
+enforced coverage gates, mutation suites, hardware benchmark commands and certification
+rule.
 
 ## Local CPU smoke
 
@@ -203,8 +209,8 @@ For the 8-GPU profile, `runs/h100-8gpu/` contains:
   shards.
 - `learner/checkpoints/` and `learner/manifests/`: immutable EMA artifacts.
 - `learner/candidate.json`: atomic pointer to the latest learner candidate.
-- `learner/champion.json`: atomic pointer to the only model actors and `starserve` may
-  consume.
+- `learner/champion.json`: atomic deployment pointer and the actor source used by the
+  shipped profiles. `starserve` accepts only this role.
 - `learner/metrics.jsonl` and `learner/learner-complete.json`: training metrics and
   final completion identity.
 - `arena/promotion-status.json` and arena result JSON: persisted paired evaluation.
@@ -218,12 +224,15 @@ champion, which releases actors waiting for `champion.json`. Later candidates ar
 immutable EMA checkpoints emitted every 5,000 learner steps.
 
 The arena compares each candidate with the current champion using reversed-role pairs,
-all rings, forced and unforced openings, a confidence sequence and per-ring regression
-checks. The shipped gate takes 25 new pairs per ring per look, requires at least 50,
-allows at most 200, tests a +35 Elo alternative against 0 Elo, and rejects a material
-ring regression. Only a `promote` result atomically advances `champion.json`;
-inconclusive results accumulate more non-overlapping pairs and rejected candidates
-never feed self-play.
+all rings, forced and unforced openings, a pair-level mixture-betting e-process and
+anytime-valid per-ring regression checks. The shipped gate takes 25 new pairs per ring
+per look, requires at least 50, allows at most 200, tests a +35 Elo alternative against
+0 Elo, and rejects a material ring regression. Only a `promote` result atomically
+advances `champion.json`; inconclusive results accumulate more non-overlapping pairs.
+The shipped `model_refresh.selfplay_source: champion` means rejected candidates never
+feed self-play. Research ablations may select `candidate` or
+`candidate_champion_mix`; the selected role and policy-supervision rate are written to
+actor metrics and model swaps still occur only at complete batch boundaries.
 
 If candidate/champion lag reaches the configured plateau, the learner pauses for a
 terminal arena result. After three terminal rejections, the shipped profile resets

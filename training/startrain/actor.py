@@ -7,6 +7,7 @@ import time
 from collections.abc import Callable, Mapping
 from dataclasses import asdict, replace
 from pathlib import Path
+from typing import Literal
 
 import torch
 
@@ -17,6 +18,7 @@ from .model import GraphResTNet
 from .replay_store import ReplayStore
 from .runtime import HeartbeatReporter, RunIdentity, append_jsonl
 from .selfplay import SelfPlayActor, SelfPlayIdentity
+from .training import maybe_compile_model
 
 
 class RingMixtureScheduler:
@@ -56,11 +58,13 @@ class ManifestModelProvider:
         *,
         device: str,
         run_identity: RunIdentity,
+        expected_role: Literal["champion", "candidate"] = "champion",
     ) -> None:
         self.config = config
         self.manifest_path = Path(manifest_path)
         self.device = device
         self.run_identity = run_identity
+        self.expected_role = expected_role
         self.manifest: ModelManifest | None = None
         self.evaluator: GraphInferenceAdapter | None = None
         self._pointer_signature: tuple[int, int, int] | None = None
@@ -77,9 +81,11 @@ class ManifestModelProvider:
             if self.manifest_path.is_file():
                 return self.refresh()
             if time.monotonic() - started >= refresh.startup_timeout_seconds:
-                raise TimeoutError("actor timed out waiting for champion.json")
+                raise TimeoutError(
+                    f"actor timed out waiting for {self.expected_role}.json"
+                )
             if progress is not None:
-                progress(phase="waiting_for_champion")
+                progress(phase=f"waiting_for_{self.expected_role}")
             time.sleep(refresh.manifest_poll_seconds)
         return None
 
@@ -89,8 +95,8 @@ class ManifestModelProvider:
         if self._pointer_signature == signature and self.evaluator is not None:
             return self.evaluator
         manifest = load_model_manifest(self.manifest_path)
-        if manifest.role != "champion":
-            raise ValueError("self-play may consume only the champion pointer")
+        if manifest.role != self.expected_role:
+            raise ValueError(f"self-play expected a {self.expected_role} model pointer")
         if (
             self.manifest is not None
             and manifest.model_version == self.manifest.model_version
@@ -119,8 +125,14 @@ class ManifestModelProvider:
         ):
             raise ValueError("model manifest and checkpoint identity disagree")
         model.eval()
-        self.evaluator = GraphInferenceAdapter(
+        inference_model = maybe_compile_model(
             model,
+            enabled=self.config.train.compile,
+            dynamic=True,
+            fullgraph=True,
+        )
+        self.evaluator = GraphInferenceAdapter(
+            inference_model,
             device=self.device,
             config=InferenceConfig(
                 precision=self.config.train.precision,
@@ -169,6 +181,22 @@ class ActorSupervisor:
             manifest_path,
             device=device,
             run_identity=run_identity,
+            expected_role="champion",
+        )
+        source = experiment.orchestration.model_refresh.selfplay_source
+        self.candidate_provider = (
+            ManifestModelProvider(
+                experiment,
+                candidate_manifest_path,
+                device=device,
+                run_identity=run_identity,
+                expected_role="candidate",
+            )
+            if source != "champion"
+            else None
+        )
+        self.model_random = random.Random(
+            experiment.selfplay.seed + gpu.gpu_id * 1_000_003 + 0x5E1F
         )
         self.heartbeat = HeartbeatReporter(
             heartbeat_path,
@@ -186,7 +214,8 @@ class ActorSupervisor:
         self.heartbeat.start()
         final_phase = "stopped"
         try:
-            evaluator = self.provider.wait_for_initial(
+            _, initial_provider = self._select_model_provider()
+            evaluator = initial_provider.wait_for_initial(
                 stop_requested=stop_requested,
                 progress=self.heartbeat.advance,
             )
@@ -202,7 +231,8 @@ class ActorSupervisor:
                 while not stop_requested():
                     # This is the sole model refresh point. The evaluator object is
                     # never mutated while SelfPlayActor owns active games.
-                    evaluator = self.provider.refresh()
+                    model_role, provider = self._select_model_provider()
+                    evaluator = provider.refresh()
                     candidate = self._read_candidate()
                     if (
                         candidate.run_id != self.run_identity.run_id
@@ -214,7 +244,11 @@ class ActorSupervisor:
                         )
                     lag = candidate.model_step - evaluator.model_step
                     plateau = self.experiment.orchestration.plateau
-                    if plateau.enabled and lag > plateau.max_learner_champion_lag_steps:
+                    if (
+                        model_role == "champion"
+                        and plateau.enabled
+                        and lag > plateau.max_learner_champion_lag_steps
+                    ):
                         self.heartbeat.advance(
                             phase="champion_selfplay_plateau",
                             candidate_step=candidate.model_step,
@@ -241,6 +275,7 @@ class ActorSupervisor:
                         batch=batches,
                         generation=generation,
                         ring=ring,
+                        model_role=model_role,
                         model_version=evaluator.model_version,
                         model_step=evaluator.model_step,
                     )
@@ -265,6 +300,12 @@ class ActorSupervisor:
                     losses = sum(summary.winner == 1 for summary in summaries)
                     draws = sum(summary.winner == -1 for summary in summaries)
                     samples = sum(summary.samples for summary in summaries)
+                    policy_samples = sum(
+                        summary.policy_samples for summary in summaries
+                    )
+                    search_simulations = sum(
+                        summary.search_simulations for summary in summaries
+                    )
                     append_jsonl(
                         self.metrics_path,
                         {
@@ -278,10 +319,28 @@ class ActorSupervisor:
                             "ring": ring,
                             "games": len(summaries),
                             "samples": samples,
+                            "policy_samples": policy_samples,
+                            "policy_supervision_rate": (
+                                policy_samples / samples if samples else 0.0
+                            ),
+                            "search_simulations": search_simulations,
+                            "search_simulations_per_second": (
+                                search_simulations / elapsed if elapsed else 0.0
+                            ),
+                            "games_per_second": (
+                                len(summaries) / elapsed if elapsed else 0.0
+                            ),
+                            "samples_per_second": (
+                                samples / elapsed if elapsed else 0.0
+                            ),
                             "wins_player_zero": wins,
                             "wins_player_one": losses,
                             "draws": draws,
                             "elapsed_seconds": elapsed,
+                            "model_role": model_role,
+                            "selfplay_source": (
+                                self.experiment.orchestration.model_refresh.selfplay_source
+                            ),
                             "model_version": evaluator.model_version,
                             "model_identity": evaluator.model_identity,
                             "model_step": evaluator.model_step,
@@ -303,6 +362,19 @@ class ActorSupervisor:
             self.heartbeat.close(final_phase=final_phase)
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+
+    def _select_model_provider(
+        self,
+    ) -> tuple[Literal["champion", "candidate"], ManifestModelProvider]:
+        refresh = self.experiment.orchestration.model_refresh
+        if refresh.selfplay_source == "champion":
+            return "champion", self.provider
+        assert self.candidate_provider is not None
+        if refresh.selfplay_source == "candidate":
+            return "candidate", self.candidate_provider
+        if self.model_random.random() < refresh.candidate_probability:
+            return "candidate", self.candidate_provider
+        return "champion", self.provider
 
     def _read_candidate(self) -> ModelManifest:
         stat = self.candidate_manifest_path.stat()

@@ -318,11 +318,16 @@ def arena_main(argv: list[str] | None = None) -> None:
         config=experiment.arena,
     ).run()
     atomic_json(arguments.output, result)
+    promotion = result.get("promotion")
+    if not isinstance(promotion, dict) or not isinstance(
+        promotion.get("decision"), str
+    ):
+        raise RuntimeError("arena result omitted a promotion decision")
     print(
         json.dumps(
             {
                 "output": str(Path(arguments.output).resolve()),
-                "decision": result["promotion"]["decision"],
+                "decision": promotion["decision"],
                 "aggregate": result["aggregate"],
             },
             sort_keys=True,

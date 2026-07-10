@@ -32,10 +32,17 @@ serve = [
 test = [
   "fastapi>=0.115",
   "httpx>=0.28",
+  "hypothesis>=6.156.5",
+  "maturin>=1.14.1",
+  "mutmut>=3.6.0",
   "onnx>=1.17",
   "onnxruntime>=1.20",
   "onnxscript>=0.4",
+  "pip-audit>=2.10.1",
+  "pyright>=1.1.411",
   "pytest>=8.3",
+  "pytest-cov>=7.1.0",
+  "pytest-timeout>=2.4.0",
   "ruff",
 ]
 onnx = ["onnx>=1.17", "onnxruntime>=1.20", "onnxscript>=0.4"]
@@ -56,9 +63,57 @@ exclude = [
 packages = ["startrain", "starserve"]
 
 [tool.pytest.ini_options]
-addopts = "-q -p no:cacheprovider"
+addopts = "-q -p no:cacheprovider --strict-config --strict-markers"
 testpaths = ["tests"]
+timeout = 60
+xfail_strict = true
+filterwarnings = [
+  "error::DeprecationWarning:startrain.*",
+  "error::DeprecationWarning:starserve.*",
+  'ignore:Using `httpx` with `starlette.testclient` is deprecated.*',
+  'ignore:`isinstance\(treespec, LeafSpec\)` is deprecated.*:FutureWarning',
+  "ignore:# The axis name.*will not be used.*:UserWarning",
+]
+markers = [
+  "native: requires the compiled star_native extension",
+  "cuda: requires one CUDA-capable GPU",
+  "multi_gpu: requires at least two CUDA-capable GPUs",
+  "soak: long-running target-host reliability validation",
+]
 
 [tool.ruff]
 target-version = "py311"
 line-length = 88
+
+[tool.coverage.run]
+branch = true
+source = ["startrain", "starserve"]
+
+[tool.coverage.report]
+fail_under = 0
+show_missing = true
+skip_covered = true
+
+[tool.pyright]
+include = ["startrain", "starserve", "scripts"]
+pythonVersion = "3.11"
+typeCheckingMode = "standard"
+reportMissingTypeStubs = false
+
+[tool.mutmut]
+source_paths = ["startrain"]
+only_mutate = [
+  "startrain/arena.py",
+  "startrain/losses.py",
+  "startrain/replay.py",
+  "startrain/selfplay.py",
+]
+mutate_only_covered_lines = true
+also_copy = ["configs"]
+pytest_add_cli_args = ["-q", "-p", "no:cacheprovider"]
+pytest_add_cli_args_test_selection = [
+  "tests/test_arena.py",
+  "tests/test_losses.py",
+  "tests/test_pipeline_core.py",
+  "tests/test_replay.py",
+]

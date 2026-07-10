@@ -83,6 +83,10 @@ def test_yaml_configs_load_strictly() -> None:
     continuous = load_config(CONFIGS / "h100-8gpu.yaml")
     assert continuous.profile == "continuous"
     assert continuous.data.ring_stratified is True
+    assert continuous.orchestration.model_refresh.selfplay_source == "champion"
+    assert continuous.orchestration.model_refresh.candidate_probability == 0.8
+    assert continuous.selfplay.record_fast_policy_targets is False
+    assert continuous.selfplay.max_considered_cap == 64
 
 
 def test_optimizer_decay_groups_and_muon_selection() -> None:

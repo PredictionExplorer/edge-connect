@@ -41,11 +41,19 @@ training infrastructure, not a claim of superhuman playing strength. See the
 npm ci
 npm run dev              # development server at http://localhost:3000
 npm test                 # Vitest suite
+npm run test:coverage    # unit/component coverage with risk-weighted floors
+npm run test:e2e         # production build + Chromium/Firefox/WebKit flows
 npm run lint             # ESLint
+npm run typecheck        # strict TypeScript
 npm run build            # production Next.js build
 npm run start            # serve the production build
 npm run build:star-wasm  # optional local-AI Rust/WASM artifacts
 ```
+
+CI also builds the native Python extension, runs pytest with per-module coverage
+floors, Rust property and WASM contract suites, mutation jobs, dependency audits,
+and a container smoke. CUDA, NCCL, and soak tests are separate hardware tiers; see
+[testing and H100 validation](training/docs/testing-and-h100-validation.md).
 
 The rules engine lives in `src/lib/star/`:
 

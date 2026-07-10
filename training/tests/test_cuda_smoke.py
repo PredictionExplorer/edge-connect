@@ -1,0 +1,77 @@
+from __future__ import annotations
+
+import torch
+
+import pytest
+from startrain.features import DoubleStarPosition, encode_batch
+from startrain.model import GraphResTNet, ModelConfig
+from startrain.topology import get_topology
+from startrain.training import maybe_compile_model
+
+
+def _batch(batch_size: int = 4):
+    topology = get_topology(3)
+    position = DoubleStarPosition(
+        rings=3,
+        stones=torch.full((topology.n,), -1, dtype=torch.int8),
+        to_move=0,
+        moves_left=1,
+        opening=True,
+        pass_streak=0,
+        terminal=False,
+    )
+    return encode_batch([position] * batch_size).to("cuda")
+
+
+def _model() -> GraphResTNet:
+    return GraphResTNet(
+        ModelConfig(
+            width=32,
+            rrt_groups=1,
+            attention_heads=4,
+            kv_heads=1,
+        )
+    ).cuda()
+
+
+@pytest.mark.cuda
+def test_cuda_bf16_compiled_forward_backward_is_finite() -> None:
+    model = _model()
+    compiled = maybe_compile_model(
+        model, enabled=True, dynamic=False, fullgraph=True, backend="inductor"
+    )
+    batch = _batch()
+    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        output = compiled(*batch.model_args())
+        loss = (
+            output.wdl_logits.float().square().mean()
+            + output.score_margin_logits.float().square().mean()
+            + output.ownership_logits.float().square().mean()
+        )
+    loss.backward()
+    torch.cuda.synchronize()
+    assert torch.isfinite(loss)
+    assert all(
+        parameter.grad is None or bool(torch.isfinite(parameter.grad).all())
+        for parameter in model.parameters()
+    )
+
+
+@pytest.mark.cuda
+@pytest.mark.soak
+def test_cuda_repeated_inference_stays_finite_and_memory_bounded() -> None:
+    model = _model().eval()
+    batch = _batch(batch_size=16)
+    torch.cuda.reset_peak_memory_stats()
+    with (
+        torch.inference_mode(),
+        torch.autocast(device_type="cuda", dtype=torch.bfloat16),
+    ):
+        for _ in range(500):
+            output = model(*batch.model_args())
+            assert bool(torch.isfinite(output.wdl_logits).all())
+    torch.cuda.synchronize()
+    peak = torch.cuda.max_memory_allocated()
+    allocated = torch.cuda.memory_allocated()
+    assert allocated <= peak
+    assert peak < 2 * 1024**3

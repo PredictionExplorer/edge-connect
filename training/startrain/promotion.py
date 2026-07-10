@@ -13,7 +13,12 @@ from pathlib import Path
 
 import torch
 
-from .arena import ArenaPair, ArenaRunner, summarize_arena_pairs
+from .arena import (
+    ARENA_RESULT_SCHEMA_VERSION,
+    ArenaPair,
+    ArenaRunner,
+    summarize_arena_pairs,
+)
 from .checkpoint import (
     ModelManifest,
     collect_model_garbage,
@@ -200,7 +205,11 @@ class PromotionSupervisor:
             }
             if all(count <= 0 for count in counts.values()):
                 assert previous is not None
-                previous["promotion"]["decision"] = "reject_max_pairs"
+                previous["schema_version"] = ARENA_RESULT_SCHEMA_VERSION
+                previous_promotion = previous.get("promotion")
+                if not isinstance(previous_promotion, dict):
+                    raise ValueError("persisted arena promotion is invalid")
+                previous_promotion["decision"] = "reject_max_pairs"
                 previous["terminal"] = True
                 atomic_json(self._result_path(candidate, champion), previous)
                 self._write_status(
@@ -238,22 +247,34 @@ class PromotionSupervisor:
             accumulated.extend(self._pairs_from_result(result))
             unique = {(pair.ring, pair.pair): pair for pair in accumulated}
             accumulated = [unique[key] for key in sorted(unique)]
+            result["schema_version"] = ARENA_RESULT_SCHEMA_VERSION
             result["pairs"] = [asdict(pair) for pair in accumulated]
             result.update(summarize_arena_pairs(accumulated, self.experiment.arena))
             if previous is not None:
+                previous_games = previous.get("games", [])
+                result_games = result.get("games", [])
+                if not isinstance(previous_games, list) or not isinstance(
+                    result_games, list
+                ):
+                    raise ValueError("persisted arena games are invalid")
                 result["games"] = [
-                    *previous.get("games", []),
-                    *result.get("games", []),
+                    *previous_games,
+                    *result_games,
                 ]
             max_reached = all(
                 sum(pair.ring == ring for pair in accumulated)
                 >= self.experiment.arena.max_pairs_per_ring
                 for ring in self.experiment.arena.rings
             )
-            decision = str(result["promotion"]["decision"])
+            promotion_result = result.get("promotion")
+            if not isinstance(promotion_result, dict) or not isinstance(
+                promotion_result.get("decision"), str
+            ):
+                raise ValueError("arena result promotion is invalid")
+            decision = promotion_result["decision"]
             if decision == "continue" and max_reached:
                 decision = "reject_max_pairs"
-                result["promotion"]["decision"] = decision
+                promotion_result["decision"] = decision
             terminal = decision != "continue"
             result["terminal"] = terminal
             result_path = self._result_path(candidate, champion)
@@ -354,6 +375,7 @@ class PromotionSupervisor:
             return None
         valid = (
             isinstance(payload, dict)
+            and payload.get("schema_version") in (1, ARENA_RESULT_SCHEMA_VERSION)
             and payload.get("candidate") == candidate.model_identity
             and payload.get("baseline") == champion.model_identity
             and isinstance(payload.get("promotion"), dict)
@@ -392,13 +414,14 @@ class PromotionSupervisor:
         if previous is not None and bool(previous.get("terminal")):
             return
         payload: dict[str, object] = previous or {
-            "schema_version": 1,
+            "schema_version": ARENA_RESULT_SCHEMA_VERSION,
             "candidate": candidate.model_identity,
             "baseline": champion.model_identity,
             "pairs": [],
             "games": [],
             "promotion": {},
         }
+        payload["schema_version"] = ARENA_RESULT_SCHEMA_VERSION
         payload["terminal"] = True
         payload["promotion"] = {
             "decision": "superseded",
@@ -423,7 +446,12 @@ class PromotionSupervisor:
                     prior = loaded
             except (OSError, json.JSONDecodeError):
                 prior = {}
-        streak = int(prior.get("consecutive_terminal_rejections", 0))
+        raw_streak = prior.get("consecutive_terminal_rejections", 0)
+        streak = (
+            raw_streak
+            if isinstance(raw_streak, int) and not isinstance(raw_streak, bool)
+            else 0
+        )
         prior_candidate = prior.get("candidate_identity")
         prior_terminal = bool(prior.get("terminal"))
         prior_decision = prior.get("decision")

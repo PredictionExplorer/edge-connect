@@ -1,6 +1,6 @@
 'use client';
 
-import { memo, useMemo, useState } from 'react';
+import { memo, useId, useMemo, useRef, useState, type KeyboardEvent } from 'react';
 import type { Board } from '@/lib/star/board';
 import { EMPTY } from '@/lib/star/scoring';
 import { PLAYER_COLORS } from './theme';
@@ -21,6 +21,7 @@ export interface StarBoardProps {
   interactive?: boolean;
   onPlace?: (node: number) => void;
   onHover?: (node: number) => void;
+  playerNames?: readonly [string, string];
   className?: string;
 }
 
@@ -32,6 +33,42 @@ function pentagonPath(radius: number, rotate = 54): string {
     pts.push(`${(radius * Math.cos(a)).toFixed(2)},${(radius * Math.sin(a)).toFixed(2)}`);
   }
   return `M${pts.join('L')}Z`;
+}
+
+type DirectionKey = 'ArrowUp' | 'ArrowDown' | 'ArrowLeft' | 'ArrowRight';
+
+/**
+ * Choose the nearest node that lies substantially in the requested visual
+ * direction. This makes the board behave like a spatial control rather than
+ * exposing implementation-order navigation.
+ */
+function nodeInDirection(board: Board, from: number, key: DirectionKey): number {
+  const direction =
+    key === 'ArrowUp'
+      ? [0, -1]
+      : key === 'ArrowDown'
+        ? [0, 1]
+        : key === 'ArrowLeft'
+          ? [-1, 0]
+          : [1, 0];
+  let best = from;
+  let bestCost = Number.POSITIVE_INFINITY;
+
+  for (let candidate = 0; candidate < board.n; candidate++) {
+    if (candidate === from) continue;
+    const dx = board.xs[candidate] - board.xs[from];
+    const dy = board.ys[candidate] - board.ys[from];
+    const distance = Math.hypot(dx, dy);
+    const alignment = (dx * direction[0] + dy * direction[1]) / distance;
+    if (alignment < 0.35) continue;
+    const cost = distance / alignment;
+    if (cost < bestCost) {
+      best = candidate;
+      bestCost = cost;
+    }
+  }
+
+  return best;
 }
 
 export const StarBoard = memo(function StarBoard({
@@ -46,9 +83,14 @@ export const StarBoard = memo(function StarBoard({
   interactive = false,
   onPlace,
   onHover,
+  playerNames,
   className,
 }: StarBoardProps) {
   const [hovered, setHovered] = useState(-1);
+  const [activeNode, setActiveNode] = useState(0);
+  const [focusedNode, setFocusedNode] = useState(-1);
+  const nodeRefs = useRef(new Map<number, SVGCircleElement>());
+  const instructionsId = useId();
 
   const stoneR = Math.min(board.minEdge * 0.46 * S, 9.5);
 
@@ -111,15 +153,61 @@ export const StarBoard = memo(function StarBoard({
   };
 
   const territory = showTerritory && nodeOwner ? nodeOwner : null;
+  const occupiedCount = Array.from({ length: board.n }, (_, node) => stones[node]).filter(
+    (stone) => stone !== EMPTY,
+  ).length;
+  const currentPlayerName = playerNames?.[toMove] || PLAYER_COLORS[toMove].name;
+
+  const focusNode = (node: number) => {
+    setActiveNode(node);
+    nodeRefs.current.get(node)?.focus();
+  };
+
+  const handleNodeKeyDown = (
+    event: KeyboardEvent<SVGCircleElement>,
+    node: number,
+    isEmpty: boolean,
+  ) => {
+    if (event.key === 'Enter' || event.key === ' ') {
+      event.preventDefault();
+      if (isEmpty) onPlace?.(node);
+      return;
+    }
+
+    let next = node;
+    if (
+      event.key === 'ArrowUp' ||
+      event.key === 'ArrowDown' ||
+      event.key === 'ArrowLeft' ||
+      event.key === 'ArrowRight'
+    ) {
+      next = nodeInDirection(board, node, event.key);
+    } else if (event.key === 'Home') {
+      next = 0;
+    } else if (event.key === 'End') {
+      next = board.n - 1;
+    } else {
+      return;
+    }
+
+    event.preventDefault();
+    focusNode(next);
+  };
 
   return (
     <svg
       viewBox="-119 -119 238 238"
       className={className}
-      role="application"
-      aria-label={`*Star board with ${board.rings} rings`}
+      role={interactive ? 'group' : 'img'}
+      aria-label={`*Star board with ${board.rings} rings, ${occupiedCount} of ${board.n} nodes occupied`}
+      aria-describedby={instructionsId}
       onMouseLeave={() => hover(-1)}
     >
+      <desc id={instructionsId}>
+        {interactive
+          ? 'Use the arrow keys to move between nodes. Press Enter or Space to place a stone on an empty node.'
+          : 'A non-interactive preview of the game board.'}
+      </desc>
       <defs>
         <radialGradient id="plate" cx="38%" cy="30%" r="90%">
           <stop offset="0%" stopColor="#1b2140" />
@@ -180,6 +268,14 @@ export const StarBoard = memo(function StarBoard({
         const quark = board.isQuark[u] === 1;
         const peri = board.isPeri[u] === 1;
         const dead = !isEmpty && aliveStone && showTerritory ? aliveStone[u] === 0 : false;
+        const nodeKind = quark ? 'quark peri' : peri ? 'peri' : 'interior node';
+        const nodeState = isEmpty
+          ? `empty ${nodeKind}; ${currentPlayerName} may place here`
+          : `${playerNames?.[stone as 0 | 1] || PLAYER_COLORS[stone as 0 | 1].name} stone on ${nodeKind}${
+              dead ? ', not currently part of a living star' : ''
+            }${u === lastMove ? ', last move' : ''}${
+              currentTurnMoves.includes(u) && u !== lastMove ? ', placed this turn' : ''
+            }`;
 
         return (
           <g key={u}>
@@ -251,7 +347,13 @@ export const StarBoard = memo(function StarBoard({
               <circle cx={x} cy={y} r={stoneR * 0.22} fill="rgba(255,255,255,0.85)" />
             )}
             {u === lastMove && (
-              <circle cx={x} cy={y} fill="none" stroke="rgba(255,255,255,0.9)">
+              <circle
+                className="last-move-pulse"
+                cx={x}
+                cy={y}
+                fill="none"
+                stroke="rgba(255,255,255,0.9)"
+              >
                 {/* SMIL keeps the pulse alive without JS-driven animation. */}
                 <animate
                   attributeName="r"
@@ -274,16 +376,49 @@ export const StarBoard = memo(function StarBoard({
               </circle>
             )}
 
-            {/* hit target */}
-            {interactive && isEmpty && (
+            {interactive && focusedNode === u && (
               <circle
+                aria-hidden
+                cx={x}
+                cy={y}
+                r={Math.max(stoneR * 1.45, 5.5)}
+                fill="none"
+                stroke="rgba(255,255,255,0.95)"
+                strokeWidth="1.1"
+                pointerEvents="none"
+              />
+            )}
+
+            {/* hit target */}
+            {interactive && (
+              <circle
+                ref={(element) => {
+                  if (element) nodeRefs.current.set(u, element);
+                  else nodeRefs.current.delete(u);
+                }}
                 cx={x}
                 cy={y}
                 r={Math.max(stoneR, 4)}
                 fill="transparent"
-                style={{ cursor: 'pointer' }}
+                role="button"
+                tabIndex={activeNode === u ? 0 : -1}
+                aria-label={`Node ${board.labels[u]}, ${nodeState}`}
+                aria-disabled={!isEmpty}
+                style={{ cursor: isEmpty ? 'pointer' : 'default', outline: 'none' }}
                 onMouseEnter={() => hover(u)}
-                onClick={() => onPlace?.(u)}
+                onFocus={() => {
+                  setActiveNode(u);
+                  setFocusedNode(u);
+                  hover(u);
+                }}
+                onBlur={() => {
+                  setFocusedNode((current) => (current === u ? -1 : current));
+                  hover(-1);
+                }}
+                onKeyDown={(event) => handleNodeKeyDown(event, u, isEmpty)}
+                onClick={() => {
+                  if (isEmpty) onPlace?.(u);
+                }}
               />
             )}
           </g>

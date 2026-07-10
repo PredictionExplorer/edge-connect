@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from typing import cast
 
 import torch
 from torch import nn
@@ -47,8 +48,19 @@ def maybe_compile_model(
     if not enabled:
         return model
     if backend is None:
-        return torch.compile(model, dynamic=dynamic, fullgraph=fullgraph)
-    return torch.compile(model, dynamic=dynamic, fullgraph=fullgraph, backend=backend)
+        return cast(
+            nn.Module,
+            torch.compile(model, dynamic=dynamic, fullgraph=fullgraph),
+        )
+    return cast(
+        nn.Module,
+        torch.compile(
+            model,
+            dynamic=dynamic,
+            fullgraph=fullgraph,
+            backend=backend,
+        ),
+    )
 
 
 def build_scheduler(

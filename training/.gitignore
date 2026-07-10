@@ -1,8 +1,15 @@
 .venv/
 .pytest_cache/
 .ruff_cache/
+.coverage
+.mutmut-cache/
 __pycache__/
 *.py[cod]
+coverage.xml
+coverage.json
 dist/
+htmlcov/
+mutants/
+mutants.out/
 runs/
 target/

@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 import threading
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -20,6 +20,7 @@ from startrain.features import GLOBAL_FEATURE_DIM, NODE_FEATURE_DIM
 from startrain.inference import GraphInferenceAdapter, InferenceConfig
 from startrain.model import GraphResTNet
 from startrain.native import BITBOARD_WORDS, load_star_native, positions_from_native
+from startrain.training import maybe_compile_model
 
 from .config import ServerConfig
 from .schemas import AnalyzeRequest
@@ -101,6 +102,7 @@ class AtomicModelManager:
     def lease(self) -> Iterator[ModelLease]:
         reload_ms = 0.0
         should_refresh = False
+        current: LoadedModel | None = None
         with self._condition:
             while self._loading:
                 self._condition.wait()
@@ -155,6 +157,7 @@ class AtomicModelManager:
                 current = self._current
                 self._condition.notify_all()
 
+        assert current is not None
         try:
             yield ModelLease(current, reload_ms)
         finally:
@@ -223,8 +226,15 @@ class AtomicModelManager:
         )
         if int(metadata["step"]) != manifest.model_step:
             raise ValueError("model manifest and EMA checkpoint identity disagree")
+        model.eval()
+        inference_model = maybe_compile_model(
+            model,
+            enabled=experiment.train.compile,
+            dynamic=True,
+            fullgraph=True,
+        )
         evaluator = GraphInferenceAdapter(
-            model.eval(),
+            inference_model,
             device=target,
             config=InferenceConfig(
                 precision=experiment.train.precision,
@@ -249,7 +259,7 @@ class NativeAnalysisService:
         model_manager: AtomicModelManager | None = None,
     ) -> None:
         self.config = config
-        self.native = native_module or load_star_native(required=True)
+        self.native: Any = native_module or load_star_native(required=True)
         assert self.native is not None
         self.models = model_manager or AtomicModelManager(config)
 
@@ -324,7 +334,7 @@ class NativeAnalysisService:
             )
         return payload
 
-    def _import_state(self, request: AnalyzeRequest) -> object:
+    def _import_state(self, request: AnalyzeRequest) -> Any:
         zero_bits = _pack_stones(request.stones, player=0)
         one_bits = _pack_stones(request.stones, player=1)
         state_batch = getattr(self.native, "StateBatch", None)
@@ -335,7 +345,7 @@ class NativeAnalysisService:
                 "star_native lacks StateBatch.from_semantic",
             )
         try:
-            states = importer(
+            states: Any = importer(
                 request.rings,
                 zero_bits,
                 one_bits,
@@ -375,7 +385,7 @@ class NativeAnalysisService:
 
     @staticmethod
     def _response_payload(
-        results: object,
+        results: Any,
         detailed: Any,
         *,
         evaluator: GraphInferenceAdapter,
@@ -483,7 +493,7 @@ class NativeAnalysisService:
         }
 
 
-def _pack_stones(stones: list[int], *, player: int) -> list[int]:
+def _pack_stones(stones: Sequence[int], *, player: int) -> list[int]:
     words = [0] * BITBOARD_WORDS
     for node, stone in enumerate(stones):
         if stone == player:

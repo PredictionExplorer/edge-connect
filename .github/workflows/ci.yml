@@ -1,0 +1,170 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  web:
+    name: Web quality gates
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm audit --audit-level=moderate
+      - run: npm run typecheck
+      - run: npm run lint
+      - run: npm run test:coverage
+      - run: node scripts/export-star-conformance.mjs "$RUNNER_TEMP/conformance-v1.json"
+      - run: cmp testdata/star/conformance-v1.json "$RUNNER_TEMP/conformance-v1.json"
+      - run: STAR_BENCH_ITERATIONS=10000 npm run bench:scoring
+      - run: npm run build
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: web-coverage
+          path: coverage/
+          if-no-files-found: ignore
+
+  rust:
+    name: Rust quality gates
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: training
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.93.0
+          components: rustfmt, clippy, llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: training
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --locked
+      - run: cargo install cargo-llvm-cov --locked
+      - run: >-
+          cargo llvm-cov -p star-engine -p star-search --locked
+          --fail-under-lines 90 --fail-under-functions 85
+          --fail-under-regions 88 --summary-only
+      - run: cargo install cargo-audit --locked
+      - run: cargo audit --deny warnings
+
+  python-native:
+    name: Python and native pipeline
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    defaults:
+      run:
+        working-directory: training
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.93.0
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - run: uv sync --extra test --extra serve --extra onnx --locked
+      - run: uv run pip-audit
+      - run: uv run maturin develop --release --locked --manifest-path crates/star-py/Cargo.toml
+      - run: uv run python -c "import star_native; print(star_native.native_rules_hash_tag())"
+      - run: uv run ruff check startrain starserve tests scripts
+      - run: uv run ruff format --check startrain starserve tests scripts
+      - run: uv run pyright
+      - run: >-
+          uv run pytest --require-native
+          -m "not cuda and not multi_gpu and not soak"
+          --cov --cov-report=xml --cov-report=json:coverage.json
+      - run: uv run python scripts/check_coverage.py coverage.json
+      - run: >-
+          uv run python scripts/benchmark_native_features.py
+          --batch-size 64 --iterations 3 --warmup 1
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: python-coverage
+          path: training/coverage.xml
+          if-no-files-found: ignore
+
+  wasm:
+    name: Browser WASM contract
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.93.0
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: training
+      - run: npm ci
+      - run: cargo install wasm-pack --locked
+      - run: npm run build:star-wasm
+      - run: wasm-pack test --node training/crates/star-wasm
+
+  container:
+    name: Starserve container smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: training
+          load: true
+          push: false
+          tags: edgeconnect-starserve:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - run: >-
+          docker run --rm --entrypoint python3 edgeconnect-starserve:ci
+          -c "import star_native, starserve, startrain, torch;
+          print(star_native.native_rules_hash_tag(), torch.__version__)"
+
+  e2e:
+    name: Browser end-to-end
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npx playwright install --with-deps chromium firefox webkit
+      - run: npm run test:e2e
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: playwright-report
+          path: playwright-report/
+          if-no-files-found: ignore
+
