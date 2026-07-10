@@ -1,7 +1,9 @@
 # Model serving and browser distillation
 
 Start with the [operator guide](../README.md) to install Rust 1.93, Python 3.11,
-CUDA PyTorch and the native extension. From `training/`, the equivalent pip setup is:
+CUDA PyTorch and the native extension. Production trainers should complete the
+[H100 training runbook](production-h100-training-runbook.md) before using the
+publication steps below. From `training/`, the equivalent pip setup is:
 
 ```bash
 python -m pip install "maturin==1.14.1" -e ".[serve,onnx]"

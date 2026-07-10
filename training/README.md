@@ -8,6 +8,11 @@ pipeline contracts; they do not establish strong or superhuman play. `starserve`
 valid `champion.json`, and local browser AI needs a separately distilled and published
 model.
 
+For an actual multi-H100 launch, follow the
+[production H100 training runbook](docs/production-h100-training-runbook.md) from
+host preparation through graceful shutdown and recovery. Do not launch a long run from
+the abbreviated examples alone.
+
 ## Architecture
 
 - `crates/star-engine`: authoritative Rust board, rules, scoring and D5 symmetry.
@@ -165,6 +170,11 @@ Choose a new directory and run ID for a clean repeat. Outside `--cpu-smoke`,
 raw `.pt` file.
 
 ## Start a 4- or 8-H100 run
+
+This section is a command summary. The complete installation, driver-selection,
+NVMe/profile preparation, CUDA/NCCL preflight, tmux/systemd launch, monitoring,
+troubleshooting and resume procedure is in the
+[production H100 training runbook](docs/production-h100-training-runbook.md).
 
 First verify all GPUs and CUDA PyTorch:
 

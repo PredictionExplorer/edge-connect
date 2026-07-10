@@ -3,6 +3,10 @@
 The repository uses four explicit validation tiers. A lower tier passing never
 implies that a higher tier passed.
 
+For the end-to-end host preparation, frozen profile, process supervision,
+monitoring, graceful stop and recovery sequence, use the
+[production H100 training runbook](production-h100-training-runbook.md).
+
 ## Tier 1: deterministic CPU checks
 
 Run on every pull request:

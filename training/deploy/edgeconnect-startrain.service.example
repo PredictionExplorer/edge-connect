@@ -1,0 +1,26 @@
+[Unit]
+Description=EdgeConnect Double Star H100 training coordinator
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=1800
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User=@USER@
+WorkingDirectory=@TRAINING_DIR@
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=TORCH_NCCL_ASYNC_ERROR_HANDLING=1
+Environment=PATH=@TRAINING_DIR@/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=@TRAINING_DIR@/.venv/bin/startrain-orchestrate --config @PROFILE@
+Restart=on-failure
+RestartSec=30
+KillSignal=SIGTERM
+TimeoutStopSec=1000
+LimitNOFILE=1048576
+NoNewPrivileges=true
+UMask=0027
+
+[Install]
+WantedBy=multi-user.target
