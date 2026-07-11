@@ -553,6 +553,11 @@ journalctl -u "edgeconnect-startrain-$RUN_ID.service" -f
 Do not run tmux and systemd coordinators against the same run root at the same
 time.
 
+Do not `git pull`, switch branches, rebuild the editable environment, or modify
+source inside an active unit's `WorkingDirectory`. Actor and coordinator
+restarts import from that physical checkout. Fetch updates into a separate
+detached worktree and use that worktree only for monitoring or a future run.
+
 ## 14. Expected startup lifecycle
 
 Normal startup order:
@@ -585,6 +590,51 @@ Re-establish the run path in every shell:
 
 ```bash
 export RUN_ROOT="/mnt/nvme/edgeconnect/<run-id>"
+```
+
+For a detachable, once-per-minute operator summary, use the read-only monitor
+from a checkout that is not modified by the active run:
+
+```bash
+export UNIT="edgeconnect-startrain-<run-id>.service"
+export MONITOR_TRAINING="$HOME/edgeconnect-releases/main-<sha>/training"
+export MONITOR_PYTHON="$HOME/edge-connect-local/training/.venv/bin/python"
+export MONITOR_SESSION="startrain-monitor-<run-id>"
+export MONITOR_LOG="$RUN_ROOT/operator-monitor.log"
+
+screen -DmS "$MONITOR_SESSION" bash -lc '
+  set -o pipefail
+  cd "$1"
+  "$2" -u scripts/monitor_run.py \
+    --run-root "$3" \
+    --unit "$4" \
+    --interval 60 \
+    --format text 2>&1 |
+  tee -a "$5"
+' monitor "$MONITOR_TRAINING" "$MONITOR_PYTHON" \
+  "$RUN_ROOT" "$UNIT" "$MONITOR_LOG"
+```
+
+Inspect and detach:
+
+```bash
+screen -ls
+screen -r "$MONITOR_SESSION"
+# Detach interactively with Ctrl-A, then D.
+tail -F "$MONITOR_LOG"
+```
+
+Stop only the monitor with:
+
+```bash
+screen -S "$MONITOR_SESSION" -X quit
+```
+
+For structured ingestion, use `--format jsonl`. A one-shot status check is:
+
+```bash
+"$MONITOR_PYTHON" -u "$MONITOR_TRAINING/scripts/monitor_run.py" \
+  --run-root "$RUN_ROOT" --unit "$UNIT" --once
 ```
 
 GPU health:
