@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any, Literal, TypeVar, cast
@@ -19,6 +20,31 @@ _T = TypeVar("_T")
 
 class ConfigError(ValueError):
     pass
+
+
+def parse_cpu_affinity(value: str) -> tuple[int, ...]:
+    """Parse a Linux CPU-list such as ``0-7,16-23``."""
+
+    if not isinstance(value, str) or not value.strip():
+        raise ConfigError("cpu_affinity must be a non-empty CPU list")
+    cpus: set[int] = set()
+    for item in value.split(","):
+        token = item.strip()
+        if not token:
+            raise ConfigError("cpu_affinity contains an empty range")
+        if "-" in token:
+            parts = token.split("-")
+            if len(parts) != 2 or not all(part.isdigit() for part in parts):
+                raise ConfigError("cpu_affinity ranges must use START-END")
+            start, end = (int(part) for part in parts)
+            if end < start:
+                raise ConfigError("cpu_affinity range end precedes start")
+            cpus.update(range(start, end + 1))
+        else:
+            if not token.isdigit():
+                raise ConfigError("cpu_affinity entries must be non-negative integers")
+            cpus.add(int(token))
+    return tuple(sorted(cpus))
 
 
 @dataclass(frozen=True, slots=True)
@@ -104,6 +130,8 @@ class LearnerConfig:
     max_replay_lag_steps: int = 50_000
     steps_per_window: int = 100
     candidate_interval: int = 1_000
+    candidate_interval_examples: int | None = None
+    target_updates_per_new_sample: float | None = None
     metrics_interval: int = 10
     replay_poll_seconds: float = 2.0
     replay_wait_timeout_seconds: float = 0.0
@@ -128,6 +156,21 @@ class LearnerConfig:
             raise ConfigError("learner loop intervals and windows are invalid")
         if self.minimum_unique_samples_per_ring > self.recent_samples_per_ring:
             raise ConfigError("per-ring minimum cannot exceed the recent quota")
+        if self.candidate_interval_examples is not None and (
+            isinstance(self.candidate_interval_examples, bool)
+            or not isinstance(self.candidate_interval_examples, int)
+            or self.candidate_interval_examples <= 0
+        ):
+            raise ConfigError("candidate_interval_examples must be positive")
+        if self.target_updates_per_new_sample is not None and (
+            isinstance(self.target_updates_per_new_sample, bool)
+            or not isinstance(self.target_updates_per_new_sample, int | float)
+            or not math.isfinite(float(self.target_updates_per_new_sample))
+            or self.target_updates_per_new_sample <= 0
+        ):
+            raise ConfigError(
+                "target_updates_per_new_sample must be finite and positive"
+            )
         if self.replay_poll_seconds <= 0 or self.replay_wait_timeout_seconds < 0:
             raise ConfigError("learner replay wait settings are invalid")
         if not self.device:
@@ -142,6 +185,8 @@ class GPUWorkerConfig:
     role: Literal["learner", "actor"]
     cpu_threads: int
     actor_batch_size: int | None = None
+    actor_lanes: int = 1
+    cpu_affinity: str | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -165,8 +210,18 @@ class GPUWorkerConfig:
                 or self.actor_batch_size <= 0
             ):
                 raise ConfigError("actor GPUs require a positive actor_batch_size")
+            if (
+                isinstance(self.actor_lanes, bool)
+                or not isinstance(self.actor_lanes, int)
+                or self.actor_lanes <= 0
+            ):
+                raise ConfigError("actor_lanes must be a positive integer")
         elif self.actor_batch_size is not None:
             raise ConfigError("learner GPUs cannot set actor_batch_size")
+        elif self.actor_lanes != 1:
+            raise ConfigError("learner GPUs cannot configure actor lanes")
+        if self.cpu_affinity is not None:
+            parse_cpu_affinity(self.cpu_affinity)
 
 
 @dataclass(frozen=True, slots=True)
@@ -496,6 +551,18 @@ class OrchestrationConfig:
             raise ConfigError(
                 "pause-sharing mode requires exactly one learner or actor GPU overlap"
             )
+        shared_actor = next(
+            (
+                gpu
+                for gpu in actors
+                if self.promotion.enabled and gpu.gpu_id == self.promotion.gpu_id
+            ),
+            None,
+        )
+        if shared_actor is not None and shared_actor.actor_lanes != 1:
+            raise ConfigError(
+                "the pause-shared arena GPU must use exactly one actor lane"
+            )
         if not self.distributed.enabled and len(learners) > 1:
             raise ConfigError("multiple learner GPUs require distributed.enabled")
         if self.distributed.enabled and len(learners) < 2:
@@ -503,6 +570,13 @@ class OrchestrationConfig:
         if self.distributed.enabled and len({gpu.cpu_threads for gpu in learners}) != 1:
             raise ConfigError(
                 "distributed learner GPUs require equal per-rank CPU budgets"
+            )
+        if (
+            self.distributed.enabled
+            and len({gpu.cpu_affinity for gpu in learners}) != 1
+        ):
+            raise ConfigError(
+                "distributed learner GPUs require one shared CPU affinity mask"
             )
 
     @property
@@ -600,9 +674,16 @@ class ExperimentConfig:
             )
         plateau = self.orchestration.plateau
         if plateau.enabled and plateau.action == "reset_from_champion":
+            candidate_interval_steps = self.learner.candidate_interval
+            if self.learner.candidate_interval_examples is not None:
+                world_size = max(1, len(self.orchestration.learner_gpus))
+                global_batch = self.train.global_batch_size(world_size)
+                candidate_interval_steps = max(
+                    1,
+                    math.ceil(self.learner.candidate_interval_examples / global_batch),
+                )
             rejection_span = (
-                self.learner.candidate_interval
-                * plateau.consecutive_terminal_rejections
+                candidate_interval_steps * plateau.consecutive_terminal_rejections
             )
             if rejection_span > self.learner.max_replay_lag_steps:
                 raise ConfigError(

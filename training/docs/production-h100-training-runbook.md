@@ -28,8 +28,11 @@ The supplied layouts are single-host profiles:
   1–7 to self-play actors, and pause-shares GPU 7 with arena/promotion.
   The coordinator stops and reaps `actor-gpu-7` before acknowledging the
   arena lease, so learner GPU 0 remains continuous.
+- `configs/h100-8gpu-throughput.yaml` keeps that physical role layout, runs
+  two actor lanes on GPUs 1–6, keeps GPU 7 single-lane for pause sharing, and
+  applies the measured target host's NUMA affinity.
 
-Both profiles deliberately use one learner GPU and set
+All supplied continuous profiles deliberately use one learner GPU and set
 `distributed.enabled: false`. The real training command is therefore
 `startrain-orchestrate`, not `torchrun`. NCCL is used only by the preflight
 smoke unless an operator creates and validates a separate multi-learner
@@ -62,6 +65,8 @@ The current profiles allocate these CPU-thread budgets:
 
 - historical 8-GPU profile: 16 learner + 48 actor + 8 arena = 72 threads.
 - optimized 8-GPU profile: 16 learner + 56 actor + 8 arena = 80 threads.
+- throughput 8-GPU profile: 16 learner + 104 actor-lane + 8 arena threads =
+  128 configured threads; the arena and GPU-7 actor do not run concurrently.
 - 4-GPU profile: 24 learner + 24 actor + 8 arena = 56 threads.
 
 Have at least that many logical CPUs or lower the per-worker budgets in a new
@@ -138,7 +143,8 @@ sudo apt-get install -y \
   git \
   jq \
   sqlite3 \
-  tmux
+  tmux \
+  util-linux
 ```
 
 The NVIDIA driver and `nvidia-smi` must already work. Driver installation is
@@ -422,6 +428,12 @@ The benchmark includes native-state decoding, schema-v2 features, host/device
 transfer, compiled BF16 model execution, and legal-policy return. Both commands
 must exit zero and meet the configured threshold of at least 5,000 realistic
 leaf evaluations per second per H100.
+
+For a replacement run, also benchmark a production-sized shard with
+`scripts/benchmark_replay_pipeline.py`. The learner soak must report less than
+10% data-wait time and at least 85% GPU-0 duty after compile warm-up.
+`examples_per_second` is end-to-end wall throughput;
+`device_examples_per_second` isolates GPU execution.
 
 Keep the emitted JSON in the run root:
 

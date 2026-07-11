@@ -70,10 +70,14 @@ The supplied layouts are single-host profiles:
 
 - `configs/h100-4gpu.yaml`: GPU 0 learner, GPUs 1–2 actors, GPU 3 arena.
 - `configs/h100-8gpu.yaml`: GPU 0 learner, GPUs 1–6 actors, GPU 7 arena.
+- `configs/h100-8gpu-throughput.yaml`: GPU 0 learner, two actor lanes on
+  GPUs 1–6, one pause-shared actor/arena lane on GPU 7, and target-host NUMA
+  affinity.
 - `configs/h100.yaml`: one-board-size standalone smoke/tuning profile, not a continuous
   all-ring run.
 
-Both continuous profiles set `distributed.enabled: false`; they do not use NCCL.
+All supplied continuous profiles set `distributed.enabled: false`; they do not use
+NCCL.
 
 ## Install and build `star_native`
 
@@ -217,6 +221,17 @@ to the learner. Promotion receives a token-matched ready acknowledgement only af
 champion update are durable. Copy and freeze the profile per run exactly like the
 control profile.
 
+The higher-utilization successor is intentionally a separate profile:
+
+```bash
+startrain-orchestrate --config configs/h100-8gpu-throughput.yaml
+```
+
+It combines decode-once replay loading, real pinned asynchronous learner transfers,
+truthful wall-step telemetry, two independent actor lanes on GPUs 1–6, compiled
+concurrent arena search, and NUMA affinity. GPU 7 remains single-lane so the
+coordinator's actor/arena pause lease still has exactly one target.
+
 The orchestrator has no `--run-id` or `--run-identity` option. It atomically creates
 `<run-root>/run.json`, then passes that required identity path to every learner, actor
 and promotion child process. An existing `run.json` is reused; a configured `run_id`
@@ -359,6 +374,25 @@ python scripts/h100_system_benchmark.py \
   --batch-sizes 64 128 256 \
   --repeats 3 \
   --metrics-root "$RUN_ROOT"
+```
+
+Measure a representative replay shard independently:
+
+```bash
+python scripts/benchmark_replay_pipeline.py \
+  --shard "$RUN_ROOT/replay/shards/<representative-shard>.npz" \
+  --rows 512 \
+  --repeats 5
+```
+
+Join learner duty cycle, actor work, policy-target confidence and fixed-baseline arena
+results into a strength-per-provisioned-GPU-hour report:
+
+```bash
+python scripts/strength_efficiency_report.py \
+  --run-root "$RUN_ROOT" \
+  --provisioned-gpus 8 \
+  --output "$RUN_ROOT/strength-efficiency.json"
 ```
 
 Before committing to a long run, use these planning gates:

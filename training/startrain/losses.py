@@ -52,27 +52,95 @@ class TrainingTargets:
     alive_mask: Tensor
     soft_policy_mask: Tensor
     sample_weight: Tensor | None = None
+    policy_weight: Tensor | None = None
 
-    def to(self, device: torch.device | str) -> "TrainingTargets":
+    def to(
+        self,
+        device: torch.device | str,
+        *,
+        non_blocking: bool = False,
+    ) -> "TrainingTargets":
         return TrainingTargets(
-            policy=self.policy.to(device),
-            wdl=self.wdl.to(device),
-            score_margin=self.score_margin.to(device),
-            ownership=self.ownership.to(device),
-            alive=self.alive.to(device),
-            soft_policy=self.soft_policy.to(device),
-            policy_mask=self.policy_mask.to(device),
-            wdl_mask=self.wdl_mask.to(device),
-            score_margin_mask=self.score_margin_mask.to(device),
-            ownership_mask=self.ownership_mask.to(device),
-            alive_mask=self.alive_mask.to(device),
-            soft_policy_mask=self.soft_policy_mask.to(device),
+            policy=self.policy.to(device, non_blocking=non_blocking),
+            wdl=self.wdl.to(device, non_blocking=non_blocking),
+            score_margin=self.score_margin.to(device, non_blocking=non_blocking),
+            ownership=self.ownership.to(device, non_blocking=non_blocking),
+            alive=self.alive.to(device, non_blocking=non_blocking),
+            soft_policy=self.soft_policy.to(device, non_blocking=non_blocking),
+            policy_mask=self.policy_mask.to(device, non_blocking=non_blocking),
+            wdl_mask=self.wdl_mask.to(device, non_blocking=non_blocking),
+            score_margin_mask=self.score_margin_mask.to(
+                device, non_blocking=non_blocking
+            ),
+            ownership_mask=self.ownership_mask.to(device, non_blocking=non_blocking),
+            alive_mask=self.alive_mask.to(device, non_blocking=non_blocking),
+            soft_policy_mask=self.soft_policy_mask.to(
+                device, non_blocking=non_blocking
+            ),
             sample_weight=(
-                self.sample_weight.to(device)
+                self.sample_weight.to(device, non_blocking=non_blocking)
                 if self.sample_weight is not None
                 else None
             ),
+            policy_weight=(
+                self.policy_weight.to(device, non_blocking=non_blocking)
+                if self.policy_weight is not None
+                else None
+            ),
         )
+
+    def pin_memory(self) -> "TrainingTargets":
+        return TrainingTargets(
+            policy=self.policy.pin_memory(),
+            wdl=self.wdl.pin_memory(),
+            score_margin=self.score_margin.pin_memory(),
+            ownership=self.ownership.pin_memory(),
+            alive=self.alive.pin_memory(),
+            soft_policy=self.soft_policy.pin_memory(),
+            policy_mask=self.policy_mask.pin_memory(),
+            wdl_mask=self.wdl_mask.pin_memory(),
+            score_margin_mask=self.score_margin_mask.pin_memory(),
+            ownership_mask=self.ownership_mask.pin_memory(),
+            alive_mask=self.alive_mask.pin_memory(),
+            soft_policy_mask=self.soft_policy_mask.pin_memory(),
+            sample_weight=(
+                self.sample_weight.pin_memory()
+                if self.sample_weight is not None
+                else None
+            ),
+            policy_weight=(
+                self.policy_weight.pin_memory()
+                if self.policy_weight is not None
+                else None
+            ),
+        )
+
+    def record_stream(self, stream: torch.Stream) -> None:
+        tensors = (
+            self.policy,
+            self.wdl,
+            self.score_margin,
+            self.ownership,
+            self.alive,
+            self.soft_policy,
+            self.policy_mask,
+            self.wdl_mask,
+            self.score_margin_mask,
+            self.ownership_mask,
+            self.alive_mask,
+            self.soft_policy_mask,
+        )
+        for tensor in tensors:
+            tensor.record_stream(stream)
+        if self.sample_weight is not None:
+            self.sample_weight.record_stream(stream)
+        if self.policy_weight is not None:
+            self.policy_weight.record_stream(stream)
+
+
+def _require_tensor(condition: Tensor, message: str) -> None:
+    if not bool(condition.all()):
+        raise ValueError(message)
 
 
 def _weighted_mean(values: Tensor, valid: Tensor, weights: Tensor) -> Tensor:
@@ -120,6 +188,7 @@ def compute_losses(
     score_margin_min: int = SCORE_MARGIN_MIN,
     score_margin_max: int = SCORE_MARGIN_MAX,
     weights: LossWeights = LossWeights(),
+    validate_targets: bool = True,
 ) -> dict[str, Tensor]:
     """Compute losses using explicit availability masks.
 
@@ -133,18 +202,35 @@ def compute_losses(
         if targets.sample_weight is not None
         else torch.ones(batch_size, device=output.policy_logits.device)
     )
-    if bool((sample_weight < 0).any()) or not bool(torch.isfinite(sample_weight).all()):
-        raise ValueError("sample weights must be finite and non-negative")
+    if validate_targets:
+        _require_tensor(
+            (sample_weight >= 0) & torch.isfinite(sample_weight),
+            "sample weights must be finite and non-negative",
+        )
+    policy_weight = (
+        targets.policy_weight
+        if targets.policy_weight is not None
+        else torch.ones_like(sample_weight)
+    )
+    if validate_targets:
+        _require_tensor(
+            (policy_weight >= 0) & torch.isfinite(policy_weight),
+            "policy weights must be finite and non-negative",
+        )
+    policy_sample_weight = sample_weight * policy_weight
 
     policy_values, policy_has_mass = _soft_cross_entropy(
         output.policy_logits, targets.policy, legal_action_mask
     )
     policy_valid = policy_has_mass & targets.policy_mask.bool()
-    policy_loss = _weighted_mean(policy_values, policy_valid, sample_weight)
+    policy_loss = _weighted_mean(policy_values, policy_valid, policy_sample_weight)
 
     wdl_mask = targets.wdl_mask.bool()
-    if bool(((targets.wdl[wdl_mask] < 0) | (targets.wdl[wdl_mask] > 2)).any()):
-        raise ValueError("available WDL labels must be in 0..2")
+    if validate_targets:
+        _require_tensor(
+            (targets.wdl[wdl_mask] >= 0) & (targets.wdl[wdl_mask] <= 2),
+            "available WDL labels must be in 0..2",
+        )
     safe_wdl = torch.where(wdl_mask, targets.wdl, torch.zeros_like(targets.wdl))
     wdl_values = functional.cross_entropy(
         output.wdl_logits.float(), safe_wdl.long(), reduction="none"
@@ -153,15 +239,12 @@ def compute_losses(
 
     margin_mask = targets.score_margin_mask.bool()
     available_margin = targets.score_margin[margin_mask]
-    if bool(
-        (
-            (available_margin < score_margin_min)
-            | (available_margin > score_margin_max)
-        ).any()
-    ):
-        raise ValueError(
+    if validate_targets:
+        _require_tensor(
+            (available_margin >= score_margin_min)
+            & (available_margin <= score_margin_max),
             f"available score margins must be in "
-            f"[{score_margin_min}, {score_margin_max}]"
+            f"[{score_margin_min}, {score_margin_max}]",
         )
     safe_margin = torch.where(
         margin_mask,
@@ -179,8 +262,11 @@ def compute_losses(
         node_mask & ownership_sample_mask.unsqueeze(1) & (targets.ownership != -100)
     )
     available_ownership = targets.ownership[ownership_valid]
-    if bool(((available_ownership < 0) | (available_ownership > 2)).any()):
-        raise ValueError("available ownership labels must be in 0..2")
+    if validate_targets:
+        _require_tensor(
+            (available_ownership >= 0) & (available_ownership <= 2),
+            "available ownership labels must be in 0..2",
+        )
     safe_ownership = torch.where(
         ownership_valid,
         targets.ownership,
@@ -204,8 +290,11 @@ def compute_losses(
     alive_sample_mask = targets.alive_mask.bool()
     alive_valid = node_mask & alive_sample_mask.unsqueeze(1) & (targets.alive >= 0)
     available_alive = targets.alive[alive_valid]
-    if bool(((available_alive < 0) | (available_alive > 1)).any()):
-        raise ValueError("available alive labels must be in [0, 1]")
+    if validate_targets:
+        _require_tensor(
+            (available_alive >= 0) & (available_alive <= 1),
+            "available alive labels must be in [0, 1]",
+        )
     alive_target = targets.alive.float().clamp(0, 1)
     alive_values = functional.binary_cross_entropy_with_logits(
         output.alive_logits.float(), alive_target, reduction="none"
@@ -223,7 +312,11 @@ def compute_losses(
         output.soft_policy_logits, targets.soft_policy, legal_action_mask
     )
     soft_valid = soft_has_mass & targets.soft_policy_mask.bool()
-    soft_policy_loss = _weighted_mean(soft_values, soft_valid, sample_weight)
+    soft_policy_loss = _weighted_mean(
+        soft_values,
+        soft_valid,
+        policy_sample_weight,
+    )
 
     total = (
         weights.policy * policy_loss

@@ -55,7 +55,7 @@ from startrain.scoring import score_position
 from startrain.selfplay import SelfPlayActor, SelfPlayConfig, SelfPlayIdentity
 from startrain.topology import get_topology
 from startrain.training import build_scheduler
-from startrain.checkpoint import ExponentialMovingAverage
+from startrain.checkpoint import ExponentialMovingAverage, save_checkpoint
 from startrain.features import DoubleStarPosition
 
 
@@ -186,6 +186,67 @@ def test_inference_maps_dense_logits_to_native_legal_order_and_keeps_pass() -> N
     assert after.evaluator_calls == 1
     assert after.evaluator_rows == 1
     assert after.delta(before) == after
+
+
+def test_inference_packed_d2h_preserves_multirow_uneven_csr_offsets() -> None:
+    first = opening_position()
+    second = DoubleStarPosition(
+        rings=3,
+        stones=first.stones.clone(),
+        to_move=1,
+        moves_left=2,
+        opening=False,
+        pass_streak=0,
+        terminal=False,
+    )
+    second.stones[0] = 0
+    rows = [state_data(first), state_data(second)]
+    states = FakeStateData(
+        rings=3,
+        node_count=first.stones.numel(),
+        batch_size=2,
+        zero_bits=[*rows[0].zero_bits, *rows[1].zero_bits],
+        one_bits=[*rows[0].one_bits, *rows[1].one_bits],
+        legal_bits=[*rows[0].legal_bits, *rows[1].legal_bits],
+        hashes=[123, 456],
+        stones_placed=[0, 1],
+        to_move=[0, 1],
+        moves_left=[1, 2],
+        opening=[True, False],
+        mid_turn=[False, False],
+        pass_streak=[0, 0],
+        terminal=[False, False],
+        pass_legal=[True, True],
+    )
+    first_actions = list(range(first.stones.numel())) + [-1]
+    second_actions = list(range(1, second.stones.numel())) + [-1]
+    requests = FakeEvalBatch(
+        tokens=[7, 9],
+        states=states,
+        legal_offsets=[0, len(first_actions), len(first_actions) + len(second_actions)],
+        legal_actions=[*first_actions, *second_actions],
+    )
+    adapter = GraphInferenceAdapter(
+        FixedNetwork(),
+        config=InferenceConfig(initial_pass_logit_penalty=2.5),
+        model_version="fixed",
+    )
+
+    response = adapter.evaluate(requests)
+
+    assert response.tokens == [7, 9]
+    assert response.policy_offsets == requests.legal_offsets
+    assert len(response.values) == 2
+    assert response.policy_logits[: len(first_actions) - 1] == pytest.approx(
+        list(range(first.stones.numel()))
+    )
+    assert response.policy_logits[len(first_actions) - 1] == pytest.approx(
+        first.stones.numel() - 2.5
+    )
+    second_logits = response.policy_logits[len(first_actions) :]
+    assert second_logits == pytest.approx(
+        [*range(1, second.stones.numel()), second.stones.numel()]
+    )
 
 
 class FakeEvaluator:
@@ -838,6 +899,13 @@ def test_replay_gc_watermark_and_quarantine_preserve_committed_ledger(
             {3: 1},
             records[-1].shard_id,
         )
+        assert (
+            store.total_committed_sample_count(
+                run_id=identity.run_id,
+                generation_family=identity.generation_family,
+            )
+            == 3
+        )
         store.set_gc_watermark("learner", protected)
         dry = store.collect_garbage(
             run_id=identity.run_id,
@@ -857,7 +925,38 @@ def test_replay_gc_watermark_and_quarantine_preserve_committed_ledger(
         assert records[0].path.exists()
         assert not records[1].path.exists()
         assert records[2].path.exists()
+        assert (
+            store.total_committed_sample_count(
+                run_id=identity.run_id,
+                generation_family=identity.generation_family,
+            )
+            == 3
+        )
         store.clear_gc_watermark("learner")
+        store.append(
+            [
+                make_replay_sample(
+                    identity=identity,
+                    game_id="game-gc-after-delete",
+                )
+            ],
+            phase_min=0,
+            phase_max=0,
+            model_version="sha256-" + "1" * 64,
+            model_step=0,
+            model_identity="sha256-" + "1" * 64,
+            run_id=identity.run_id,
+            generation_family=identity.generation_family,
+            actor_id="actor-test",
+            generation=generation,
+        )
+        assert (
+            store.total_committed_sample_count(
+                run_id=identity.run_id,
+                generation_family=identity.generation_family,
+            )
+            == 4
+        )
 
     records[0].path.unlink()
     with records[2].path.open("ab") as stream:
@@ -876,7 +975,64 @@ def test_replay_gc_watermark_and_quarantine_preserve_committed_ledger(
         game_count = store.connection.execute("SELECT COUNT(*) FROM games").fetchone()[
             0
         ]
-        assert game_count == 3
+        assert game_count == 4
+
+
+def test_legacy_replay_counter_migration_fails_closed_after_unknown_gc(
+    tmp_path,
+) -> None:
+    identity = run_identity(tmp_path)
+    root = tmp_path / "legacy-counter"
+    with ReplayStore(root) as store:
+        generation = store.lease_generation(identity, "actor-test")
+        for index in range(2):
+            store.append(
+                [
+                    make_replay_sample(
+                        identity=identity,
+                        game_id=f"legacy-counter-{index}",
+                    )
+                ],
+                phase_min=0,
+                phase_max=0,
+                model_version="sha256-" + "1" * 64,
+                model_step=0,
+                model_identity="sha256-" + "1" * 64,
+                run_id=identity.run_id,
+                generation_family=identity.generation_family,
+                actor_id="actor-test",
+                generation=generation,
+            )
+        deleted = store.collect_garbage(
+            run_id=identity.run_id,
+            generation_family=identity.generation_family,
+            retain_shards_per_ring=1,
+            dry_run=False,
+        )
+        assert deleted["deleted_shards"] == 1
+        store.connection.execute("DROP TABLE run_counters")
+
+    with ReplayStore(root) as migrated:
+        assert (
+            migrated.total_committed_sample_count(
+                run_id=identity.run_id,
+                generation_family=identity.generation_family,
+            )
+            == 1
+        )
+        assert not migrated.committed_sample_history_is_complete(
+            run_id=identity.run_id,
+            generation_family=identity.generation_family,
+        )
+        learner = object.__new__(LearnerLoop)
+        learner.store = migrated
+        learner.run_identity = identity
+        learner.learner_config = LearnerConfig(target_updates_per_new_sample=1.0)
+        learner.train_config = TrainConfig(per_rank_batch_size=1)
+        learner.world_size = 1
+        learner._latest_total_replay_samples = 0
+        with pytest.raises(ValueError, match="complete committed-sample history"):
+            learner._utd_step_budget()
 
 
 def tiny_model() -> GraphResTNet:
@@ -1052,7 +1208,34 @@ def test_learner_runs_homogeneous_batch_publishes_and_resumes_curriculum_opt_in(
         checkpoint = published.checkpoint
         assert checkpoint.exists()
         assert not (tmp_path / "learner" / "champion.json").exists()
-        assert (tmp_path / "learner" / "metrics.jsonl").read_text().count("\n") == 1
+        metric_lines = (tmp_path / "learner" / "metrics.jsonl").read_text().splitlines()
+        assert len(metric_lines) == 1
+        metric = json.loads(metric_lines[0])
+        assert metric["metrics_interval_steps"] == 1
+        assert metric["metrics_interval_wall_seconds"] > 0
+        assert metric["step_seconds"] > 0
+        assert metric["device_step_seconds"] > 0
+        assert metric["examples_per_second"] > 0
+        assert metric["device_examples_per_second"] > 0
+        assert metric["data_wait_seconds"] >= 0
+        assert metric["window_setup_seconds"] >= 0
+        assert metric["h2d_seconds"] == 0
+        assert metric["examples_consumed"] == 2
+        assert metric["total_replay_samples"] == 2
+        assert metric["updates_per_new_sample"] == 1
+        learner.learner_config = replace(
+            learner.learner_config,
+            target_updates_per_new_sample=2.0,
+            candidate_interval_examples=4,
+        )
+        learner.examples_consumed = 0
+        assert learner._utd_step_budget() == 2
+        learner.examples_consumed = 2
+        assert learner._utd_step_budget() == 1
+        assert learner._candidate_due() is False
+        learner.examples_consumed = 4
+        assert learner._candidate_due() is True
+        learner.examples_consumed = 2
 
         restored_model = tiny_model()
         restored_optimizer = build_optimizer(
@@ -1088,7 +1271,38 @@ def test_learner_runs_homogeneous_batch_publishes_and_resumes_curriculum_opt_in(
             expected_bytes=published.checkpoint_bytes,
         )
         assert restored.step == 1
+        assert restored.examples_consumed == 2
         assert restored.learner_config.use_ring_mixture_curriculum is True
+        legacy_checkpoint = save_checkpoint(
+            tmp_path / "legacy-checkpoint.pt",
+            model=restored.model,
+            optimizer=restored.optimizer,
+            scheduler=restored.scheduler,
+            ema=restored.ema,
+            step=1,
+            epoch=0,
+            config=restored.serialized_config,
+            extra={
+                "run_id": identity.run_id,
+                "generation_family": identity.generation_family,
+            },
+        )
+        restored.learner_config = replace(
+            restored.learner_config,
+            target_updates_per_new_sample=1.0,
+        )
+        before_rejected_resume = {
+            name: value.detach().clone()
+            for name, value in restored.model.state_dict().items()
+        }
+        before_step = restored.step
+        before_examples = restored.examples_consumed
+        with pytest.raises(ValueError, match="legacy checkpoint"):
+            restored.resume(legacy_checkpoint)
+        assert restored.step == before_step
+        assert restored.examples_consumed == before_examples
+        for name, value in restored.model.state_dict().items():
+            torch.testing.assert_close(value, before_rejected_resume[name])
 
 
 def test_learner_publishes_initial_ema_then_waits_for_minimum_replay(
@@ -1217,7 +1431,9 @@ def test_lazy_replay_sampler_is_unique_deterministic_and_homogeneous(
         assert len({dataset[index].rings for index in batch}) == 1
 
 
-def test_shard_aware_512_batch_decompresses_one_selected_shard(tmp_path) -> None:
+def test_shard_aware_512_batch_decodes_once_and_materializes_selected_rows(
+    tmp_path,
+) -> None:
     sample = make_replay_sample(game_id="game-amplification")
     spans = []
     for shard_id in range(1, 5):
@@ -1266,10 +1482,11 @@ def test_shard_aware_512_batch_decompresses_one_selected_shard(tmp_path) -> None
             )
         )
     )
-    for index in batch:
-        dataset[index]
+    selected = dataset.__getitems__(batch[:17])
+    assert len(selected) == 17
     assert dataset.shard_load_count == 1
     assert dataset.checksum_verification_count == 1
+    assert dataset.sample_materialization_count == 17
 
 
 def test_plateau_policy_keeps_champion_replay_live_and_resets_after_rejections() -> (

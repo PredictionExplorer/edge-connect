@@ -43,6 +43,7 @@ from .runtime import (
     atomic_json,
     load_run_identity,
 )
+from .training import maybe_compile_model
 
 
 def load_manifest_evaluator(
@@ -65,8 +66,15 @@ def load_manifest_evaluator(
     )
     if int(metadata["step"]) != manifest.model_step:
         raise ValueError("manifest and checkpoint step disagree")
+    model.eval()
+    inference_model = maybe_compile_model(
+        model,
+        enabled=experiment.train.compile,
+        dynamic=True,
+        fullgraph=True,
+    )
     return GraphInferenceAdapter(
-        model.eval(),
+        inference_model,
         device=device,
         config=InferenceConfig(
             precision=experiment.train.precision,

@@ -253,6 +253,7 @@ def actor_main(argv: list[str] | None = None) -> None:
     )
     parser.add_argument("--config", required=True)
     parser.add_argument("--gpu-id", required=True, type=int)
+    parser.add_argument("--lane-id", type=int, default=0)
     parser.add_argument("--replay-store", required=True)
     parser.add_argument("--manifest", required=True)
     parser.add_argument("--candidate-manifest", required=True)
@@ -270,6 +271,8 @@ def actor_main(argv: list[str] | None = None) -> None:
     ]
     if len(matches) != 1:
         raise ValueError("gpu-id is not a unique configured actor GPU")
+    if arguments.lane_id < 0 or arguments.lane_id >= matches[0].actor_lanes:
+        raise ValueError("lane-id is outside the configured actor lane range")
     native = load_star_native(required=True)
     assert native is not None
     stop = SignalLatch()
@@ -286,6 +289,7 @@ def actor_main(argv: list[str] | None = None) -> None:
         heartbeat_path=arguments.heartbeat,
         metrics_path=arguments.metrics,
         device=arguments.device,
+        lane_id=arguments.lane_id,
     ).run(stop_requested=stop.is_set)
     print(json.dumps({"batches": batches}, sort_keys=True))
 

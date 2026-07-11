@@ -8,7 +8,7 @@ import os
 import re
 import tempfile
 import time
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -81,13 +81,29 @@ class ExponentialMovingAverage:
         }:
             raise ValueError("model state does not match EMA state")
         self.num_updates += 1
+        groups: dict[
+            tuple[torch.device, torch.dtype],
+            tuple[list[Tensor], list[Tensor]],
+        ] = {}
         for name, average in self.shadow.items():
             source = (
                 model_state[name]
                 .detach()
                 .to(device=average.device, dtype=average.dtype)
             )
-            average.lerp_(source, 1.0 - self.decay)
+            averages, sources = groups.setdefault(
+                (average.device, average.dtype),
+                ([], []),
+            )
+            averages.append(average)
+            sources.append(source)
+        for averages, sources in groups.values():
+            foreach_lerp = getattr(torch, "_foreach_lerp_", None)
+            if callable(foreach_lerp):
+                foreach_lerp(averages, sources, 1.0 - self.decay)
+            else:
+                for average, source in zip(averages, sources, strict=True):
+                    average.lerp_(source, 1.0 - self.decay)
 
     @torch.no_grad()
     def copy_to(self, model: nn.Module) -> None:
@@ -216,6 +232,7 @@ def load_checkpoint(
     expected_generation_family: str | None = None,
     expected_sha256: str | None = None,
     expected_bytes: int | None = None,
+    metadata_validator: Callable[[Mapping[str, Any]], object] | None = None,
 ) -> dict[str, Any]:
     checkpoint_path = Path(source)
     if expected_sha256 is not None or expected_bytes is not None:
@@ -235,6 +252,14 @@ def load_checkpoint(
     ema_payload = payload["ema"]
     if (use_ema_weights or require_ema) and ema_payload is None:
         raise ValueError("checkpoint has no EMA weights")
+    metadata = {
+        "step": int(payload["step"]),
+        "epoch": int(payload["epoch"]),
+        "config": payload["config"],
+        "extra": payload["extra"],
+    }
+    if metadata_validator is not None:
+        metadata_validator(metadata)
     model.load_state_dict(payload["model"], strict=strict)
     if use_ema_weights:
         evaluation_ema = ExponentialMovingAverage(model)
@@ -252,12 +277,7 @@ def load_checkpoint(
         if payload["ema"] is None:
             raise ValueError("checkpoint has no EMA state")
         ema.load_state_dict(payload["ema"])
-    return {
-        "step": int(payload["step"]),
-        "epoch": int(payload["epoch"]),
-        "config": payload["config"],
-        "extra": payload["extra"],
-    }
+    return metadata
 
 
 def load_ema_checkpoint(

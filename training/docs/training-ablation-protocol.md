@@ -25,6 +25,8 @@ The following switches are deliberately first-class and recorded in metrics:
   seeded mixture;
 - `selfplay.record_fast_policy_targets`: retain completed-Q policy targets from
   reduced searches;
+- `selfplay.fast_policy_weight`: confidence weight applied only to policy and
+  soft-policy losses for retained fast-search targets;
 - `selfplay.max_considered_ring_exponent`: scale the candidate set with board
   radius; and
 - `selfplay.max_considered_cap`: bound the scaled candidate set;
@@ -32,6 +34,11 @@ The following switches are deliberately first-class and recorded in metrics:
   actor small-to-large unlock schedule; and
 - actor `actor_batch_size` plus `orchestration.actor_games_per_batch`, changed
   together so the requested cohort can actually fill the larger GPU batch.
+- actor `actor_lanes`, evaluated at fixed total leaf work before enabling more
+  than one process on a GPU;
+- `learner.target_updates_per_new_sample` and
+  `learner.candidate_interval_examples`, which make replay ratio and candidate
+  cadence explicit instead of accidental consequences of throughput.
 
 Candidate/champion mixing keeps pointer roles and run identities strict. Models
 are refreshed only between complete game batches, so no game contains weights
@@ -63,6 +70,10 @@ Each report must retain:
 - paired aggregate and per-ring Elo intervals;
 - peak memory, replay I/O, restarts, and failed/quarantined shards; and
 - final strength divided by GPU-hours and leaf evaluations.
+
+Generate `scripts/strength_efficiency_report.py` for every treatment and control.
+Count every provisioned GPU-hour, including learner stalls and arena pause intervals,
+rather than normalizing away idle hardware.
 
 An optimization is accepted only when it preserves correctness gates and either
 improves the lower confidence bound on strength per compute or materially

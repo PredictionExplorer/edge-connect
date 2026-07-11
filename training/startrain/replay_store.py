@@ -83,11 +83,33 @@ class ReplayStore:
         self.connection.row_factory = sqlite3.Row
         self.connection.execute("PRAGMA foreign_keys=ON")
         self.connection.execute("PRAGMA busy_timeout=30000")
-        self.connection.execute("PRAGMA journal_mode=WAL")
+        self._execute_with_busy_retry("PRAGMA journal_mode=WAL")
         self.connection.execute("PRAGMA synchronous=FULL")
         self._initialize()
 
+    def _execute_with_busy_retry(self, statement: str) -> sqlite3.Cursor:
+        deadline = time.monotonic() + 30.0
+        delay = 0.01
+        while True:
+            try:
+                return self.connection.execute(statement)
+            except sqlite3.OperationalError as error:
+                busy = "locked" in str(error).lower() or "busy" in str(error).lower()
+                if not busy or time.monotonic() >= deadline:
+                    raise
+                time.sleep(delay)
+                delay = min(0.5, delay * 2)
+
     def _initialize(self) -> None:
+        counter_table_preexisting = (
+            self.connection.execute(
+                """
+                SELECT 1 FROM sqlite_master
+                WHERE type = 'table' AND name = 'run_counters'
+                """
+            ).fetchone()
+            is not None
+        )
         self.connection.executescript(
             """
             CREATE TABLE IF NOT EXISTS store_metadata (
@@ -158,8 +180,28 @@ class ReplayStore:
                 sample_offset INTEGER NOT NULL,
                 updated_ns INTEGER NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS run_counters (
+                run_id TEXT NOT NULL,
+                generation_family TEXT NOT NULL,
+                committed_samples INTEGER NOT NULL CHECK(committed_samples >= 0),
+                updated_ns INTEGER NOT NULL,
+                history_complete INTEGER NOT NULL CHECK(history_complete IN (0, 1)),
+                PRIMARY KEY(run_id, generation_family)
+            );
             """
         )
+        counter_columns = {
+            str(row["name"])
+            for row in self.connection.execute("PRAGMA table_info(run_counters)")
+        }
+        if "history_complete" not in counter_columns:
+            self.connection.execute(
+                """
+                ALTER TABLE run_counters
+                ADD COLUMN history_complete INTEGER NOT NULL DEFAULT 1
+                CHECK(history_complete IN (0, 1))
+                """
+            )
         expected = {
             "manifest_schema_version": str(MANIFEST_SCHEMA_VERSION),
             "rules_hash": RULES_HASH_WIRE,
@@ -182,6 +224,28 @@ class ReplayStore:
         except Exception:
             self.connection.execute("ROLLBACK")
             raise
+        if not counter_table_preexisting:
+            self.connection.execute(
+                """
+                INSERT INTO run_counters(
+                    run_id, generation_family, committed_samples, updated_ns,
+                    history_complete
+                )
+                SELECT
+                    runs.run_id,
+                    runs.generation_family,
+                    COALESCE(SUM(shards.sample_count), 0),
+                    ?,
+                    0
+                FROM runs
+                LEFT JOIN shards
+                  ON shards.run_id = runs.run_id
+                 AND shards.generation_family = runs.generation_family
+                GROUP BY runs.run_id, runs.generation_family
+                ON CONFLICT(run_id, generation_family) DO NOTHING
+                """,
+                (time.time_ns(),),
+            )
         self.reconciliation_metrics = self.reconcile_orphans()
 
     def close(self) -> None:
@@ -208,6 +272,20 @@ class ReplayStore:
         ).fetchone()
         if row is None or row["generation_family"] != identity.generation_family:
             raise ValueError("run_id is registered to another generation family")
+        self.connection.execute(
+            """
+            INSERT INTO run_counters(
+                run_id, generation_family, committed_samples, updated_ns,
+                history_complete
+            ) VALUES (?, ?, 0, ?, 1)
+            ON CONFLICT(run_id, generation_family) DO NOTHING
+            """,
+            (
+                identity.run_id,
+                identity.generation_family,
+                time.time_ns(),
+            ),
+        )
 
     def lease_generation(self, identity: RunIdentity, actor_id: str) -> int:
         actor = validate_identifier("actor_id", actor_id)
@@ -565,6 +643,18 @@ class ReplayStore:
                 raise DuplicateGameError(
                     "replay manifest already contains a completed game ID"
                 ) from exc
+            self.connection.execute(
+                """
+                INSERT INTO run_counters(
+                    run_id, generation_family, committed_samples, updated_ns,
+                    history_complete
+                ) VALUES (?, ?, ?, ?, 1)
+                ON CONFLICT(run_id, generation_family) DO UPDATE SET
+                    committed_samples = committed_samples + excluded.committed_samples,
+                    updated_ns = excluded.updated_ns
+                """,
+                (run_id, generation_family, len(samples), time.time_ns()),
+            )
             self.connection.execute("COMMIT")
         except Exception:
             self.connection.execute("ROLLBACK")
@@ -735,6 +825,42 @@ class ReplayStore:
             parameters,
         ).fetchone()
         return int(row["samples"])
+
+    def total_committed_sample_count(
+        self,
+        *,
+        run_id: str,
+        generation_family: str,
+    ) -> int:
+        row = self.connection.execute(
+            """
+            SELECT committed_samples FROM run_counters
+            WHERE run_id = ? AND generation_family = ?
+            """,
+            (
+                validate_identifier("run_id", run_id),
+                validate_identifier("generation_family", generation_family),
+            ),
+        ).fetchone()
+        return int(row["committed_samples"]) if row is not None else 0
+
+    def committed_sample_history_is_complete(
+        self,
+        *,
+        run_id: str,
+        generation_family: str,
+    ) -> bool:
+        row = self.connection.execute(
+            """
+            SELECT history_complete FROM run_counters
+            WHERE run_id = ? AND generation_family = ?
+            """,
+            (
+                validate_identifier("run_id", run_id),
+                validate_identifier("generation_family", generation_family),
+            ),
+        ).fetchone()
+        return bool(row is not None and int(row["history_complete"]) == 1)
 
     def eligible_sample_counts(
         self,

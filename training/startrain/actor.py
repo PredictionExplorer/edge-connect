@@ -161,15 +161,28 @@ class ActorSupervisor:
         heartbeat_path: str | Path,
         metrics_path: str | Path,
         device: str = "cuda",
+        lane_id: int = 0,
     ) -> None:
         if gpu.role != "actor" or gpu.actor_batch_size is None:
             raise ValueError("actor supervisor requires an actor GPU assignment")
+        if (
+            isinstance(lane_id, bool)
+            or not isinstance(lane_id, int)
+            or lane_id < 0
+            or lane_id >= gpu.actor_lanes
+        ):
+            raise ValueError("actor lane_id is outside the configured lane range")
         self.native = native_module
         self.experiment = experiment
         self.gpu = gpu
         self.replay_directory = Path(replay_directory)
         self.run_identity = run_identity
-        self.actor_id = f"actor-gpu-{gpu.gpu_id}"
+        self.lane_id = lane_id
+        self.actor_id = (
+            f"actor-gpu-{gpu.gpu_id}"
+            if gpu.actor_lanes == 1
+            else f"actor-gpu-{gpu.gpu_id}-lane-{lane_id}"
+        )
         self.device = torch.device(device)
         self.candidate_manifest_path = Path(candidate_manifest_path)
         self._candidate_manifest: ModelManifest | None = None
@@ -194,7 +207,10 @@ class ActorSupervisor:
             else None
         )
         self.model_random = random.Random(
-            experiment.selfplay.seed + gpu.gpu_id * 1_000_003 + 0x5E1F
+            experiment.selfplay.seed
+            + gpu.gpu_id * 1_000_003
+            + lane_id * 104_729
+            + 0x5E1F
         )
         self.heartbeat = HeartbeatReporter(
             heartbeat_path,
@@ -204,7 +220,9 @@ class ActorSupervisor:
         self.metrics_path = Path(metrics_path)
         self.scheduler = RingMixtureScheduler(
             experiment.orchestration.ring_mixture,
-            seed=experiment.selfplay.seed + gpu.gpu_id * 1_000_003,
+            seed=(
+                experiment.selfplay.seed + gpu.gpu_id * 1_000_003 + lane_id * 104_729
+            ),
         )
 
     def run(self, *, stop_requested: Callable[[], bool]) -> int:
@@ -292,6 +310,7 @@ class ActorSupervisor:
                         getattr(evaluator, "evaluator_calls", 0)
                     )
                     evaluator_rows_before = int(getattr(evaluator, "evaluator_rows", 0))
+                    batch_started_ns = time.time_ns()
                     started = time.monotonic()
                     selfplay = SelfPlayActor(
                         self.native,
@@ -352,6 +371,12 @@ class ActorSupervisor:
                         if selfplay_metrics.policy_entropy_count
                         else None
                     )
+                    policy_weight_mean = (
+                        selfplay_metrics.policy_weight_sum
+                        / selfplay_metrics.policy_entropy_count
+                        if selfplay_metrics.policy_entropy_count
+                        else None
+                    )
                     attempted_decisions = (
                         selfplay_metrics.full_decisions
                         + selfplay_metrics.fast_decisions
@@ -360,12 +385,17 @@ class ActorSupervisor:
                         peak_cuda_memory_bytes,
                         peak_cuda_reserved_memory_bytes,
                     ) = self._peak_cuda_memory()
+                    batch_completed_ns = time.time_ns()
                     append_jsonl(
                         self.metrics_path,
                         {
                             "schema_version": 1,
-                            "timestamp_ns": time.time_ns(),
+                            "timestamp_ns": batch_completed_ns,
+                            "batch_started_ns": batch_started_ns,
+                            "batch_completed_ns": batch_completed_ns,
                             "worker": self.actor_id,
+                            "gpu_id": self.gpu.gpu_id,
+                            "lane_id": self.lane_id,
                             "run_id": self.run_identity.run_id,
                             "generation_family": (self.run_identity.generation_family),
                             "generation": generation,
@@ -409,6 +439,11 @@ class ActorSupervisor:
                             "policy_entropy_sum": selfplay_metrics.policy_entropy_sum,
                             "policy_entropy_mean": policy_entropy_mean,
                             "policy_entropy_unit": "nats",
+                            "policy_weight_sum": (selfplay_metrics.policy_weight_sum),
+                            "policy_weight_count": (
+                                selfplay_metrics.policy_entropy_count
+                            ),
+                            "policy_weight_mean": policy_weight_mean,
                             "interrupted_cohorts": (
                                 selfplay_metrics.interrupted_cohorts
                             ),

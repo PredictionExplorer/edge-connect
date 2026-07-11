@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+import threading
 
 import numpy as np
 import torch
@@ -14,6 +15,30 @@ from startrain.topology import get_topology
 
 
 MODEL_IDENTITY = "sha256-" + "c" * 64
+
+
+def test_cold_replay_store_allows_simultaneous_wal_initialization(tmp_path) -> None:
+    root = tmp_path / "cold-replay"
+    identity = RunIdentity(
+        tmp_path / "run.json",
+        "run-cold-concurrent",
+        "family-cold-concurrent",
+        1,
+    )
+    actors = 8
+    barrier = threading.Barrier(actors)
+
+    def open_actor(actor: int) -> tuple[int, str]:
+        barrier.wait()
+        with ReplayStore(root) as store:
+            generation = store.lease_generation(identity, f"actor-{actor}")
+            journal = store.connection.execute("PRAGMA journal_mode").fetchone()[0]
+            return generation, str(journal)
+
+    with ThreadPoolExecutor(max_workers=actors) as executor:
+        results = list(executor.map(open_actor, range(actors)))
+
+    assert results == [(0, "wal")] * actors
 
 
 def _sample(

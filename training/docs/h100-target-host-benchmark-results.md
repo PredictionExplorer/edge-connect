@@ -111,7 +111,7 @@ bound was -80.6 Elo. Two seeds were positive, but the preregistered lower-bound
 gate did not pass. The production run therefore retains champion-only
 self-play rather than spending a multi-day run on an inconclusive treatment.
 
-## Active production run
+## Original production run
 
 - run ID: `star-maxlearn-20260711T0500Z`
 - run root: `/home/ubuntu/edgeconnect-runs/star-maxlearn-20260711T0500Z`
@@ -129,6 +129,32 @@ Evaluator throughput rose from 1,788 to 2,992 rows/s. The production profile
 uses 50-pair rounds, 15k-step candidate publication, candidate backlog
 coalescing, candidate-specific seed blocks, a 45k plateau limit and a
 worst-case final drain allowance.
+
+The original service was gracefully stopped and disabled after the learner input
+amplification was confirmed. Its complete run root remains preserved.
+
+## Efficiency replacement validation
+
+The decode-once and asynchronous-pipeline candidate was validated on 11 July 2026
+before replacing the original run:
+
+- one live ring-12 shard decoded all 32 NPZ members in a 41.3 ms mean, then
+  materialized 512 validated rows in a 147.3 ms median;
+- a stopped-service 100-step learner soak sustained 3,609 true examples/s over
+  its final 50 steps, with 98.3% device duty, 0.39% data-wait fraction and
+  0.31 ms mean H2D time;
+- two ring-6 actor lanes completed twice the games 14.8% faster than one lane;
+  simultaneous cold WAL initialization initially exposed a lock race, which was
+  fixed with bounded busy retry and an eight-way cold-open regression test;
+- all 150 non-CUDA Python/native tests and both single-GPU CUDA tests passed in
+  the frozen release checkout.
+
+The active replacement is `star-efficiency-20260711T115150Z`. Its first steady
+early-curriculum snapshot reached 6,484 true learner examples/s
+(`device_examples_per_second=6,775`) with 1.1% data wait. Thirteen actor lanes
+reported 152.9k aggregate evaluator rows/s while most actor GPUs were at
+75–82% SM. This early ring-3–6 snapshot is operational evidence, not a
+matched-strength comparison with the prior all-ring run.
 
 ## Time estimate
 

@@ -62,6 +62,7 @@ class SelfPlayConfig:
     max_considered_ring_exponent: float = 0.0
     max_considered_cap: int = 64
     record_fast_policy_targets: bool = False
+    fast_policy_weight: float = 0.25
     c_visit: float = 50.0
     c_scale: float = 1.0
     initial_pass_logit_penalty: float = 1.5
@@ -93,6 +94,8 @@ class SelfPlayConfig:
             raise ValueError("candidate scaling and shard_size are invalid")
         if type(self.record_fast_policy_targets) is not bool:
             raise ValueError("record_fast_policy_targets must be boolean")
+        if not 0 <= self.fast_policy_weight <= 1:
+            raise ValueError("fast_policy_weight must be in [0, 1]")
         if self.initial_pass_logit_penalty < 0:
             raise ValueError("initial pass logit penalty must be non-negative")
         if not 0 <= self.score_utility_weight <= 1:
@@ -163,6 +166,7 @@ class SelfPlayMetrics:
     pass_decisions: int = 0
     policy_entropy_count: int = 0
     policy_entropy_sum: float = 0.0
+    policy_weight_sum: float = 0.0
     interrupted_cohorts: int = 0
     dropped_games: int = 0
     dropped_decisions: int = 0
@@ -208,6 +212,7 @@ class _Decision:
     phase: int
     search_seed: int
     ply: int
+    policy_weight: float
 
 
 class SelfPlayActor:
@@ -239,6 +244,7 @@ class SelfPlayActor:
         self.pass_decisions = 0
         self.policy_entropy_count = 0
         self.policy_entropy_sum = 0.0
+        self.policy_weight_sum = 0.0
         self.interrupted_cohorts = 0
         self.dropped_games = 0
         self.dropped_decisions = 0
@@ -254,6 +260,7 @@ class SelfPlayActor:
             pass_decisions=self.pass_decisions,
             policy_entropy_count=self.policy_entropy_count,
             policy_entropy_sum=self.policy_entropy_sum,
+            policy_weight_sum=self.policy_weight_sum,
             interrupted_cohorts=self.interrupted_cohorts,
             dropped_games=self.dropped_games,
             dropped_decisions=self.dropped_decisions,
@@ -481,6 +488,9 @@ class SelfPlayActor:
                     phase=int(stones_placed[row]),
                     search_seed=search_seed,
                     ply=len(trajectories[row]),
+                    policy_weight=(
+                        1.0 if full_search else self.config.fast_policy_weight
+                    ),
                 )
             )
             if full_search:
@@ -492,6 +502,9 @@ class SelfPlayActor:
             if policy_entropy is not None:
                 self.policy_entropy_count += 1
                 self.policy_entropy_sum += policy_entropy
+                self.policy_weight_sum += (
+                    1.0 if full_search else self.config.fast_policy_weight
+                )
 
     def _finalize_rows(
         self,
@@ -546,6 +559,7 @@ class SelfPlayActor:
                         game_id=game_id,
                         ply=decision.ply,
                         model_identity=model_identity,
+                        policy_weight=decision.policy_weight,
                     )
                 )
                 self.pending_phases.append(decision.phase)

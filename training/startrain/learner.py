@@ -41,15 +41,17 @@ from .losses import LossWeights
 from .model import GraphResTNet
 from .optim import build_optimizer
 from .replay import (
+    DecodedReplayShard,
     ReplaySample,
     augment_sample,
     collate_replay_samples,
-    read_replay_shard,
+    decode_replay_shard,
 )
 from .replay_store import ReplaySelection, ReplaySpan, ReplayStore
 from .runtime import RunIdentity, atomic_json
 from .symmetry import deterministic_transform
 from .training import (
+    DeviceBatchPrefetcher,
     build_scheduler,
     maybe_compile_model,
     train_step,
@@ -121,10 +123,11 @@ class LazyShardReplayDataset(Dataset[ReplaySample]):
             total += span.sample_count
             self._ends.append(total)
             self._ring_ranges[span.record.ring].append((start, total))
-        self._cache: OrderedDict[int, list[ReplaySample]] = OrderedDict()
+        self._cache: OrderedDict[int, DecodedReplayShard] = OrderedDict()
         self._verified_shards: set[int] = set()
         self.shard_load_count = 0
         self.checksum_verification_count = 0
+        self.sample_materialization_count = 0
 
     def __len__(self) -> int:
         return self._ends[-1]
@@ -179,8 +182,9 @@ class LazyShardReplayDataset(Dataset[ReplaySample]):
         span_index = bisect_right(self._ends, index)
         previous_end = self._ends[span_index - 1] if span_index else 0
         span = self.spans[span_index]
-        samples = self._load_span_shard(span)
-        sample = samples[span.sample_start + index - previous_end]
+        shard = self._load_span_shard(span)
+        sample = shard.sample(span.sample_start + index - previous_end)
+        self.sample_materialization_count += 1
         if not self.augmentation_enabled:
             return sample
         transform = deterministic_transform(
@@ -188,15 +192,21 @@ class LazyShardReplayDataset(Dataset[ReplaySample]):
         )
         return augment_sample(sample, transform)
 
+    def __getitems__(self, indices: list[int]) -> list[ReplaySample]:
+        """Bulk Dataset hook used by DataLoader for one shard-local batch."""
+
+        return [self[index] for index in indices]
+
     def __getstate__(self) -> dict[str, object]:
         state = dict(self.__dict__)
         state["_cache"] = OrderedDict()
         state["_verified_shards"] = set()
         state["shard_load_count"] = 0
         state["checksum_verification_count"] = 0
+        state["sample_materialization_count"] = 0
         return state
 
-    def _load_span_shard(self, span: ReplaySpan) -> list[ReplaySample]:
+    def _load_span_shard(self, span: ReplaySpan) -> DecodedReplayShard:
         shard_id = span.record.shard_id
         cached = self._cache.pop(shard_id, None)
         if cached is None:
@@ -207,7 +217,7 @@ class LazyShardReplayDataset(Dataset[ReplaySample]):
                         f"replay shard checksum failed: {span.record.path}"
                     )
                 self._verified_shards.add(shard_id)
-            cached = read_replay_shard(span.record.path)
+            cached = decode_replay_shard(span.record.path)
             self.shard_load_count += 1
             if len(cached) != span.record.sample_count:
                 raise ValueError("replay shard count disagrees with its manifest")
@@ -362,6 +372,8 @@ class ImmutableModelPublisher:
         step: int,
         epoch: int,
         config: dict[str, object],
+        examples_consumed: int | None = None,
+        global_batch_size: int | None = None,
     ) -> ModelManifest:
         if self.candidate_path.is_file():
             current = load_model_manifest(self.candidate_path)
@@ -385,6 +397,14 @@ class ImmutableModelPublisher:
                 "training_step_version": f"step-{step:012d}",
                 "run_id": self.run_identity.run_id,
                 "generation_family": self.run_identity.generation_family,
+                **(
+                    {
+                        "examples_consumed": examples_consumed,
+                        "global_batch_size": global_batch_size,
+                    }
+                    if examples_consumed is not None
+                    else {}
+                ),
             },
         )
         checkpoint_sha256 = sha256_file(staged)
@@ -503,6 +523,8 @@ class LearnerLoop:
             )
         self.step = 0
         self.epoch = 0
+        self.examples_consumed = 0
+        self._latest_total_replay_samples = 0
         # Replay batches are fixed-size and ring-homogeneous. Static compilation
         # avoids Inductor's dynamic backward reductions (which fail on variable
         # graph lengths) while allowing one cached graph per encountered ring.
@@ -596,9 +618,34 @@ class LearnerLoop:
             expected_generation_family=self.run_identity.generation_family,
             expected_sha256=expected_sha256,
             expected_bytes=expected_bytes,
+            metadata_validator=self._resume_examples_consumed,
         )
         self.step = int(metadata["step"])
         self.epoch = int(metadata["epoch"])
+        self.examples_consumed = self._resume_examples_consumed(metadata)
+
+    def _resume_examples_consumed(self, metadata: Mapping[str, object]) -> int:
+        extra = metadata.get("extra")
+        consumed = (
+            extra.get("examples_consumed") if isinstance(extra, Mapping) else None
+        )
+        if isinstance(consumed, int) and not isinstance(consumed, bool):
+            if consumed < 0:
+                raise ValueError("checkpoint examples_consumed must be non-negative")
+            return consumed
+        uses_example_cadence = (
+            self.learner_config.target_updates_per_new_sample is not None
+            or self.learner_config.candidate_interval_examples is not None
+        )
+        if uses_example_cadence:
+            raise ValueError(
+                "legacy checkpoint lacks examples_consumed required by "
+                "example-based learner controls"
+            )
+        step = metadata.get("step")
+        if isinstance(step, bool) or not isinstance(step, int) or step < 0:
+            raise ValueError("checkpoint step must be a non-negative integer")
+        return step * self.train_config.global_batch_size(self.world_size)
 
     def run(
         self,
@@ -614,6 +661,13 @@ class LearnerLoop:
         if self.rank == 0:
             self._publish()
         self._distributed_barrier()
+        interval_started = time.perf_counter()
+        interval_steps = 0
+        interval_data_wait_seconds = 0.0
+        interval_window_setup_seconds = 0.0
+        interval_cpu_device_seconds = 0.0
+        interval_device_events: list[tuple[torch.cuda.Event, torch.cuda.Event]] = []
+        interval_copy_events: list[tuple[torch.cuda.Event, torch.cuda.Event]] = []
         while self.step < target:
             if self._collective_stop(stop_requested()):
                 break
@@ -638,15 +692,49 @@ class LearnerLoop:
                 target - self.step,
                 maximum_batches,
                 self._plateau_step_budget(),
+                self._utd_step_budget(),
             )
             batches = self._collective_min_int(batches)
             if batches <= 0:
+                if progress is not None and self.rank == 0:
+                    progress(
+                        phase="update_to_data_wait",
+                        step=self.step,
+                        examples_consumed=self.examples_consumed,
+                        replay_samples=self._latest_total_replay_samples,
+                        target_updates_per_new_sample=(
+                            self.learner_config.target_updates_per_new_sample
+                        ),
+                    )
+                time.sleep(self.learner_config.replay_poll_seconds)
                 continue
             watermark_name = f"learner-{self.run_identity.run_id}"
             if self.rank == 0:
                 self.store.set_gc_watermark(watermark_name, selection)
+            setup_started = time.perf_counter()
             loader = self._loader(selection, batches=batches)
-            for batch in loader:
+            device = next(self.model.parameters()).device
+            prefetcher = DeviceBatchPrefetcher(
+                loader,
+                device=device,
+                enabled=self.data_config.pin_memory,
+            )
+            batch_iterator = iter(prefetcher)
+            if self.rank == 0:
+                interval_window_setup_seconds += time.perf_counter() - setup_started
+            while True:
+                data_wait_started = time.perf_counter()
+                try:
+                    batch = next(batch_iterator)
+                except StopIteration:
+                    break
+                if self.rank == 0:
+                    interval_data_wait_seconds += (
+                        time.perf_counter() - data_wait_started
+                    )
+                consumed_copy_events = prefetcher.pop_copy_events()
+                if self.rank == 0:
+                    interval_copy_events.extend(consumed_copy_events)
                 if not self._gpu_pause_control(
                     stop_requested=stop_requested, progress=progress
                 ):
@@ -654,6 +742,13 @@ class LearnerLoop:
                 if self._collective_stop(stop_requested()):
                     break
                 step_started = time.perf_counter()
+                device_events: tuple[torch.cuda.Event, torch.cuda.Event] | None = None
+                if self.rank == 0 and device.type == "cuda":
+                    device_events = (
+                        torch.cuda.Event(enable_timing=True),
+                        torch.cuda.Event(enable_timing=True),
+                    )
+                    device_events[0].record()
                 result = train_step(
                     self.compiled_model,
                     batch,
@@ -663,13 +758,45 @@ class LearnerLoop:
                     gradient_clip_norm=self.train_config.gradient_clip_norm,
                     scheduler=self.scheduler,
                     ema=self.ema,
+                    trusted_batch=True,
                 )
-                step_seconds = time.perf_counter() - step_started
+                if device_events is not None:
+                    device_events[1].record()
+                    interval_device_events.append(device_events)
+                elif self.rank == 0:
+                    interval_cpu_device_seconds += time.perf_counter() - step_started
                 self.step += 1
+                self.examples_consumed += self.train_config.global_batch_size(
+                    self.world_size
+                )
+                if self.rank == 0:
+                    interval_steps += 1
                 if (
                     self.rank == 0
                     and self.step % self.learner_config.metrics_interval == 0
                 ):
+                    host_metrics = result.to_host()
+                    h2d_seconds = (
+                        sum(
+                            started.elapsed_time(completed)
+                            for started, completed in interval_copy_events
+                        )
+                        / 1_000.0
+                    )
+                    device_seconds = (
+                        interval_cpu_device_seconds
+                        + sum(
+                            started.elapsed_time(completed)
+                            for started, completed in interval_device_events
+                        )
+                        / 1_000.0
+                    )
+                    measured_at = time.perf_counter()
+                    wall_seconds = measured_at - interval_started
+                    measured_steps = max(1, interval_steps)
+                    global_batch_size = self.train_config.global_batch_size(
+                        self.world_size
+                    )
                     self.metrics.append(
                         {
                             "schema_version": 1,
@@ -678,13 +805,35 @@ class LearnerLoop:
                             "step": self.step,
                             "epoch": self.epoch,
                             "world_size": self.world_size,
-                            "losses": result.losses,
-                            "gradient_norm": result.gradient_norm,
-                            "learning_rates": result.learning_rates,
-                            "step_seconds": step_seconds,
+                            "losses": host_metrics.losses,
+                            "gradient_norm": host_metrics.gradient_norm,
+                            "learning_rates": host_metrics.learning_rates,
+                            "step_seconds": wall_seconds / measured_steps,
                             "examples_per_second": (
-                                self.train_config.global_batch_size(self.world_size)
-                                / step_seconds
+                                global_batch_size * measured_steps / wall_seconds
+                            ),
+                            "device_step_seconds": (device_seconds / measured_steps),
+                            "device_examples_per_second": (
+                                global_batch_size * measured_steps / device_seconds
+                                if device_seconds
+                                else None
+                            ),
+                            "data_wait_seconds": (
+                                interval_data_wait_seconds / measured_steps
+                            ),
+                            "h2d_seconds": h2d_seconds / measured_steps,
+                            "window_setup_seconds": (
+                                interval_window_setup_seconds / measured_steps
+                            ),
+                            "metrics_interval_steps": measured_steps,
+                            "metrics_interval_wall_seconds": wall_seconds,
+                            "examples_consumed": self.examples_consumed,
+                            "total_replay_samples": (self._latest_total_replay_samples),
+                            "updates_per_new_sample": (
+                                self.examples_consumed
+                                / self._latest_total_replay_samples
+                                if self._latest_total_replay_samples
+                                else None
                             ),
                             "feature_path": batch.feature_path,
                             "replay_samples": selection.sample_count,
@@ -702,10 +851,14 @@ class LearnerLoop:
                             ),
                         }
                     )
-                if (
-                    self.rank == 0
-                    and self.step % self.learner_config.candidate_interval == 0
-                ):
+                    interval_started = measured_at
+                    interval_steps = 0
+                    interval_data_wait_seconds = 0.0
+                    interval_window_setup_seconds = 0.0
+                    interval_cpu_device_seconds = 0.0
+                    interval_device_events.clear()
+                    interval_copy_events.clear()
+                if self.rank == 0 and self._candidate_due():
                     self._publish()
                 if progress is not None and self.rank == 0:
                     progress(phase="training", step=self.step, epoch=self.epoch)
@@ -776,6 +929,8 @@ class LearnerLoop:
             step=self.step,
             epoch=self.epoch,
             config=self.serialized_config,
+            examples_consumed=self.examples_consumed,
+            global_batch_size=self.train_config.global_batch_size(self.world_size),
         )
 
     def _wait_for_replay(
@@ -877,6 +1032,35 @@ class LearnerLoop:
         if self.data_config.ring_stratified:
             return sum(count // batch for count in counts.values())
         return sum(counts.values()) // batch
+
+    def _utd_step_budget(self) -> int:
+        self._latest_total_replay_samples = self.store.total_committed_sample_count(
+            run_id=self.run_identity.run_id,
+            generation_family=self.run_identity.generation_family,
+        )
+        target = self.learner_config.target_updates_per_new_sample
+        if target is None:
+            return self.learner_config.steps_per_window
+        if not self.store.committed_sample_history_is_complete(
+            run_id=self.run_identity.run_id,
+            generation_family=self.run_identity.generation_family,
+        ):
+            raise ValueError(
+                "update-to-data control requires a complete committed-sample history"
+            )
+        allowed_examples = int(target * self._latest_total_replay_samples)
+        remaining = max(0, allowed_examples - self.examples_consumed)
+        return remaining // self.train_config.global_batch_size(self.world_size)
+
+    def _candidate_due(self) -> bool:
+        interval_examples = self.learner_config.candidate_interval_examples
+        if interval_examples is None:
+            return self.step % self.learner_config.candidate_interval == 0
+        batch = self.train_config.global_batch_size(self.world_size)
+        previous = max(0, self.examples_consumed - batch)
+        return (
+            previous // interval_examples < self.examples_consumed // interval_examples
+        )
 
     def _plateau_step_budget(self) -> int:
         configured = self._plateau_config()

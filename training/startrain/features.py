@@ -197,18 +197,66 @@ class EncodedBatch:
         device: torch.device | str,
         *,
         feature_dtype: torch.dtype | None = None,
+        non_blocking: bool = False,
     ) -> "EncodedBatch":
         dtype = feature_dtype or self.node_features.dtype
         return EncodedBatch(
-            node_features=self.node_features.to(device=device, dtype=dtype),
-            global_features=self.global_features.to(device=device, dtype=dtype),
-            neighbor_index=self.neighbor_index.to(device=device),
-            neighbor_mask=self.neighbor_mask.to(device=device),
-            neighbor_edge_type=self.neighbor_edge_type.to(device=device),
-            node_mask=self.node_mask.to(device=device),
-            legal_action_mask=self.legal_action_mask.to(device=device),
-            rings=self.rings.to(device=device),
+            node_features=self.node_features.to(
+                device=device, dtype=dtype, non_blocking=non_blocking
+            ),
+            global_features=self.global_features.to(
+                device=device, dtype=dtype, non_blocking=non_blocking
+            ),
+            neighbor_index=self.neighbor_index.to(
+                device=device, non_blocking=non_blocking
+            ),
+            neighbor_mask=self.neighbor_mask.to(
+                device=device, non_blocking=non_blocking
+            ),
+            neighbor_edge_type=self.neighbor_edge_type.to(
+                device=device, non_blocking=non_blocking
+            ),
+            node_mask=self.node_mask.to(device=device, non_blocking=non_blocking),
+            legal_action_mask=self.legal_action_mask.to(
+                device=device, non_blocking=non_blocking
+            ),
+            rings=self.rings.to(device=device, non_blocking=non_blocking),
         )
+
+    def pin_memory(self, *, pin_topology: bool = True) -> "EncodedBatch":
+        return EncodedBatch(
+            node_features=self.node_features.pin_memory(),
+            global_features=self.global_features.pin_memory(),
+            neighbor_index=(
+                self.neighbor_index.pin_memory()
+                if pin_topology
+                else self.neighbor_index
+            ),
+            neighbor_mask=(
+                self.neighbor_mask.pin_memory() if pin_topology else self.neighbor_mask
+            ),
+            neighbor_edge_type=(
+                self.neighbor_edge_type.pin_memory()
+                if pin_topology
+                else self.neighbor_edge_type
+            ),
+            node_mask=self.node_mask.pin_memory() if pin_topology else self.node_mask,
+            legal_action_mask=self.legal_action_mask.pin_memory(),
+            rings=self.rings.pin_memory() if pin_topology else self.rings,
+        )
+
+    def record_stream(self, stream: torch.Stream) -> None:
+        for tensor in (
+            self.node_features,
+            self.global_features,
+            self.neighbor_index,
+            self.neighbor_mask,
+            self.neighbor_edge_type,
+            self.node_mask,
+            self.legal_action_mask,
+            self.rings,
+        ):
+            tensor.record_stream(stream)
 
     def model_args(
         self,

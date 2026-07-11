@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+import startrain.promotion as promotion_module
 from startrain.checkpoint import (
     ExponentialMovingAverage,
     collect_model_garbage,
@@ -24,9 +25,50 @@ from startrain.learner import ImmutableModelPublisher
 from startrain.model import GraphResTNet
 from startrain.optim import OptimizerConfig, build_optimizer
 from startrain.orchestration import gpu_pause_ack_path
-from startrain.promotion import CoordinatorPauseLease, PromotionSupervisor
+from startrain.promotion import (
+    CoordinatorPauseLease,
+    PromotionSupervisor,
+    load_manifest_evaluator,
+)
 from startrain.runtime import RunIdentity, atomic_json
 from startrain.training import build_scheduler
+
+
+def test_arena_manifest_evaluator_uses_compiled_inference_model(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    experiment = load_config(Path(__file__).parents[1] / "configs" / "small.yaml")
+    experiment = replace(experiment, train=replace(experiment.train, compile=True))
+    model = torch.nn.Linear(1, 1)
+    compile_calls: list[dict[str, object]] = []
+    manifest = SimpleNamespace(
+        checkpoint=tmp_path / "checkpoint.pt",
+        checkpoint_sha256="a" * 64,
+        checkpoint_bytes=1,
+        model_step=4,
+        model_version="sha256-" + "a" * 64,
+        model_identity="sha256-" + "a" * 64,
+        run_id="run-compile",
+        generation_family="family-compile",
+    )
+    monkeypatch.setattr(promotion_module, "GraphResTNet", lambda _config: model)
+    monkeypatch.setattr(
+        promotion_module,
+        "load_ema_checkpoint",
+        lambda *_args, **_kwargs: {"step": 4},
+    )
+
+    def compile_model(module, **options):
+        assert module is model
+        compile_calls.append(options)
+        return module
+
+    monkeypatch.setattr(promotion_module, "maybe_compile_model", compile_model)
+
+    evaluator = load_manifest_evaluator(experiment, manifest, device="cpu")
+
+    assert evaluator.model is model
+    assert compile_calls == [{"enabled": True, "dynamic": True, "fullgraph": True}]
 
 
 def test_promotion_supervisor_bootstraps_and_only_promotes_arena_pass(
@@ -329,9 +371,7 @@ def test_inconclusive_candidate_persists_nonoverlapping_pairs_until_max(
     assert newer is not None
     assert supervisor.run(stop_requested=lambda: False, once=True) == 1
     newer_path = (
-        tmp_path
-        / "arena"
-        / f"{newer.model_identity}-vs-{champion.model_identity}.json"
+        tmp_path / "arena" / f"{newer.model_identity}-vs-{champion.model_identity}.json"
     )
     newer_progress = json.loads(newer_path.read_text())
     assert newer_progress["terminal"] is False

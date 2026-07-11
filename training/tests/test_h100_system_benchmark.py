@@ -239,12 +239,22 @@ def test_orchestration_metrics_summary_covers_throughput_and_replay_waits(
             "timestamp_ns": 1_000_000_000,
             "examples_per_second": 100.0,
             "step_seconds": 1.0,
+            "device_examples_per_second": 400.0,
+            "device_step_seconds": 0.25,
+            "data_wait_seconds": 0.5,
+            "h2d_seconds": 0.01,
+            "window_setup_seconds": 0.1,
         },
         {
             "worker": "learner",
             "timestamp_ns": 2_000_000_000,
             "examples_per_second": 200.0,
             "step_seconds": 0.5,
+            "device_examples_per_second": 800.0,
+            "device_step_seconds": 0.125,
+            "data_wait_seconds": 0.2,
+            "h2d_seconds": 0.02,
+            "window_setup_seconds": 0.0,
         },
         {
             "worker": "learner",
@@ -333,6 +343,10 @@ def test_orchestration_metrics_summary_covers_throughput_and_replay_waits(
     assert isinstance(learner, dict)
     assert learner["examples_per_second"]["mean"] == 150.0
     assert learner["batch_seconds"]["median"] == 0.75
+    assert learner["device_examples_per_second"]["mean"] == 600.0
+    assert learner["device_batch_seconds"]["median"] == 0.1875
+    assert learner["data_wait_seconds"]["mean"] == pytest.approx(0.35)
+    assert learner["h2d_seconds"]["maximum"] == 0.02
     actors = summary["actors"]
     assert isinstance(actors, dict)
     assert actors["games_per_second"]["mean"] == 3.0

@@ -93,6 +93,7 @@ def test_actor_supervisor_refreshes_only_at_batch_boundaries_and_emits_metrics(
                 pass_decisions=1,
                 policy_entropy_count=2,
                 policy_entropy_sum=1.25,
+                policy_weight_sum=0.5,
                 replay_append_calls=1,
                 replay_append_bytes=2_048,
                 replay_append_seconds=0.25,
@@ -134,6 +135,8 @@ def test_actor_supervisor_refreshes_only_at_batch_boundaries_and_emits_metrics(
 
     metric = json.loads((tmp_path / "metrics.jsonl").read_text().strip())
     assert metric["games"] == 1
+    assert metric["gpu_id"] == 2
+    assert metric["batch_completed_ns"] >= metric["batch_started_ns"]
     assert metric["samples"] == 3
     assert metric["policy_samples"] == 1
     assert metric["policy_supervision_rate"] == 1 / 3
@@ -152,6 +155,9 @@ def test_actor_supervisor_refreshes_only_at_batch_boundaries_and_emits_metrics(
     assert metric["mean_game_length"] == 3
     assert metric["policy_entropy_count"] == 2
     assert metric["policy_entropy_mean"] == 0.625
+    assert metric["policy_weight_count"] == 2
+    assert metric["policy_weight_sum"] == 0.5
+    assert metric["policy_weight_mean"] == 0.25
     assert metric["dropped_games"] == 0
     assert metric["dropped_decisions"] == 0
     assert metric["model_refresh_latency_seconds"] >= 0
@@ -161,8 +167,40 @@ def test_actor_supervisor_refreshes_only_at_batch_boundaries_and_emits_metrics(
     assert metric["peak_cuda_memory_allocated_bytes"] is None
     assert metric["peak_cuda_memory_reserved_bytes"] is None
     assert metric["model_step"] == 7
+    assert metric["lane_id"] == 0
     heartbeat = json.loads((tmp_path / "heartbeat.json").read_text())
     assert heartbeat["phase"] == "stopped"
+
+
+def test_actor_lane_identity_is_unique_and_range_checked(tmp_path) -> None:
+    experiment = load_config(Path(__file__).parents[1] / "configs" / "small.yaml")
+    identity = RunIdentity(tmp_path / "run.json", "run-lanes", "family-lanes", 1)
+    gpu = GPUWorkerConfig(
+        gpu_id=2,
+        role="actor",
+        cpu_threads=1,
+        actor_batch_size=2,
+        actor_lanes=3,
+    )
+    options = {
+        "native_module": object(),
+        "experiment": experiment,
+        "gpu": gpu,
+        "replay_directory": tmp_path / "replay",
+        "manifest_path": tmp_path / "champion.json",
+        "candidate_manifest_path": tmp_path / "candidate.json",
+        "run_identity": identity,
+        "heartbeat_path": tmp_path / "heartbeat.json",
+        "metrics_path": tmp_path / "metrics.jsonl",
+        "device": "cpu",
+    }
+
+    supervisor = ActorSupervisor(**options, lane_id=1)
+
+    assert supervisor.actor_id == "actor-gpu-2-lane-1"
+    assert supervisor.lane_id == 1
+    with pytest.raises(ValueError, match="lane_id"):
+        ActorSupervisor(**options, lane_id=3)
 
 
 def test_actor_supervisor_records_interrupted_cohort_metrics(

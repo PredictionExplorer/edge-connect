@@ -9,7 +9,7 @@ import tempfile
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Sequence
+from typing import Mapping, Sequence
 
 import numpy as np
 import torch
@@ -55,6 +55,40 @@ REPLAY_SHARD_FORMAT = "startrain.replay.npz"
 MISSING_LEADER = -2
 MISSING_OWNERSHIP = -100
 MISSING_ALIVE = 255
+
+_REPLAY_SAMPLE_ARRAY_NAMES = (
+    "rings",
+    "node_offsets",
+    "action_offsets",
+    "stones",
+    "to_move",
+    "moves_left",
+    "opening",
+    "pass_streak",
+    "terminal",
+    "policy",
+    "soft_policy",
+    "target_mask",
+    "final_leader",
+    "final_scores",
+    "final_quarks",
+    "final_ownership",
+    "final_alive",
+    "search_provenance",
+    "policy_provenance",
+    "run_id",
+    "generation_family",
+    "actor_id",
+    "generation",
+    "game_id",
+    "ply",
+    "model_identity",
+    "soft_policy_temperature",
+    "rules_hash",
+    "feature_schema_hash",
+    "weight",
+)
+_REPLAY_OPTIONAL_ARRAY_NAMES = ("policy_weight",)
 
 
 class ReplaySchemaError(ValueError):
@@ -156,6 +190,7 @@ class ReplaySample:
     rules_hash: int = RULES_HASH
     feature_schema_hash: int = FEATURE_SCHEMA_HASH
     weight: float = 1.0
+    policy_weight: float = 1.0
     schema_version: int = REPLAY_SCHEMA_VERSION
 
     def __post_init__(self) -> None:
@@ -242,6 +277,11 @@ class ReplaySample:
         weight = float(self.weight)
         if not np.isfinite(weight) or weight <= 0:
             raise ReplaySchemaError("sample weight must be finite and positive")
+        policy_weight = float(self.policy_weight)
+        if not np.isfinite(policy_weight) or policy_weight < 0:
+            raise ReplaySchemaError(
+                "sample policy_weight must be finite and non-negative"
+            )
 
         legal = np.zeros(topology.n + 1, dtype=np.bool_)
         if not terminal:
@@ -314,6 +354,7 @@ class ReplaySample:
         self.rules_hash = rules_hash
         self.feature_schema_hash = feature_hash
         self.weight = weight
+        self.policy_weight = policy_weight
         self.schema_version = schema_version
         self.run_id = run_id
         self.generation_family = generation_family
@@ -351,6 +392,7 @@ class ReplaySample:
         policy_provenance: str,
         include_spatial_targets: bool = True,
         weight: float = 1.0,
+        policy_weight: float = 1.0,
         run_id: str = "manual",
         generation_family: str = "manual",
         actor_id: str = "manual",
@@ -425,6 +467,7 @@ class ReplaySample:
             ply=ply,
             model_identity=model_identity,
             weight=weight,
+            policy_weight=policy_weight,
         )
 
     def to_position(self) -> DoubleStarPosition:
@@ -511,6 +554,7 @@ def augment_sample(sample: ReplaySample, transform: D5Transform) -> ReplaySample
         ply=sample.ply,
         model_identity=sample.model_identity,
         weight=sample.weight,
+        policy_weight=sample.policy_weight,
     )
 
 
@@ -602,6 +646,9 @@ def write_replay_shard(
             [sample.feature_schema_hash for sample in samples], dtype=np.uint64
         ),
         "weight": np.asarray([sample.weight for sample in samples], dtype=np.float32),
+        "policy_weight": np.asarray(
+            [sample.policy_weight for sample in samples], dtype=np.float32
+        ),
     }
     writer = np.savez_compressed if compressed else np.savez
     temporary_name: str | None = None
@@ -629,68 +676,176 @@ def write_replay_shard(
     return destination
 
 
-def read_replay_shard(source: str | Path) -> list[ReplaySample]:
-    with np.load(Path(source), allow_pickle=False) as shard:
+@dataclass(frozen=True, slots=True)
+class DecodedReplayShard:
+    """A validated shard whose NPZ members have each been materialized once."""
+
+    source: Path
+    metadata: Mapping[str, object]
+    arrays: Mapping[str, np.ndarray]
+    sample_count: int
+
+    def __len__(self) -> int:
+        return self.sample_count
+
+    def sample(self, index: int) -> ReplaySample:
+        if index < 0:
+            index += self.sample_count
+        if index < 0 or index >= self.sample_count:
+            raise IndexError(index)
+        arrays = self.arrays
+        node_offsets = arrays["node_offsets"]
+        action_offsets = arrays["action_offsets"]
+        node_slice = slice(int(node_offsets[index]), int(node_offsets[index + 1]))
+        action_slice = slice(int(action_offsets[index]), int(action_offsets[index + 1]))
+        return ReplaySample(
+            rings=arrays["rings"][index],
+            stones=arrays["stones"][node_slice].copy(),
+            to_move=arrays["to_move"][index],
+            moves_left=arrays["moves_left"][index],
+            opening=arrays["opening"][index],
+            pass_streak=arrays["pass_streak"][index],
+            terminal=arrays["terminal"][index],
+            policy=arrays["policy"][action_slice].copy(),
+            soft_policy=arrays["soft_policy"][action_slice].copy(),
+            target_mask=arrays["target_mask"][index],
+            final_leader=arrays["final_leader"][index],
+            final_scores=arrays["final_scores"][index].copy(),
+            final_quarks=arrays["final_quarks"][index].copy(),
+            final_ownership=arrays["final_ownership"][node_slice].copy(),
+            final_alive=arrays["final_alive"][node_slice].copy(),
+            search_provenance=str(arrays["search_provenance"][index]),
+            policy_provenance=str(arrays["policy_provenance"][index]),
+            run_id=str(arrays["run_id"][index]),
+            generation_family=str(arrays["generation_family"][index]),
+            actor_id=str(arrays["actor_id"][index]),
+            generation=int(arrays["generation"][index]),
+            game_id=str(arrays["game_id"][index]),
+            ply=int(arrays["ply"][index]),
+            model_identity=str(arrays["model_identity"][index]),
+            soft_policy_temperature=float(arrays["soft_policy_temperature"][index]),
+            rules_hash=arrays["rules_hash"][index],
+            feature_schema_hash=arrays["feature_schema_hash"][index],
+            weight=float(arrays["weight"][index]),
+            policy_weight=float(arrays["policy_weight"][index]),
+        )
+
+    def samples(self, indices: Sequence[int] | None = None) -> list[ReplaySample]:
+        requested = range(self.sample_count) if indices is None else indices
+        return [self.sample(index) for index in requested]
+
+
+def decode_replay_shard(source: str | Path) -> DecodedReplayShard:
+    """Load every compressed NPZ member once and validate its column layout."""
+
+    path = Path(source)
+    with np.load(path, allow_pickle=False) as shard:
+        required = {"metadata", *_REPLAY_SAMPLE_ARRAY_NAMES}
+        missing = required.difference(shard.files)
+        if missing:
+            raise ReplaySchemaError(
+                f"replay shard is missing arrays: {', '.join(sorted(missing))}"
+            )
         metadata = json.loads(str(shard["metadata"].item()))
-        expected_metadata = {
-            "format": REPLAY_SHARD_FORMAT,
-            "schema_version": REPLAY_SCHEMA_VERSION,
-            "rules_schema": RULES_SCHEMA_ID,
-            "rules_hash": RULES_HASH,
-            "rules_hash_wire": RULES_HASH_WIRE,
-            "feature_schema_hash": FEATURE_SCHEMA_HASH,
-            "action_layout_version": ACTION_LAYOUT_VERSION,
-            "soft_policy_temperature": SOFT_POLICY_TEMPERATURE,
-        }
-        for key, expected in expected_metadata.items():
-            if metadata.get(key) != expected:
-                raise ReplaySchemaError(f"incompatible shard metadata: {key}")
-        count = _checked_int("sample_count", metadata.get("sample_count"))
-        if shard["rings"].shape != (count,):
-            raise ReplaySchemaError("shard sample count does not match arrays")
-        node_offsets = shard["node_offsets"]
-        action_offsets = shard["action_offsets"]
-        samples: list[ReplaySample] = []
-        for index in range(count):
-            node_slice = slice(int(node_offsets[index]), int(node_offsets[index + 1]))
-            action_slice = slice(
-                int(action_offsets[index]), int(action_offsets[index + 1])
-            )
-            samples.append(
-                ReplaySample(
-                    rings=shard["rings"][index],
-                    stones=shard["stones"][node_slice].copy(),
-                    to_move=shard["to_move"][index],
-                    moves_left=shard["moves_left"][index],
-                    opening=shard["opening"][index],
-                    pass_streak=shard["pass_streak"][index],
-                    terminal=shard["terminal"][index],
-                    policy=shard["policy"][action_slice].copy(),
-                    soft_policy=shard["soft_policy"][action_slice].copy(),
-                    target_mask=shard["target_mask"][index],
-                    final_leader=shard["final_leader"][index],
-                    final_scores=shard["final_scores"][index].copy(),
-                    final_quarks=shard["final_quarks"][index].copy(),
-                    final_ownership=shard["final_ownership"][node_slice].copy(),
-                    final_alive=shard["final_alive"][node_slice].copy(),
-                    search_provenance=str(shard["search_provenance"][index]),
-                    policy_provenance=str(shard["policy_provenance"][index]),
-                    run_id=str(shard["run_id"][index]),
-                    generation_family=str(shard["generation_family"][index]),
-                    actor_id=str(shard["actor_id"][index]),
-                    generation=int(shard["generation"][index]),
-                    game_id=str(shard["game_id"][index]),
-                    ply=int(shard["ply"][index]),
-                    model_identity=str(shard["model_identity"][index]),
-                    soft_policy_temperature=float(
-                        shard["soft_policy_temperature"][index]
-                    ),
-                    rules_hash=shard["rules_hash"][index],
-                    feature_schema_hash=shard["feature_schema_hash"][index],
-                    weight=float(shard["weight"][index]),
-                )
-            )
-    return samples
+        # NpzFile is lazy and does not cache __getitem__ results. Materializing
+        # these columns here prevents each sample from reopening and inflating
+        # the same compressed ZIP members.
+        arrays = {name: shard[name] for name in _REPLAY_SAMPLE_ARRAY_NAMES}
+        arrays.update(
+            {
+                name: shard[name]
+                for name in _REPLAY_OPTIONAL_ARRAY_NAMES
+                if name in shard.files
+            }
+        )
+
+    expected_metadata = {
+        "format": REPLAY_SHARD_FORMAT,
+        "schema_version": REPLAY_SCHEMA_VERSION,
+        "rules_schema": RULES_SCHEMA_ID,
+        "rules_hash": RULES_HASH,
+        "rules_hash_wire": RULES_HASH_WIRE,
+        "feature_schema_hash": FEATURE_SCHEMA_HASH,
+        "action_layout_version": ACTION_LAYOUT_VERSION,
+        "soft_policy_temperature": SOFT_POLICY_TEMPERATURE,
+    }
+    for key, expected in expected_metadata.items():
+        if metadata.get(key) != expected:
+            raise ReplaySchemaError(f"incompatible shard metadata: {key}")
+    count = _checked_int("sample_count", metadata.get("sample_count"))
+    if count <= 0:
+        raise ReplaySchemaError("shard sample_count must be positive")
+    if "policy_weight" not in arrays:
+        arrays["policy_weight"] = np.ones(count, dtype=np.float32)
+    _validate_decoded_shard_arrays(arrays, count=count)
+    return DecodedReplayShard(path, metadata, arrays, count)
+
+
+def _validate_decoded_shard_arrays(
+    arrays: Mapping[str, np.ndarray],
+    *,
+    count: int,
+) -> None:
+    per_sample = (
+        "rings",
+        "to_move",
+        "moves_left",
+        "opening",
+        "pass_streak",
+        "terminal",
+        "target_mask",
+        "final_leader",
+        "search_provenance",
+        "policy_provenance",
+        "run_id",
+        "generation_family",
+        "actor_id",
+        "generation",
+        "game_id",
+        "ply",
+        "model_identity",
+        "soft_policy_temperature",
+        "rules_hash",
+        "feature_schema_hash",
+        "weight",
+        "policy_weight",
+    )
+    if any(arrays[name].shape != (count,) for name in per_sample):
+        raise ReplaySchemaError("shard sample count does not match arrays")
+    if arrays["final_scores"].shape != (count, 2) or arrays["final_quarks"].shape != (
+        count,
+        2,
+    ):
+        raise ReplaySchemaError("shard result columns have invalid shapes")
+
+    node_offsets = arrays["node_offsets"]
+    action_offsets = arrays["action_offsets"]
+    if node_offsets.shape != (count + 1,) or action_offsets.shape != (count + 1,):
+        raise ReplaySchemaError("shard offsets have invalid shapes")
+    if (
+        int(node_offsets[0]) != 0
+        or int(action_offsets[0]) != 0
+        or np.any(np.diff(node_offsets) < 0)
+        or np.any(np.diff(action_offsets) < 0)
+    ):
+        raise ReplaySchemaError("shard offsets must be monotonic and zero-based")
+    node_values = int(node_offsets[-1])
+    action_values = int(action_offsets[-1])
+    if any(
+        arrays[name].shape != (node_values,)
+        for name in ("stones", "final_ownership", "final_alive")
+    ):
+        raise ReplaySchemaError("shard node columns disagree with node offsets")
+    if any(
+        arrays[name].shape != (action_values,) for name in ("policy", "soft_policy")
+    ):
+        raise ReplaySchemaError("shard policy columns disagree with action offsets")
+    if len(np.unique(arrays["rings"])) != 1:
+        raise ReplaySchemaError("replay shard must be ring-homogeneous")
+
+
+def read_replay_shard(source: str | Path) -> list[ReplaySample]:
+    return decode_replay_shard(source).samples()
 
 
 class ReplayDataset(Dataset[ReplaySample]):
@@ -723,12 +878,28 @@ class ReplayBatch:
         device: torch.device | str,
         *,
         feature_dtype: torch.dtype | None = None,
+        non_blocking: bool = False,
     ) -> "ReplayBatch":
         return ReplayBatch(
-            inputs=self.inputs.to(device, feature_dtype=feature_dtype),
-            targets=self.targets.to(device),
+            inputs=self.inputs.to(
+                device,
+                feature_dtype=feature_dtype,
+                non_blocking=non_blocking,
+            ),
+            targets=self.targets.to(device, non_blocking=non_blocking),
             feature_path=self.feature_path,
         )
+
+    def pin_memory(self) -> "ReplayBatch":
+        return ReplayBatch(
+            inputs=self.inputs.pin_memory(pin_topology=False),
+            targets=self.targets.pin_memory(),
+            feature_path=self.feature_path,
+        )
+
+    def record_stream(self, stream: torch.Stream) -> None:
+        self.inputs.record_stream(stream)
+        self.targets.record_stream(stream)
 
 
 def collate_replay_samples(
@@ -831,6 +1002,9 @@ def collate_replay_samples(
             soft_policy_mask=masks["soft"],
             sample_weight=torch.tensor(
                 [sample.weight for sample in samples], dtype=torch.float32
+            ),
+            policy_weight=torch.tensor(
+                [sample.policy_weight for sample in samples], dtype=torch.float32
             ),
         ),
         feature_path=feature_path,

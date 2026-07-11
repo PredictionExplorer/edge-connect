@@ -369,7 +369,9 @@ def collect_snapshot(
     learner_metric = _latest_jsonl(root / "learner" / "metrics.jsonl") or {}
     learner_heartbeat = _read_json(root / "status" / "learner.heartbeat.json") or {}
     losses = learner_metric.get("losses")
-    if isinstance(losses, dict) and any(_number(value) is None for value in losses.values()):
+    if isinstance(losses, dict) and any(
+        _number(value) is None for value in losses.values()
+    ):
         _add_warning(warnings, "ERROR", "nonfinite_loss", "learner loss is non-finite")
     if learner_metric.get("feature_path") not in (None, "rust"):
         _add_warning(
@@ -378,13 +380,33 @@ def collect_snapshot(
             "python_feature_path",
             f"learner feature path={learner_metric.get('feature_path')}",
         )
+    step_seconds = _number(learner_metric.get("step_seconds"))
+    data_wait_seconds = _number(learner_metric.get("data_wait_seconds"))
+    data_wait_fraction = (
+        data_wait_seconds / step_seconds
+        if data_wait_seconds is not None and step_seconds
+        else None
+    )
+    if data_wait_fraction is not None and data_wait_fraction > 0.25:
+        _add_warning(
+            warnings,
+            "WARN",
+            "learner_data_wait",
+            f"learner data wait is {data_wait_fraction:.1%} of wall step time",
+        )
     learner = {
         "step": learner_heartbeat.get("step", learner_metric.get("step")),
         "target_steps": target_steps,
         "epoch": learner_heartbeat.get("epoch", learner_metric.get("epoch")),
         "phase": learner_heartbeat.get("phase"),
         "examples_per_second": learner_metric.get("examples_per_second"),
+        "device_examples_per_second": learner_metric.get("device_examples_per_second"),
         "step_seconds": learner_metric.get("step_seconds"),
+        "device_step_seconds": learner_metric.get("device_step_seconds"),
+        "data_wait_seconds": learner_metric.get("data_wait_seconds"),
+        "data_wait_fraction": data_wait_fraction,
+        "h2d_seconds": learner_metric.get("h2d_seconds"),
+        "updates_per_new_sample": learner_metric.get("updates_per_new_sample"),
         "losses": losses,
         "gradient_norm": learner_metric.get("gradient_norm"),
         "feature_path": learner_metric.get("feature_path"),

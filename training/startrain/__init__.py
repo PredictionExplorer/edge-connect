@@ -49,6 +49,7 @@ from .config import (
     ShutdownConfig,
     TrainConfig,
     load_config,
+    parse_cpu_affinity,
 )
 from .contracts import (
     ACTION_LAYOUT_SCHEMA_ID,
@@ -138,11 +139,13 @@ from .orchestration import (
 )
 from .replay import (
     REPLAY_SCHEMA_VERSION,
+    DecodedReplayShard,
     ReplayBatch,
     ReplayDataset,
     ReplaySample,
     augment_sample,
     collate_replay_samples,
+    decode_replay_shard,
     katago_soft_policy_target,
     read_replay_shard,
     write_replay_shard,
@@ -188,6 +191,8 @@ from .topology import (
     ring_start,
 )
 from .training import (
+    DeviceBatchPrefetcher,
+    HostTrainStepMetrics,
     TrainStepResult,
     build_scheduler,
     maybe_compile_model,
@@ -207,6 +212,7 @@ __all__ = [
     "CONFORMANCE_SCHEMA_ID",
     "Coordinator",
     "CurriculumStage",
+    "DecodedReplayShard",
     "D5Augmenter",
     "D5Transform",
     "DataConfig",
@@ -221,6 +227,7 @@ __all__ = [
     "DistillationTrainConfig",
     "DoubleStarPosition",
     "DetailedInferenceResponse",
+    "DeviceBatchPrefetcher",
     "EncodedBatch",
     "ExponentialMovingAverage",
     "ExperimentConfig",
@@ -234,6 +241,7 @@ __all__ = [
     "GameSummary",
     "GraphInferenceAdapter",
     "GraphResTNet",
+    "HostTrainStepMetrics",
     "LossWeights",
     "LearnerConfig",
     "LearnerLoop",
@@ -318,6 +326,7 @@ __all__ = [
     "build_scheduler",
     "build_worker_specs",
     "collate_replay_samples",
+    "decode_replay_shard",
     "compute_losses",
     "collect_model_garbage",
     "deterministic_transform",
@@ -330,6 +339,7 @@ __all__ = [
     "get_topology",
     "katago_soft_policy_target",
     "load_config",
+    "parse_cpu_affinity",
     "load_distillation_config",
     "load_checkpoint",
     "load_ema_checkpoint",

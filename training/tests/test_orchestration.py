@@ -185,6 +185,61 @@ def test_h100_layouts_assign_one_learner_and_every_actor_gpu() -> None:
     assert "--gpu-pause" in arena.command
 
 
+def test_actor_lanes_expand_worker_specs_with_distinct_identity_and_affinity(
+    tmp_path,
+) -> None:
+    experiment = load_config(CONFIGS / "h100-8gpu-optimized.yaml")
+    gpus = tuple(
+        replace(
+            gpu,
+            actor_lanes=2,
+            cpu_affinity="0-3,8",
+        )
+        if gpu.gpu_id == 1
+        else gpu
+        for gpu in experiment.orchestration.gpus
+    )
+    experiment = replace(
+        experiment,
+        orchestration=replace(
+            experiment.orchestration,
+            gpus=gpus,
+            directories=RunDirectoryConfig(root=str(tmp_path / "lanes")),
+        ),
+    )
+    directories = RunDirectories.from_experiment(experiment)
+
+    specs = build_worker_specs(
+        experiment,
+        config_path=CONFIGS / "h100-8gpu-optimized.yaml",
+        directories=directories,
+        python_executable="/test/python",
+        base_environment={},
+    )
+    lanes = [spec for spec in specs if spec.name.startswith("actor-gpu-1-lane-")]
+
+    assert [spec.name for spec in lanes] == [
+        "actor-gpu-1-lane-0",
+        "actor-gpu-1-lane-1",
+    ]
+    assert [spec.command[spec.command.index("--lane-id") + 1] for spec in lanes] == [
+        "0",
+        "1",
+    ]
+    assert all(spec.cpu_affinity == (0, 1, 2, 3, 8) for spec in lanes)
+    assert all(
+        spec.environment["STARTRAIN_CPU_AFFINITY"] == "0,1,2,3,8" for spec in lanes
+    )
+    shared = next(gpu for gpu in gpus if gpu.gpu_id == 7)
+    with pytest.raises(ConfigError, match="exactly one actor lane"):
+        replace(
+            experiment.orchestration,
+            gpus=tuple(
+                replace(gpu, actor_lanes=2) if gpu is shared else gpu for gpu in gpus
+            ),
+        )
+
+
 def test_ring_scheduler_curriculum_then_favors_deficits() -> None:
     experiment = load_config(CONFIGS / "h100-8gpu.yaml")
     scheduler = RingMixtureScheduler(experiment.orchestration.ring_mixture, seed=11)
@@ -242,6 +297,15 @@ def test_explicit_ddp_builds_one_torchrun_job_and_partitions_batches(
     assert "torch.distributed.run" in learner.command
     assert "--nproc-per-node=2" in learner.command
     assert learner.command.count("--distributed-backend") == 1
+    with pytest.raises(ConfigError, match="shared CPU affinity"):
+        replace(
+            orchestration,
+            gpus=(
+                GPUWorkerConfig(0, "learner", 8, cpu_affinity="0-7"),
+                GPUWorkerConfig(2, "learner", 8),
+                GPUWorkerConfig(5, "actor", 4, 32),
+            ),
+        )
 
 
 class FakeProcess:
@@ -288,6 +352,67 @@ class FakeClock:
 
     def sleep(self, seconds: float) -> None:
         self.value += seconds
+
+
+def test_coordinator_applies_configured_cpu_affinity(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    experiment = load_config(CONFIGS / "h100-4gpu.yaml")
+    gpus = tuple(
+        replace(gpu, cpu_affinity="4-6") if gpu.gpu_id == 1 else gpu
+        for gpu in experiment.orchestration.gpus
+    )
+    experiment = replace(
+        experiment,
+        orchestration=replace(
+            experiment.orchestration,
+            gpus=gpus,
+            directories=RunDirectoryConfig(root=str(tmp_path / "affinity")),
+        ),
+    )
+    directories = RunDirectories.from_experiment(experiment)
+    directories.create()
+    specs = build_worker_specs(
+        experiment,
+        config_path=CONFIGS / "h100-4gpu.yaml",
+        directories=directories,
+        base_environment={},
+    )
+    process = FakeProcess(exit_immediately=False)
+    commands: list[list[str]] = []
+    monkeypatch.setattr(
+        orchestration_module.shutil,
+        "which",
+        lambda executable, **_kwargs: f"/usr/bin/{executable}",
+    )
+
+    def process_factory(command, **_kwargs):
+        commands.append(command)
+        return process
+
+    coordinator = Coordinator(
+        experiment=experiment,
+        specs=specs,
+        directories=directories,
+        process_factory=process_factory,
+    )
+    worker = coordinator.workers["actor-gpu-1"]
+
+    coordinator._start(worker)
+
+    assert commands == [
+        [
+            "/usr/bin/taskset",
+            "--cpu-list",
+            "4,5,6",
+            *worker.spec.command,
+        ]
+    ]
+    assert worker.live
+    worker.process = None
+    if worker.log_stream is not None:
+        worker.log_stream.close()
+        worker.log_stream = None
 
 
 def pause_shared_experiment(tmp_path: Path):

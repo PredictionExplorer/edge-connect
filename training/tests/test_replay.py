@@ -20,6 +20,7 @@ from startrain.replay import (
     ReplaySchemaError,
     augment_sample,
     collate_replay_samples,
+    decode_replay_shard,
     read_replay_shard,
     write_replay_shard,
 )
@@ -154,6 +155,55 @@ def test_terminal_and_opening_states_round_trip_in_one_shard(tmp_path) -> None:
     batch = collate_replay_samples(loaded)
     assert batch.targets.policy_mask.tolist() == [True, False]
     assert not bool(batch.inputs.legal_action_mask[1].any())
+
+
+def test_decode_materializes_each_npz_member_exactly_once(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = write_replay_shard(
+        tmp_path / "decode-once.npz",
+        [sample_for(4), sample_for(4), sample_for(4)],
+    )
+    with np.load(path, allow_pickle=False) as archive:
+        archive_type = type(archive)
+    original_getitem = archive_type.__getitem__
+    calls: dict[str, int] = {}
+
+    def counted_getitem(archive, key):
+        calls[str(key)] = calls.get(str(key), 0) + 1
+        return original_getitem(archive, key)
+
+    monkeypatch.setattr(archive_type, "__getitem__", counted_getitem)
+    decoded = decode_replay_shard(path)
+
+    assert len(decoded) == 3
+    assert set(calls) == {"metadata", *decoded.arrays}
+    assert set(calls.values()) == {1}
+    np.testing.assert_array_equal(decoded.sample(1).stones, sample_for(4).stones)
+    with pytest.raises(IndexError):
+        decoded.sample(3)
+
+
+def test_policy_confidence_weight_round_trips_and_legacy_shards_default_to_one(
+    tmp_path,
+) -> None:
+    weighted = replace(sample_for(3), policy_weight=0.25)
+    path = write_replay_shard(tmp_path / "weighted.npz", [weighted])
+
+    loaded = read_replay_shard(path)
+
+    assert loaded[0].policy_weight == pytest.approx(0.25)
+    batch = collate_replay_samples(loaded)
+    assert batch.targets.policy_weight is not None
+    assert batch.targets.policy_weight.tolist() == pytest.approx([0.25])
+
+    with np.load(path, allow_pickle=False) as archive:
+        legacy_arrays = {
+            name: archive[name] for name in archive.files if name != "policy_weight"
+        }
+    legacy_path = tmp_path / "legacy-without-policy-weight.npz"
+    np.savez_compressed(legacy_path, **legacy_arrays)
+    assert read_replay_shard(legacy_path)[0].policy_weight == 1.0
 
 
 def test_action_relocation_has_one_pass_and_sentinel_gap() -> None:

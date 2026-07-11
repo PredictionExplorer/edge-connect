@@ -44,6 +44,7 @@ def targets(batch: int = 2, nodes: int = 3, actions: int = 4) -> TrainingTargets
         alive_mask=false.clone(),
         soft_policy_mask=false.clone(),
         sample_weight=torch.ones(batch),
+        policy_weight=torch.ones(batch),
     )
 
 
@@ -102,6 +103,45 @@ def test_weights_below_one_are_normalized_not_clamped() -> None:
         ),
     )
     assert losses["wdl"].item() == pytest.approx(math.log(3), rel=1e-6)
+
+
+def test_policy_confidence_weights_affect_only_policy_heads() -> None:
+    output = outputs()
+    policy_logits = output.policy_logits.detach().clone()
+    policy_logits[0, 0] = 3
+    policy_logits[1, 1] = 3
+    output = output._replace(policy_logits=policy_logits.requires_grad_())
+    target = targets()
+    target.policy[:, 0] = 1
+    target.policy_mask[:] = True
+    target.wdl[:] = torch.tensor([0, 2])
+    target.wdl_mask[:] = True
+    assert target.policy_weight is not None
+    target.policy_weight[:] = torch.tensor([1.0, 0.0])
+    legal = torch.ones(2, 4, dtype=torch.bool)
+
+    losses = compute_losses(
+        output,
+        target,
+        legal_action_mask=legal,
+        node_mask=torch.ones(2, 3, dtype=torch.bool),
+        weights=LossWeights(1, 1, 0, 0, 0, 0),
+    )
+
+    expected_policy = torch.nn.functional.cross_entropy(
+        policy_logits[:1], torch.tensor([0])
+    )
+    torch.testing.assert_close(losses["policy"], expected_policy)
+    assert losses["wdl"].item() == pytest.approx(math.log(3), rel=1e-6)
+
+    target.policy_weight[1] = -1
+    with pytest.raises(ValueError, match="policy weights"):
+        compute_losses(
+            output,
+            target,
+            legal_action_mask=legal,
+            node_mask=torch.ones(2, 3, dtype=torch.bool),
+        )
 
 
 @pytest.mark.parametrize("head", ["ownership", "alive"])

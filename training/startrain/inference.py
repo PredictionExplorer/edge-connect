@@ -114,6 +114,7 @@ class GraphInferenceAdapter:
             tuple[int, int, int, int],
             tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
         ] = {}
+        self._score_support: torch.Tensor | None = None
 
     @property
     def evaluator_calls(self) -> int:
@@ -149,22 +150,22 @@ class GraphInferenceAdapter:
         if topology is None:
             topology = (
                 encoded.neighbor_index[0]
-                .to(self.device)
+                .to(self.device, non_blocking=True)
                 .unsqueeze(0)
                 .expand(batch_size, -1, -1)
                 .contiguous(),
                 encoded.neighbor_mask[0]
-                .to(self.device)
+                .to(self.device, non_blocking=True)
                 .unsqueeze(0)
                 .expand(batch_size, -1, -1)
                 .contiguous(),
                 encoded.neighbor_edge_type[0]
-                .to(self.device)
+                .to(self.device, non_blocking=True)
                 .unsqueeze(0)
                 .expand(batch_size, -1, -1)
                 .contiguous(),
                 encoded.node_mask[0]
-                .to(self.device)
+                .to(self.device, non_blocking=True)
                 .unsqueeze(0)
                 .expand(batch_size, -1)
                 .contiguous(),
@@ -172,14 +173,16 @@ class GraphInferenceAdapter:
             self._topology_cache[key] = topology
         neighbor_index, neighbor_mask, neighbor_edge_type, node_mask = topology
         return EncodedBatch(
-            node_features=encoded.node_features.to(self.device),
-            global_features=encoded.global_features.to(self.device),
+            node_features=encoded.node_features.to(self.device, non_blocking=True),
+            global_features=encoded.global_features.to(self.device, non_blocking=True),
             neighbor_index=neighbor_index,
             neighbor_mask=neighbor_mask,
             neighbor_edge_type=neighbor_edge_type,
             node_mask=node_mask,
-            legal_action_mask=encoded.legal_action_mask.to(self.device),
-            rings=encoded.rings.to(self.device),
+            legal_action_mask=encoded.legal_action_mask.to(
+                self.device, non_blocking=True
+            ),
+            rings=encoded.rings.to(self.device, non_blocking=True),
         )
 
     def evaluate(self, requests: NativeEvalBatchProtocol) -> InferenceResponse:
@@ -272,7 +275,8 @@ class GraphInferenceAdapter:
         self._evaluator_calls += 1
         self._evaluator_rows += rows
         was_training = self.model.training
-        self.model.eval()
+        if was_training:
+            self.model.eval()
         autocast = self.config.precision == "bf16"
         if autocast and self.device.type not in ("cpu", "cuda"):
             raise ValueError(f"BF16 inference is unsupported on {self.device.type}")
@@ -292,16 +296,17 @@ class GraphInferenceAdapter:
                 score_probability = None
                 score_belief = None
                 if self.config.score_utility_weight or include_details:
-                    support = torch.arange(
-                        SCORE_MARGIN_MIN,
-                        SCORE_MARGIN_MAX + 1,
-                        device=self.device,
-                        dtype=torch.float32,
-                    )
+                    if self._score_support is None:
+                        self._score_support = torch.arange(
+                            SCORE_MARGIN_MIN,
+                            SCORE_MARGIN_MAX + 1,
+                            device=self.device,
+                            dtype=torch.float32,
+                        )
                     score_probability = torch.softmax(
                         output.score_margin_logits.float(), dim=-1
                     )
-                    score_belief = (score_probability * support).sum(dim=-1)
+                    score_belief = (score_probability * self._score_support).sum(dim=-1)
                     score_belief = score_belief / max(
                         abs(SCORE_MARGIN_MIN), SCORE_MARGIN_MAX
                     )
@@ -314,9 +319,17 @@ class GraphInferenceAdapter:
                     encoded.legal_action_mask
                 )
         finally:
-            self.model.train(was_training)
+            if was_training:
+                self.model.train()
 
-        flattened = legal_logits.cpu().tolist()
+        if include_details:
+            flattened = legal_logits.cpu().tolist()
+            host_values = values.cpu().tolist()
+        else:
+            packed = torch.cat((values.float(), legal_logits))
+            host = packed.cpu().tolist()
+            host_values = host[:rows]
+            flattened = host[rows:]
         openings = list(requests.states.opening)
         if len(openings) != rows:
             raise ValueError("opening metadata row count is invalid")
@@ -332,7 +345,7 @@ class GraphInferenceAdapter:
                         flattened[end - 1] -= penalty
         response = InferenceResponse(
             tokens=tokens,
-            values=values.cpu().tolist(),
+            values=host_values,
             policy_offsets=legal_offsets,
             policy_logits=flattened,
         )

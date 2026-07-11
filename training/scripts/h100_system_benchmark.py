@@ -957,6 +957,11 @@ def summarize_orchestration_metrics(root: Path) -> dict[str, object]:
 
     learner_examples: list[float] = []
     learner_batches: list[float] = []
+    learner_device_examples: list[float] = []
+    learner_device_batches: list[float] = []
+    learner_data_waits: list[float] = []
+    learner_h2d: list[float] = []
+    learner_window_setup: list[float] = []
     actor_metrics = _actor_series()
     actor_by_worker: dict[str, dict[str, list[float]]] = {}
     replay_wait_durations: list[float] = []
@@ -1015,6 +1020,19 @@ def summarize_orchestration_metrics(root: Path) -> dict[str, object]:
                         learner_examples.append(examples)
                     if step_seconds is not None:
                         learner_batches.append(step_seconds)
+                    for destination, names in (
+                        (
+                            learner_device_examples,
+                            ("device_examples_per_second",),
+                        ),
+                        (learner_device_batches, ("device_step_seconds",)),
+                        (learner_data_waits, ("data_wait_seconds",)),
+                        (learner_h2d, ("h2d_seconds",)),
+                        (learner_window_setup, ("window_setup_seconds",)),
+                    ):
+                        value = _metric_number(record, *names)
+                        if value is not None:
+                            destination.append(value)
 
                 games = _metric_number(record, "games_per_second")
                 samples = _metric_number(record, "samples_per_second")
@@ -1114,6 +1132,11 @@ def summarize_orchestration_metrics(root: Path) -> dict[str, object]:
             "records": learner_records,
             "examples_per_second": _stats(learner_examples),
             "batch_seconds": _stats(learner_batches),
+            "device_examples_per_second": _stats(learner_device_examples),
+            "device_batch_seconds": _stats(learner_device_batches),
+            "data_wait_seconds": _stats(learner_data_waits),
+            "h2d_seconds": _stats(learner_h2d),
+            "window_setup_seconds": _stats(learner_window_setup),
         },
         "actors": actors,
         "replay_waits": {

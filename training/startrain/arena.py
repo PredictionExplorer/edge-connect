@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import random
 import time
+from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from statistics import NormalDist
@@ -727,8 +728,7 @@ class ArenaRunner:
                     )
         statistical = summarize_arena_pairs(pairs, self.config)
         candidate_calls = (
-            int(getattr(self.candidate, "evaluator_calls", 0))
-            - candidate_calls_before
+            int(getattr(self.candidate, "evaluator_calls", 0)) - candidate_calls_before
         )
         candidate_rows = (
             int(getattr(self.candidate, "evaluator_rows", 0)) - candidate_rows_before
@@ -764,9 +764,7 @@ class ArenaRunner:
                 "baseline_evaluator_rows": baseline_rows,
                 "total_evaluator_calls": candidate_calls + baseline_calls,
                 "total_evaluator_rows": total_rows,
-                "evaluator_rows_per_second": (
-                    total_rows / elapsed if elapsed else 0.0
-                ),
+                "evaluator_rows_per_second": (total_rows / elapsed if elapsed else 0.0),
             },
             "search": {
                 "deterministic": True,
@@ -811,71 +809,71 @@ class ArenaRunner:
         searched_moves = [0] * len(specifications)
         wave = 0
         maximum_moves = 2 * get_topology(ring).n + 2
-        while True:
-            data = states.data()
-            active = [row for row, terminal in enumerate(data.terminal) if not terminal]
-            if not active:
-                break
-            groups: dict[int, list[int]] = {0: [], 1: []}
-            for row in active:
-                candidate_player = specifications[row][1]
-                evaluator_index = 0 if int(data.to_move[row]) == candidate_player else 1
-                groups[evaluator_index].append(row)
-            for evaluator_index, rows in groups.items():
-                if not rows:
-                    continue
-                subset = self._semantic_subset(data, rows)
-                evaluator = self.candidate if evaluator_index == 0 else self.baseline
-                budget = (
-                    self.candidate_search
-                    if evaluator_index == 0
-                    else self.baseline_search
-                )
-                search = self.native.SearchBatch(
-                    subset,
-                    simulations=budget.simulations,
-                    max_considered=budget.max_considered,
-                    c_visit=budget.c_visit,
-                    c_scale=budget.c_scale,
-                    deterministic_seed=_batch_search_seed(
+        with ThreadPoolExecutor(
+            max_workers=2,
+            thread_name_prefix="arena-search",
+        ) as executor:
+            while True:
+                data = states.data()
+                active = [
+                    row for row, terminal in enumerate(data.terminal) if not terminal
+                ]
+                if not active:
+                    break
+                groups: dict[int, list[int]] = {0: [], 1: []}
+                for row in active:
+                    candidate_player = specifications[row][1]
+                    evaluator_index = (
+                        0 if int(data.to_move[row]) == candidate_player else 1
+                    )
+                    groups[evaluator_index].append(row)
+                futures = []
+                for evaluator_index, rows in groups.items():
+                    if not rows:
+                        continue
+                    subset = self._semantic_subset(data, rows)
+                    evaluator = (
+                        self.candidate if evaluator_index == 0 else self.baseline
+                    )
+                    budget = (
+                        self.candidate_search
+                        if evaluator_index == 0
+                        else self.baseline_search
+                    )
+                    seed = _batch_search_seed(
                         ring,
                         wave,
                         evaluator_index,
                         [specifications[row][2] for row in rows],
-                    ),
-                )
-                roots = search.root_requests()
-                response = evaluator.evaluate(roots)
-                search.initialize_roots(*response.submit_args())
-                guard = 0
-                while not search.is_done():
-                    guard += 1
-                    if guard > budget.simulations * len(rows) * 4 + 16:
-                        raise RuntimeError(
-                            "batched arena search failed to make progress"
+                    )
+                    futures.append(
+                        executor.submit(
+                            self._search_group,
+                            subset,
+                            evaluator,
+                            budget,
+                            seed,
+                            len(rows),
+                            rows,
                         )
-                    requests = search.next_requests()
-                    if len(requests) == 0:
-                        continue
-                    response = evaluator.evaluate(requests)
-                    search.submit(*response.submit_args())
-                results = search.results()
-                actions = [int(value) for value in results.selected_actions]
-                if any(action == -2 for action in actions):
-                    raise RuntimeError("active batched arena row became terminal")
-                states.apply_many(rows, actions)
-                for row in rows:
-                    searched_moves[row] += 1
-                    if searched_moves[row] > maximum_moves:
-                        raise RuntimeError("batched arena game exceeded the move bound")
-            wave += 1
-            if progress is not None and wave % 16 == 0:
-                progress(
-                    phase="arena_batch",
-                    ring=ring,
-                    active_games=len(active),
-                    wave=wave,
-                )
+                    )
+                for future in futures:
+                    rows, actions = future.result()
+                    states.apply_many(rows, actions)
+                    for row in rows:
+                        searched_moves[row] += 1
+                        if searched_moves[row] > maximum_moves:
+                            raise RuntimeError(
+                                "batched arena game exceeded the move bound"
+                            )
+                wave += 1
+                if progress is not None and wave % 16 == 0:
+                    progress(
+                        phase="arena_batch",
+                        ring=ring,
+                        active_games=len(active),
+                        wave=wave,
+                    )
         winners = [int(value) for value in states.score_data().winner]
         output = []
         for row, specification in enumerate(specifications):
@@ -896,6 +894,44 @@ class ArenaRunner:
                 )
             )
         return output
+
+    def _search_group(
+        self,
+        states: Any,
+        evaluator: ArenaEvaluatorProtocol,
+        budget: ArenaSearchBudget,
+        seed: int,
+        row_count: int,
+        rows: Sequence[int],
+    ) -> tuple[list[int], list[int]]:
+        search = self.native.SearchBatch(
+            states,
+            simulations=budget.simulations,
+            max_considered=budget.max_considered,
+            c_visit=budget.c_visit,
+            c_scale=budget.c_scale,
+            deterministic_seed=seed,
+        )
+        roots = search.root_requests()
+        response = evaluator.evaluate(roots)
+        search.initialize_roots(*response.submit_args())
+        guard = 0
+        while not search.is_done():
+            guard += 1
+            if guard > budget.simulations * row_count * 4 + 16:
+                raise RuntimeError("batched arena search failed to make progress")
+            requests = search.next_requests()
+            if len(requests) == 0:
+                continue
+            response = evaluator.evaluate(requests)
+            search.submit(*response.submit_args())
+        results = search.results()
+        actions = [int(value) for value in results.selected_actions]
+        if len(actions) != len(rows):
+            raise RuntimeError("batched arena search returned the wrong row count")
+        if any(action == -2 for action in actions):
+            raise RuntimeError("active batched arena row became terminal")
+        return list(rows), actions
 
     def _semantic_subset(self, data: Any, rows: Sequence[int]) -> Any:
         def words(name: str) -> list[int]:

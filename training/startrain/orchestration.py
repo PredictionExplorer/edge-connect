@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -14,7 +15,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol, TextIO
 
-from .config import ExperimentConfig, load_config
+from .config import ExperimentConfig, load_config, parse_cpu_affinity
 from .runtime import (
     SignalLatch,
     append_jsonl,
@@ -96,6 +97,7 @@ class WorkerSpec:
     heartbeat_path: Path
     metrics_path: Path
     log_path: Path
+    cpu_affinity: tuple[int, ...] | None = None
 
 
 @dataclass(slots=True)
@@ -206,10 +208,19 @@ def build_worker_specs(
     champion_manifest = directories.learner / "champion.json"
     learner_gpus = orchestration.learner_gpus
     learner_threads = learner_gpus[0].cpu_threads
+    learner_affinity_specs = {
+        gpu.cpu_affinity for gpu in learner_gpus if gpu.cpu_affinity is not None
+    }
+    learner_affinity = (
+        parse_cpu_affinity(next(iter(learner_affinity_specs)))
+        if len(learner_affinity_specs) == 1
+        else None
+    )
     learner_environment = _worker_environment(
         environment,
         gpu_ids=tuple(gpu.gpu_id for gpu in learner_gpus),
         cpu_threads=learner_threads,
+        cpu_affinity=learner_affinity,
     )
     train_arguments = (
         "--config",
@@ -270,53 +281,77 @@ def build_worker_specs(
             heartbeat_path=directories.status / "learner.heartbeat.json",
             metrics_path=directories.learner / "metrics.jsonl",
             log_path=directories.logs / "learner.log",
+            cpu_affinity=learner_affinity,
         )
     ]
     for gpu in orchestration.actor_gpus:
-        name = f"actor-gpu-{gpu.gpu_id}"
-        specs.append(
-            WorkerSpec(
-                name=name,
-                role="actor",
-                gpu_ids=(gpu.gpu_id,),
-                cpu_threads=gpu.cpu_threads,
-                command=(
-                    python_executable,
-                    "-m",
-                    "startrain.cli",
-                    "actor",
-                    "--config",
-                    config,
-                    "--gpu-id",
-                    str(gpu.gpu_id),
-                    "--replay-store",
-                    str(directories.replay),
-                    "--manifest",
-                    str(champion_manifest),
-                    "--candidate-manifest",
-                    str(candidate_manifest),
-                    "--run-identity",
-                    str(directories.run_identity),
-                    "--heartbeat",
-                    str(directories.status / f"{name}.heartbeat.json"),
-                    "--metrics",
-                    str(directories.metrics / f"{name}.jsonl"),
-                    "--device",
-                    "cuda",
-                ),
-                environment=_worker_environment(
-                    environment,
+        affinity = (
+            parse_cpu_affinity(gpu.cpu_affinity)
+            if gpu.cpu_affinity is not None
+            else None
+        )
+        for lane_id in range(gpu.actor_lanes):
+            name = (
+                f"actor-gpu-{gpu.gpu_id}"
+                if gpu.actor_lanes == 1
+                else f"actor-gpu-{gpu.gpu_id}-lane-{lane_id}"
+            )
+            specs.append(
+                WorkerSpec(
+                    name=name,
+                    role="actor",
                     gpu_ids=(gpu.gpu_id,),
                     cpu_threads=gpu.cpu_threads,
-                ),
-                heartbeat_path=directories.status / f"{name}.heartbeat.json",
-                metrics_path=directories.metrics / f"{name}.jsonl",
-                log_path=directories.logs / f"{name}.log",
+                    command=(
+                        python_executable,
+                        "-m",
+                        "startrain.cli",
+                        "actor",
+                        "--config",
+                        config,
+                        "--gpu-id",
+                        str(gpu.gpu_id),
+                        "--lane-id",
+                        str(lane_id),
+                        "--replay-store",
+                        str(directories.replay),
+                        "--manifest",
+                        str(champion_manifest),
+                        "--candidate-manifest",
+                        str(candidate_manifest),
+                        "--run-identity",
+                        str(directories.run_identity),
+                        "--heartbeat",
+                        str(directories.status / f"{name}.heartbeat.json"),
+                        "--metrics",
+                        str(directories.metrics / f"{name}.jsonl"),
+                        "--device",
+                        "cuda",
+                    ),
+                    environment=_worker_environment(
+                        environment,
+                        gpu_ids=(gpu.gpu_id,),
+                        cpu_threads=gpu.cpu_threads,
+                        cpu_affinity=affinity,
+                    ),
+                    heartbeat_path=directories.status / f"{name}.heartbeat.json",
+                    metrics_path=directories.metrics / f"{name}.jsonl",
+                    log_path=directories.logs / f"{name}.log",
+                    cpu_affinity=affinity,
+                )
             )
-        )
     promotion = orchestration.promotion
     if promotion.enabled:
         name = "arena-promotion"
+        promotion_gpu = next(
+            (gpu for gpu in orchestration.gpus if gpu.gpu_id == promotion.gpu_id),
+            None,
+        )
+        promotion_affinity = (
+            parse_cpu_affinity(promotion_gpu.cpu_affinity)
+            if promotion_gpu is not None and promotion_gpu.cpu_affinity is not None
+            else None
+        )
         specs.append(
             WorkerSpec(
                 name=name,
@@ -352,10 +387,12 @@ def build_worker_specs(
                     environment,
                     gpu_ids=(promotion.gpu_id,),
                     cpu_threads=promotion.cpu_threads,
+                    cpu_affinity=promotion_affinity,
                 ),
                 heartbeat_path=directories.status / f"{name}.heartbeat.json",
                 metrics_path=directories.metrics / f"{name}.jsonl",
                 log_path=directories.logs / f"{name}.log",
+                cpu_affinity=promotion_affinity,
             )
         )
     return tuple(specs)
@@ -366,6 +403,7 @@ def _worker_environment(
     *,
     gpu_ids: Sequence[int],
     cpu_threads: int,
+    cpu_affinity: Sequence[int] | None = None,
 ) -> dict[str, str]:
     output = dict(base)
     output.update(
@@ -379,6 +417,8 @@ def _worker_environment(
             "PYTHONUNBUFFERED": "1",
         }
     )
+    if cpu_affinity:
+        output["STARTRAIN_CPU_AFFINITY"] = ",".join(str(cpu) for cpu in cpu_affinity)
     return output
 
 
@@ -817,9 +857,7 @@ class Coordinator:
                 heartbeat = json.load(stream)
         except (OSError, json.JSONDecodeError):
             return
-        progress_ns = (
-            heartbeat.get("progress_ns") if isinstance(heartbeat, dict) else 0
-        )
+        progress_ns = heartbeat.get("progress_ns") if isinstance(heartbeat, dict) else 0
         if (
             isinstance(heartbeat, dict)
             and heartbeat.get("phase") == "arena_gpu_pause"
@@ -1071,8 +1109,18 @@ class Coordinator:
         worker.log_stream = worker.spec.log_path.open(
             "a", encoding="utf-8", buffering=1
         )
-        worker.process = self.process_factory(
-            list(worker.spec.command),
+        command = list(worker.spec.command)
+        if worker.spec.cpu_affinity is not None:
+            taskset = shutil.which(
+                "taskset",
+                path=worker.spec.environment.get("PATH"),
+            )
+            if taskset is None:
+                raise OSError("configured CPU affinity requires the taskset executable")
+            cpu_list = ",".join(str(cpu) for cpu in worker.spec.cpu_affinity)
+            command = [taskset, "--cpu-list", cpu_list, *command]
+        process = self.process_factory(
+            command,
             stdin=subprocess.DEVNULL,
             stdout=worker.log_stream,
             stderr=subprocess.STDOUT,
@@ -1080,6 +1128,7 @@ class Coordinator:
             close_fds=True,
             start_new_session=True,
         )
+        worker.process = process
         worker.started_at = self.clock()
         worker.state = "running"
         worker.last_exit_code = None

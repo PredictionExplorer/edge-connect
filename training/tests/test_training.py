@@ -25,6 +25,7 @@ from startrain.sampling import RingStratifiedSampler
 from startrain.scoring import score_position
 from startrain.topology import get_topology
 from startrain.training import (
+    DeviceBatchPrefetcher,
     build_scheduler,
     maybe_compile_model,
     train_step,
@@ -92,12 +93,21 @@ def test_yaml_configs_load_strictly() -> None:
     optimized = load_config(CONFIGS / "h100-8gpu-optimized.yaml")
     assert optimized.learner.use_ring_mixture_curriculum is True
     assert len(optimized.orchestration.actor_gpus) == 7
-    assert {
-        gpu.actor_batch_size for gpu in optimized.orchestration.actor_gpus
-    } == {128}
+    assert {gpu.actor_batch_size for gpu in optimized.orchestration.actor_gpus} == {128}
     assert optimized.orchestration.actor_games_per_batch == 128
     assert optimized.orchestration.promotion.gpu_id == 7
     assert optimized.orchestration.promotion.pause_sharing_mode is True
+    throughput = load_config(CONFIGS / "h100-8gpu-throughput.yaml")
+    assert sum(gpu.actor_lanes for gpu in throughput.orchestration.actor_gpus) == 13
+    assert throughput.data.shard_cache_size == 8
+    assert throughput.orchestration.learner_gpus[0].cpu_affinity == "0-103"
+    assert (
+        next(
+            gpu for gpu in throughput.orchestration.actor_gpus if gpu.gpu_id == 7
+        ).actor_lanes
+        == 1
+    )
+    assert throughput.selfplay.fast_policy_weight == 0.25
 
 
 def test_yaml_parses_opt_in_learner_ring_mixture_curriculum(tmp_path) -> None:
@@ -122,6 +132,16 @@ def test_plateau_candidate_cadence_fits_replay_lag() -> None:
         replace(
             experiment,
             learner=replace(experiment.learner, candidate_interval=10_000),
+        )
+    with pytest.raises(ConfigError, match="reset-triggering candidate"):
+        replace(
+            experiment,
+            learner=replace(
+                experiment.learner,
+                candidate_interval=1,
+                candidate_interval_examples=10_000
+                * experiment.train.per_rank_batch_size,
+            ),
         )
     with pytest.raises(ConfigError, match="replay lag eligibility"):
         replace(
@@ -220,8 +240,13 @@ def test_bf16_compiled_train_step_scheduler_and_checkpoint(tmp_path) -> None:
         scheduler=scheduler,
         ema=ema,
     )
-    assert all(np.isfinite(value) for value in result.losses.values())
-    assert np.isfinite(result.gradient_norm)
+    assert all(
+        isinstance(value, torch.Tensor) for value in result.loss_tensors.values()
+    )
+    host_metrics = result.to_host()
+    assert all(np.isfinite(value) for value in host_metrics.losses.values())
+    assert np.isfinite(host_metrics.gradient_norm)
+    assert result.losses == host_metrics.losses
     assert ema.num_updates == 1
 
     path = save_checkpoint(
@@ -261,6 +286,115 @@ def test_bf16_compiled_train_step_scheduler_and_checkpoint(tmp_path) -> None:
     torch.save(payload, tampered_path)
     with pytest.raises(ValueError, match="rules hash"):
         load_checkpoint(tampered_path, model=tiny_model())
+
+
+def test_public_train_step_validates_untrusted_target_weights() -> None:
+    model = tiny_model()
+    optimizer = build_optimizer(model, OptimizerConfig(kind="adamw"))
+    batch = collate_replay_samples([sample()])
+    assert batch.targets.policy_weight is not None
+    batch.targets.policy_weight[0] = -1
+    before = {
+        name: value.detach().clone() for name, value in model.state_dict().items()
+    }
+
+    with pytest.raises(ValueError, match="policy weights"):
+        train_step(model, batch, optimizer)
+
+    for name, value in model.state_dict().items():
+        torch.testing.assert_close(value, before[name])
+
+
+def test_train_step_fails_all_ranks_before_optimizer_mutation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = tiny_model()
+    optimizer = build_optimizer(model, OptimizerConfig(kind="adamw"))
+    batch = collate_replay_samples([sample()])
+    reductions: list[torch.Tensor] = []
+    monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+
+    def reject_one_rank(tensor: torch.Tensor, **_kwargs) -> None:
+        reductions.append(tensor.clone())
+        tensor[0] = 0
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", reject_one_rank)
+    before = {
+        name: value.detach().clone() for name, value in model.state_dict().items()
+    }
+
+    with pytest.raises(FloatingPointError, match="at least one rank"):
+        train_step(model, batch, optimizer)
+
+    assert len(reductions) == 1
+    for name, value in model.state_dict().items():
+        torch.testing.assert_close(value, before[name])
+
+
+def test_device_prefetcher_cpu_path_preserves_batches() -> None:
+    batches = [collate_replay_samples([sample()]) for _ in range(3)]
+
+    observed = list(DeviceBatchPrefetcher(batches, device="cpu"))
+
+    assert [batch.feature_path for batch in observed] == [
+        batch.feature_path for batch in batches
+    ]
+    for expected, actual in zip(batches, observed, strict=True):
+        torch.testing.assert_close(
+            expected.inputs.node_features, actual.inputs.node_features
+        )
+        torch.testing.assert_close(expected.targets.policy, actual.targets.policy)
+
+
+@pytest.mark.cuda
+def test_cuda_prefetcher_reuses_ring_topology_and_tracks_copy_time() -> None:
+    sources = [
+        collate_replay_samples([sample(), sample()]).pin_memory() for _ in range(3)
+    ]
+    assert sources[0].inputs.node_features.is_pinned()
+    assert sources[0].inputs.legal_action_mask.is_pinned()
+    assert not sources[0].inputs.neighbor_index.is_pinned()
+    assert not sources[0].inputs.node_mask.is_pinned()
+    prefetcher = DeviceBatchPrefetcher(sources, device="cuda")
+
+    first = next(prefetcher)
+    second = next(prefetcher)
+    torch.cuda.synchronize()
+    consumed_events = prefetcher.pop_copy_events()
+
+    assert first.inputs.node_features.is_cuda
+    assert second.targets.policy.is_cuda
+    assert (
+        first.inputs.neighbor_index.data_ptr()
+        == second.inputs.neighbor_index.data_ptr()
+    )
+    assert first.inputs.node_mask.data_ptr() == second.inputs.node_mask.data_ptr()
+    assert len(consumed_events) == 2
+    assert sum(start.elapsed_time(end) for start, end in consumed_events) / 1_000 >= 0
+    next(prefetcher)
+    torch.cuda.synchronize()
+    assert len(prefetcher.pop_copy_events()) == 1
+
+
+def test_ema_foreach_update_matches_exact_lerp() -> None:
+    model = tiny_model()
+    ema = ExponentialMovingAverage(model, decay=0.75)
+    before = {name: value.clone() for name, value in ema.shadow.items()}
+    with torch.no_grad():
+        for value in model.parameters():
+            value.add_(0.125)
+
+    ema.update(model)
+
+    state = model.state_dict()
+    assert ema.num_updates == 1
+    for name, average in ema.shadow.items():
+        expected = before[name].lerp(
+            state[name].detach().to(dtype=average.dtype),
+            0.25,
+        )
+        torch.testing.assert_close(average, expected)
 
 
 def test_ring_stratified_sampler_remains_balanced() -> None:

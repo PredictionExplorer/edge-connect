@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import random
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -20,6 +21,7 @@ from startrain.arena import (
 )
 from startrain.config import ArenaConfig, load_config
 from startrain.inference import InferenceResponse
+from startrain.native import BITBOARD_WORDS
 
 
 class FakeRequests:
@@ -160,6 +162,124 @@ def test_arena_pairs_identical_openings_and_reverses_roles() -> None:
     assert evaluation["baseline_evaluator_calls"] == baseline.calls
     assert evaluation["total_evaluator_rows"] == candidate.calls + baseline.calls
     assert evaluation["evaluator_rows_per_second"] > 0
+
+
+def test_batched_arena_advances_candidate_and_baseline_groups_concurrently() -> None:
+    barrier = threading.Barrier(2, timeout=2)
+
+    class BatchRequests:
+        def __init__(self, size: int) -> None:
+            self.tokens = list(range(size))
+            self.states = SimpleNamespace(opening=[False] * size)
+            self.legal_offsets = list(range(size + 1))
+            self.legal_actions = [0] * size
+
+        def __len__(self) -> int:
+            return len(self.tokens)
+
+    class ConcurrentEvaluator:
+        evaluator_calls = 0
+        evaluator_rows = 0
+
+        def __init__(self, name: str) -> None:
+            self.model_version = name
+
+        def evaluate(self, requests: BatchRequests) -> InferenceResponse:
+            barrier.wait()
+            self.evaluator_calls += 1
+            self.evaluator_rows += len(requests)
+            return InferenceResponse(
+                tokens=list(requests.tokens),
+                values=[0.0] * len(requests),
+                policy_offsets=list(requests.legal_offsets),
+                policy_logits=[1.0] * len(requests),
+            )
+
+    class BatchStates:
+        def __init__(self, rings: int, batch_size: int) -> None:
+            self.rings = rings
+            self.batch_size = batch_size
+            self.terminal = [False] * batch_size
+            self.to_move = [0] * batch_size
+
+        @classmethod
+        def from_semantic(
+            cls,
+            rings: int,
+            _zero_bits: list[int],
+            _one_bits: list[int],
+            to_move: list[int],
+            _moves_left: list[int],
+            _opening: list[bool],
+            _pass_streak: list[int],
+        ) -> "BatchStates":
+            states = cls(rings, len(to_move))
+            states.to_move = list(to_move)
+            return states
+
+        def data(self) -> object:
+            words = [0] * (self.batch_size * BITBOARD_WORDS)
+            return SimpleNamespace(
+                rings=self.rings,
+                zero_bits=words,
+                one_bits=words,
+                to_move=list(self.to_move),
+                moves_left=[1] * self.batch_size,
+                opening=[False] * self.batch_size,
+                pass_streak=[0] * self.batch_size,
+                terminal=list(self.terminal),
+            )
+
+        def apply_many(self, rows: list[int], _actions: list[int]) -> None:
+            for row in rows:
+                self.terminal[row] = True
+
+        def score_data(self) -> object:
+            return SimpleNamespace(winner=[-1] * self.batch_size)
+
+    class BatchSearch:
+        def __init__(self, states: BatchStates, **_options: object) -> None:
+            self.size = states.batch_size
+            self.initialized = False
+
+        def root_requests(self) -> BatchRequests:
+            return BatchRequests(self.size)
+
+        def initialize_roots(self, *_buffers: object) -> None:
+            self.initialized = True
+
+        def is_done(self) -> bool:
+            return self.initialized
+
+        def next_requests(self) -> BatchRequests:
+            raise AssertionError("batch search completes at the root")
+
+        def submit(self, *_buffers: object) -> None:
+            raise AssertionError("batch search has no leaves")
+
+        def results(self) -> object:
+            return SimpleNamespace(
+                terminal=[False] * self.size,
+                selected_actions=[0] * self.size,
+            )
+
+    native = SimpleNamespace(StateBatch=BatchStates, SearchBatch=BatchSearch)
+    result = ArenaRunner(
+        native_module=native,
+        candidate=ConcurrentEvaluator("candidate"),
+        baseline=ConcurrentEvaluator("baseline"),
+        config=ArenaConfig(
+            rings=(3,),
+            pairs_per_ring=2,
+            simulations=1,
+            max_considered=1,
+            regression_floor_elo=-2_500,
+        ),
+    ).run()
+
+    assert result["aggregate"]["draws"] == 4
+    assert result["evaluation_metrics"]["candidate_evaluator_calls"] == 1
+    assert result["evaluation_metrics"]["baseline_evaluator_calls"] == 1
 
 
 def test_pair_level_elo_and_e_process_promotion_with_anytime_ring_floors() -> None:
@@ -412,10 +532,7 @@ def test_configured_ring_floors_allow_representative_non_regression() -> None:
 
 
 def test_pair_summary_and_internal_target_use_anytime_valid_lower_bound() -> None:
-    pairs = [
-        ArenaPair(4, pair, pair, 0, True, (1, 1))
-        for pair in range(50)
-    ]
+    pairs = [ArenaPair(4, pair, pair, 0, True, (1, 1)) for pair in range(50)]
     summary = summarize_pairs(
         pairs,
         confidence=0.95,
