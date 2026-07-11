@@ -16,12 +16,18 @@ from startrain.config import load_config
 from startrain.features import DoubleStarPosition, encode_batch
 from startrain.model import GraphResTNet
 from startrain.topology import get_topology
+from startrain.training import maybe_compile_model
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--batch-size", type=int, default=2)
+    parser.add_argument(
+        "--all-rings",
+        action="store_true",
+        help="compile ten rank-shifted ring shapes before verifying agreement",
+    )
     arguments = parser.parse_args()
     if arguments.batch_size <= 0:
         raise SystemExit("batch-size must be positive")
@@ -44,33 +50,44 @@ def main() -> int:
         experiment = load_config(arguments.config)
         torch.manual_seed(experiment.train.seed)
         model = GraphResTNet(experiment.model).to(device)
+        compiled = maybe_compile_model(
+            model,
+            enabled=experiment.train.compile,
+            dynamic=False,
+            recompile_limit=len(experiment.orchestration.ring_mixture.rings),
+            isolate_recompiles=True,
+        )
         wrapped = DistributedDataParallel(
-            model, device_ids=[local_rank], output_device=local_rank
+            compiled, device_ids=[local_rank], output_device=local_rank
         )
         optimizer = torch.optim.AdamW(model.parameters(), lr=1e-5)
 
-        topology = get_topology(3)
-        position = DoubleStarPosition(
-            rings=3,
-            stones=torch.full((topology.n,), -1, dtype=torch.int8),
-            to_move=0,
-            moves_left=1,
-            opening=True,
-            pass_streak=0,
-            terminal=False,
-        )
-        batch = encode_batch([position] * arguments.batch_size).to(device)
-        optimizer.zero_grad(set_to_none=True)
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            output = wrapped(*batch.model_args())
-            loss = (
-                output.wdl_logits.float().square().mean()
-                + output.score_margin_logits.float().square().mean()
-                + output.ownership_logits.float().square().mean()
-                + output.alive_logits.float().square().mean()
+        steps = 10 if arguments.all_rings else 1
+        loss = torch.zeros((), device=device)
+        for step in range(steps):
+            rings = 3 + ((step + rank) % 10) if arguments.all_rings else 3
+            topology = get_topology(rings)
+            position = DoubleStarPosition(
+                rings=rings,
+                stones=torch.full((topology.n,), -1, dtype=torch.int8),
+                to_move=0,
+                moves_left=1,
+                opening=True,
+                pass_streak=0,
+                terminal=False,
             )
-        loss.backward()
-        optimizer.step()
+            batch = encode_batch([position] * arguments.batch_size).to(device)
+            optimizer.zero_grad(set_to_none=True)
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                output = wrapped(*batch.model_args())
+                loss = (
+                    output.wdl_logits.float().square().mean()
+                    + output.score_margin_logits.float().square().mean()
+                    + output.ownership_logits.float().square().mean()
+                    + output.alive_logits.float().square().mean()
+                )
+            loss.backward()
+            optimizer.step()
         torch.cuda.synchronize(device)
 
         checksum = torch.stack(
@@ -91,6 +108,14 @@ def main() -> int:
                         "device": torch.cuda.get_device_name(device),
                         "loss": float(loss.detach()),
                         "parameter_checksum": float(checksum),
+                        "all_rings": arguments.all_rings,
+                        "rank_ring_sequences": {
+                            str(other_rank): [
+                                3 + ((step + other_rank) % 10)
+                                for step in range(steps)
+                            ]
+                            for other_rank in range(world_size)
+                        },
                         "passed": True,
                     },
                     sort_keys=True,

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import random
+import statistics
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import asdict, replace
@@ -17,7 +18,7 @@ from .inference import GraphInferenceAdapter, InferenceConfig
 from .model import GraphResTNet
 from .replay_store import ReplayStore
 from .runtime import HeartbeatReporter, RunIdentity, append_jsonl
-from .selfplay import SelfPlayActor, SelfPlayIdentity
+from .selfplay import SelfPlayActor, SelfPlayIdentity, SelfPlayMetrics
 from .training import maybe_compile_model
 
 
@@ -169,6 +170,7 @@ class ActorSupervisor:
         self.replay_directory = Path(replay_directory)
         self.run_identity = run_identity
         self.actor_id = f"actor-gpu-{gpu.gpu_id}"
+        self.device = torch.device(device)
         self.candidate_manifest_path = Path(candidate_manifest_path)
         self._candidate_manifest: ModelManifest | None = None
         self._candidate_signature: tuple[int, int, int] | None = None
@@ -210,13 +212,19 @@ class ActorSupervisor:
         self.heartbeat.start()
         final_phase = "stopped"
         try:
-            _, initial_provider = self._select_model_provider()
-            evaluator = initial_provider.wait_for_initial(
+            evaluator = self.provider.wait_for_initial(
                 stop_requested=stop_requested,
                 progress=self.heartbeat.advance,
             )
             if evaluator is None:
                 return batches
+            if self.candidate_provider is not None:
+                candidate_evaluator = self.candidate_provider.wait_for_initial(
+                    stop_requested=stop_requested,
+                    progress=self.heartbeat.advance,
+                )
+                if candidate_evaluator is None:
+                    return batches
             with ReplayStore(self.replay_directory) as store:
                 if any(store.reconciliation_metrics.values()):
                     self.heartbeat.advance(
@@ -228,7 +236,12 @@ class ActorSupervisor:
                     # This is the sole model refresh point. The evaluator object is
                     # never mutated while SelfPlayActor owns active games.
                     model_role, provider = self._select_model_provider()
+                    self._reset_peak_cuda_memory()
+                    refresh_started = time.perf_counter()
                     evaluator = provider.refresh()
+                    model_refresh_latency_seconds = (
+                        time.perf_counter() - refresh_started
+                    )
                     candidate = self._read_candidate()
                     if (
                         candidate.run_id != self.run_identity.run_id
@@ -275,8 +288,12 @@ class ActorSupervisor:
                         model_version=evaluator.model_version,
                         model_step=evaluator.model_step,
                     )
+                    evaluator_calls_before = int(
+                        getattr(evaluator, "evaluator_calls", 0)
+                    )
+                    evaluator_rows_before = int(getattr(evaluator, "evaluator_rows", 0))
                     started = time.monotonic()
-                    summaries = SelfPlayActor(
+                    selfplay = SelfPlayActor(
                         self.native,
                         evaluator,
                         store,
@@ -287,13 +304,31 @@ class ActorSupervisor:
                             actor_id=self.actor_id,
                             generation=generation,
                         ),
-                    ).run(
+                    )
+                    summaries = selfplay.run(
                         stop_requested=stop_requested,
                         progress=self.heartbeat.advance,
                     )
-                    if not summaries and stop_requested():
-                        break
                     elapsed = time.monotonic() - started
+                    evaluator_calls = (
+                        int(getattr(evaluator, "evaluator_calls", 0))
+                        - evaluator_calls_before
+                    )
+                    evaluator_rows = (
+                        int(getattr(evaluator, "evaluator_rows", 0))
+                        - evaluator_rows_before
+                    )
+                    if evaluator_calls < 0 or evaluator_rows < 0:
+                        raise RuntimeError("evaluator metrics counters moved backwards")
+                    metrics_snapshot = getattr(selfplay, "metrics_snapshot", None)
+                    measured_metrics = (
+                        metrics_snapshot() if callable(metrics_snapshot) else None
+                    )
+                    selfplay_metrics = (
+                        measured_metrics
+                        if isinstance(measured_metrics, SelfPlayMetrics)
+                        else SelfPlayMetrics()
+                    )
                     wins = sum(summary.winner == 0 for summary in summaries)
                     losses = sum(summary.winner == 1 for summary in summaries)
                     draws = sum(summary.winner == -1 for summary in summaries)
@@ -304,6 +339,27 @@ class ActorSupervisor:
                     search_simulations = sum(
                         summary.search_simulations for summary in summaries
                     )
+                    game_lengths = [int(summary.samples) for summary in summaries]
+                    game_length_distribution: dict[str, int] = {}
+                    for game_length in game_lengths:
+                        key = str(game_length)
+                        game_length_distribution[key] = (
+                            game_length_distribution.get(key, 0) + 1
+                        )
+                    policy_entropy_mean = (
+                        selfplay_metrics.policy_entropy_sum
+                        / selfplay_metrics.policy_entropy_count
+                        if selfplay_metrics.policy_entropy_count
+                        else None
+                    )
+                    attempted_decisions = (
+                        selfplay_metrics.full_decisions
+                        + selfplay_metrics.fast_decisions
+                    )
+                    (
+                        peak_cuda_memory_bytes,
+                        peak_cuda_reserved_memory_bytes,
+                    ) = self._peak_cuda_memory()
                     append_jsonl(
                         self.metrics_path,
                         {
@@ -325,6 +381,58 @@ class ActorSupervisor:
                             "search_simulations_per_second": (
                                 search_simulations / elapsed if elapsed else 0.0
                             ),
+                            "evaluator_calls": evaluator_calls,
+                            "evaluator_rows": evaluator_rows,
+                            "evaluator_rows_per_second": (
+                                evaluator_rows / elapsed if elapsed else 0.0
+                            ),
+                            "completed_decisions": (
+                                selfplay_metrics.completed_decisions
+                            ),
+                            "attempted_decisions": attempted_decisions,
+                            "full_decisions": selfplay_metrics.full_decisions,
+                            "fast_decisions": selfplay_metrics.fast_decisions,
+                            "pass_decisions": selfplay_metrics.pass_decisions,
+                            "pass_decision_rate": (
+                                selfplay_metrics.pass_decisions / attempted_decisions
+                                if attempted_decisions
+                                else 0.0
+                            ),
+                            "game_lengths": game_lengths,
+                            "game_length_distribution": game_length_distribution,
+                            "mean_game_length": (
+                                statistics.fmean(game_lengths) if game_lengths else None
+                            ),
+                            "policy_entropy_count": (
+                                selfplay_metrics.policy_entropy_count
+                            ),
+                            "policy_entropy_sum": selfplay_metrics.policy_entropy_sum,
+                            "policy_entropy_mean": policy_entropy_mean,
+                            "policy_entropy_unit": "nats",
+                            "interrupted_cohorts": (
+                                selfplay_metrics.interrupted_cohorts
+                            ),
+                            "dropped_games": selfplay_metrics.dropped_games,
+                            "dropped_decisions": selfplay_metrics.dropped_decisions,
+                            "model_refresh_latency_seconds": (
+                                model_refresh_latency_seconds
+                            ),
+                            "replay_append_calls": (
+                                selfplay_metrics.replay_append_calls
+                            ),
+                            "replay_append_bytes": (
+                                selfplay_metrics.replay_append_bytes
+                            ),
+                            "replay_append_seconds": (
+                                selfplay_metrics.replay_append_seconds
+                            ),
+                            "peak_cuda_memory_bytes": peak_cuda_memory_bytes,
+                            "peak_cuda_memory_allocated_bytes": (
+                                peak_cuda_memory_bytes
+                            ),
+                            "peak_cuda_memory_reserved_bytes": (
+                                peak_cuda_reserved_memory_bytes
+                            ),
                             "games_per_second": (
                                 len(summaries) / elapsed if elapsed else 0.0
                             ),
@@ -344,6 +452,16 @@ class ActorSupervisor:
                             "model_step": evaluator.model_step,
                         },
                     )
+                    if not summaries and stop_requested():
+                        self.heartbeat.advance(
+                            phase="cohort_interrupted",
+                            batch=batches,
+                            generation=generation,
+                            dropped_games=selfplay_metrics.dropped_games,
+                            dropped_decisions=selfplay_metrics.dropped_decisions,
+                            evaluator_rows=evaluator_rows,
+                        )
+                        break
                     batches += 1
                     self.heartbeat.advance(
                         phase="cohort_complete",
@@ -351,6 +469,7 @@ class ActorSupervisor:
                         generation=generation,
                         games=len(summaries),
                         samples=samples,
+                        evaluator_rows=evaluator_rows,
                     )
             return batches
         except Exception:
@@ -360,6 +479,18 @@ class ActorSupervisor:
             self.heartbeat.close(final_phase=final_phase)
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+
+    def _reset_peak_cuda_memory(self) -> None:
+        if self.device.type == "cuda" and torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats(self.device)
+
+    def _peak_cuda_memory(self) -> tuple[int | None, int | None]:
+        if self.device.type != "cuda" or not torch.cuda.is_available():
+            return None, None
+        return (
+            int(torch.cuda.max_memory_allocated(self.device)),
+            int(torch.cuda.max_memory_reserved(self.device)),
+        )
 
     def _select_model_provider(
         self,

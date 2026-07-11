@@ -84,12 +84,16 @@ class UniformRandomBaseline:
         self.model_version = definition.identity
         self.model_identity = definition.identity
         self.search_budget = definition.search_budget
+        self.evaluator_calls = 0
+        self.evaluator_rows = 0
 
     def result_metadata(self) -> dict[str, object]:
         return self.definition.metadata()
 
     def evaluate(self, requests: NativeEvalBatchProtocol) -> InferenceResponse:
         tokens, offsets, actions = _request_layout(requests)
+        self.evaluator_calls += 1
+        self.evaluator_rows += len(tokens)
         return InferenceResponse(
             tokens=tokens,
             values=[0.0] * len(tokens),
@@ -114,12 +118,16 @@ class NativeGreedyBaseline:
         self.model_version = definition.identity
         self.model_identity = definition.identity
         self.search_budget = definition.search_budget
+        self.evaluator_calls = 0
+        self.evaluator_rows = 0
 
     def result_metadata(self) -> dict[str, object]:
         return self.definition.metadata()
 
     def evaluate(self, requests: NativeEvalBatchProtocol) -> InferenceResponse:
         tokens, offsets, actions = _request_layout(requests)
+        self.evaluator_calls += 1
+        self.evaluator_rows += len(tokens)
         rows = len(tokens)
         if rows == 0:
             return InferenceResponse([], [], [0], [])

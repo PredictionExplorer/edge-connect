@@ -671,6 +671,11 @@ class ArenaRunner:
         pair_counts: Mapping[int, int] | None = None,
     ) -> dict[str, object]:
         started_ns = time.time_ns()
+        started = time.perf_counter()
+        candidate_calls_before = int(getattr(self.candidate, "evaluator_calls", 0))
+        candidate_rows_before = int(getattr(self.candidate, "evaluator_rows", 0))
+        baseline_calls_before = int(getattr(self.baseline, "evaluator_calls", 0))
+        baseline_rows_before = int(getattr(self.baseline, "evaluator_rows", 0))
         games: list[ArenaGame] = []
         pairs: list[ArenaPair] = []
         for ring in self.config.rings:
@@ -721,6 +726,23 @@ class ArenaRunner:
                         completed_pairs=len(pairs),
                     )
         statistical = summarize_arena_pairs(pairs, self.config)
+        candidate_calls = (
+            int(getattr(self.candidate, "evaluator_calls", 0))
+            - candidate_calls_before
+        )
+        candidate_rows = (
+            int(getattr(self.candidate, "evaluator_rows", 0)) - candidate_rows_before
+        )
+        baseline_calls = (
+            int(getattr(self.baseline, "evaluator_calls", 0)) - baseline_calls_before
+        )
+        baseline_rows = (
+            int(getattr(self.baseline, "evaluator_rows", 0)) - baseline_rows_before
+        )
+        if min(candidate_calls, candidate_rows, baseline_calls, baseline_rows) < 0:
+            raise RuntimeError("arena evaluator metrics counters moved backwards")
+        elapsed = time.perf_counter() - started
+        total_rows = candidate_rows + baseline_rows
         baseline_metadata = dict(self.baseline_metadata)
         baseline_metadata.setdefault("kind", "checkpoint")
         baseline_metadata["identity"] = self.baseline.model_version
@@ -734,6 +756,18 @@ class ArenaRunner:
             "baseline_metadata": baseline_metadata,
             "started_ns": started_ns,
             "completed_ns": time.time_ns(),
+            "evaluation_metrics": {
+                "wall_seconds": elapsed,
+                "candidate_evaluator_calls": candidate_calls,
+                "candidate_evaluator_rows": candidate_rows,
+                "baseline_evaluator_calls": baseline_calls,
+                "baseline_evaluator_rows": baseline_rows,
+                "total_evaluator_calls": candidate_calls + baseline_calls,
+                "total_evaluator_rows": total_rows,
+                "evaluator_rows_per_second": (
+                    total_rows / elapsed if elapsed else 0.0
+                ),
+            },
             "search": {
                 "deterministic": True,
                 **self.candidate_search.metadata(),

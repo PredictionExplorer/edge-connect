@@ -709,6 +709,247 @@ def _is_replay_wait(record: dict[str, object]) -> bool:
     return False
 
 
+_ACTOR_SERIES_NAMES = (
+    "games",
+    "samples",
+    "batches",
+    "evaluator_calls",
+    "evaluator_rows",
+    "evaluator_seconds",
+    "evaluator_rows_per_second",
+    "completed_decisions",
+    "attempted_decisions",
+    "full_decisions",
+    "fast_decisions",
+    "pass_decisions",
+    "pass_decision_rate",
+    "game_lengths",
+    "policy_entropy_count",
+    "policy_entropy_sum",
+    "policy_entropy_mean",
+    "interrupted_cohorts",
+    "dropped_games",
+    "dropped_decisions",
+    "model_refresh_latency_seconds",
+    "replay_append_calls",
+    "replay_append_bytes",
+    "replay_append_seconds",
+    "peak_cuda_memory_bytes",
+    "peak_cuda_memory_reserved_bytes",
+)
+
+
+def _actor_series() -> dict[str, list[float]]:
+    return {name: [] for name in _ACTOR_SERIES_NAMES}
+
+
+def _append_actor_record(
+    series: dict[str, list[float]],
+    record: dict[str, object],
+    *,
+    games_per_second: float | None,
+    samples_per_second: float | None,
+    batch_seconds: float | None,
+) -> None:
+    for name, value in (
+        ("games", games_per_second),
+        ("samples", samples_per_second),
+        ("batches", batch_seconds),
+    ):
+        if value is not None:
+            series[name].append(value)
+
+    aliases = {
+        "evaluator_calls": ("evaluator_calls",),
+        "evaluator_rows": ("evaluator_rows",),
+        "evaluator_rows_per_second": ("evaluator_rows_per_second",),
+        "completed_decisions": ("completed_decisions",),
+        "attempted_decisions": ("attempted_decisions",),
+        "full_decisions": ("full_decisions", "full_search_decisions"),
+        "fast_decisions": ("fast_decisions", "fast_search_decisions"),
+        "pass_decisions": ("pass_decisions",),
+        "pass_decision_rate": ("pass_decision_rate", "pass_rate"),
+        "policy_entropy_count": (
+            "policy_entropy_count",
+            "policy_target_count",
+        ),
+        "policy_entropy_sum": ("policy_entropy_sum",),
+        "policy_entropy_mean": (
+            "policy_entropy_mean",
+            "mean_policy_entropy",
+        ),
+        "interrupted_cohorts": ("interrupted_cohorts",),
+        "dropped_games": (
+            "dropped_games",
+            "interrupted_cohort_dropped_games",
+        ),
+        "dropped_decisions": (
+            "dropped_decisions",
+            "interrupted_cohort_dropped_decisions",
+        ),
+        "model_refresh_latency_seconds": (
+            "model_refresh_latency_seconds",
+            "model_refresh_seconds",
+        ),
+        "replay_append_calls": ("replay_append_calls",),
+        "replay_append_bytes": ("replay_append_bytes",),
+        "replay_append_seconds": (
+            "replay_append_seconds",
+            "replay_append_time_seconds",
+        ),
+        "peak_cuda_memory_bytes": (
+            "peak_cuda_memory_bytes",
+            "peak_cuda_memory_allocated_bytes",
+        ),
+        "peak_cuda_memory_reserved_bytes": (
+            "peak_cuda_memory_reserved_bytes",
+            "peak_cuda_reserved_memory_bytes",
+        ),
+    }
+    for destination, names in aliases.items():
+        value = _metric_number(record, *names)
+        if value is not None:
+            series[destination].append(value)
+    if (
+        _metric_number(record, "evaluator_rows") is not None
+        and batch_seconds is not None
+    ):
+        series["evaluator_seconds"].append(batch_seconds)
+    if _metric_number(record, "attempted_decisions") is None:
+        full = _metric_number(record, "full_decisions", "full_search_decisions")
+        fast = _metric_number(record, "fast_decisions", "fast_search_decisions")
+        if full is not None and fast is not None:
+            series["attempted_decisions"].append(full + fast)
+    if _metric_number(record, "policy_entropy_sum") is None:
+        entropy_count = _metric_number(
+            record,
+            "policy_entropy_count",
+            "policy_target_count",
+        )
+        entropy_mean = _metric_number(
+            record,
+            "policy_entropy_mean",
+            "mean_policy_entropy",
+        )
+        if entropy_count is not None and entropy_mean is not None:
+            series["policy_entropy_sum"].append(entropy_count * entropy_mean)
+
+    raw_lengths = record.get("game_lengths")
+    if isinstance(raw_lengths, list):
+        for raw_length in raw_lengths:
+            length = _number(raw_length)
+            if length is not None and length >= 0 and length.is_integer():
+                series["game_lengths"].append(length)
+        return
+    distribution = record.get("game_length_distribution")
+    if not isinstance(distribution, dict):
+        return
+    for raw_length, raw_count in distribution.items():
+        try:
+            length = float(raw_length)
+        except (TypeError, ValueError):
+            continue
+        count = _number(raw_count)
+        if (
+            math.isfinite(length)
+            and length >= 0
+            and length.is_integer()
+            and count is not None
+            and count >= 0
+            and count.is_integer()
+        ):
+            series["game_lengths"].extend([length] * int(count))
+
+
+def _counter_summary(values: Sequence[float]) -> dict[str, object] | None:
+    if not values:
+        return None
+    total: int | float = sum(values)
+    if all(value.is_integer() for value in values):
+        total = int(total)
+    return {
+        "total": total,
+        "per_batch": _stats(values),
+    }
+
+
+def _actor_series_summary(series: dict[str, list[float]]) -> dict[str, object]:
+    game_length_stats = _stats(series["game_lengths"])
+    game_length_distribution: dict[str, int] = {}
+    for length in sorted(int(value) for value in series["game_lengths"]):
+        key = str(length)
+        game_length_distribution[key] = game_length_distribution.get(key, 0) + 1
+
+    attempted = sum(series["attempted_decisions"])
+    if not series["attempted_decisions"]:
+        attempted = sum(series["full_decisions"]) + sum(series["fast_decisions"])
+    passes = sum(series["pass_decisions"])
+    entropy_count = sum(series["policy_entropy_count"])
+    entropy_sum = sum(series["policy_entropy_sum"])
+    replay_bytes = sum(series["replay_append_bytes"])
+    replay_seconds = sum(series["replay_append_seconds"])
+    evaluator_rows = sum(series["evaluator_rows"])
+    evaluator_seconds = sum(series["evaluator_seconds"])
+    return {
+        "games_per_second": _stats(series["games"]),
+        "samples_per_second": _stats(series["samples"]),
+        "batch_seconds": _stats(series["batches"]),
+        "evaluator": {
+            "calls": _counter_summary(series["evaluator_calls"]),
+            "rows": _counter_summary(series["evaluator_rows"]),
+            "rows_per_second": _stats(series["evaluator_rows_per_second"]),
+            "aggregate_rows_per_second": (
+                evaluator_rows / evaluator_seconds if evaluator_seconds else None
+            ),
+        },
+        "decisions": {
+            "completed": _counter_summary(series["completed_decisions"]),
+            "attempted": _counter_summary(series["attempted_decisions"]),
+            "full": _counter_summary(series["full_decisions"]),
+            "fast": _counter_summary(series["fast_decisions"]),
+            "passes": _counter_summary(series["pass_decisions"]),
+            "pass_rate": passes / attempted if attempted else None,
+            "pass_rate_per_batch": _stats(series["pass_decision_rate"]),
+        },
+        "game_length": {
+            "mean": (
+                game_length_stats["mean"] if game_length_stats is not None else None
+            ),
+            "distribution": game_length_distribution,
+            "statistics": game_length_stats,
+        },
+        "policy_entropy": {
+            "unit": "nats",
+            "target_count": (
+                int(entropy_count) if series["policy_entropy_count"] else None
+            ),
+            "sum": entropy_sum if series["policy_entropy_sum"] else None,
+            "mean": entropy_sum / entropy_count if entropy_count else None,
+            "per_batch_mean": _stats(series["policy_entropy_mean"]),
+        },
+        "interrupted_cohorts": {
+            "cohorts": _counter_summary(series["interrupted_cohorts"]),
+            "dropped_games": _counter_summary(series["dropped_games"]),
+            "dropped_decisions": _counter_summary(series["dropped_decisions"]),
+        },
+        "model_refresh_latency_seconds": _stats(
+            series["model_refresh_latency_seconds"]
+        ),
+        "replay_append": {
+            "calls": _counter_summary(series["replay_append_calls"]),
+            "bytes": _counter_summary(series["replay_append_bytes"]),
+            "seconds": _counter_summary(series["replay_append_seconds"]),
+            "bytes_per_second": (
+                replay_bytes / replay_seconds if replay_seconds else None
+            ),
+        },
+        "peak_cuda_memory_bytes": _stats(series["peak_cuda_memory_bytes"]),
+        "peak_cuda_memory_reserved_bytes": _stats(
+            series["peak_cuda_memory_reserved_bytes"]
+        ),
+    }
+
+
 def summarize_orchestration_metrics(root: Path) -> dict[str, object]:
     paths = _discover_metric_paths(root)
     if not paths:
@@ -716,9 +957,7 @@ def summarize_orchestration_metrics(root: Path) -> dict[str, object]:
 
     learner_examples: list[float] = []
     learner_batches: list[float] = []
-    actor_games: list[float] = []
-    actor_samples: list[float] = []
-    actor_batches: list[float] = []
+    actor_metrics = _actor_series()
     actor_by_worker: dict[str, dict[str, list[float]]] = {}
     replay_wait_durations: list[float] = []
     active_replay_waits: dict[str, int] = {}
@@ -792,23 +1031,25 @@ def summarize_orchestration_metrics(root: Path) -> dict[str, object]:
                         "batch_time_seconds",
                         "elapsed_seconds",
                     )
-                    if games is not None:
-                        actor_games.append(games)
-                    if samples is not None:
-                        actor_samples.append(samples)
-                    if batch_seconds is not None:
-                        actor_batches.append(batch_seconds)
                     worker = str(record.get("worker") or path.stem)
                     worker_values = actor_by_worker.setdefault(
                         worker,
-                        {"games": [], "samples": [], "batches": []},
+                        _actor_series(),
                     )
-                    if games is not None:
-                        worker_values["games"].append(games)
-                    if samples is not None:
-                        worker_values["samples"].append(samples)
-                    if batch_seconds is not None:
-                        worker_values["batches"].append(batch_seconds)
+                    _append_actor_record(
+                        actor_metrics,
+                        record,
+                        games_per_second=games,
+                        samples_per_second=samples,
+                        batch_seconds=batch_seconds,
+                    )
+                    _append_actor_record(
+                        worker_values,
+                        record,
+                        games_per_second=games,
+                        samples_per_second=samples,
+                        batch_seconds=batch_seconds,
+                    )
 
                 wait_marker = _is_replay_wait(record)
                 explicit_wait = _metric_number(
@@ -851,13 +1092,16 @@ def summarize_orchestration_metrics(root: Path) -> dict[str, object]:
         )
 
     workers = {
-        worker: {
-            "games_per_second": _stats(values["games"]),
-            "samples_per_second": _stats(values["samples"]),
-            "batch_seconds": _stats(values["batches"]),
-        }
+        worker: _actor_series_summary(values)
         for worker, values in sorted(actor_by_worker.items())
     }
+    actors = _actor_series_summary(actor_metrics)
+    actors.update(
+        {
+            "records": actor_records,
+            "by_worker": workers,
+        }
+    )
     return {
         "status": "complete" if not parse_failures else "incomplete",
         "summarized_at_utc": _utc_now(),
@@ -871,13 +1115,7 @@ def summarize_orchestration_metrics(root: Path) -> dict[str, object]:
             "examples_per_second": _stats(learner_examples),
             "batch_seconds": _stats(learner_batches),
         },
-        "actors": {
-            "records": actor_records,
-            "games_per_second": _stats(actor_games),
-            "samples_per_second": _stats(actor_samples),
-            "batch_seconds": _stats(actor_batches),
-            "by_worker": workers,
-        },
+        "actors": actors,
         "replay_waits": {
             "availability": (
                 "observed" if replay_wait_events else "not_recorded_in_jsonl"

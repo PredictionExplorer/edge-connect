@@ -367,6 +367,8 @@ class PromotionConfig:
     bootstrap_initial_champion: bool = False
     device: str = "cuda"
     pause_sharing_mode: bool = False
+    pause_ready_timeout_seconds: float = 1_200.0
+    pause_release_timeout_seconds: float = 120.0
     final_drain_timeout_seconds: float = 7_200.0
 
     def __post_init__(self) -> None:
@@ -382,9 +384,13 @@ class PromotionConfig:
             or type(self.cpu_threads) is not int
             or self.cpu_threads <= 0
             or self.poll_seconds <= 0
+            or self.pause_ready_timeout_seconds <= 0
+            or self.pause_release_timeout_seconds <= 0
             or self.final_drain_timeout_seconds <= 0
         ):
-            raise ConfigError("promotion GPU, CPU, and poll settings are invalid")
+            raise ConfigError(
+                "promotion GPU, CPU, poll, and pause timeout settings are invalid"
+            )
         if not isinstance(self.device, str) or not self.device:
             raise ConfigError("promotion device must be non-empty")
 
@@ -477,15 +483,18 @@ class OrchestrationConfig:
             raise ConfigError("enabled orchestration requires promotion supervision")
         actor_ids = {gpu.gpu_id for gpu in actors}
         learner_ids = {gpu.gpu_id for gpu in learners}
-        if self.promotion.enabled and self.promotion.gpu_id in actor_ids:
-            raise ConfigError("promotion GPU cannot overlap a self-play actor")
+        promotion_overlap = (
+            self.promotion.enabled and self.promotion.gpu_id in actor_ids | learner_ids
+        )
+        if promotion_overlap and not self.promotion.pause_sharing_mode:
+            raise ConfigError("promotion GPU overlap requires pause-sharing mode")
         if (
             self.promotion.enabled
-            and self.promotion.gpu_id in learner_ids
-            and not self.promotion.pause_sharing_mode
+            and self.promotion.pause_sharing_mode
+            and not promotion_overlap
         ):
             raise ConfigError(
-                "promotion GPU overlaps a learner/actor without pause-sharing mode"
+                "pause-sharing mode requires exactly one learner or actor GPU overlap"
             )
         if not self.distributed.enabled and len(learners) > 1:
             raise ConfigError("multiple learner GPUs require distributed.enabled")
@@ -589,6 +598,20 @@ class ExperimentConfig:
             raise ConfigError(
                 "plateau lag cannot exceed learner replay lag eligibility"
             )
+        plateau = self.orchestration.plateau
+        if plateau.enabled and plateau.action == "reset_from_champion":
+            rejection_span = (
+                self.learner.candidate_interval
+                * plateau.consecutive_terminal_rejections
+            )
+            if rejection_span > self.learner.max_replay_lag_steps:
+                raise ConfigError(
+                    "candidate rejection span cannot exceed replay lag eligibility"
+                )
+            if plateau.max_learner_champion_lag_steps < rejection_span:
+                raise ConfigError(
+                    "plateau lag must allow every reset-triggering candidate"
+                )
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)

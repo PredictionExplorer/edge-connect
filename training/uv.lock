@@ -1947,7 +1947,7 @@ requires-dist = [
     { name = "pytest-timeout", marker = "extra == 'test'", specifier = ">=2.4.0" },
     { name = "pyyaml", specifier = ">=6.0.2" },
     { name = "ruff", marker = "extra == 'test'" },
-    { name = "torch", specifier = ">=2.4" },
+    { name = "torch", specifier = ">=2.13" },
     { name = "uvicorn", extras = ["standard"], marker = "extra == 'serve'", specifier = ">=0.34" },
 ]
 provides-extras = ["serve", "test", "onnx"]

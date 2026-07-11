@@ -24,6 +24,10 @@ The supplied layouts are single-host profiles:
   self-play actors, and GPU 3 to arena/promotion.
 - `configs/h100-8gpu.yaml` assigns GPU 0 to the learner, GPUs 1–6 to
   self-play actors, and GPU 7 to arena/promotion.
+- `configs/h100-8gpu-optimized.yaml` assigns GPU 0 to the learner, GPUs
+  1–7 to self-play actors, and pause-shares GPU 7 with arena/promotion.
+  The coordinator stops and reaps `actor-gpu-7` before acknowledging the
+  arena lease, so learner GPU 0 remains continuous.
 
 Both profiles deliberately use one learner GPU and set
 `distributed.enabled: false`. The real training command is therefore
@@ -56,7 +60,8 @@ Required:
 
 The current profiles allocate these CPU-thread budgets:
 
-- 8-GPU profile: 16 learner + 48 actor + 8 arena = 72 threads.
+- historical 8-GPU profile: 16 learner + 48 actor + 8 arena = 72 threads.
+- optimized 8-GPU profile: 16 learner + 56 actor + 8 arena = 80 threads.
 - 4-GPU profile: 24 learner + 24 actor + 8 arena = 56 threads.
 
 Have at least that many logical CPUs or lower the per-worker budgets in a new
@@ -202,7 +207,7 @@ source .venv/bin/activate
 
 uv pip install \
   --index-url https://download.pytorch.org/whl/cu126 \
-  "torch>=2.4"
+  "torch>=2.13"
 
 uv pip install "maturin==1.14.1" -e ".[test,serve,onnx]"
 ```
@@ -463,6 +468,7 @@ torchrun \
   --standalone \
   --nproc-per-node 2 \
   scripts/nccl_smoke.py \
+  --all-rings \
   --config "$PROFILE" \
   | tee "$RUN_ROOT/nccl-smoke.json"
 ```

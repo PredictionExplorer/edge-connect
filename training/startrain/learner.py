@@ -510,6 +510,8 @@ class LearnerLoop:
             self.model,
             enabled=train_config.compile,
             dynamic=False,
+            recompile_limit=len(self.ring_mixture_config.rings),
+            isolate_recompiles=True,
         )
         if world_size > 1:
             parameter = next(self.model.parameters())

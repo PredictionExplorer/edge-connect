@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import signal
 import shutil
+import time
 from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any
@@ -38,6 +39,7 @@ from startrain.orchestration import (
     Coordinator,
     RunDirectories,
     build_worker_specs,
+    gpu_pause_ack_path,
 )
 from startrain.runtime import (
     RunIdentity,
@@ -82,10 +84,15 @@ def test_graceful_stop_signals_only_worker_leader_before_group_kill(
 def test_h100_layouts_assign_one_learner_and_every_actor_gpu() -> None:
     eight = load_config(CONFIGS / "h100-8gpu.yaml")
     four = load_config(CONFIGS / "h100-4gpu.yaml")
+    optimized = load_config(CONFIGS / "h100-8gpu-optimized.yaml")
     assert [gpu.gpu_id for gpu in eight.orchestration.learner_gpus] == [0]
     assert [gpu.gpu_id for gpu in eight.orchestration.actor_gpus] == list(range(1, 7))
     assert [gpu.gpu_id for gpu in four.orchestration.learner_gpus] == [0]
     assert [gpu.gpu_id for gpu in four.orchestration.actor_gpus] == [1, 2]
+    assert [gpu.gpu_id for gpu in optimized.orchestration.actor_gpus] == list(
+        range(1, 8)
+    )
+    assert optimized.orchestration.promotion.gpu_id == 7
 
     directories = RunDirectories.from_experiment(four)
     specs = build_worker_specs(
@@ -105,7 +112,7 @@ def test_h100_layouts_assign_one_learner_and_every_actor_gpu() -> None:
         assert spec.environment["RAYON_NUM_THREADS"] == str(spec.cpu_threads)
         assert spec.environment["OMP_NUM_THREADS"] == str(spec.cpu_threads)
     assert specs[-1].role == "arena"
-    with pytest.raises(ConfigError, match="overlaps"):
+    with pytest.raises(ConfigError, match="overlap"):
         replace(
             four.orchestration,
             promotion=replace(
@@ -123,15 +130,59 @@ def test_h100_layouts_assign_one_learner_and_every_actor_gpu() -> None:
         ),
     )
     assert shared.promotion.pause_sharing_mode is True
-    with pytest.raises(ConfigError, match="self-play actor"):
+    learner_shared_experiment = replace(four, orchestration=shared)
+    learner_shared_specs = build_worker_specs(
+        learner_shared_experiment,
+        config_path=CONFIGS / "h100-4gpu.yaml",
+        directories=RunDirectories.from_experiment(learner_shared_experiment),
+        python_executable="/test/python",
+        base_environment={},
+    )
+    assert "--gpu-pause" in learner_shared_specs[0].command
+    actor_shared = replace(
+        four.orchestration,
+        promotion=replace(
+            four.orchestration.promotion,
+            gpu_id=1,
+            pause_sharing_mode=True,
+        ),
+    )
+    assert actor_shared.promotion.gpu_id == 1
+    with pytest.raises(ConfigError, match="overlap requires"):
         replace(
             four.orchestration,
             promotion=replace(
                 four.orchestration.promotion,
                 gpu_id=1,
+                pause_sharing_mode=False,
+            ),
+        )
+    with pytest.raises(ConfigError, match="requires exactly one"):
+        replace(
+            four.orchestration,
+            promotion=replace(
+                four.orchestration.promotion,
+                gpu_id=9,
                 pause_sharing_mode=True,
             ),
         )
+
+    optimized_directories = RunDirectories.from_experiment(optimized)
+    optimized_specs = build_worker_specs(
+        optimized,
+        config_path=CONFIGS / "h100-8gpu-optimized.yaml",
+        directories=optimized_directories,
+        python_executable="/test/python",
+        base_environment={},
+    )
+    learner, *_, actor_seven, arena = optimized_specs
+    assert learner.role == "learner"
+    assert "--gpu-pause" not in learner.command
+    assert actor_seven.name == "actor-gpu-7"
+    assert actor_seven.environment["CUDA_VISIBLE_DEVICES"] == "7"
+    assert arena.role == "arena"
+    assert arena.environment["CUDA_VISIBLE_DEVICES"] == "7"
+    assert "--gpu-pause" in arena.command
 
 
 def test_ring_scheduler_curriculum_then_favors_deficits() -> None:
@@ -196,11 +247,21 @@ def test_explicit_ddp_builds_one_torchrun_job_and_partitions_batches(
 class FakeProcess:
     next_pid = 10_000
 
-    def __init__(self, *, exit_immediately: bool) -> None:
+    def __init__(
+        self,
+        *,
+        exit_immediately: bool,
+        exit_on_terminate: bool = True,
+        exit_on_kill: bool = True,
+    ) -> None:
         self.pid = FakeProcess.next_pid
         FakeProcess.next_pid += 1
         self.returncode: int | None = None
         self.exit_immediately = exit_immediately
+        self.exit_on_terminate = exit_on_terminate
+        self.exit_on_kill = exit_on_kill
+        self.terminate_calls = 0
+        self.kill_calls = 0
 
     def poll(self) -> int | None:
         if self.returncode is None and self.exit_immediately:
@@ -208,10 +269,14 @@ class FakeProcess:
         return self.returncode
 
     def terminate(self) -> None:
-        self.returncode = -15
+        self.terminate_calls += 1
+        if self.exit_on_terminate:
+            self.returncode = -15
 
     def kill(self) -> None:
-        self.returncode = -9
+        self.kill_calls += 1
+        if self.exit_on_kill:
+            self.returncode = -9
 
 
 class FakeClock:
@@ -223,6 +288,83 @@ class FakeClock:
 
     def sleep(self, seconds: float) -> None:
         self.value += seconds
+
+
+def pause_shared_experiment(tmp_path: Path):
+    experiment = load_config(CONFIGS / "h100-8gpu-optimized.yaml")
+    return replace(
+        experiment,
+        orchestration=replace(
+            experiment.orchestration,
+            directories=RunDirectoryConfig(root=str(tmp_path / "pause-run")),
+            restart=RestartPolicyConfig(
+                max_restarts=2,
+                initial_backoff_seconds=0.01,
+                maximum_backoff_seconds=0.02,
+                stable_reset_seconds=100.0,
+            ),
+            shutdown=ShutdownConfig(
+                monitor_interval_seconds=0.01,
+                heartbeat_interval_seconds=0.02,
+                stale_heartbeat_seconds=0.1,
+                stall_timeout_seconds=1.0,
+                terminate_grace_seconds=0.02,
+                kill_grace_seconds=0.01,
+            ),
+            promotion=replace(
+                experiment.orchestration.promotion,
+                pause_ready_timeout_seconds=0.1,
+                pause_release_timeout_seconds=0.1,
+            ),
+        ),
+    )
+
+
+def write_pause_request(
+    path: Path,
+    *,
+    token: str,
+    owner_pid: int,
+    state: str = "requested",
+    requested_ns: int | None = None,
+    heartbeat_ns: int | None = None,
+    gpu_id: int = 7,
+) -> None:
+    requested = requested_ns or time.time_ns()
+    atomic_json(
+        path,
+        {
+            "schema_version": 1,
+            "protocol": "coordinator-pause-v1",
+            "token": token,
+            "pid": owner_pid,
+            "gpu_id": gpu_id,
+            "candidate_identity": "candidate-test",
+            "state": state,
+            "requested_ns": requested,
+            "heartbeat_ns": heartbeat_ns or time.time_ns(),
+        },
+    )
+
+
+def worker_name(command: list[str]) -> str:
+    if "train" in command:
+        return "learner"
+    if "actor" in command:
+        gpu_index = command.index("--gpu-id") + 1
+        return f"actor-gpu-{command[gpu_index]}"
+    if "promote" in command:
+        return "arena-promotion"
+    raise AssertionError(f"unknown worker command: {command}")
+
+
+def coordinator_events(directories: RunDirectories) -> list[dict[str, object]]:
+    return [
+        json.loads(line)
+        for line in (directories.metrics / "coordinator.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
 
 
 def test_coordinator_restarts_failed_actor_without_duplicate(tmp_path) -> None:
@@ -302,6 +444,604 @@ def test_coordinator_restarts_failed_actor_without_duplicate(tmp_path) -> None:
     )
     assert status["state"] == "stopped"
     assert not (directories.root / "coordinator.lock").exists()
+
+
+def test_pause_lease_reaps_actor_before_ready_and_restarts_once(tmp_path) -> None:
+    experiment = pause_shared_experiment(tmp_path)
+    directories = RunDirectories.from_experiment(experiment)
+    specs = build_worker_specs(
+        experiment,
+        config_path=CONFIGS / "h100-8gpu-optimized.yaml",
+        directories=directories,
+        base_environment={},
+    )
+    launches: dict[str, list[FakeProcess]] = {}
+
+    def process_factory(command: list[str], **_options: Any) -> FakeProcess:
+        name = worker_name(command)
+        process = FakeProcess(exit_immediately=False)
+        launches.setdefault(name, []).append(process)
+        return process
+
+    token = "normal-pause-token"
+    phase = "request"
+    post_release_cycles = 0
+
+    def stop_requested() -> bool:
+        nonlocal phase, post_release_cycles
+        if "arena-promotion" not in launches:
+            return False
+        if phase == "request":
+            write_pause_request(
+                directories.gpu_pause,
+                token=token,
+                owner_pid=launches["arena-promotion"][0].pid,
+            )
+            phase = "ready"
+            return False
+        if phase == "ready":
+            ack_path = gpu_pause_ack_path(directories.gpu_pause)
+            if ack_path.is_file():
+                acknowledgement = json.loads(ack_path.read_text(encoding="utf-8"))
+                if acknowledgement["state"] == "ready":
+                    assert launches["actor-gpu-7"][0].returncode == -15
+                    request = json.loads(
+                        directories.gpu_pause.read_text(encoding="utf-8")
+                    )
+                    request["state"] = "released"
+                    request["heartbeat_ns"] = time.time_ns()
+                    atomic_json(directories.gpu_pause, request)
+                    phase = "released"
+            return False
+        if phase == "released" and len(launches["actor-gpu-7"]) == 2:
+            post_release_cycles += 1
+            return post_release_cycles >= 3
+        return False
+
+    clock = FakeClock()
+    coordinator = Coordinator(
+        experiment=experiment,
+        specs=specs,
+        directories=directories,
+        process_factory=process_factory,
+        clock=clock,
+        sleep=clock.sleep,
+    )
+    assert coordinator.run(stop_requested=stop_requested, max_monitor_cycles=10) == 0
+    assert len(launches["actor-gpu-7"]) == 2
+    assert coordinator.workers["actor-gpu-7"].restart_count == 0
+    acknowledgement = json.loads(
+        gpu_pause_ack_path(directories.gpu_pause).read_text(encoding="utf-8")
+    )
+    assert acknowledgement["token"] == token
+    assert acknowledgement["state"] == "released"
+    assert json.loads(directories.gpu_pause.read_text())["state"] == "released"
+    event_names = [event["event"] for event in coordinator_events(directories)]
+    ordered = [
+        "pause_lease_requested",
+        "pause_target_reaped",
+        "pause_lease_ready",
+        "pause_lease_release_requested",
+        "pause_target_restarted",
+    ]
+    assert [event_names.index(name) for name in ordered] == sorted(
+        event_names.index(name) for name in ordered
+    )
+
+
+def test_pause_lease_never_acknowledges_live_actor(tmp_path) -> None:
+    experiment = pause_shared_experiment(tmp_path)
+    directories = RunDirectories.from_experiment(experiment)
+    specs = build_worker_specs(
+        experiment,
+        config_path=CONFIGS / "h100-8gpu-optimized.yaml",
+        directories=directories,
+        base_environment={},
+    )
+    launches: dict[str, list[FakeProcess]] = {}
+
+    def process_factory(command: list[str], **_options: Any) -> FakeProcess:
+        name = worker_name(command)
+        process = FakeProcess(
+            exit_immediately=False,
+            exit_on_terminate=name != "actor-gpu-7",
+            exit_on_kill=name != "actor-gpu-7",
+        )
+        launches.setdefault(name, []).append(process)
+        return process
+
+    requested = False
+
+    def stop_requested() -> bool:
+        nonlocal requested
+        if "arena-promotion" in launches and not requested:
+            requested = True
+            write_pause_request(
+                directories.gpu_pause,
+                token="live-actor-token",
+                owner_pid=launches["arena-promotion"][0].pid,
+            )
+        return False
+
+    clock = FakeClock()
+    coordinator = Coordinator(
+        experiment=experiment,
+        specs=specs,
+        directories=directories,
+        process_factory=process_factory,
+        clock=clock,
+        sleep=clock.sleep,
+    )
+    assert coordinator.run(stop_requested=stop_requested, max_monitor_cycles=1) == 0
+    acknowledgement = json.loads(
+        gpu_pause_ack_path(directories.gpu_pause).read_text(encoding="utf-8")
+    )
+    assert acknowledgement["state"] == "stopping"
+    assert launches["actor-gpu-7"][0].returncode is None
+    assert not any(
+        event["event"] == "pause_lease_ready"
+        for event in coordinator_events(directories)
+    )
+
+
+def test_pause_lease_hard_kills_after_grace_then_restarts_actor(tmp_path) -> None:
+    experiment = pause_shared_experiment(tmp_path)
+    directories = RunDirectories.from_experiment(experiment)
+    specs = build_worker_specs(
+        experiment,
+        config_path=CONFIGS / "h100-8gpu-optimized.yaml",
+        directories=directories,
+        base_environment={},
+    )
+    launches: dict[str, list[FakeProcess]] = {}
+
+    def process_factory(command: list[str], **_options: Any) -> FakeProcess:
+        name = worker_name(command)
+        first_shared_actor = name == "actor-gpu-7" and name not in launches
+        process = FakeProcess(
+            exit_immediately=False,
+            exit_on_terminate=not first_shared_actor,
+            exit_on_kill=True,
+        )
+        launches.setdefault(name, []).append(process)
+        return process
+
+    phase = "request"
+
+    def stop_requested() -> bool:
+        nonlocal phase
+        if "arena-promotion" not in launches:
+            return False
+        if phase == "request":
+            write_pause_request(
+                directories.gpu_pause,
+                token="hard-kill-token",
+                owner_pid=launches["arena-promotion"][0].pid,
+            )
+            phase = "ready"
+            return False
+        ack_path = gpu_pause_ack_path(directories.gpu_pause)
+        if phase == "ready" and ack_path.is_file():
+            acknowledgement = json.loads(ack_path.read_text())
+            if acknowledgement["state"] == "ready":
+                assert launches["actor-gpu-7"][0].returncode == -9
+                request = json.loads(directories.gpu_pause.read_text())
+                request["state"] = "released"
+                request["heartbeat_ns"] = time.time_ns()
+                atomic_json(directories.gpu_pause, request)
+                phase = "released"
+        return phase == "released" and len(launches["actor-gpu-7"]) == 2
+
+    clock = FakeClock()
+    coordinator = Coordinator(
+        experiment=experiment,
+        specs=specs,
+        directories=directories,
+        process_factory=process_factory,
+        clock=clock,
+        sleep=clock.sleep,
+    )
+    assert coordinator.run(stop_requested=stop_requested, max_monitor_cycles=20) == 0
+    first_actor = launches["actor-gpu-7"][0]
+    assert first_actor.terminate_calls == 1
+    assert first_actor.kill_calls == 1
+    assert len(launches["actor-gpu-7"]) == 2
+
+
+def test_pause_lease_fails_closed_when_actor_ignores_sigkill(tmp_path) -> None:
+    experiment = pause_shared_experiment(tmp_path)
+    directories = RunDirectories.from_experiment(experiment)
+    specs = build_worker_specs(
+        experiment,
+        config_path=CONFIGS / "h100-8gpu-optimized.yaml",
+        directories=directories,
+        base_environment={},
+    )
+    launches: dict[str, list[FakeProcess]] = {}
+
+    def process_factory(command: list[str], **_options: Any) -> FakeProcess:
+        name = worker_name(command)
+        stubborn = name == "actor-gpu-7"
+        process = FakeProcess(
+            exit_immediately=False,
+            exit_on_terminate=not stubborn,
+            exit_on_kill=not stubborn,
+        )
+        launches.setdefault(name, []).append(process)
+        return process
+
+    requested = False
+
+    def stop_requested() -> bool:
+        nonlocal requested
+        if "arena-promotion" in launches and not requested:
+            requested = True
+            write_pause_request(
+                directories.gpu_pause,
+                token="fail-closed-token",
+                owner_pid=launches["arena-promotion"][0].pid,
+            )
+        return False
+
+    clock = FakeClock()
+    coordinator = Coordinator(
+        experiment=experiment,
+        specs=specs,
+        directories=directories,
+        process_factory=process_factory,
+        clock=clock,
+        sleep=clock.sleep,
+    )
+    assert coordinator.run(stop_requested=stop_requested) == 1
+    assert len(launches["actor-gpu-7"]) == 1
+    acknowledgement = json.loads(
+        gpu_pause_ack_path(directories.gpu_pause).read_text(encoding="utf-8")
+    )
+    assert acknowledgement["state"] == "failed"
+    assert "SIGKILL" in acknowledgement["reason"]
+    assert not any(
+        event["event"] == "pause_lease_ready"
+        for event in coordinator_events(directories)
+    )
+
+
+def test_pause_lease_fails_closed_when_actor_restart_cannot_spawn(tmp_path) -> None:
+    experiment = pause_shared_experiment(tmp_path)
+    directories = RunDirectories.from_experiment(experiment)
+    specs = build_worker_specs(
+        experiment,
+        config_path=CONFIGS / "h100-8gpu-optimized.yaml",
+        directories=directories,
+        base_environment={},
+    )
+    launches: dict[str, list[FakeProcess]] = {}
+
+    def process_factory(command: list[str], **_options: Any) -> FakeProcess:
+        name = worker_name(command)
+        if name == "actor-gpu-7" and name in launches:
+            raise OSError("injected pause restart failure")
+        process = FakeProcess(exit_immediately=False)
+        launches.setdefault(name, []).append(process)
+        return process
+
+    phase = "request"
+
+    def stop_requested() -> bool:
+        nonlocal phase
+        if "arena-promotion" not in launches:
+            return False
+        if phase == "request":
+            write_pause_request(
+                directories.gpu_pause,
+                token="spawn-failure-token",
+                owner_pid=launches["arena-promotion"][0].pid,
+            )
+            phase = "ready"
+            return False
+        ack_path = gpu_pause_ack_path(directories.gpu_pause)
+        if phase == "ready" and ack_path.is_file():
+            acknowledgement = json.loads(ack_path.read_text())
+            if acknowledgement["state"] == "ready":
+                request = json.loads(directories.gpu_pause.read_text())
+                request["state"] = "released"
+                request["heartbeat_ns"] = time.time_ns()
+                atomic_json(directories.gpu_pause, request)
+                phase = "released"
+        return False
+
+    clock = FakeClock()
+    coordinator = Coordinator(
+        experiment=experiment,
+        specs=specs,
+        directories=directories,
+        process_factory=process_factory,
+        clock=clock,
+        sleep=clock.sleep,
+    )
+    assert coordinator.run(stop_requested=stop_requested) == 1
+    assert len(launches["actor-gpu-7"]) == 1
+    assert coordinator.workers["actor-gpu-7"].restart_count == 0
+    acknowledgement = json.loads(
+        gpu_pause_ack_path(directories.gpu_pause).read_text(encoding="utf-8")
+    )
+    assert acknowledgement["state"] == "failed"
+    assert "injected pause restart failure" in acknowledgement["reason"]
+
+
+@pytest.mark.parametrize("failure", ["crash", "stale"])
+def test_arena_failure_or_stale_lease_restores_actor(tmp_path, failure: str) -> None:
+    experiment = pause_shared_experiment(tmp_path)
+    directories = RunDirectories.from_experiment(experiment)
+    specs = build_worker_specs(
+        experiment,
+        config_path=CONFIGS / "h100-8gpu-optimized.yaml",
+        directories=directories,
+        base_environment={},
+    )
+    launches: dict[str, list[FakeProcess]] = {}
+
+    def process_factory(command: list[str], **_options: Any) -> FakeProcess:
+        name = worker_name(command)
+        process = FakeProcess(exit_immediately=False)
+        launches.setdefault(name, []).append(process)
+        return process
+
+    token = f"{failure}-recovery-token"
+    requested_ns = time.time_ns() - 1_000_000_000
+    phase = "request"
+
+    def stop_requested() -> bool:
+        nonlocal phase
+        if "arena-promotion" not in launches:
+            return False
+        if phase == "request":
+            write_pause_request(
+                directories.gpu_pause,
+                token=token,
+                owner_pid=launches["arena-promotion"][0].pid,
+                requested_ns=requested_ns,
+            )
+            phase = "ready"
+            return False
+        ack_path = gpu_pause_ack_path(directories.gpu_pause)
+        if phase == "ready" and ack_path.is_file():
+            acknowledgement = json.loads(ack_path.read_text())
+            if acknowledgement["state"] == "ready":
+                if failure == "crash":
+                    launches["arena-promotion"][0].returncode = 17
+                else:
+                    write_pause_request(
+                        directories.gpu_pause,
+                        token=token,
+                        owner_pid=launches["arena-promotion"][0].pid,
+                        state="active",
+                        requested_ns=requested_ns,
+                        heartbeat_ns=requested_ns,
+                    )
+                phase = "recovering"
+            return False
+        if phase == "recovering" and ack_path.is_file():
+            acknowledgement = json.loads(ack_path.read_text())
+            return (
+                acknowledgement["state"] == "recovered"
+                and len(launches["actor-gpu-7"]) == 2
+            )
+        return False
+
+    clock = FakeClock()
+    coordinator = Coordinator(
+        experiment=experiment,
+        specs=specs,
+        directories=directories,
+        process_factory=process_factory,
+        clock=clock,
+        sleep=clock.sleep,
+    )
+    assert coordinator.run(stop_requested=stop_requested, max_monitor_cycles=20) == 0
+    assert len(launches["actor-gpu-7"]) == 2
+    acknowledgement = json.loads(
+        gpu_pause_ack_path(directories.gpu_pause).read_text(encoding="utf-8")
+    )
+    assert acknowledgement["state"] == "recovered"
+    event_names = [event["event"] for event in coordinator_events(directories)]
+    assert "pause_owner_reaped" in event_names
+    assert "pause_target_restarted" in event_names
+
+
+def test_learner_pause_sharing_waits_for_fresh_progress_ack(tmp_path) -> None:
+    experiment = load_config(CONFIGS / "h100-4gpu.yaml")
+    experiment = replace(
+        experiment,
+        orchestration=replace(
+            experiment.orchestration,
+            directories=RunDirectoryConfig(root=str(tmp_path / "learner-share")),
+            shutdown=ShutdownConfig(
+                monitor_interval_seconds=0.01,
+                heartbeat_interval_seconds=0.02,
+                stale_heartbeat_seconds=0.1,
+                stall_timeout_seconds=1.0,
+                terminate_grace_seconds=0.02,
+                kill_grace_seconds=0.01,
+            ),
+            promotion=replace(
+                experiment.orchestration.promotion,
+                gpu_id=0,
+                pause_sharing_mode=True,
+                pause_ready_timeout_seconds=0.1,
+                pause_release_timeout_seconds=0.1,
+            ),
+        ),
+    )
+    directories = RunDirectories.from_experiment(experiment)
+    specs = build_worker_specs(
+        experiment,
+        config_path=CONFIGS / "h100-4gpu.yaml",
+        directories=directories,
+        base_environment={},
+    )
+    launches: dict[str, list[FakeProcess]] = {}
+
+    def process_factory(command: list[str], **_options: Any) -> FakeProcess:
+        name = worker_name(command)
+        process = FakeProcess(exit_immediately=False)
+        launches.setdefault(name, []).append(process)
+        return process
+
+    token = "learner-share-token"
+    phase = "request"
+    observed_without_termination = False
+
+    def stop_requested() -> bool:
+        nonlocal observed_without_termination, phase
+        if "arena-promotion" not in launches:
+            return False
+        if phase == "request":
+            write_pause_request(
+                directories.gpu_pause,
+                token=token,
+                owner_pid=launches["arena-promotion"][0].pid,
+                gpu_id=0,
+            )
+            phase = "heartbeat"
+            return False
+        if phase == "heartbeat":
+            request = json.loads(directories.gpu_pause.read_text())
+            atomic_json(
+                directories.status / "learner.heartbeat.json",
+                {
+                    "schema_version": 1,
+                    "worker": "learner",
+                    "pid": launches["learner"][0].pid,
+                    "heartbeat_ns": time.time_ns(),
+                    "phase": "arena_gpu_pause",
+                    "progress": 1,
+                    "progress_ns": max(time.time_ns(), request["requested_ns"]),
+                },
+            )
+            phase = "ready"
+            return False
+        acknowledgement = json.loads(
+            gpu_pause_ack_path(directories.gpu_pause).read_text(encoding="utf-8")
+        )
+        if phase == "ready" and acknowledgement["state"] == "ready":
+            assert launches["learner"][0].terminate_calls == 0
+            request = json.loads(directories.gpu_pause.read_text())
+            request["state"] = "released"
+            request["heartbeat_ns"] = time.time_ns()
+            atomic_json(directories.gpu_pause, request)
+            phase = "released"
+            return False
+        if phase == "released" and acknowledgement["state"] == "released":
+            observed_without_termination = launches["learner"][0].terminate_calls == 0
+            return True
+        return False
+
+    clock = FakeClock()
+    coordinator = Coordinator(
+        experiment=experiment,
+        specs=specs,
+        directories=directories,
+        process_factory=process_factory,
+        clock=clock,
+        sleep=clock.sleep,
+    )
+    assert coordinator.run(stop_requested=stop_requested, max_monitor_cycles=10) == 0
+    assert observed_without_termination is True
+    assert len(launches["learner"]) == 1
+    assert not directories.gpu_pause.exists()
+
+
+def test_final_drain_suppresses_pause_actor_restart(tmp_path) -> None:
+    experiment = pause_shared_experiment(tmp_path)
+    directories = RunDirectories.from_experiment(experiment)
+    directories.create()
+    identity = load_or_create_run_identity(directories.run_identity)
+    specs = build_worker_specs(
+        experiment,
+        config_path=CONFIGS / "h100-8gpu-optimized.yaml",
+        directories=directories,
+        base_environment={},
+    )
+    launches: dict[str, list[FakeProcess]] = {}
+
+    def process_factory(command: list[str], **_options: Any) -> FakeProcess:
+        name = worker_name(command)
+        process = FakeProcess(exit_immediately=False)
+        launches.setdefault(name, []).append(process)
+        return process
+
+    token = "final-drain-token"
+    final_identity = "sha256-" + "d" * 64
+    phase = "request"
+
+    def stop_requested() -> bool:
+        nonlocal phase
+        if "arena-promotion" not in launches:
+            return False
+        if phase == "request":
+            write_pause_request(
+                directories.gpu_pause,
+                token=token,
+                owner_pid=launches["arena-promotion"][0].pid,
+            )
+            phase = "ready"
+            return False
+        acknowledgement = json.loads(
+            gpu_pause_ack_path(directories.gpu_pause).read_text(encoding="utf-8")
+        )
+        if phase == "ready" and acknowledgement["state"] == "ready":
+            atomic_json(
+                directories.learner / "learner-complete.json",
+                {
+                    "schema_version": 1,
+                    "run_id": identity.run_id,
+                    "generation_family": identity.generation_family,
+                    "candidate_identity": final_identity,
+                    "candidate_step": 100,
+                    "completed_ns": time.time_ns(),
+                },
+            )
+            launches["learner"][0].returncode = 0
+            phase = "learner_exiting"
+            return False
+        if phase == "learner_exiting":
+            assert coordinator.draining is True
+            request = json.loads(directories.gpu_pause.read_text())
+            request["state"] = "released"
+            request["heartbeat_ns"] = time.time_ns()
+            atomic_json(directories.gpu_pause, request)
+            atomic_json(
+                directories.arena / "promotion-status.json",
+                {
+                    "schema_version": 1,
+                    "candidate_identity": final_identity,
+                    "terminal": True,
+                    "decision": "reject",
+                },
+            )
+            phase = "released"
+        return False
+
+    clock = FakeClock()
+    coordinator = Coordinator(
+        experiment=experiment,
+        specs=specs,
+        directories=directories,
+        process_factory=process_factory,
+        clock=clock,
+        sleep=clock.sleep,
+    )
+    assert coordinator.run(stop_requested=stop_requested, max_monitor_cycles=10) == 0
+    assert len(launches["actor-gpu-7"]) == 1
+    acknowledgement = json.loads(
+        gpu_pause_ack_path(directories.gpu_pause).read_text(encoding="utf-8")
+    )
+    assert acknowledgement["state"] == "draining"
+    assert coordinator.workers["actor-gpu-7"].failure_reason is None
+    assert not any(
+        event["event"] == "pause_target_restarted"
+        for event in coordinator_events(directories)
+    )
 
 
 def test_coordinator_drains_final_candidate_before_stopping(tmp_path) -> None:

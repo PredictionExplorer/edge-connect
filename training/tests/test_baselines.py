@@ -82,6 +82,8 @@ def test_frozen_evaluators_are_deterministic_and_versioned() -> None:
     first = greedy.evaluate(GreedyRequests())
     second = greedy.evaluate(GreedyRequests())
     assert first == second
+    assert greedy.evaluator_calls == 2
+    assert greedy.evaluator_rows == 2
     assert first.policy_logits[1] == max(first.policy_logits)
     assert greedy.model_version == "frozen-greedy-native-score-v1-s1-k1-cv50-cs1"
 
@@ -96,6 +98,8 @@ def test_frozen_evaluators_are_deterministic_and_versioned() -> None:
     random_alias = create_frozen_baseline("random", native_module=GreedyNative)
     assert random_alias.model_version == uniform.model_version
     assert uniform.evaluate(GreedyRequests()) == uniform.evaluate(GreedyRequests())
+    assert uniform.evaluator_calls == 2
+    assert uniform.evaluator_rows == 2
 
 
 @pytest.mark.native

@@ -5,6 +5,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 from scripts import h100_system_benchmark as benchmark
 
 
@@ -262,6 +264,28 @@ def test_orchestration_metrics_summary_covers_throughput_and_replay_waits(
             "games_per_second": 2.0,
             "samples_per_second": 20.0,
             "elapsed_seconds": 4.0,
+            "evaluator_calls": 4,
+            "evaluator_rows": 100,
+            "evaluator_rows_per_second": 25.0,
+            "completed_decisions": 10,
+            "attempted_decisions": 10,
+            "full_decisions": 4,
+            "fast_decisions": 6,
+            "pass_decisions": 2,
+            "pass_decision_rate": 0.2,
+            "game_lengths": [4, 6],
+            "policy_entropy_count": 4,
+            "policy_entropy_sum": 2.0,
+            "policy_entropy_mean": 0.5,
+            "interrupted_cohorts": 0,
+            "dropped_games": 0,
+            "dropped_decisions": 0,
+            "model_refresh_latency_seconds": 0.2,
+            "replay_append_calls": 1,
+            "replay_append_bytes": 1_000,
+            "replay_append_seconds": 0.1,
+            "peak_cuda_memory_bytes": 100,
+            "peak_cuda_memory_reserved_bytes": 200,
         },
         {
             "worker": "actor-gpu-1",
@@ -269,6 +293,28 @@ def test_orchestration_metrics_summary_covers_throughput_and_replay_waits(
             "games_per_second": 4.0,
             "samples_per_second": 40.0,
             "elapsed_seconds": 3.0,
+            "evaluator_calls": 6,
+            "evaluator_rows": 180,
+            "evaluator_rows_per_second": 60.0,
+            "completed_decisions": 12,
+            "attempted_decisions": 20,
+            "full_decisions": 8,
+            "fast_decisions": 12,
+            "pass_decisions": 3,
+            "pass_decision_rate": 0.25,
+            "game_lengths": [5, 7],
+            "policy_entropy_count": 6,
+            "policy_entropy_sum": 4.2,
+            "policy_entropy_mean": 0.7,
+            "interrupted_cohorts": 1,
+            "dropped_games": 2,
+            "dropped_decisions": 8,
+            "model_refresh_latency_seconds": 0.4,
+            "replay_append_calls": 2,
+            "replay_append_bytes": 3_000,
+            "replay_append_seconds": 0.3,
+            "peak_cuda_memory_bytes": 150,
+            "peak_cuda_memory_reserved_bytes": 250,
         },
     ]
     learner_path.write_text(
@@ -292,6 +338,32 @@ def test_orchestration_metrics_summary_covers_throughput_and_replay_waits(
     assert actors["games_per_second"]["mean"] == 3.0
     assert actors["batch_seconds"]["maximum"] == 4.0
     assert actors["by_worker"]["actor-gpu-1"]["samples_per_second"]["p95"] == 40.0
+    assert actors["evaluator"]["calls"]["total"] == 10
+    assert actors["evaluator"]["rows"]["total"] == 280
+    assert actors["evaluator"]["rows_per_second"]["mean"] == 42.5
+    assert actors["evaluator"]["aggregate_rows_per_second"] == 40
+    assert actors["decisions"]["attempted"]["total"] == 30
+    assert actors["decisions"]["full"]["total"] == 12
+    assert actors["decisions"]["fast"]["total"] == 18
+    assert actors["decisions"]["passes"]["total"] == 5
+    assert actors["decisions"]["pass_rate"] == 5 / 30
+    assert actors["game_length"]["mean"] == 5.5
+    assert actors["game_length"]["distribution"] == {
+        "4": 1,
+        "5": 1,
+        "6": 1,
+        "7": 1,
+    }
+    assert actors["policy_entropy"]["target_count"] == 10
+    assert actors["policy_entropy"]["mean"] == pytest.approx(0.62)
+    assert actors["interrupted_cohorts"]["cohorts"]["total"] == 1
+    assert actors["interrupted_cohorts"]["dropped_games"]["total"] == 2
+    assert actors["interrupted_cohorts"]["dropped_decisions"]["total"] == 8
+    assert actors["model_refresh_latency_seconds"]["mean"] == pytest.approx(0.3)
+    assert actors["replay_append"]["bytes"]["total"] == 4_000
+    assert actors["replay_append"]["bytes_per_second"] == pytest.approx(10_000)
+    assert actors["peak_cuda_memory_bytes"]["maximum"] == 150
+    assert actors["peak_cuda_memory_reserved_bytes"]["maximum"] == 250
     replay_waits = summary["replay_waits"]
     assert isinstance(replay_waits, dict)
     assert replay_waits["availability"] == "observed"

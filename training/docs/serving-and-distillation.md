@@ -70,10 +70,19 @@ in actor metrics. Newer candidates supersede older unfinished candidates
 explicitly. The 4-GPU and 8-GPU presets reserve GPU 3
 and GPU 7 respectively for arena work, so learner and arena CUDA allocations
 do not overlap.
-Custom layouts that intentionally share a learner GPU must set
-`promotion.pause_sharing_mode`; the arena then publishes a process-owned pause
-lease and all DDP ranks stop launching training steps until that lease clears.
-Arena/actor overlap is always rejected.
+The optimized 8-GPU profile instead keeps the learner continuous on GPU 0 and
+pause-shares GPU 7 between `actor-gpu-7` and arena/promotion. Promotion
+atomically publishes a tokenized request; the coordinator acknowledges that
+exact token only after the actor has exited and been reaped. CUDA evaluators
+are created only after that acknowledgement. The coordinator restores the
+actor once the result, promotion status, and any champion pointer update are
+durable. Lease heartbeat expiry or arena exit first stops/reaps the arena
+owner, then restores the actor; shutdown and final drain suppress restoration.
+
+Custom layouts may still pause-share a learner GPU. The coordinator waits for
+a fresh learner `arena_gpu_pause` progress acknowledgement before granting the
+same tokenized lease. Pause sharing must overlap exactly one configured learner
+or actor GPU; all uncoordinated overlap is rejected.
 
 Model pointers use pointer-relative manifest paths, and immutable manifests use
 manifest-relative checkpoint paths. The whole learner artifact tree can be

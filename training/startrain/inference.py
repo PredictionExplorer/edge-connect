@@ -63,6 +63,21 @@ class InferenceConfig:
             raise ValueError("initial_pass_logit_penalty must be non-negative")
 
 
+@dataclass(frozen=True, slots=True)
+class InferenceMetrics:
+    """Monotonic evaluator counters suitable for batch-boundary deltas."""
+
+    evaluator_calls: int = 0
+    evaluator_rows: int = 0
+
+    def delta(self, previous: "InferenceMetrics") -> "InferenceMetrics":
+        calls = self.evaluator_calls - previous.evaluator_calls
+        rows = self.evaluator_rows - previous.evaluator_rows
+        if calls < 0 or rows < 0:
+            raise ValueError("inference metrics counters must be monotonic")
+        return InferenceMetrics(evaluator_calls=calls, evaluator_rows=rows)
+
+
 def _integer_list(name: str, values: Sequence[int]) -> list[int]:
     output: list[int] = []
     for value in values:
@@ -93,10 +108,26 @@ class GraphInferenceAdapter:
         self.model_identity = model_identity or model_version
         self.last_feature_path: str | None = None
         self.feature_path_counts = {"rust": 0, "python": 0}
+        self._evaluator_calls = 0
+        self._evaluator_rows = 0
         self._topology_cache: dict[
             tuple[int, int, int, int],
             tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
         ] = {}
+
+    @property
+    def evaluator_calls(self) -> int:
+        return self._evaluator_calls
+
+    @property
+    def evaluator_rows(self) -> int:
+        return self._evaluator_rows
+
+    def metrics_snapshot(self) -> InferenceMetrics:
+        return InferenceMetrics(
+            evaluator_calls=self._evaluator_calls,
+            evaluator_rows=self._evaluator_rows,
+        )
 
     def _to_device(self, encoded: EncodedBatch) -> EncodedBatch:
         ring_values = encoded.rings.tolist()
@@ -192,6 +223,7 @@ class GraphInferenceAdapter:
         if rows == 0:
             if legal_offsets != [0] or legal_actions:
                 raise ValueError("empty request batches require offsets [0]")
+            self._evaluator_calls += 1
             response = InferenceResponse([], [], [0], [])
             details = (
                 DetailedInferenceResponse(response, [], [], [], [])
@@ -236,9 +268,9 @@ class GraphInferenceAdapter:
             expected_indices == node_count, -1
         ).tolist()
         if legal_offsets != expected_offsets or legal_actions != expected_actions:
-            raise ValueError(
-                "native legal action order does not match nodes-then-pass"
-            )
+            raise ValueError("native legal action order does not match nodes-then-pass")
+        self._evaluator_calls += 1
+        self._evaluator_rows += rows
         was_training = self.model.training
         self.model.eval()
         autocast = self.config.precision == "bf16"

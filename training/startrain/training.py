@@ -44,22 +44,24 @@ def maybe_compile_model(
     dynamic: bool = True,
     fullgraph: bool = True,
     backend: str | None = None,
+    recompile_limit: int | None = None,
+    isolate_recompiles: bool = False,
 ) -> nn.Module:
     if not enabled:
         return model
-    if backend is None:
-        return cast(
-            nn.Module,
-            torch.compile(model, dynamic=dynamic, fullgraph=fullgraph),
-        )
+    if recompile_limit is not None and recompile_limit <= 0:
+        raise ValueError("compile recompile_limit must be positive")
+    options = {
+        "dynamic": dynamic,
+        "fullgraph": fullgraph,
+        "recompile_limit": recompile_limit,
+        "isolate_recompiles": isolate_recompiles,
+    }
+    if backend is not None:
+        options["backend"] = backend
     return cast(
         nn.Module,
-        torch.compile(
-            model,
-            dynamic=dynamic,
-            fullgraph=fullgraph,
-            backend=backend,
-        ),
+        torch.compile(model, **options),
     )
 
 

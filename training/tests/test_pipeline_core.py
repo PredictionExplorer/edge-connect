@@ -172,6 +172,7 @@ def test_inference_maps_dense_logits_to_native_legal_order_and_keeps_pass() -> N
         config=InferenceConfig(initial_pass_logit_penalty=2.5),
         model_version="fixed",
     )
+    before = adapter.metrics_snapshot()
     response = adapter.evaluate(requests)
     assert response.tokens == [99]
     assert response.policy_offsets == [0, len(actions)]
@@ -181,6 +182,10 @@ def test_inference_maps_dense_logits_to_native_legal_order_and_keeps_pass() -> N
     assert response.policy_logits[-1] == pytest.approx(position.stones.numel() - 2.5)
     assert response.values[0] > 0
     assert actions[-1] == -1
+    after = adapter.metrics_snapshot()
+    assert after.evaluator_calls == 1
+    assert after.evaluator_rows == 1
+    assert after.delta(before) == after
 
 
 class FakeEvaluator:
@@ -301,7 +306,7 @@ class FakeSearchBatch:
     def results(self) -> object:
         target = [1.0] + [0.0] * 30
         return SimpleNamespace(
-            selected_actions=[0],
+            selected_actions=[-1],
             terminal=[False],
             terminal_values=[0.0],
             action_offsets=[0, 31],
@@ -346,7 +351,9 @@ def test_selfplay_retains_all_targets_but_policy_only_for_full_search(
         shard_size=8,
         seed=41,
     )
-    summaries = SelfPlayActor(FakeNative, FakeEvaluator(), sink, config).run()
+    actor = SelfPlayActor(FakeNative, FakeEvaluator(), sink, config)
+    before_metrics = actor.metrics_snapshot()
+    summaries = actor.run()
     assert len(summaries) == 1
     assert summaries[0].model_version == "fake-v1"
     assert len(sink.samples) == 1
@@ -360,6 +367,16 @@ def test_selfplay_retains_all_targets_but_policy_only_for_full_search(
     else:
         assert not sink.samples[0].policy.any()
     assert sink.calls[0]["model_step"] == 7
+    metrics = actor.metrics_snapshot()
+    assert metrics.completed_decisions == 1
+    assert metrics.full_decisions == int(full)
+    assert metrics.fast_decisions == int(not full)
+    assert metrics.pass_decisions == 1
+    assert metrics.policy_entropy_count == int(full)
+    assert metrics.policy_entropy_sum == pytest.approx(0.0)
+    assert metrics.replay_append_calls == 1
+    assert metrics.replay_append_seconds >= 0
+    assert metrics.delta(before_metrics) == metrics
 
 
 def test_selfplay_playout_randomization_is_seeded_and_board_scaled() -> None:
@@ -393,6 +410,29 @@ def test_selfplay_playout_randomization_is_seeded_and_board_scaled() -> None:
     assert runs[0][0] == runs[1][0]
     np.testing.assert_array_equal(runs[0][1], runs[1][1])
     assert runs[0][2] == runs[1][2]
+
+
+def test_selfplay_measures_accessible_replay_append_bytes(tmp_path) -> None:
+    class SizedSink(CapturingSink):
+        def append(self, samples: list[ReplaySample], **metadata: object) -> object:
+            super().append(samples, **metadata)
+            path = tmp_path / "measured-shard.npz"
+            path.write_bytes(b"x" * 137)
+            return SimpleNamespace(sample_count=len(samples), path=path)
+
+    sink = SizedSink()
+    actor = SelfPlayActor(
+        FakeNative,
+        FakeEvaluator(),
+        sink,
+        SelfPlayConfig.cpu_smoke(seed=42),
+    )
+    actor.run()
+
+    metrics = actor.metrics_snapshot()
+    assert metrics.replay_append_calls == 1
+    assert metrics.replay_append_bytes == 137
+    assert metrics.replay_append_seconds >= 0
 
 
 def test_selfplay_exact_cohort_never_resets_or_drops_uneven_games(
@@ -566,7 +606,7 @@ def test_selfplay_exact_cohort_never_resets_or_drops_uneven_games(
         return abort_checks["count"] >= 3
 
     aborted_sink = CapturingSink()
-    aborted = SelfPlayActor(
+    aborted_actor = SelfPlayActor(
         SimpleNamespace(StateBatch=UnevenStates, SearchBatch=UnevenSearch),
         UnevenEvaluator(),
         aborted_sink,
@@ -582,7 +622,8 @@ def test_selfplay_exact_cohort_never_resets_or_drops_uneven_games(
             shard_size=64,
         ),
         SelfPlayIdentity("run-test", "family-test", "actor-abort", 6),
-    ).run(
+    )
+    aborted = aborted_actor.run(
         stop_requested=stop_mid_cohort,
         progress=lambda **details: abort_events.append(details),
     )
@@ -591,6 +632,13 @@ def test_selfplay_exact_cohort_never_resets_or_drops_uneven_games(
     abort = next(event for event in abort_events if event["phase"] == "selfplay_abort")
     assert abort["dropped_games"] == 2
     assert abort["dropped_decisions"] == 2
+    abort_metrics = aborted_actor.metrics_snapshot()
+    assert abort_metrics.interrupted_cohorts == 1
+    assert abort_metrics.dropped_games == 2
+    assert abort_metrics.dropped_decisions == 2
+    assert abort_metrics.completed_decisions == 0
+    assert abort_metrics.full_decisions == 2
+    assert abort_metrics.fast_decisions == 0
 
 
 def make_replay_sample(

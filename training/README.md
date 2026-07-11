@@ -86,7 +86,7 @@ rustup toolchain install 1.93.0 --profile minimal
 
 uv venv --python 3.11 .venv
 source .venv/bin/activate
-uv pip install --index-url https://download.pytorch.org/whl/cu126 "torch>=2.4"
+uv pip install --index-url https://download.pytorch.org/whl/cu126 "torch>=2.13"
 uv pip install "maturin==1.14.1" -e ".[test,serve,onnx]"
 maturin develop --release --locked --manifest-path crates/star-py/Cargo.toml
 
@@ -210,8 +210,11 @@ control unchanged:
 startrain-orchestrate --config configs/h100-8gpu-optimized.yaml
 ```
 
-It uses 128-game actor cohorts, seven actor GPUs, learner/arena pause-sharing on GPU 0,
-and learner-aware progressive rings. Copy and freeze it per run exactly like the
+It uses 128-game actor cohorts, seven actor GPUs, learner-aware progressive rings,
+and coordinator-owned actor/arena pause-sharing on GPU 7. GPU 0 remains dedicated
+to the learner. Promotion receives a token-matched ready acknowledgement only after
+`actor-gpu-7` exits, and the actor is restored only after the arena result and any
+champion update are durable. Copy and freeze the profile per run exactly like the
 control profile.
 
 The orchestrator has no `--run-id` or `--run-identity` option. It atomically creates
@@ -245,8 +248,11 @@ For the 8-GPU profile, `runs/h100-8gpu/` contains:
   shipped profiles. `starserve` accepts only this role.
 - `learner/metrics.jsonl` and `learner/learner-complete.json`: training metrics and
   final completion identity.
-- `arena/promotion-status.json` and arena result JSON: persisted paired evaluation.
-- `status/`: coordinator and worker heartbeats.
+- `arena/promotion-status.json`, arena result JSON, and
+  `arena/pause-lease-events.jsonl`: persisted paired evaluation and promotion-side
+  lease transitions.
+- `status/`: coordinator/worker heartbeats plus the tokenized
+  `arena-gpu-pause.json` request and coordinator-owned `.ack.json`.
 - `metrics/`: coordinator and actor JSONL metrics.
 - `logs/`: one combined stdout/stderr log per child.
 

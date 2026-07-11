@@ -38,9 +38,13 @@ class RoleEvaluator:
         self.model_version = model_version
         self.selected_action = selected_action
         self.calls = 0
+        self.evaluator_calls = 0
+        self.evaluator_rows = 0
 
     def evaluate(self, requests: FakeRequests) -> InferenceResponse:
         self.calls += 1
+        self.evaluator_calls += 1
+        self.evaluator_rows += len(requests)
         logits = [0.0, 0.0]
         logits[self.selected_action] = 1.0
         return InferenceResponse(
@@ -151,6 +155,11 @@ def test_arena_pairs_identical_openings_and_reverses_roles() -> None:
     assert any(pair["forced_opening"] for pair in result["pairs"])
     assert result["search"]["pie_rule"] is False
     assert result["search"]["deterministic"] is True
+    evaluation = result["evaluation_metrics"]
+    assert evaluation["candidate_evaluator_calls"] == candidate.calls
+    assert evaluation["baseline_evaluator_calls"] == baseline.calls
+    assert evaluation["total_evaluator_rows"] == candidate.calls + baseline.calls
+    assert evaluation["evaluator_rows_per_second"] > 0
 
 
 def test_pair_level_elo_and_e_process_promotion_with_anytime_ring_floors() -> None:

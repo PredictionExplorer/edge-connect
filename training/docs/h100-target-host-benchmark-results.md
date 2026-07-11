@@ -20,14 +20,17 @@ fsync-bound 4 KiB writes/s.
 The following target-host gates passed:
 
 - Rust formatting, Clippy and workspace tests
-- Ruff, Pyright and 107 non-CUDA Python/native tests
-- compiled BF16 CUDA forward/backward and repeated-inference soak
+- Ruff, Pyright and 122 non-CUDA Python/native tests
+- all ten static BF16 CUDA forward/backward shapes and reverse cache reuse
 - exact native/Python feature parity
-- real two-rank NCCL BF16 optimizer step with matching parameters
+- rank-shifted ten-ring NCCL BF16 optimizer steps with matching parameters
 - replay generation, checkpoint publication and resume contracts
-- learner/arena pause sharing
+- coordinator-owned actor/arena GPU handoff with token-matched acknowledgement
 - graceful actor and DataLoader shutdown
 - a complete 10-step learner run with two terminal candidate arena decisions
+
+The production ring-12 batch-512 backward gate used 50.8 GB allocated and
+52.0 GB reserved memory, leaving safe headroom on an 80 GB H100.
 
 ## Inference boundary
 
@@ -58,12 +61,19 @@ simulations/s. The first treatment exposed excessive stop latency on a ring-12
 cohort; incomplete cohorts now abort at a search-wave boundary without writing
 partial replay.
 
-Moving promotion to the learner GPU with pause sharing and assigning GPU 7 as
-a seventh actor raised aggregate throughput to 100.9k simulations/s, 73% above
-control. The run stopped within seven seconds with every worker exiting zero.
+The initial treatment moved promotion to the learner GPU with pause sharing
+and assigned GPU 7 as a seventh actor. It raised aggregate throughput to
+100.9k simulations/s, 73% above control, but production-sized arenas would
+pause the learner for hours.
 
 The selected reusable profile is
 [`../configs/h100-8gpu-optimized.yaml`](../configs/h100-8gpu-optimized.yaml).
+The reusable profile now keeps learner GPU 0 continuous and
+coordinator-pauses `actor-gpu-7` before arena work on GPU 7. The token-matched
+request/ready/release protocol was exercised twice in a complete learner and
+arena cycle. Actor handoff took 2.01 and 1.01 seconds, released GPU memory
+before arena allocation, preserved a zero restart count, and restored the
+actor only after durable result/champion persistence.
 
 ## Progressive board curriculum
 
@@ -81,19 +91,44 @@ On the target host, the corrected curriculum:
 
 Learner compilation is static per homogeneous ring. Dynamic backward
 compilation was rejected after reproducing a PyTorch Inductor `CantSplit`
-failure on the target host.
+failure on the target host. Static compilation now uses an isolated
+ten-specialization budget: the original eight-entry Dynamo limit caused the
+failed preflight learner to restart nine times after reaching step 360.
+
+## Prelaunch learning-efficiency experiment
+
+Three matched-compute seeds compared champion-only self-play with an 80%
+candidate / 20% champion mixture on rings 3–6. Direct paired evaluation at
+matched learner steps produced:
+
+- seed 101: +107.5 Elo;
+- seed 202: +8.7 Elo;
+- seed 303: -26.1 Elo.
+
+The aggregate point estimate was +29.0 Elo over 60 pairs, but its paired
+bootstrap interval was approximately -37.8 to +98.1 Elo and its anytime lower
+bound was -80.6 Elo. Two seeds were positive, but the preregistered lower-bound
+gate did not pass. The production run therefore retains champion-only
+self-play rather than spending a multi-day run on an inconclusive treatment.
 
 ## Active production run
 
-- run ID: `star-opt-20260711T0030Z`
-- run root: `/home/ubuntu/edgeconnect-runs/star-opt-20260711T0030Z`
-- service: `edgeconnect-startrain-star-opt-20260711T0030Z.service`
-- profile: frozen, SHA-256 recorded
+- run ID: `star-maxlearn-20260711T0500Z`
+- run root: `/home/ubuntu/edgeconnect-runs/star-maxlearn-20260711T0500Z`
+- service: `edgeconnect-startrain-star-maxlearn-20260711T0500Z.service`
+- profile and source tree: frozen with SHA-256 records
 - retention: enabled in dry-run mode
 
-The service is enabled across reboot and started with seven healthy actors,
-one learner and pause-shared promotion. No worker or service restart was
-observed during startup.
+The clean run started with seven healthy actors, one continuous learner and
+actor-pause-shared promotion. The learner passed the replay gate, began
+training, and reached measured steps with zero worker or systemd restarts.
+
+Arena calibration doubled a round from 25 to 50 pairs per ring while increasing
+wall time only from 71.2 to 84.8 seconds in the reduced-search calibration.
+Evaluator throughput rose from 1,788 to 2,992 rows/s. The production profile
+uses 50-pair rounds, 15k-step candidate publication, candidate backlog
+coalescing, candidate-specific seed blocks, a 45k plateau limit and a
+worst-case final drain allowance.
 
 ## Time estimate
 

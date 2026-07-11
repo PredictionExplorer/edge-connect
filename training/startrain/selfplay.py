@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import hashlib
+import math
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Protocol, Sequence
 
 import numpy as np
@@ -146,6 +149,38 @@ class GameSummary:
 
 
 @dataclass(frozen=True, slots=True)
+class SelfPlayMetrics:
+    """Monotonic counters for one self-play actor lifetime.
+
+    Decision-mode, pass, and entropy counters are recorded when a decision is
+    made. ``completed_decisions`` and ``dropped_decisions`` partition those
+    attempts at the end of a run.
+    """
+
+    completed_decisions: int = 0
+    full_decisions: int = 0
+    fast_decisions: int = 0
+    pass_decisions: int = 0
+    policy_entropy_count: int = 0
+    policy_entropy_sum: float = 0.0
+    interrupted_cohorts: int = 0
+    dropped_games: int = 0
+    dropped_decisions: int = 0
+    replay_append_calls: int = 0
+    replay_append_bytes: int = 0
+    replay_append_seconds: float = 0.0
+
+    def delta(self, previous: "SelfPlayMetrics") -> "SelfPlayMetrics":
+        values = {
+            field: getattr(self, field) - getattr(previous, field)
+            for field in self.__dataclass_fields__
+        }
+        if any(value < 0 for value in values.values()):
+            raise ValueError("self-play metrics counters must be monotonic")
+        return SelfPlayMetrics(**values)
+
+
+@dataclass(frozen=True, slots=True)
 class SelfPlayIdentity:
     run_id: str
     generation_family: str
@@ -198,6 +233,34 @@ class SelfPlayActor:
         self.pending_samples: list[ReplaySample] = []
         self.pending_phases: list[int] = []
         self.persisted_decisions = 0
+        self.completed_decisions = 0
+        self.full_decisions = 0
+        self.fast_decisions = 0
+        self.pass_decisions = 0
+        self.policy_entropy_count = 0
+        self.policy_entropy_sum = 0.0
+        self.interrupted_cohorts = 0
+        self.dropped_games = 0
+        self.dropped_decisions = 0
+        self.replay_append_calls = 0
+        self.replay_append_bytes = 0
+        self.replay_append_seconds = 0.0
+
+    def metrics_snapshot(self) -> SelfPlayMetrics:
+        return SelfPlayMetrics(
+            completed_decisions=self.completed_decisions,
+            full_decisions=self.full_decisions,
+            fast_decisions=self.fast_decisions,
+            pass_decisions=self.pass_decisions,
+            policy_entropy_count=self.policy_entropy_count,
+            policy_entropy_sum=self.policy_entropy_sum,
+            interrupted_cohorts=self.interrupted_cohorts,
+            dropped_games=self.dropped_games,
+            dropped_decisions=self.dropped_decisions,
+            replay_append_calls=self.replay_append_calls,
+            replay_append_bytes=self.replay_append_bytes,
+            replay_append_seconds=self.replay_append_seconds,
+        )
 
     def run(
         self,
@@ -235,7 +298,13 @@ class SelfPlayActor:
         completed_decisions = sum(summary.samples for summary in summaries)
         if len({summary.game_id for summary in summaries}) != len(summaries):
             raise RuntimeError("self-play generated duplicate game identifiers")
-        if self.pending_samples or self.persisted_decisions != completed_decisions:
+        if (
+            self.pending_samples
+            or self.persisted_decisions != completed_decisions
+            or self.completed_decisions != completed_decisions
+            or self.full_decisions + self.fast_decisions
+            != completed_decisions + self.dropped_decisions
+        ):
             raise RuntimeError(
                 "completed-game and persisted-decision accounting disagree"
             )
@@ -267,13 +336,17 @@ class SelfPlayActor:
             if all(bool(terminal) for terminal in state_data.terminal):
                 break
             if stop_requested():
+                dropped_decisions = sum(len(row) for row in trajectories)
+                self.interrupted_cohorts += 1
+                self.dropped_games += cohort_size
+                self.dropped_decisions += dropped_decisions
                 if progress is not None:
                     progress(
                         phase="selfplay_abort",
                         cohort=cohort,
                         ply_wave=iteration,
                         dropped_games=cohort_size,
-                        dropped_decisions=sum(len(row) for row in trajectories),
+                        dropped_decisions=dropped_decisions,
                     )
                 return []
             current_pin = (
@@ -359,14 +432,18 @@ class SelfPlayActor:
         offsets = [int(value) for value in results.action_offsets]
         actions = [int(value) for value in results.actions]
         probabilities = np.asarray(results.policy_target, dtype=np.float32)
+        selected_actions = [int(value) for value in results.selected_actions]
         if len(offsets) != len(positions) + 1 or offsets[-1] != len(actions):
             raise RuntimeError("native search result CSR is invalid")
+        if len(selected_actions) != len(positions):
+            raise RuntimeError("native search selected-action rows are invalid")
         stones_placed = list(getattr(state_data, "stones_placed"))
         terminal = [bool(value) for value in results.terminal]
         for row, position in enumerate(positions):
             if terminal[row]:
                 continue
             policy = None
+            policy_entropy = None
             if full_search or self.config.record_fast_policy_targets:
                 start, end = offsets[row], offsets[row + 1]
                 if end <= start or end > probabilities.size:
@@ -383,6 +460,18 @@ class SelfPlayActor:
                 if mass <= 0:
                     raise RuntimeError("completed-Q policy has no mass")
                 policy /= mass
+                positive = policy[policy > 0]
+                policy_entropy = max(
+                    0.0,
+                    -float(
+                        np.sum(
+                            positive * np.log(positive),
+                            dtype=np.float64,
+                        )
+                    ),
+                )
+                if not math.isfinite(policy_entropy):
+                    raise RuntimeError("completed-Q policy entropy is not finite")
             trajectories[row].append(
                 _Decision(
                     position=position,
@@ -394,6 +483,15 @@ class SelfPlayActor:
                     ply=len(trajectories[row]),
                 )
             )
+            if full_search:
+                self.full_decisions += 1
+            else:
+                self.fast_decisions += 1
+            if selected_actions[row] == -1:
+                self.pass_decisions += 1
+            if policy_entropy is not None:
+                self.policy_entropy_count += 1
+                self.policy_entropy_sum += policy_entropy
 
     def _finalize_rows(
         self,
@@ -451,6 +549,7 @@ class SelfPlayActor:
                     )
                 )
                 self.pending_phases.append(decision.phase)
+                self.completed_decisions += 1
             metadata = trajectory_rows[row]
             summaries.append(
                 GameSummary(
@@ -491,6 +590,7 @@ class SelfPlayActor:
         if model_step is None:
             model_step = self.evaluator.model_step
         expected = len(self.pending_samples)
+        append_started = time.perf_counter()
         record = self.sink.append(
             self.pending_samples,
             phase_min=min(self.pending_phases),
@@ -503,9 +603,20 @@ class SelfPlayActor:
             actor_id=self.identity.actor_id,
             generation=self.identity.generation,
         )
+        append_seconds = time.perf_counter() - append_started
         persisted = int(getattr(record, "sample_count", expected))
         if persisted != expected:
             raise RuntimeError("replay sink persisted an unexpected decision count")
+        append_bytes = 0
+        record_path = getattr(record, "path", None)
+        if record_path is not None:
+            try:
+                append_bytes = Path(record_path).stat().st_size
+            except (OSError, TypeError, ValueError):
+                pass
+        self.replay_append_calls += 1
+        self.replay_append_bytes += append_bytes
+        self.replay_append_seconds += append_seconds
         self.persisted_decisions += persisted
         self.pending_samples = []
         self.pending_phases = []

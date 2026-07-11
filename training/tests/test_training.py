@@ -1,3 +1,4 @@
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -9,7 +10,7 @@ from startrain.checkpoint import (
     load_checkpoint,
     save_checkpoint,
 )
-from startrain.config import SchedulerConfig, load_config
+from startrain.config import ConfigError, SchedulerConfig, load_config
 from startrain.export import ONNX_INPUT_NAMES, ONNXStarModel, export_onnx
 from startrain.features import DoubleStarPosition, encode_batch
 from startrain.model import GraphResTNet, ModelConfig
@@ -95,7 +96,7 @@ def test_yaml_configs_load_strictly() -> None:
         gpu.actor_batch_size for gpu in optimized.orchestration.actor_gpus
     } == {128}
     assert optimized.orchestration.actor_games_per_batch == 128
-    assert optimized.orchestration.promotion.gpu_id == 0
+    assert optimized.orchestration.promotion.gpu_id == 7
     assert optimized.orchestration.promotion.pause_sharing_mode is True
 
 
@@ -113,6 +114,30 @@ def test_yaml_parses_opt_in_learner_ring_mixture_curriculum(tmp_path) -> None:
 
     experiment = load_config(configured)
     assert experiment.learner.use_ring_mixture_curriculum is True
+
+
+def test_plateau_candidate_cadence_fits_replay_lag() -> None:
+    experiment = load_config(CONFIGS / "h100-8gpu.yaml")
+    with pytest.raises(ConfigError, match="reset-triggering candidate"):
+        replace(
+            experiment,
+            learner=replace(experiment.learner, candidate_interval=10_000),
+        )
+    with pytest.raises(ConfigError, match="replay lag eligibility"):
+        replace(
+            experiment,
+            learner=replace(
+                experiment.learner,
+                candidate_interval=20_000,
+            ),
+            orchestration=replace(
+                experiment.orchestration,
+                plateau=replace(
+                    experiment.orchestration.plateau,
+                    max_learner_champion_lag_steps=50_000,
+                ),
+            ),
+        )
 
 
 def test_optimizer_decay_groups_and_muon_selection() -> None:
@@ -138,6 +163,41 @@ def test_optimizer_decay_groups_and_muon_selection() -> None:
         group["algorithm"] == "adamw" and group["weight_decay"] == 0
         for group in muon.param_groups
     )
+
+
+def test_compile_forwards_isolated_recompile_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = tiny_model()
+    calls: list[dict[str, object]] = []
+
+    def compile_model(module, **options):
+        assert module is model
+        calls.append(options)
+        return module
+
+    monkeypatch.setattr(torch, "compile", compile_model)
+    compiled = maybe_compile_model(
+        model,
+        enabled=True,
+        dynamic=False,
+        fullgraph=True,
+        backend="eager",
+        recompile_limit=10,
+        isolate_recompiles=True,
+    )
+    assert compiled is model
+    assert calls == [
+        {
+            "dynamic": False,
+            "fullgraph": True,
+            "backend": "eager",
+            "recompile_limit": 10,
+            "isolate_recompiles": True,
+        }
+    ]
+    with pytest.raises(ValueError, match="recompile_limit"):
+        maybe_compile_model(model, enabled=True, recompile_limit=0)
 
 
 def test_bf16_compiled_train_step_scheduler_and_checkpoint(tmp_path) -> None:

@@ -6,13 +6,13 @@ import pytest
 from startrain.features import DoubleStarPosition, encode_batch
 from startrain.model import GraphResTNet, ModelConfig
 from startrain.topology import get_topology
-from startrain.training import maybe_compile_model
+from startrain.training import maybe_compile_model, unwrap_model
 
 
-def _batch(batch_size: int = 4):
-    topology = get_topology(3)
+def _batch(batch_size: int = 4, *, rings: int = 3):
+    topology = get_topology(rings)
     position = DoubleStarPosition(
-        rings=3,
+        rings=rings,
         stones=torch.full((topology.n,), -1, dtype=torch.int8),
         to_move=0,
         moves_left=1,
@@ -35,26 +35,38 @@ def _model() -> GraphResTNet:
 
 
 @pytest.mark.cuda
+@pytest.mark.timeout(600)
 def test_cuda_bf16_compiled_forward_backward_is_finite() -> None:
     model = _model()
+    parameter_ids = tuple(id(parameter) for parameter in model.parameters())
     compiled = maybe_compile_model(
-        model, enabled=True, dynamic=False, fullgraph=True, backend="inductor"
+        model,
+        enabled=True,
+        dynamic=False,
+        fullgraph=True,
+        backend="inductor",
+        recompile_limit=10,
+        isolate_recompiles=True,
     )
-    batch = _batch()
-    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-        output = compiled(*batch.model_args())
-        loss = (
-            output.wdl_logits.float().square().mean()
-            + output.score_margin_logits.float().square().mean()
-            + output.ownership_logits.float().square().mean()
+    assert unwrap_model(compiled) is model
+    assert tuple(id(parameter) for parameter in model.parameters()) == parameter_ids
+    for rings in (*range(3, 13), *range(12, 2, -1)):
+        model.zero_grad(set_to_none=True)
+        batch = _batch(batch_size=2, rings=rings)
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            output = compiled(*batch.model_args())
+            loss = (
+                output.wdl_logits.float().square().mean()
+                + output.score_margin_logits.float().square().mean()
+                + output.ownership_logits.float().square().mean()
+            )
+        loss.backward()
+        torch.cuda.synchronize()
+        assert torch.isfinite(loss)
+        assert all(
+            parameter.grad is None or bool(torch.isfinite(parameter.grad).all())
+            for parameter in model.parameters()
         )
-    loss.backward()
-    torch.cuda.synchronize()
-    assert torch.isfinite(loss)
-    assert all(
-        parameter.grad is None or bool(torch.isfinite(parameter.grad).all())
-        for parameter in model.parameters()
-    )
 
 
 @pytest.mark.cuda
