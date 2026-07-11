@@ -7,29 +7,29 @@
  * Optional classic and pie-rule UI modes are outside this parity contract.
  */
 
-export const STAR_RULES_VERSION = 1 as const;
+export const STAR_RULES_VERSION = 2 as const;
 export const STAR_RULES_HASH_ALGORITHM = 'fnv1a64' as const;
-export const STAR_RULES_SCHEMA_ID = 'edgeconnect.star.rules.v1' as const;
+export const STAR_RULES_SCHEMA_ID = 'edgeconnect.star.rules.v2' as const;
 export const STAR_CONFORMANCE_SCHEMA_ID =
-  'edgeconnect.star.conformance.v1' as const;
+  'edgeconnect.star.conformance.v2' as const;
 /**
  * Model feature definitions live outside this TypeScript rules package.
  * Exported identifiers let training/inference artifacts pin their own schema
  * without folding model-only changes into the gameplay rules hash.
  */
 export const STAR_FEATURE_SCHEMA_ID =
-  'edgeconnect.star.model-features.external.v1' as const;
+  'edgeconnect.star.model-features.external.v2' as const;
 export const STAR_ACTION_LAYOUT_SCHEMA_ID =
-  'edgeconnect.star.action-layout.nodes-then-pass.v1' as const;
-export const STAR_PASS_ACTION_CODE = -1 as const;
+  'edgeconnect.star.action-layout.nodes-only.v1' as const;
 
 export const STAR_RULES_CONTRACT = {
   schema: STAR_RULES_SCHEMA_ID,
   version: STAR_RULES_VERSION,
   variant: 'double-star',
   board: {
-    minimumRings: 3,
-    maximumRings: 12,
+    supportedRings: [4, 6, 8, 10],
+    minimumRings: 4,
+    maximumRings: 10,
     nodeCount: '5*rings*(rings+1)/2',
     nodeOrder: 'ring-major, then sector-major, then position-major',
     ringStart: '5*x*(x-1)/2',
@@ -70,27 +70,23 @@ export const STAR_RULES_CONTRACT = {
     total: 'peries + quarkPeri + award',
     leader: 'higher total, then higher quark count, otherwise tie',
     terminalValue:
-      'from terminal toMove perspective: winner 1, loser -1, tie 0',
-    wdlClass: 'loss 0, draw 1, win 2',
+      'from terminal toMove perspective: winner 1, loser -1; a terminal tie is invalid',
+    outcomeClass: 'loss 0, win 1',
     scoreMargin: 'toMove total - opponent total',
   },
   game: {
     openingPlacements: 1,
     laterTurnPlacements: 2,
     pieRule: false,
-    actionTypes: ['place', 'pass'],
+    actionTypes: ['place'],
     actionWireEncoding: {
       place: 'dense node id 0..n-1',
-      pass: STAR_PASS_ACTION_CODE,
     },
-    legalActionOrder: 'legal placements by ascending node id, then pass',
-    nativeActionLayout: 'node u at slot u; pass at slot n',
-    pass: 'forfeits the remainder of the current turn',
-    termination: 'board full or two consecutive pass actions',
+    legalActionOrder: 'legal placements by ascending node id',
+    nativeActionLayout: 'node u at slot u',
+    termination: 'board full',
     fullBoardResidual:
-      'the final placement decrements movesLeft and terminates before endTurn; actor and turnCount are retained; movesLeft is 0 or 1; midTurn is movesLeft > 0; passStreak is 0; lastMove is the final node; currentTurnMoves retains the final partial turn',
-    doublePassResidual:
-      'the first pass ends the turn with movesLeft 2 and clears currentTurnMoves; the second pass terminates without endTurn with passStreak 2, movesLeft 2, midTurn false, unchanged lastMove, and the second passer retained as toMove',
+      'the final placement decrements movesLeft and terminates before endTurn; actor and turnCount are retained; movesLeft is 0 or 1; midTurn is movesLeft > 0; lastMove is the final node; currentTurnMoves retains the final partial turn',
     terminalLegalActions: 'none',
     placement: 'only an empty in-range node is legal',
     replay: 'apply the ordered action log to a fresh initial state',
@@ -103,7 +99,7 @@ export const STAR_RULES_CONTRACT = {
     ringCoordinate: 't = sector*ring + position modulo 5*ring',
     rotation: 'r(k): t -> t + k*ring for k in 0..4',
     reflection: 'f(k): t -> k*ring - t for k in 0..4',
-    action: 'place transforms by the node map; pass is invariant',
+    action: 'place transforms by the node map',
   },
 } as const;
 
@@ -112,8 +108,8 @@ export const STAR_RULES_CONTRACT = {
  * bytes so every runtime derives the same unsigned 64-bit fingerprint.
  */
 export const STAR_RULES_CANONICAL = [
-  'double-star/rules-v1;',
-  'rings=integer:3..12;',
+  'double-star/rules-v2;',
+  'rings=even:{4,6,8,10};',
   'node-count=5*r*(r+1)/2;',
   'node-order=x:1..r,s:0..4,y:0..x-1;',
   'node-id=5*x*(x-1)/2+s*x+y;',
@@ -133,30 +129,27 @@ export const STAR_RULES_CANONICAL = [
   'opening-placements=1;',
   'later-turn-placements=2;',
   'pie=false;',
-  'actions=atomic-place-pass;',
-  'action-wire=place(node)->node,pass->-1;',
-  'legal-order=empty-node-id-ascending,pass-last;',
-  'native-action-layout=node-u-at-u,pass-at-n;',
-  'pass=forfeit-turn-remainder;',
-  'placement-resets-pass-streak=0;',
-  'terminal=full-or-two-consecutive-passes;',
-  'full-terminal=decrement-movesLeft,retain-actor-and-turnCount,no-endTurn,movesLeft-in-{0,1},midTurn=(movesLeft>0),passStreak=0,lastMove=final-node,currentTurnMoves=final-partial-turn;',
-  'double-pass-terminal=first-pass-endTurn-to-movesLeft-2-and-clear-currentTurnMoves,second-pass-retain-actor,no-endTurn,passStreak=2,movesLeft=2,midTurn=false,lastMove=unchanged;',
+  'actions=atomic-place;',
+  'action-wire=place(node)->node;',
+  'legal-order=empty-node-id-ascending;',
+  'native-action-layout=node-u-at-u;',
+  'terminal=full;',
+  'full-terminal=decrement-movesLeft,retain-actor-and-turnCount,no-endTurn,movesLeft-in-{0,1},midTurn=(movesLeft>0),lastMove=final-node,currentTurnMoves=final-partial-turn;',
   'pair-semantic=AB==BA-excluding-lastMove;',
   'stones=empty:-1,players:0,1;',
   'star=same-color-connected-group-with-at-least-two-directly-occupied-peries;',
   'territory=after-dead-removal,maximal-nonalive-component-owned-iff-adjacent-alive-color-set-is-exactly-one-player;',
   'score=peries+quark-peri+2*(opponent-stars-own-stars);',
   'tiebreak=quarks;',
-  'terminal-value=toMove-perspective:win=1,draw=0,loss=-1;',
-  'wdl-class=loss:0,draw:1,win:2;',
+  'terminal-value=toMove-perspective:win=1,loss=-1,tie=invalid;',
+  'outcome-class=loss:0,win:1;',
   'score-margin=toMove-total-opponent-total;',
   'terminal-legal-actions=empty;',
   'd5-order=r0,r1,r2,r3,r4,f0,f1,f2,f3,f4;',
   'd5-coordinate=t=s*x+y(mod5*x);',
   'd5-rk=t+k*x(mod5*x);',
   'd5-fk=k*x-t(mod5*x);',
-  'd5-action=map-place-node,pass-invariant',
+  'd5-action=map-place-node',
 ].join('');
 
 /** Compute the unsigned 64-bit FNV-1a hash used by the parity contract. */
@@ -172,4 +165,4 @@ export function fnv1a64(value: string): string {
 
 /** Stable wire fingerprint for the complete gameplay contract above. */
 export const STAR_RULES_HASH =
-  'fnv1a64:cdb34fb02be82843' as const;
+  'fnv1a64:2da3783519381453' as const;

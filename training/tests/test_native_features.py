@@ -22,9 +22,9 @@ from startrain.replay import (
     augment_sample,
     collate_replay_samples,
 )
-from startrain.scoring import score_position
+from startrain.scoring import PlayerScore, ScoreResult
 from startrain.symmetry import D5Transform
-from startrain.topology import get_topology
+from startrain.topology import SUPPORTED_RINGS, get_topology
 
 
 def assert_encoded_equal(actual: EncodedBatch, expected: EncodedBatch) -> None:
@@ -78,16 +78,24 @@ def live_sample(rings: int) -> ReplaySample:
         to_move=1,
         moves_left=2,
         opening=False,
-        pass_streak=0,
         terminal=False,
     )
-    legal = np.concatenate(((stones.numpy() == -1), np.asarray([True])))
+    legal = stones.numpy() == -1
     policy = legal.astype(np.float32)
     policy /= policy.sum()
     return ReplaySample.from_position(
         position,
         policy=policy,
-        final_score=score_position(topology, stones),
+        final_score=ScoreResult(
+            players=(
+                PlayerScore(10, 3, 1, 1, 0, 11),
+                PlayerScore(5, 2, 1, 0, 0, 5),
+            ),
+            node_owner=torch.zeros(topology.n, dtype=torch.int8),
+            alive_stone=torch.zeros(topology.n, dtype=torch.bool),
+            contested_peries=0,
+            leader=0,
+        ),
         search_provenance="mcts:native-feature-parity",
         policy_provenance="visits",
     )
@@ -97,7 +105,7 @@ def live_sample(rings: int) -> ReplaySample:
 def test_native_features_and_scores_match_oracle_all_rings_and_d5() -> None:
     native = pytest.importorskip("star_native")
     reset_native_feature_path_stats()
-    for rings in range(3, 13):
+    for rings in SUPPORTED_RINGS:
         topology = get_topology(rings)
         states = native.StateBatch(rings, 3)
         states.apply_many([1], [0])
@@ -112,21 +120,19 @@ def test_native_features_and_scores_match_oracle_all_rings_and_d5() -> None:
                 transformed.feature_data(), transformed.score_data()
             )
     stats = native_feature_path_stats()
-    assert stats["native_state_batches"] == 100
-    assert stats["native_state_rows"] == 300
+    assert stats["native_state_batches"] == 40
+    assert stats["native_state_rows"] == 120
     assert not any(key.startswith("python_") for key in stats)
 
 
 @pytest.mark.native
-def test_native_features_cover_double_pass_and_full_board_terminals() -> None:
+def test_native_features_cover_full_board_terminals() -> None:
     native = pytest.importorskip("star_native")
-    topology = get_topology(3)
-    states = native.StateBatch(3, 2)
-    states.apply_many([0, 0], [-1, -1])
-    states.apply_many([1] * topology.n, list(range(topology.n)))
+    topology = get_topology(4)
+    states = native.StateBatch(4, 1)
+    states.apply_many([0] * topology.n, list(range(topology.n)))
     state_data = states.data()
-    assert list(state_data.terminal) == [True, True]
-    assert list(state_data.pass_streak) == [2, 0]
+    assert list(state_data.terminal) == [True]
     assert_encoded_equal(
         encode_native_state_data(state_data),
         encode_batch(positions_from_native(state_data)),
@@ -138,25 +144,33 @@ def test_native_features_cover_double_pass_and_full_board_terminals() -> None:
 def test_heterogeneous_learner_batch_uses_native_exact_path() -> None:
     pytest.importorskip("star_native")
     samples = [
-        augment_sample(live_sample(rings), D5Transform.from_index(rings - 3))
-        for rings in range(3, 13)
+        augment_sample(live_sample(rings), D5Transform.from_index(index))
+        for index, rings in enumerate(SUPPORTED_RINGS)
     ]
-    topology = get_topology(3)
+    topology = get_topology(4)
     terminal = DoubleStarPosition(
-        rings=3,
-        stones=torch.full((topology.n,), -1, dtype=torch.int8),
+        rings=4,
+        stones=torch.arange(topology.n, dtype=torch.int8) % 2,
         to_move=1,
-        moves_left=2,
+        moves_left=0,
         opening=False,
-        pass_streak=2,
         terminal=True,
     )
     samples.append(
         ReplaySample.from_position(
             terminal,
             policy=None,
-            final_score=score_position(topology, terminal.stones),
-            search_provenance="terminal:double-pass",
+            final_score=ScoreResult(
+                players=(
+                    PlayerScore(10, 3, 1, 1, 0, 11),
+                    PlayerScore(5, 2, 1, 0, 0, 5),
+                ),
+                node_owner=torch.zeros(topology.n, dtype=torch.int8),
+                alive_stone=torch.zeros(topology.n, dtype=torch.bool),
+                contested_peries=0,
+                leader=0,
+            ),
+            search_provenance="terminal:full-board",
             policy_provenance="none",
         )
     )

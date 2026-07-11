@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Measure the real Python→native-feature→GPU inference boundary.
 
-This benchmark intentionally includes native-state decoding, schema-v2 feature
+This benchmark intentionally includes native-state decoding, schema-v3 feature
 construction, host-to-device transfer, model execution, and legal-logit copies.
 It is therefore a more useful actor-capacity gate than a model-only microbenchmark.
 """
@@ -20,6 +20,7 @@ from startrain.config import load_config
 from startrain.inference import GraphInferenceAdapter, InferenceConfig
 from startrain.model import GraphResTNet
 from startrain.native import load_star_native
+from startrain.topology import get_topology
 from startrain.training import maybe_compile_model
 
 
@@ -46,6 +47,7 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit(
             "batch-size/iterations must be positive and warmup non-negative"
         )
+    get_topology(arguments.rings)
     device = torch.device(arguments.device)
     if device.type != "cuda" or not torch.cuda.is_available():
         raise SystemExit("hardware preflight requires a CUDA device")
@@ -67,7 +69,6 @@ def main(argv: list[str] | None = None) -> int:
         config=InferenceConfig(
             precision=experiment.train.precision,
             score_utility_weight=experiment.selfplay.score_utility_weight,
-            initial_pass_logit_penalty=(experiment.selfplay.initial_pass_logit_penalty),
         ),
         model_version="hardware-preflight",
     )

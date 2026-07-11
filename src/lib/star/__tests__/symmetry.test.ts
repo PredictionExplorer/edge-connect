@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { getBoard, MAX_RINGS, MIN_RINGS, type Board } from '../board';
+import { getBoard, SUPPORTED_RINGS, type Board } from '../board';
 import {
   applyAction,
   initialState,
@@ -55,7 +55,6 @@ function expectStateEquivariant(
     toMove: transformed.toMove,
     movesLeft: transformed.movesLeft,
     midTurn: transformed.midTurn,
-    passStreak: transformed.passStreak,
     over: transformed.over,
     canSwap: transformed.canSwap,
     swapped: transformed.swapped,
@@ -65,7 +64,6 @@ function expectStateEquivariant(
     toMove: original.toMove,
     movesLeft: original.movesLeft,
     midTurn: original.midTurn,
-    passStreak: original.passStreak,
     over: original.over,
     canSwap: original.canSwap,
     swapped: original.swapped,
@@ -85,7 +83,7 @@ function expectStateEquivariant(
 
 describe('D5 board symmetries', () => {
   it('uses the exact sector/ring/position formulas', () => {
-    const board = getBoard(7);
+    const board = getBoard(8);
     for (let u = 0; u < board.n; u++) {
       const s = board.sectorOf[u];
       const x = board.ringOf[u];
@@ -104,8 +102,8 @@ describe('D5 board symmetries', () => {
     }
   });
 
-  it('is a graph automorphism preserving perimeter and quarks for rings 3..12', () => {
-    for (let rings = MIN_RINGS; rings <= MAX_RINGS; rings++) {
+  it('is a graph automorphism on every supported board', () => {
+    for (const rings of SUPPORTED_RINGS) {
       const board = getBoard(rings);
       const neighbors = neighborSets(board);
       for (const symmetry of D5_SYMMETRIES) {
@@ -132,7 +130,7 @@ describe('D5 board symmetries', () => {
   });
 
   it('obeys D5 composition and inverse laws', () => {
-    const board = getBoard(5);
+    const board = getBoard(6);
     for (const after of D5_SYMMETRIES) {
       const inverse = inverseD5Symmetry(after);
       expect(composeD5Symmetries(inverse, after).id).toBe('r0');
@@ -153,7 +151,7 @@ describe('D5 board symmetries', () => {
   });
 
   it('round-trips complete stone arrays on every board size', () => {
-    for (let rings = MIN_RINGS; rings <= MAX_RINGS; rings++) {
+    for (const rings of SUPPORTED_RINGS) {
       const board = getBoard(rings);
       const stones = new Int8Array(board.n);
       for (let u = 0; u < board.n; u++) {
@@ -173,9 +171,9 @@ describe('D5 board symmetries', () => {
 });
 
 describe('D5 scoring equivariance', () => {
-  it('preserves scores and transforms per-node results for rings 3..12', () => {
+  it('preserves scores and transforms per-node results', () => {
     const rng = mulberry32(0xd5e91a);
-    for (let rings = MIN_RINGS; rings <= MAX_RINGS; rings++) {
+    for (const rings of SUPPORTED_RINGS) {
       const board = getBoard(rings);
       for (const density of [0.08, 0.45, 0.9]) {
         const stones = new Int8Array(board.n).fill(EMPTY);
@@ -213,32 +211,33 @@ describe('D5 scoring equivariance', () => {
 describe('D5 Double *Star transition and replay equivariance', () => {
   it('commutes with every action, intermediate transition, and replay', () => {
     const config: GameConfig = {
-      rings: 5,
+      rings: 6,
       mode: 'double',
       pieRule: false,
       playerNames: ['Aurora', 'Vega'],
     };
     const board = getBoard(config.rings);
     const log: GameAction[] = [
-      { type: 'place', node: board.idx(0, 5, 0) },
+      { type: 'place', node: board.idx(0, 6, 0) },
       { type: 'place', node: board.idx(1, 4, 1) },
       { type: 'place', node: board.idx(2, 4, 2) },
-      { type: 'place', node: board.idx(3, 5, 0) },
-      { type: 'pass' },
-      { type: 'place', node: board.idx(4, 5, 1) },
+      { type: 'place', node: board.idx(3, 6, 0) },
+      { type: 'place', node: board.idx(4, 6, 1) },
       { type: 'place', node: board.idx(0, 4, 2) },
-      { type: 'pass' },
-      { type: 'pass' },
+      { type: 'place', node: board.idx(2, 5, 3) },
     ];
 
     for (const symmetry of D5_SYMMETRIES) {
       expect(
         transformActions(
           board,
-          [{ type: 'pass' }, { type: 'swap' }],
+          [{ type: 'place', node: 0 }, { type: 'swap' }],
           symmetry,
         ),
-      ).toEqual([{ type: 'pass' }, { type: 'swap' }]);
+      ).toEqual([
+        { type: 'place', node: transformNode(board, 0, symmetry) },
+        { type: 'swap' },
+      ]);
       const transformedLog = transformActions(board, log, symmetry);
       expect(
         transformActions(

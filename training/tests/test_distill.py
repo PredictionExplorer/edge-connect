@@ -23,29 +23,37 @@ from startrain.distill import (
 )
 from startrain.features import DoubleStarPosition
 from startrain.model import ModelConfig, StarModelOutput
-from startrain.publish import publish_browser_artifacts
+from startrain.publish import WASM_ASSET_DIRECTORY, publish_browser_artifacts
 from startrain.replay import ReplaySample, write_replay_shard
-from startrain.scoring import score_position
+from startrain.scoring import PlayerScore, ScoreResult
 from startrain.topology import get_topology
 
 
 def replay_sample() -> ReplaySample:
-    topology = get_topology(3)
+    topology = get_topology(4)
     stones = torch.full((topology.n,), -1, dtype=torch.int8)
     position = DoubleStarPosition(
-        rings=3,
+        rings=4,
         stones=stones,
         to_move=0,
         moves_left=1,
         opening=True,
-        pass_streak=0,
         terminal=False,
     )
-    policy = np.full(topology.n + 1, 1.0 / (topology.n + 1), dtype=np.float32)
+    policy = np.full(topology.n, 1.0 / topology.n, dtype=np.float32)
     return ReplaySample.from_position(
         position,
         policy=policy,
-        final_score=score_position(topology, stones),
+        final_score=ScoreResult(
+            players=(
+                PlayerScore(10, 3, 1, 1, 0, 11),
+                PlayerScore(5, 2, 1, 0, 0, 5),
+            ),
+            node_owner=torch.zeros(topology.n, dtype=torch.int8),
+            alive_stone=torch.zeros(topology.n, dtype=torch.bool),
+            contested_peries=0,
+            leader=0,
+        ),
         search_provenance="distill-test-search",
         policy_provenance="completed-q",
     )
@@ -75,14 +83,14 @@ def test_distillation_smoke_emits_checksum_verified_browser_manifest(
         ),
         loss=DistillationLossConfig(
             policy=1.0,
-            wdl=1.0,
+            outcome=1.0,
             score_margin=0.1,
             ownership=0.1,
             alive=0.1,
         ),
         export=DistillationExportConfig(
             output_directory=output,
-            model_version="browser-smoke-v1",
+            model_version="browser-smoke-v2",
             recommended_search=BrowserSearchConfig(
                 simulations=8,
                 max_considered=4,
@@ -97,15 +105,25 @@ def test_distillation_smoke_emits_checksum_verified_browser_manifest(
     assert artifacts.onnx.is_file()
     assert artifacts.checkpoint_sha256 == sha256_file(artifacts.checkpoint)
     assert artifacts.onnx_sha256 == sha256_file(artifacts.onnx)
+    assert manifest["schema_version"] == 2
     assert manifest["artifacts"]["onnx"]["sha256"] == artifacts.onnx_sha256
     assert manifest["artifacts"]["checkpoint"]["sha256"] == artifacts.checkpoint_sha256
     assert manifest["precision"] == "float16"
     assert manifest["architecture"]["all_size"] is True
+    assert manifest["outcome"] == {
+        "classes": ["loss", "win"],
+        "value": "P(win)-P(loss)",
+    }
     assert manifest["tensors"]["inputs"]["node_features"]["shape"] == [
         "batch",
         "nodes",
         15,
     ]
+    assert manifest["tensors"]["inputs"]["legal_action_mask"]["shape"] == [
+        "batch",
+        "nodes",
+    ]
+    assert manifest["tensors"]["outputs"]["outcome_logits"]["shape"] == ["batch", 2]
     assert manifest["recommended_local_search"]["simulations"] == 8
     assert artifacts.final_losses["total"] >= 0
     wasm_source = tmp_path / "wasm-build"
@@ -131,9 +149,18 @@ def test_distillation_smoke_emits_checksum_verified_browser_manifest(
     assert json.loads(canonical.read_text()) == manifest
     published_onnx = tmp_path / "public" / "models" / "star" / artifacts.onnx.name
     assert sha256_file(published_onnx) == artifacts.onnx_sha256
-    assert (tmp_path / "public" / "models" / "star" / "wasm" / "star_wasm.js").is_file()
     assert (
-        (tmp_path / "public" / "models" / "star" / "wasm" / "star_wasm_bg.wasm")
+        tmp_path / "public" / "models" / "star" / WASM_ASSET_DIRECTORY / "star_wasm.js"
+    ).is_file()
+    assert (
+        (
+            tmp_path
+            / "public"
+            / "models"
+            / "star"
+            / WASM_ASSET_DIRECTORY
+            / "star_wasm_bg.wasm"
+        )
         .read_bytes()
         .startswith(b"\x00asm")
     )
@@ -173,8 +200,8 @@ def test_distillation_smoke_emits_checksum_verified_browser_manifest(
 def test_teacher_logit_kl_covers_all_distilled_heads() -> None:
     output = StarModelOutput(
         policy_logits=torch.tensor([[2.0, 0.0, -1.0]]),
-        wdl_logits=torch.tensor([[1.0, 0.0, -1.0]]),
-        score_margin_logits=torch.zeros(1, 363),
+        outcome_logits=torch.tensor([[1.0, -1.0]]),
+        score_margin_logits=torch.zeros(1, 303),
         ownership_logits=torch.tensor([[[1.0, 0.0, -1.0], [0.0, 1.0, -1.0]]]),
         alive_logits=torch.tensor([[1.0, -1.0]]),
         soft_policy_logits=torch.zeros(1, 3),
@@ -188,7 +215,7 @@ def test_teacher_logit_kl_covers_all_distilled_heads() -> None:
     )
     assert set(losses) == {
         "policy_kl",
-        "wdl_kl",
+        "outcome_kl",
         "score_margin_kl",
         "ownership_kl",
         "alive_kl",

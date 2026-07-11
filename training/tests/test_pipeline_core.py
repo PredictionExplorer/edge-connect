@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-import json
 import hashlib
+import json
 import os
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
+from dataclasses import replace
 from types import SimpleNamespace
 
 import numpy as np
@@ -11,6 +12,7 @@ import pytest
 import torch
 from torch import nn
 
+from startrain.checkpoint import ExponentialMovingAverage, save_checkpoint
 from startrain.config import (
     CurriculumStage,
     DataConfig,
@@ -21,14 +23,16 @@ from startrain.config import (
 )
 from startrain.contracts import (
     TARGET_ALIVE,
+    TARGET_OUTCOME,
     TARGET_OWNERSHIP,
     TARGET_POLICY,
     TARGET_SCORE_MARGIN,
-    TARGET_WDL,
 )
+from startrain.features import DoubleStarPosition
 from startrain.inference import (
     GraphInferenceAdapter,
     InferenceConfig,
+    InferenceMetrics,
     InferenceResponse,
 )
 from startrain.learner import (
@@ -51,12 +55,14 @@ from startrain.replay_store import (
     ShardRecord,
 )
 from startrain.runtime import RunIdentity
-from startrain.scoring import score_position
-from startrain.selfplay import SelfPlayActor, SelfPlayConfig, SelfPlayIdentity
-from startrain.topology import get_topology
+from startrain.scoring import PlayerScore, ScoreResult, score_position
+from startrain.selfplay import (
+    SelfPlayActor,
+    SelfPlayConfig,
+    SelfPlayMetrics,
+)
+from startrain.topology import SUPPORTED_RINGS, get_topology
 from startrain.training import build_scheduler
-from startrain.checkpoint import ExponentialMovingAverage, save_checkpoint
-from startrain.features import DoubleStarPosition
 
 
 def pack_mask(mask: torch.Tensor) -> list[int]:
@@ -80,29 +86,34 @@ class FakeStateData:
     moves_left: list[int]
     opening: list[bool]
     mid_turn: list[bool]
-    pass_streak: list[int]
     terminal: list[bool]
-    pass_legal: list[bool]
 
 
-def state_data(position: DoubleStarPosition) -> FakeStateData:
-    legal = (position.stones == -1) & (not position.terminal)
+def state_data(positions: list[DoubleStarPosition]) -> FakeStateData:
+    assert positions and len({position.rings for position in positions}) == 1
+    zero_bits: list[int] = []
+    one_bits: list[int] = []
+    legal_bits: list[int] = []
+    for position in positions:
+        zero_bits.extend(pack_mask(position.stones == 0))
+        one_bits.extend(pack_mask(position.stones == 1))
+        legal_bits.extend(pack_mask((position.stones == -1) & (not position.terminal)))
     return FakeStateData(
-        rings=position.rings,
-        node_count=position.stones.numel(),
-        batch_size=1,
-        zero_bits=pack_mask(position.stones == 0),
-        one_bits=pack_mask(position.stones == 1),
-        legal_bits=pack_mask(legal),
-        hashes=[123],
-        stones_placed=[int((position.stones >= 0).sum())],
-        to_move=[position.to_move],
-        moves_left=[position.moves_left],
-        opening=[position.opening],
-        mid_turn=[position.moves_left == 1 and not position.opening],
-        pass_streak=[position.pass_streak],
-        terminal=[position.terminal],
-        pass_legal=[not position.terminal],
+        rings=positions[0].rings,
+        node_count=positions[0].stones.numel(),
+        batch_size=len(positions),
+        zero_bits=zero_bits,
+        one_bits=one_bits,
+        legal_bits=legal_bits,
+        hashes=list(range(len(positions))),
+        stones_placed=[int((position.stones >= 0).sum()) for position in positions],
+        to_move=[position.to_move for position in positions],
+        moves_left=[position.moves_left for position in positions],
+        opening=[position.opening for position in positions],
+        mid_turn=[
+            position.moves_left == 1 and not position.opening for position in positions
+        ],
+        terminal=[position.terminal for position in positions],
     )
 
 
@@ -127,16 +138,17 @@ class FixedNetwork(nn.Module):
         legal = arguments[-1]
         batch, nodes = node_features.shape[:2]
         policy = torch.arange(
-            nodes + 1, device=node_features.device, dtype=node_features.dtype
+            nodes, device=node_features.device, dtype=node_features.dtype
         ).expand(batch, -1)
-        policy = policy + self.anchor
-        policy = policy.masked_fill(~legal, torch.finfo(policy.dtype).min)
-        margin = torch.zeros(batch, 363, device=node_features.device)
-        margin[:, 181] = 4
+        policy = (policy + self.anchor).masked_fill(
+            ~legal, torch.finfo(policy.dtype).min
+        )
+        margin = torch.zeros(batch, 303, device=node_features.device)
+        margin[:, 151] = 4
         return StarModelOutput(
             policy_logits=policy,
-            wdl_logits=torch.tensor(
-                [[0.0, 0.0, 2.0]], device=node_features.device
+            outcome_logits=torch.tensor(
+                [[0.0, 2.0]], device=node_features.device
             ).expand(batch, -1),
             score_margin_logits=margin,
             ownership_logits=torch.zeros(batch, nodes, 3, device=node_features.device),
@@ -146,564 +158,207 @@ class FixedNetwork(nn.Module):
 
 
 def opening_position() -> DoubleStarPosition:
-    topology = get_topology(3)
+    topology = get_topology(4)
     return DoubleStarPosition(
-        rings=3,
+        rings=4,
         stones=torch.full((topology.n,), -1, dtype=torch.int8),
         to_move=0,
         moves_left=1,
         opening=True,
-        pass_streak=0,
         terminal=False,
     )
 
 
-def test_inference_maps_dense_logits_to_native_legal_order_and_keeps_pass() -> None:
-    position = opening_position()
-    actions = list(range(position.stones.numel())) + [-1]
-    requests = FakeEvalBatch(
-        tokens=[99],
-        states=state_data(position),
-        legal_offsets=[0, len(actions)],
-        legal_actions=actions,
-    )
-    adapter = GraphInferenceAdapter(
-        FixedNetwork(),
-        config=InferenceConfig(initial_pass_logit_penalty=2.5),
-        model_version="fixed",
-    )
-    before = adapter.metrics_snapshot()
-    response = adapter.evaluate(requests)
-    assert response.tokens == [99]
-    assert response.policy_offsets == [0, len(actions)]
-    assert response.policy_logits[:-1] == pytest.approx(
-        list(range(position.stones.numel()))
-    )
-    assert response.policy_logits[-1] == pytest.approx(position.stones.numel() - 2.5)
-    assert response.values[0] > 0
-    assert actions[-1] == -1
-    after = adapter.metrics_snapshot()
-    assert after.evaluator_calls == 1
-    assert after.evaluator_rows == 1
-    assert after.delta(before) == after
-
-
-def test_inference_packed_d2h_preserves_multirow_uneven_csr_offsets() -> None:
+def test_inference_maps_node_logits_to_native_legal_order() -> None:
     first = opening_position()
+    second_stones = first.stones.clone()
+    second_stones[0] = 0
     second = DoubleStarPosition(
-        rings=3,
-        stones=first.stones.clone(),
+        rings=4,
+        stones=second_stones,
         to_move=1,
         moves_left=2,
         opening=False,
-        pass_streak=0,
         terminal=False,
     )
-    second.stones[0] = 0
-    rows = [state_data(first), state_data(second)]
-    states = FakeStateData(
-        rings=3,
-        node_count=first.stones.numel(),
-        batch_size=2,
-        zero_bits=[*rows[0].zero_bits, *rows[1].zero_bits],
-        one_bits=[*rows[0].one_bits, *rows[1].one_bits],
-        legal_bits=[*rows[0].legal_bits, *rows[1].legal_bits],
-        hashes=[123, 456],
-        stones_placed=[0, 1],
-        to_move=[0, 1],
-        moves_left=[1, 2],
-        opening=[True, False],
-        mid_turn=[False, False],
-        pass_streak=[0, 0],
-        terminal=[False, False],
-        pass_legal=[True, True],
-    )
-    first_actions = list(range(first.stones.numel())) + [-1]
-    second_actions = list(range(1, second.stones.numel())) + [-1]
+    first_actions = list(range(first.stones.numel()))
+    second_actions = list(range(1, second.stones.numel()))
     requests = FakeEvalBatch(
         tokens=[7, 9],
-        states=states,
+        states=state_data([first, second]),
         legal_offsets=[0, len(first_actions), len(first_actions) + len(second_actions)],
         legal_actions=[*first_actions, *second_actions],
     )
-    adapter = GraphInferenceAdapter(
-        FixedNetwork(),
-        config=InferenceConfig(initial_pass_logit_penalty=2.5),
-        model_version="fixed",
+    adapter = GraphInferenceAdapter(FixedNetwork(), model_version="fixed")
+
+    detailed = adapter.evaluate_detailed(requests)
+
+    assert detailed.response.tokens == [7, 9]
+    assert detailed.response.policy_offsets == requests.legal_offsets
+    assert detailed.response.policy_logits[: len(first_actions)] == pytest.approx(
+        first_actions
     )
+    assert detailed.response.policy_logits[len(first_actions) :] == pytest.approx(
+        second_actions
+    )
+    assert detailed.outcome_probabilities[0] == pytest.approx([0.11920292, 0.88079708])
+    assert detailed.outcome_values[0] == pytest.approx(0.76159416)
+    assert all(action >= 0 for action in requests.legal_actions)
+
+
+def test_inference_preserves_uneven_multirow_node_csr_and_metrics() -> None:
+    first = opening_position()
+    second_stones = first.stones.clone()
+    second_stones[[0, 3]] = torch.tensor([0, 1], dtype=torch.int8)
+    second = DoubleStarPosition(
+        rings=4,
+        stones=second_stones,
+        to_move=0,
+        moves_left=1,
+        opening=False,
+        terminal=False,
+    )
+    first_actions = list(range(first.stones.numel()))
+    second_actions = [
+        node for node, stone in enumerate(second.stones.tolist()) if stone == -1
+    ]
+    requests = FakeEvalBatch(
+        tokens=[7, 9],
+        states=state_data([first, second]),
+        legal_offsets=[0, len(first_actions), len(first_actions) + len(second_actions)],
+        legal_actions=[*first_actions, *second_actions],
+    )
+    adapter = GraphInferenceAdapter(FixedNetwork(), model_version="fixed")
+    before = adapter.metrics_snapshot()
 
     response = adapter.evaluate(requests)
 
     assert response.tokens == [7, 9]
     assert response.policy_offsets == requests.legal_offsets
-    assert len(response.values) == 2
-    assert response.policy_logits[: len(first_actions) - 1] == pytest.approx(
-        list(range(first.stones.numel()))
+    assert response.policy_logits[: len(first_actions)] == pytest.approx(first_actions)
+    assert response.policy_logits[len(first_actions) :] == pytest.approx(second_actions)
+    after = adapter.metrics_snapshot()
+    assert after.evaluator_calls == 1
+    assert after.evaluator_rows == 2
+    assert after.delta(before) == after
+    assert adapter.last_feature_path == "python"
+
+
+def test_inference_validates_configuration_metrics_and_empty_batches() -> None:
+    with pytest.raises(ValueError, match="precision"):
+        InferenceConfig(precision="fp16")
+    with pytest.raises(ValueError, match="score_utility_weight"):
+        InferenceConfig(score_utility_weight=1.1)
+    with pytest.raises(ValueError, match="monotonic"):
+        InferenceMetrics().delta(InferenceMetrics(evaluator_calls=1))
+
+    empty = FakeEvalBatch(
+        tokens=[],
+        states=state_data([opening_position()]),
+        legal_offsets=[0],
+        legal_actions=[],
     )
-    assert response.policy_logits[len(first_actions) - 1] == pytest.approx(
-        first.stones.numel() - 2.5
+    empty.states.batch_size = 0
+    adapter = GraphInferenceAdapter(FixedNetwork())
+    assert adapter.evaluate(empty) == InferenceResponse([], [], [0], [])
+
+    malformed = FakeEvalBatch(
+        tokens=[1],
+        states=state_data([opening_position()]),
+        legal_offsets=[1, 1],
+        legal_actions=[],
     )
-    second_logits = response.policy_logits[len(first_actions) :]
-    assert second_logits == pytest.approx(
-        [*range(1, second.stones.numel()), second.stones.numel()]
+    with pytest.raises(ValueError, match="CSR"):
+        adapter.evaluate(malformed)
+
+
+def decisive_score(position: DoubleStarPosition) -> ScoreResult:
+    topology = get_topology(position.rings)
+    return ScoreResult(
+        players=(
+            PlayerScore(10, 3, 1, 1, 0, 11),
+            PlayerScore(5, 2, 1, 0, 0, 5),
+        ),
+        node_owner=torch.zeros(topology.n, dtype=torch.int8),
+        alive_stone=torch.zeros(topology.n, dtype=torch.bool),
+        contested_peries=0,
+        leader=0,
     )
 
 
-class FakeEvaluator:
-    model_version = "fake-v1"
-    model_step = 7
-    model_identity = "sha256-" + "f" * 64
-
-    def evaluate(self, requests: FakeEvalBatch) -> InferenceResponse:
-        return InferenceResponse(
-            tokens=list(requests.tokens),
-            values=[0.0] * len(requests),
-            policy_offsets=list(requests.legal_offsets),
-            policy_logits=[0.0] * len(requests.legal_actions),
-        )
-
-
-class FakeStateBatch:
-    def __init__(self, rings: int, batch_size: int) -> None:
-        assert batch_size == 1
-        self.position = opening_position()
-        self.last_action = -2
-
-    def data(self) -> FakeStateData:
-        return state_data(self.position)
-
-    def apply_many(self, indices: list[int], actions: list[int]) -> None:
-        assert indices == [0]
-        self.last_action = actions[0]
-        stones = self.position.stones.clone()
-        if actions[0] >= 0:
-            stones[actions[0]] = self.position.to_move
-        self.position = DoubleStarPosition(
-            rings=3,
-            stones=stones,
-            to_move=0,
-            moves_left=2,
-            opening=False,
-            pass_streak=2,
-            terminal=True,
-        )
-
-    def reset_many(self, indices: list[int]) -> None:
-        assert indices == [0]
-        self.position = opening_position()
-
-    def score_data(self) -> object:
-        score = score_position(get_topology(3), self.position.stones)
-        components: list[int] = []
-        for player in score.players:
-            components.extend(
-                [
-                    player.peries,
-                    player.quarks,
-                    player.stars,
-                    player.quark_peri,
-                    player.award,
-                    player.total,
-                ]
-            )
-        components.extend([score.contested_peries, score.leader])
-        value = (
-            0.0
-            if score.leader == -1
-            else (1.0 if score.leader == self.position.to_move else -1.0)
-        )
-        margin = (
-            score.players[self.position.to_move].total
-            - score.players[1 - self.position.to_move].total
-        )
-        return SimpleNamespace(
-            batch_size=1,
-            node_count=30,
-            components=components,
-            node_owner=score.node_owner.tolist(),
-            alive_bits=pack_mask(score.alive_stone),
-            winner=[score.leader],
-            terminal_value=[value],
-            wdl_class=[int(value) + 1],
-            score_margin=[margin],
-            terminal_reason=[2],
-        )
-
-    def trajectory_data(self) -> object:
-        return SimpleNamespace(
-            batch_size=1,
-            last_move=[self.last_action],
-            current_turn_offsets=[0, 0],
-            current_turn_moves=[],
-            turn_count=[1],
-        )
-
-
-class FakeSearchBatch:
-    seeds: list[int] = []
-
-    def __init__(self, states: FakeStateBatch, **options: object) -> None:
-        self.states = states
-        self.initialized = False
-        self.seeds.append(int(options["deterministic_seed"]))
-
-    def root_requests(self) -> FakeEvalBatch:
-        data = self.states.data()
-        actions = list(range(30)) + [-1]
-        return FakeEvalBatch([55], data, [0, len(actions)], actions)
-
-    def initialize_roots(self, *buffers: object) -> None:
-        self.initialized = True
-
-    def is_done(self) -> bool:
-        return self.initialized
-
-    def next_requests(self) -> FakeEvalBatch:
-        raise AssertionError("fake search is complete after root initialization")
-
-    def submit(self, *buffers: object) -> None:
-        raise AssertionError("fake search has no leaf requests")
-
-    def results(self) -> object:
-        target = [1.0] + [0.0] * 30
-        return SimpleNamespace(
-            selected_actions=[-1],
-            terminal=[False],
-            terminal_values=[0.0],
-            action_offsets=[0, 31],
-            actions=list(range(30)) + [-1],
-            visits=[1] + [0] * 30,
-            q_values=[0.0] * 31,
-            policy_target=target,
-        )
-
-
-class FakeNative:
-    StateBatch = FakeStateBatch
-    SearchBatch = FakeSearchBatch
-
-
-class CapturingSink:
-    def __init__(self) -> None:
-        self.samples: list[ReplaySample] = []
-        self.calls: list[dict[str, object]] = []
-
-    def append(self, samples: list[ReplaySample], **metadata: object) -> object:
-        self.samples.extend(samples)
-        self.calls.append(metadata)
-        return object()
-
-
-@pytest.mark.parametrize("full", [False, True])
-def test_selfplay_retains_all_targets_but_policy_only_for_full_search(
-    full: bool,
-) -> None:
-    sink = CapturingSink()
-    config = SelfPlayConfig(
-        rings=3,
-        batch_size=1,
-        games=1,
-        fast_probability=0.0 if full else 1.0,
-        full_probability=1.0 if full else 0.0,
-        fast_simulations=2,
-        full_simulations=4,
-        simulation_reference_rings=3,
-        max_considered=2,
-        shard_size=8,
-        seed=41,
-    )
-    actor = SelfPlayActor(FakeNative, FakeEvaluator(), sink, config)
-    before_metrics = actor.metrics_snapshot()
-    summaries = actor.run()
-    assert len(summaries) == 1
-    assert summaries[0].model_version == "fake-v1"
-    assert len(sink.samples) == 1
-    target_mask = sink.samples[0].target_mask
-    required = TARGET_WDL | TARGET_SCORE_MARGIN | TARGET_OWNERSHIP | TARGET_ALIVE
-    assert target_mask & required == required
-    assert bool(target_mask & TARGET_POLICY) is full
-    if full:
-        assert sink.samples[0].policy[0] == 1
-        assert "completed-q" in sink.samples[0].policy_provenance
-    else:
-        assert not sink.samples[0].policy.any()
-    assert sink.calls[0]["model_step"] == 7
-    metrics = actor.metrics_snapshot()
-    assert metrics.completed_decisions == 1
-    assert metrics.full_decisions == int(full)
-    assert metrics.fast_decisions == int(not full)
-    assert metrics.pass_decisions == 1
-    assert metrics.policy_entropy_count == int(full)
-    assert metrics.policy_entropy_sum == pytest.approx(0.0)
-    assert metrics.replay_append_calls == 1
-    assert metrics.replay_append_seconds >= 0
-    assert metrics.delta(before_metrics) == metrics
-
-
-def test_selfplay_playout_randomization_is_seeded_and_board_scaled() -> None:
-    config = SelfPlayConfig(
-        rings=3,
-        batch_size=1,
-        games=1,
-        fast_probability=0.5,
-        full_probability=0.5,
-        fast_simulations=8,
-        full_simulations=32,
-        simulation_reference_rings=6,
-        simulation_ring_exponent=1.0,
-        max_considered=2,
-        seed=1234,
-    )
-    assert config.simulation_budget(full=False) == 4
-    assert config.simulation_budget(full=True) == 16
-    runs = []
-    for _ in range(2):
-        FakeSearchBatch.seeds.clear()
-        sink = CapturingSink()
-        SelfPlayActor(FakeNative, FakeEvaluator(), sink, config).run()
-        runs.append(
-            (
-                list(FakeSearchBatch.seeds),
-                sink.samples[0].policy.copy(),
-                sink.samples[0].search_provenance,
-            )
-        )
-    assert runs[0][0] == runs[1][0]
-    np.testing.assert_array_equal(runs[0][1], runs[1][1])
-    assert runs[0][2] == runs[1][2]
-
-
-def test_selfplay_measures_accessible_replay_append_bytes(tmp_path) -> None:
-    class SizedSink(CapturingSink):
-        def append(self, samples: list[ReplaySample], **metadata: object) -> object:
-            super().append(samples, **metadata)
-            path = tmp_path / "measured-shard.npz"
-            path.write_bytes(b"x" * 137)
-            return SimpleNamespace(sample_count=len(samples), path=path)
-
-    sink = SizedSink()
-    actor = SelfPlayActor(
-        FakeNative,
-        FakeEvaluator(),
-        sink,
-        SelfPlayConfig.cpu_smoke(seed=42),
-    )
-    actor.run()
-
-    metrics = actor.metrics_snapshot()
-    assert metrics.replay_append_calls == 1
-    assert metrics.replay_append_bytes == 137
-    assert metrics.replay_append_seconds >= 0
-
-
-def test_selfplay_exact_cohort_never_resets_or_drops_uneven_games(
-    monkeypatch,
-) -> None:
-    class UnevenStates:
-        reset_calls = 0
-
-        def __init__(self, rings: int, batch_size: int) -> None:
-            assert rings == 3 and batch_size == 2
-            self.remaining = [1, 3]
-            self.turns = [0, 0]
-
-        def data(self):
-            return SimpleNamespace(
-                terminal=[remaining == 0 for remaining in self.remaining],
-                stones_placed=list(self.turns),
-            )
-
-        def apply_many(self, indices, _actions):
-            for row in indices:
-                self.remaining[row] -= 1
-                self.turns[row] += 1
-
-        def reset_many(self, _indices):
-            UnevenStates.reset_calls += 1
-            raise AssertionError("exact cohorts must never reset rows")
-
-        def score_data(self):
-            return SimpleNamespace(
-                terminal_value=[0.0, 0.0],
-                score_margin=[0, 0],
-                terminal_reason=[2, 2],
-                winner=[-1, -1],
-            )
-
-        def trajectory_data(self):
-            return SimpleNamespace()
-
-    class UnevenSearch:
-        def __init__(self, states, **_options):
-            self.states = states
-            self.initialized = False
-
-        def root_requests(self):
-            active = sum(value > 0 for value in self.states.remaining)
-            return SimpleNamespace(
-                tokens=list(range(active)),
-                legal_offsets=list(range(active + 1)),
-                legal_actions=[0] * active,
-                __len__=lambda: active,
-            )
-
-        def initialize_roots(self, *_buffers):
-            self.initialized = True
-
-        def is_done(self):
-            return self.initialized
-
-        def next_requests(self):
-            raise AssertionError
-
-        def submit(self, *_buffers):
-            raise AssertionError
-
-        def results(self):
-            terminal = [value == 0 for value in self.states.remaining]
-            actions = [0 for value in self.states.remaining if value > 0]
-            offsets = [0]
-            for is_terminal in terminal:
-                offsets.append(offsets[-1] + (0 if is_terminal else 1))
-            return SimpleNamespace(
-                selected_actions=[-2 if is_terminal else 0 for is_terminal in terminal],
-                terminal=terminal,
-                action_offsets=offsets,
-                actions=actions,
-                policy_target=[1.0] * len(actions),
-            )
-
-    class UnevenEvaluator(FakeEvaluator):
-        def evaluate(self, requests):
-            count = len(requests.tokens)
-            return InferenceResponse(
-                tokens=list(requests.tokens),
-                values=[0.0] * count,
-                policy_offsets=list(requests.legal_offsets),
-                policy_logits=[0.0] * count,
-            )
-
-    topology = get_topology(3)
+def replay_sample(identity: RunIdentity, game_id: str) -> ReplaySample:
     position = opening_position()
-    final_score = score_position(topology, position.stones)
-    monkeypatch.setattr(
-        "startrain.selfplay.positions_from_native",
-        lambda data: [position for _ in data.terminal],
+    policy = np.ones(position.stones.numel(), dtype=np.float32)
+    policy /= policy.sum()
+    return ReplaySample.from_position(
+        position,
+        policy=policy,
+        final_score=decisive_score(position),
+        search_provenance="test",
+        policy_provenance="completed-q",
+        run_id=identity.run_id,
+        generation_family=identity.generation_family,
+        actor_id="actor-test",
+        game_id=game_id,
+        model_identity="sha256-" + "1" * 64,
     )
-    monkeypatch.setattr(
-        "startrain.selfplay.score_results_from_native",
-        lambda _data: [final_score, final_score],
+
+
+def test_replay_store_accepts_only_current_supported_data(tmp_path) -> None:
+    identity = RunIdentity(tmp_path / "run.json", "run-test", "family-test", 1)
+    with ReplayStore(tmp_path / "replay") as store:
+        generation = store.lease_generation(identity, "actor-test")
+        record = store.append(
+            [replay_sample(identity, "game-one")],
+            phase_min=0,
+            phase_max=0,
+            model_version="sha256-" + "1" * 64,
+            model_step=0,
+            model_identity="sha256-" + "1" * 64,
+            run_id=identity.run_id,
+            generation_family=identity.generation_family,
+            actor_id="actor-test",
+            generation=generation,
+        )
+        assert record.ring == 4
+        assert store.sample_counts_by_ring(
+            run_id=identity.run_id,
+            generation_family=identity.generation_family,
+        ) == {4: 1, 6: 0, 8: 0, 10: 0}
+        with pytest.raises(ValueError, match="one of"):
+            store.sample_counts_by_ring(
+                (5,),
+                run_id=identity.run_id,
+                generation_family=identity.generation_family,
+            )
+
+
+def test_curriculum_and_selfplay_reject_noncanonical_rings() -> None:
+    mixture = RingMixtureConfig(
+        curriculum=(
+            CurriculumStage(10, (4,)),
+            CurriculumStage(20, (4, 6)),
+        )
     )
-    monkeypatch.setattr(
-        "startrain.selfplay.trajectory_rows_from_native",
-        lambda _data: [
-            SimpleNamespace(turn_count=1, last_move=0),
-            SimpleNamespace(turn_count=3, last_move=0),
-        ],
-    )
-    sink = CapturingSink()
-    summaries = SelfPlayActor(
-        SimpleNamespace(StateBatch=UnevenStates, SearchBatch=UnevenSearch),
-        UnevenEvaluator(),
-        sink,
-        SelfPlayConfig(
-            rings=3,
-            batch_size=2,
-            games=2,
-            fast_probability=0.0,
-            full_probability=1.0,
-            fast_simulations=1,
-            full_simulations=1,
-            max_considered=1,
-            shard_size=64,
-        ),
-        SelfPlayIdentity("run-test", "family-test", "actor-test", 4),
-    ).run()
-    assert len(summaries) == 2
-    assert sorted(summary.samples for summary in summaries) == [1, 3]
-    assert len(sink.samples) == 4
-    assert UnevenStates.reset_calls == 0
-    assert len({summary.game_id for summary in summaries}) == 2
-    for game_id in {sample.game_id for sample in sink.samples}:
-        assert sorted(
-            sample.ply for sample in sink.samples if sample.game_id == game_id
-        ) == list(range(sum(sample.game_id == game_id for sample in sink.samples)))
+    assert mixture.active_rings(0) == (4,)
+    assert mixture.active_rings(10) == (4, 6)
+    assert mixture.active_rings(20) == SUPPORTED_RINGS
 
-    stopping = {"requested": False}
-    drained_sink = CapturingSink()
+    with pytest.raises(ValueError, match="one of"):
+        SelfPlayConfig(rings=5)
+    with pytest.raises(ValueError, match="one of"):
+        SelfPlayConfig(rings=4.0)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="selected"):
+        CurriculumStage(10, (4, 5))
 
-    def request_stop(**details):
-        if details.get("completed_games") == 2:
-            stopping["requested"] = True
 
-    drained = SelfPlayActor(
-        SimpleNamespace(StateBatch=UnevenStates, SearchBatch=UnevenSearch),
-        UnevenEvaluator(),
-        drained_sink,
-        SelfPlayConfig(
-            rings=3,
-            batch_size=2,
-            games=4,
-            fast_probability=0.0,
-            full_probability=1.0,
-            fast_simulations=1,
-            full_simulations=1,
-            max_considered=1,
-            shard_size=64,
-        ),
-        SelfPlayIdentity("run-test", "family-test", "actor-stop", 5),
-    ).run(
-        stop_requested=lambda: stopping["requested"],
-        progress=request_stop,
-    )
-    assert len(drained) == 2
-    assert len(drained_sink.samples) == sum(summary.samples for summary in drained)
-
-    abort_checks = {"count": 0}
-    abort_events: list[dict[str, object]] = []
-
-    def stop_mid_cohort() -> bool:
-        abort_checks["count"] += 1
-        return abort_checks["count"] >= 3
-
-    aborted_sink = CapturingSink()
-    aborted_actor = SelfPlayActor(
-        SimpleNamespace(StateBatch=UnevenStates, SearchBatch=UnevenSearch),
-        UnevenEvaluator(),
-        aborted_sink,
-        SelfPlayConfig(
-            rings=3,
-            batch_size=2,
-            games=2,
-            fast_probability=0.0,
-            full_probability=1.0,
-            fast_simulations=1,
-            full_simulations=1,
-            max_considered=1,
-            shard_size=64,
-        ),
-        SelfPlayIdentity("run-test", "family-test", "actor-abort", 6),
-    )
-    aborted = aborted_actor.run(
-        stop_requested=stop_mid_cohort,
-        progress=lambda **details: abort_events.append(details),
-    )
-    assert aborted == []
-    assert aborted_sink.samples == []
-    abort = next(event for event in abort_events if event["phase"] == "selfplay_abort")
-    assert abort["dropped_games"] == 2
-    assert abort["dropped_decisions"] == 2
-    abort_metrics = aborted_actor.metrics_snapshot()
-    assert abort_metrics.interrupted_cohorts == 1
-    assert abort_metrics.dropped_games == 2
-    assert abort_metrics.dropped_decisions == 2
-    assert abort_metrics.completed_decisions == 0
-    assert abort_metrics.full_decisions == 2
-    assert abort_metrics.fast_decisions == 0
+def test_inference_response_submit_contract_is_stable() -> None:
+    response = InferenceResponse([1], [0.25], [0, 1], [2.0])
+    assert response.submit_args() == ([1], [0.25], [0, 1], [2.0])
 
 
 def make_replay_sample(
-    rings: int = 3,
+    rings: int = 4,
     *,
     identity: RunIdentity | None = None,
     actor_id: str = "actor-test",
@@ -713,22 +368,20 @@ def make_replay_sample(
     model_identity: str = "sha256-" + "1" * 64,
 ) -> ReplaySample:
     topology = get_topology(rings)
-    stones = torch.full((topology.n,), -1, dtype=torch.int8)
     position = DoubleStarPosition(
         rings=rings,
-        stones=stones,
+        stones=torch.full((topology.n,), -1, dtype=torch.int8),
         to_move=0,
-        moves_left=2,
-        opening=False,
-        pass_streak=0,
+        moves_left=1,
+        opening=True,
         terminal=False,
     )
-    policy = np.ones(topology.n + 1, dtype=np.float32)
+    policy = np.ones(topology.n, dtype=np.float32)
     policy /= policy.sum()
     return ReplaySample.from_position(
         position,
         policy=policy,
-        final_score=score_position(topology, stones),
+        final_score=decisive_score(position),
         search_provenance="test",
         policy_provenance="completed-q",
         run_id=identity.run_id if identity is not None else "manual",
@@ -752,45 +405,62 @@ def run_identity(tmp_path) -> RunIdentity:
     )
 
 
-def test_replay_store_manifest_recency_lag_and_cursor(tmp_path) -> None:
+def append_replay(
+    store: ReplayStore,
+    samples: list[ReplaySample],
+    identity: RunIdentity,
+    *,
+    model_step: int,
+    generation: int = 0,
+) -> ShardRecord:
+    model_identity = "sha256-" + "1" * 64
+    return store.append(
+        samples,
+        phase_min=min(sample.ply for sample in samples),
+        phase_max=max(sample.ply for sample in samples),
+        model_version=model_identity,
+        model_step=model_step,
+        model_identity=model_identity,
+        run_id=identity.run_id,
+        generation_family=identity.generation_family,
+        actor_id="actor-test",
+        generation=generation,
+    )
+
+
+def test_replay_store_manifest_recency_lag_duplicates_and_cursor(tmp_path) -> None:
     identity = run_identity(tmp_path)
-    with ReplayStore(tmp_path / "replay") as store:
+    with ReplayStore(tmp_path / "replay-restored") as store:
         generation = store.lease_generation(identity, "actor-test")
         assert generation == 0
-        first = store.append(
-            [make_replay_sample(identity=identity, game_id="game-first")],
-            phase_min=0,
-            phase_max=3,
-            model_version="sha256-" + "1" * 64,
-            model_step=1,
-            model_identity="sha256-" + "1" * 64,
-            run_id=identity.run_id,
-            generation_family=identity.generation_family,
-            actor_id="actor-test",
-            generation=0,
-        )
-        second = store.append(
+        first = append_replay(
+            store,
             [
                 make_replay_sample(
                     identity=identity,
-                    game_id="game-second",
-                    ply=0,
-                ),
-                make_replay_sample(
-                    identity=identity,
-                    game_id="game-second",
-                    ply=1,
-                ),
+                    generation=generation,
+                    game_id="game-first",
+                )
             ],
-            phase_min=4,
-            phase_max=8,
-            model_version="sha256-" + "1" * 64,
+            identity,
+            model_step=1,
+            generation=generation,
+        )
+        second_samples = [
+            make_replay_sample(
+                identity=identity,
+                generation=generation,
+                game_id="game-second",
+                ply=ply,
+            )
+            for ply in range(2)
+        ]
+        second = append_replay(
+            store,
+            second_samples,
+            identity,
             model_step=10,
-            model_identity="sha256-" + "1" * 64,
-            run_id=identity.run_id,
-            generation_family=identity.generation_family,
-            actor_id="actor-test",
-            generation=0,
+            generation=generation,
         )
         assert first.path.exists() and second.path.exists()
         assert store.connection.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
@@ -801,18 +471,20 @@ def test_replay_store_manifest_recency_lag_and_cursor(tmp_path) -> None:
             current_model_step=10,
             max_model_lag_steps=2,
         )
-        assert len(recent) == 2
-        future = store.append(
-            [make_replay_sample(identity=identity, game_id="game-future")],
-            phase_min=0,
-            phase_max=0,
-            model_version="sha256-" + "1" * 64,
+        assert [sample.game_id for sample in recent] == ["game-second"] * 2
+
+        future = append_replay(
+            store,
+            [
+                make_replay_sample(
+                    identity=identity,
+                    generation=generation,
+                    game_id="game-future",
+                )
+            ],
+            identity,
             model_step=11,
-            model_identity="sha256-" + "1" * 64,
-            run_id=identity.run_id,
-            generation_family=identity.generation_family,
-            actor_id="actor-test",
-            generation=0,
+            generation=generation,
         )
         eligible = store.recent_shards(
             sample_window=100,
@@ -822,32 +494,19 @@ def test_replay_store_manifest_recency_lag_and_cursor(tmp_path) -> None:
             max_model_lag_steps=10,
         )
         assert future.shard_id not in {record.shard_id for record in eligible}
+
         before = set(store.shard_directory.glob("*.npz"))
         with pytest.raises(DuplicateGameError):
-            store.append(
-                [
-                    make_replay_sample(
-                        identity=identity,
-                        game_id="game-second",
-                        ply=0,
-                    ),
-                    make_replay_sample(
-                        identity=identity,
-                        game_id="game-second",
-                        ply=1,
-                    ),
-                ],
-                phase_min=0,
-                phase_max=1,
-                model_version="sha256-" + "1" * 64,
+            append_replay(
+                store,
+                second_samples,
+                identity,
                 model_step=10,
-                model_identity="sha256-" + "1" * 64,
-                run_id=identity.run_id,
-                generation_family=identity.generation_family,
-                actor_id="actor-test",
-                generation=0,
+                generation=generation,
             )
         assert set(store.shard_directory.glob("*.npz")) == before
+
+        assert store.get_cursor("learner") == ReplayCursor()
         store.set_cursor("learner", ReplayCursor(first.shard_id, 0))
         consumed = list(store.iter_after_cursor("learner"))
         assert [record.shard_id for record, _ in consumed] == [
@@ -860,43 +519,41 @@ def test_replay_store_manifest_recency_lag_and_cursor(tmp_path) -> None:
             record.shard_id for record, _ in store.iter_after_cursor("learner")
         ] == [future.shard_id]
         assert store.lease_generation(identity, "actor-test") == 1
-    orphan = tmp_path / "replay" / "shards" / "orphan.npz"
+
+    orphan = tmp_path / "replay-restored" / "shards" / "orphan.npz"
     orphan.write_bytes(b"orphan")
     os.utime(orphan, (1, 1))
-    with ReplayStore(tmp_path / "replay"):
+    with ReplayStore(tmp_path / "replay-restored") as reconciled:
         assert not orphan.exists()
+        assert reconciled.reconciliation_metrics["orphan_files"] == 1
 
 
 def test_replay_gc_watermark_and_quarantine_preserve_committed_ledger(
     tmp_path,
 ) -> None:
     identity = run_identity(tmp_path)
-    records = []
+    records: list[ShardRecord] = []
     with ReplayStore(tmp_path / "gc-replay") as store:
         generation = store.lease_generation(identity, "actor-test")
         for index in range(3):
             records.append(
-                store.append(
+                append_replay(
+                    store,
                     [
                         make_replay_sample(
                             identity=identity,
+                            generation=generation,
                             game_id=f"game-gc-{index}",
                         )
                     ],
-                    phase_min=0,
-                    phase_max=0,
-                    model_version="sha256-" + "1" * 64,
+                    identity,
                     model_step=0,
-                    model_identity="sha256-" + "1" * 64,
-                    run_id=identity.run_id,
-                    generation_family=identity.generation_family,
-                    actor_id="actor-test",
                     generation=generation,
                 )
             )
         protected = ReplaySelection(
             (ReplaySpan(records[0], 0, 1),),
-            {3: 1},
+            {4: 1},
             records[-1].shard_id,
         )
         assert (
@@ -933,21 +590,17 @@ def test_replay_gc_watermark_and_quarantine_preserve_committed_ledger(
             == 3
         )
         store.clear_gc_watermark("learner")
-        store.append(
+        append_replay(
+            store,
             [
                 make_replay_sample(
                     identity=identity,
+                    generation=generation,
                     game_id="game-gc-after-delete",
                 )
             ],
-            phase_min=0,
-            phase_max=0,
-            model_version="sha256-" + "1" * 64,
+            identity,
             model_step=0,
-            model_identity="sha256-" + "1" * 64,
-            run_id=identity.run_id,
-            generation_family=identity.generation_family,
-            actor_id="actor-test",
             generation=generation,
         )
         assert (
@@ -986,21 +639,17 @@ def test_legacy_replay_counter_migration_fails_closed_after_unknown_gc(
     with ReplayStore(root) as store:
         generation = store.lease_generation(identity, "actor-test")
         for index in range(2):
-            store.append(
+            append_replay(
+                store,
                 [
                     make_replay_sample(
                         identity=identity,
+                        generation=generation,
                         game_id=f"legacy-counter-{index}",
                     )
                 ],
-                phase_min=0,
-                phase_max=0,
-                model_version="sha256-" + "1" * 64,
+                identity,
                 model_step=0,
-                model_identity="sha256-" + "1" * 64,
-                run_id=identity.run_id,
-                generation_family=identity.generation_family,
-                actor_id="actor-test",
                 generation=generation,
             )
         deleted = store.collect_garbage(
@@ -1031,6 +680,7 @@ def test_legacy_replay_counter_migration_fails_closed_after_unknown_gc(
         learner.train_config = TrainConfig(per_rank_batch_size=1)
         learner.world_size = 1
         learner._latest_total_replay_samples = 0
+        learner.examples_consumed = 0
         with pytest.raises(ValueError, match="complete committed-sample history"):
             learner._utd_step_budget()
 
@@ -1058,8 +708,8 @@ def curriculum_learner_stub(*, enabled: bool = True) -> LearnerLoop:
     learner.data_config = DataConfig(ring_stratified=True)
     learner.ring_mixture_config = RingMixtureConfig(
         curriculum=(
-            CurriculumStage(until_samples=10, rings=(3, 4)),
-            CurriculumStage(until_samples=20, rings=(3, 4, 5, 6)),
+            CurriculumStage(until_samples=10, rings=(4,)),
+            CurriculumStage(until_samples=20, rings=(4, 6)),
         )
     )
     learner.rank = 0
@@ -1068,26 +718,26 @@ def curriculum_learner_stub(*, enabled: bool = True) -> LearnerLoop:
     return learner
 
 
-def test_learner_curriculum_readiness_expands_without_waiting_on_locked_rings() -> None:
+def test_learner_curriculum_readiness_expands_only_at_aggregate_boundaries() -> None:
     learner = curriculum_learner_stub()
-    early = {ring: 0 for ring in range(3, 13)}
-    early.update({3: 4, 4: 4})
-    assert learner._active_replay_rings(early) == (3, 4)
+    early = {ring: 0 for ring in SUPPORTED_RINGS}
+    early[4] = 4
+    assert learner._active_replay_rings(early) == (4,)
     assert learner._replay_is_ready(early)
     assert not curriculum_learner_stub(enabled=False)._replay_is_ready(early)
 
     transition = dict(early)
-    transition.update({3: 5, 4: 5})
-    assert learner._active_replay_rings(transition) == (3, 4, 5, 6)
+    transition[4] = 10
+    assert learner._active_replay_rings(transition) == (4, 6)
     assert not learner._replay_is_ready(transition)
 
     warmed = dict(transition)
-    warmed.update({5: 2, 6: 2})
+    warmed[6] = 2
     assert learner._replay_is_ready(warmed)
 
     fully_unlocked = dict(warmed)
-    fully_unlocked[3] = 11
-    assert learner._active_replay_rings(fully_unlocked) == tuple(range(3, 13))
+    fully_unlocked[4] = 18
+    assert learner._active_replay_rings(fully_unlocked) == SUPPORTED_RINGS
     assert not learner._replay_is_ready(fully_unlocked)
 
 
@@ -1100,7 +750,7 @@ def test_learner_curriculum_selects_only_currently_active_rings(tmp_path) -> Non
         def eligible_sample_counts(
             self, rings: tuple[int, ...], **_metadata: object
         ) -> dict[int, int]:
-            assert rings == tuple(range(3, 13))
+            assert rings == SUPPORTED_RINGS
             return dict(self.counts)
 
         def select_recent_spans(
@@ -1114,47 +764,41 @@ def test_learner_curriculum_selects_only_currently_active_rings(tmp_path) -> Non
             )
 
     learner = curriculum_learner_stub()
-    early = {ring: 0 for ring in range(3, 13)}
-    early.update({3: 4, 4: 4})
+    early = {ring: 0 for ring in SUPPORTED_RINGS}
+    early[4] = 4
     store = CapturingStore(early)
     learner.store = store
     learner.run_identity = run_identity(tmp_path)
 
-    assert tuple(learner._select_replay_spans().samples_by_ring) == (3, 4)
+    assert tuple(learner._select_replay_spans().samples_by_ring) == (4,)
 
-    store.counts.update({3: 5, 4: 5, 5: 2, 6: 2})
-    assert tuple(learner._select_replay_spans().samples_by_ring) == (3, 4, 5, 6)
+    store.counts.update({4: 10, 6: 2})
+    assert tuple(learner._select_replay_spans().samples_by_ring) == (4, 6)
 
-    store.counts = {ring: 2 for ring in range(3, 13)}
-    assert tuple(learner._select_replay_spans().samples_by_ring) == tuple(range(3, 13))
-    assert store.selections == [
-        (3, 4),
-        (3, 4, 5, 6),
-        tuple(range(3, 13)),
-    ]
+    store.counts = {ring: 5 for ring in SUPPORTED_RINGS}
+    assert tuple(learner._select_replay_spans().samples_by_ring) == SUPPORTED_RINGS
+    assert store.selections == [(4,), (4, 6), SUPPORTED_RINGS]
 
 
-def test_learner_runs_homogeneous_batch_publishes_and_resumes_curriculum_opt_in(
+def test_learner_runs_batch_publishes_metrics_and_resumes_example_cadence(
     tmp_path,
 ) -> None:
     identity = run_identity(tmp_path)
-    with ReplayStore(tmp_path / "replay") as store:
+    with ReplayStore(tmp_path / "learner-replay") as store:
         generation = store.lease_generation(identity, "actor-test")
-        assert generation == 0
-        store.append(
+        append_replay(
+            store,
             [
-                make_replay_sample(identity=identity, game_id="game-learner-a"),
-                make_replay_sample(identity=identity, game_id="game-learner-b"),
+                make_replay_sample(
+                    identity=identity,
+                    generation=generation,
+                    game_id=f"game-learner-{suffix}",
+                )
+                for suffix in ("a", "b")
             ],
-            phase_min=0,
-            phase_max=0,
-            model_version="sha256-" + "1" * 64,
+            identity,
             model_step=0,
-            model_identity="sha256-" + "1" * 64,
-            run_id=identity.run_id,
-            generation_family=identity.generation_family,
-            actor_id="actor-test",
-            generation=0,
+            generation=generation,
         )
         model = tiny_model()
         optimizer = build_optimizer(model, OptimizerConfig(kind="adamw"))
@@ -1185,10 +829,14 @@ def test_learner_runs_homogeneous_batch_publishes_and_resumes_curriculum_opt_in(
                 gradient_clip_norm=1.0,
                 scheduler=SchedulerConfig(warmup_steps=0, total_steps=4),
             ),
-            data_config=DataConfig(workers=0, ring_stratified=False),
+            data_config=DataConfig(
+                workers=0,
+                ring_stratified=False,
+                d5_augmentation=False,
+            ),
             loss_weights=LossWeights(),
             seed=5,
-            serialized_config={"schema_version": 2, "learner": {}},
+            serialized_config={"schema_version": 3, "learner": {}},
             run_identity=identity,
         )
         assert learner.run(steps=1) == 1
@@ -1204,6 +852,8 @@ def test_learner_runs_homogeneous_batch_publishes_and_resumes_curriculum_opt_in(
             step=learner.step,
             epoch=learner.epoch,
             config=learner.serialized_config,
+            examples_consumed=learner.examples_consumed,
+            global_batch_size=2,
         )
         checkpoint = published.checkpoint
         assert checkpoint.exists()
@@ -1223,6 +873,7 @@ def test_learner_runs_homogeneous_batch_publishes_and_resumes_curriculum_opt_in(
         assert metric["examples_consumed"] == 2
         assert metric["total_replay_samples"] == 2
         assert metric["updates_per_new_sample"] == 1
+
         learner.learner_config = replace(
             learner.learner_config,
             target_updates_per_new_sample=2.0,
@@ -1235,7 +886,6 @@ def test_learner_runs_homogeneous_batch_publishes_and_resumes_curriculum_opt_in(
         assert learner._candidate_due() is False
         learner.examples_consumed = 4
         assert learner._candidate_due() is True
-        learner.examples_consumed = 2
 
         restored_model = tiny_model()
         restored_optimizer = build_optimizer(
@@ -1260,7 +910,7 @@ def test_learner_runs_homogeneous_batch_publishes_and_resumes_curriculum_opt_in(
             loss_weights=LossWeights(),
             seed=5,
             serialized_config={
-                "schema_version": 2,
+                "schema_version": 3,
                 "learner": {"use_ring_mixture_curriculum": True},
             },
             run_identity=identity,
@@ -1273,6 +923,7 @@ def test_learner_runs_homogeneous_batch_publishes_and_resumes_curriculum_opt_in(
         assert restored.step == 1
         assert restored.examples_consumed == 2
         assert restored.learner_config.use_ring_mixture_curriculum is True
+
         legacy_checkpoint = save_checkpoint(
             tmp_path / "legacy-checkpoint.pt",
             model=restored.model,
@@ -1286,10 +937,6 @@ def test_learner_runs_homogeneous_batch_publishes_and_resumes_curriculum_opt_in(
                 "run_id": identity.run_id,
                 "generation_family": identity.generation_family,
             },
-        )
-        restored.learner_config = replace(
-            restored.learner_config,
-            target_updates_per_new_sample=1.0,
         )
         before_rejected_resume = {
             name: value.detach().clone()
@@ -1305,22 +952,23 @@ def test_learner_runs_homogeneous_batch_publishes_and_resumes_curriculum_opt_in(
             torch.testing.assert_close(value, before_rejected_resume[name])
 
 
-def test_learner_publishes_initial_ema_then_waits_for_minimum_replay(
+def test_learner_publishes_initial_ema_then_times_out_on_short_batch(
     tmp_path,
 ) -> None:
     identity = run_identity(tmp_path)
-    with ReplayStore(tmp_path / "empty-replay") as store:
+    with ReplayStore(tmp_path / "waiting-replay") as store:
         generation = store.lease_generation(identity, "actor-test")
-        store.append(
-            [make_replay_sample(identity=identity, game_id="game-only-sample")],
-            phase_min=0,
-            phase_max=0,
-            model_version="sha256-" + "1" * 64,
+        append_replay(
+            store,
+            [
+                make_replay_sample(
+                    identity=identity,
+                    generation=generation,
+                    game_id="game-only-sample",
+                )
+            ],
+            identity,
             model_step=0,
-            model_identity="sha256-" + "1" * 64,
-            run_id=identity.run_id,
-            generation_family=identity.generation_family,
-            actor_id="actor-test",
             generation=generation,
         )
         model = tiny_model()
@@ -1354,7 +1002,7 @@ def test_learner_publishes_initial_ema_then_waits_for_minimum_replay(
             data_config=DataConfig(workers=0, ring_stratified=False),
             loss_weights=LossWeights(),
             seed=5,
-            serialized_config={"schema_version": 2},
+            serialized_config={"schema_version": 3},
             run_identity=identity,
         )
         with pytest.raises(TimeoutError, match="minimum replay"):
@@ -1372,30 +1020,24 @@ def test_lazy_replay_sampler_is_unique_deterministic_and_homogeneous(
     identity = run_identity(tmp_path)
     with ReplayStore(tmp_path / "lazy-replay") as store:
         generation = store.lease_generation(identity, "actor-test")
-        assert generation == 0
-        for ring in (3, 4):
-            samples = [
-                make_replay_sample(
-                    ring,
-                    identity=identity,
-                    game_id=f"game-ring-{ring}-{index}",
-                )
-                for index in range(4)
-            ]
-            store.append(
-                samples,
-                phase_min=0,
-                phase_max=0,
-                model_version="sha256-" + "1" * 64,
+        for ring in (4, 6):
+            append_replay(
+                store,
+                [
+                    make_replay_sample(
+                        ring,
+                        identity=identity,
+                        generation=generation,
+                        game_id=f"game-ring-{ring}-{index}",
+                    )
+                    for index in range(4)
+                ],
+                identity,
                 model_step=0,
-                model_identity="sha256-" + "1" * 64,
-                run_id=identity.run_id,
-                generation_family=identity.generation_family,
-                actor_id="actor-test",
-                generation=0,
+                generation=generation,
             )
         selection = store.select_recent_spans(
-            rings=(3, 4),
+            rings=(4, 6),
             per_ring_quota=4,
             run_id=identity.run_id,
             generation_family=identity.generation_family,
@@ -1431,7 +1073,7 @@ def test_lazy_replay_sampler_is_unique_deterministic_and_homogeneous(
         assert len({dataset[index].rings for index in batch}) == 1
 
 
-def test_shard_aware_512_batch_decodes_once_and_materializes_selected_rows(
+def test_shard_aware_large_batch_decodes_once_and_materializes_selected_rows(
     tmp_path,
 ) -> None:
     sample = make_replay_sample(game_id="game-amplification")
@@ -1447,7 +1089,7 @@ def test_shard_aware_512_batch_decodes_once_and_materializes_selected_rows(
             path=path,
             created_ns=shard_id,
             sample_count=512,
-            ring=3,
+            ring=4,
             phase_min=0,
             phase_max=0,
             model_version="sha256-" + "1" * 64,
@@ -1464,7 +1106,7 @@ def test_shard_aware_512_batch_decodes_once_and_materializes_selected_rows(
         )
         spans.append(ReplaySpan(record, 0, 512))
     dataset = LazyShardReplayDataset(
-        ReplaySelection(tuple(spans), {3: 2048}, 4),
+        ReplaySelection(tuple(spans), {4: 2048}, 4),
         seed=1,
         epoch=0,
         augmentation_enabled=False,
@@ -1489,9 +1131,7 @@ def test_shard_aware_512_batch_decodes_once_and_materializes_selected_rows(
     assert dataset.sample_materialization_count == 17
 
 
-def test_plateau_policy_keeps_champion_replay_live_and_resets_after_rejections() -> (
-    None
-):
+def test_plateau_policy_keeps_replay_live_and_resets_after_rejections() -> None:
     common = {
         "soft_lag_steps": 20,
         "hard_replay_lag_steps": 50,
@@ -1500,6 +1140,15 @@ def test_plateau_policy_keeps_champion_replay_live_and_resets_after_rejections()
         "action": "reset_from_champion",
         "reset_already_applied": False,
     }
+    assert (
+        plateau_policy_decision(
+            lag_steps=19,
+            terminal_rejection=False,
+            rejection_streak=0,
+            **common,
+        )
+        == "proceed"
+    )
     assert (
         plateau_policy_decision(
             lag_steps=20,
@@ -1541,7 +1190,7 @@ def test_plateau_policy_keeps_champion_replay_live_and_resets_after_rejections()
 def test_ddp_replay_selection_metadata_is_broadcast_from_rank_zero(
     monkeypatch,
 ) -> None:
-    expected = ReplaySelection((), {3: 512}, 42)
+    expected = ReplaySelection((), {4: 512}, 42)
     learner = object.__new__(LearnerLoop)
     learner.world_size = 2
     learner.model = tiny_model()
@@ -1552,3 +1201,252 @@ def test_ddp_replay_selection_metadata_is_broadcast_from_rank_zero(
 
     monkeypatch.setattr(torch.distributed, "broadcast_object_list", broadcast)
     assert learner._broadcast_object(None) is expected
+
+
+class OneMoveStateBatch:
+    def __init__(self, rings: int, batch_size: int) -> None:
+        assert rings == 4 and batch_size == 1
+        topology = get_topology(rings)
+        stones = torch.zeros(topology.n, dtype=torch.int8)
+        stones[-1] = -1
+        self.position = DoubleStarPosition(
+            rings=4,
+            stones=stones,
+            to_move=0,
+            moves_left=1,
+            opening=False,
+            terminal=False,
+        )
+        self.last_action = -1
+
+    def data(self) -> FakeStateData:
+        return state_data([self.position])
+
+    def apply_many(self, indices: list[int], actions: list[int]) -> None:
+        assert indices == [0]
+        assert actions == [self.position.stones.numel() - 1]
+        self.last_action = actions[0]
+        stones = self.position.stones.clone()
+        stones[self.last_action] = 0
+        self.position = DoubleStarPosition(
+            rings=4,
+            stones=stones,
+            to_move=0,
+            moves_left=0,
+            opening=False,
+            terminal=True,
+        )
+
+    def score_data(self) -> object:
+        score = score_position(get_topology(4), self.position.stones)
+        assert score.leader == 0
+        components: list[int] = []
+        for player in score.players:
+            components.extend(
+                [
+                    player.peries,
+                    player.quarks,
+                    player.stars,
+                    player.quark_peri,
+                    player.award,
+                    player.total,
+                ]
+            )
+        components.extend([score.contested_peries, score.leader])
+        margin = score.players[0].total - score.players[1].total
+        return SimpleNamespace(
+            batch_size=1,
+            node_count=self.position.stones.numel(),
+            components=components,
+            node_owner=score.node_owner.tolist(),
+            alive_bits=pack_mask(score.alive_stone),
+            winner=[score.leader],
+            terminal_value=[1.0],
+            outcome_class=[1],
+            score_margin=[margin],
+        )
+
+    def trajectory_data(self) -> object:
+        return SimpleNamespace(
+            batch_size=1,
+            last_move=[self.last_action],
+            current_turn_offsets=[0, 1],
+            current_turn_moves=[self.last_action],
+            turn_count=[1],
+        )
+
+
+class OneMoveSearchBatch:
+    seeds: list[int] = []
+
+    def __init__(self, states: OneMoveStateBatch, **options: object) -> None:
+        self.states = states
+        self.initialized = False
+        self.seeds.append(int(options["deterministic_seed"]))
+
+    def root_requests(self) -> FakeEvalBatch:
+        data = self.states.data()
+        action = data.node_count - 1
+        return FakeEvalBatch([55], data, [0, 1], [action])
+
+    def initialize_roots(self, *_buffers: object) -> None:
+        self.initialized = True
+
+    def is_done(self) -> bool:
+        return self.initialized
+
+    def next_requests(self) -> FakeEvalBatch:
+        raise AssertionError("one-move search completes at root")
+
+    def submit(self, *_buffers: object) -> None:
+        raise AssertionError("one-move search has no leaves")
+
+    def results(self) -> object:
+        action = self.states.position.stones.numel() - 1
+        return SimpleNamespace(
+            selected_actions=[action],
+            terminal=[False],
+            action_offsets=[0, 1],
+            actions=[action],
+            visits=[1],
+            q_values=[1.0],
+            policy_target=[1.0],
+        )
+
+
+class OneMoveNative:
+    StateBatch = OneMoveStateBatch
+    SearchBatch = OneMoveSearchBatch
+
+
+class SelfPlayEvaluator:
+    model_version = "fake-v2"
+    model_step = 7
+    model_identity = "sha256-" + "f" * 64
+
+    def evaluate(self, requests: FakeEvalBatch) -> InferenceResponse:
+        return InferenceResponse(
+            tokens=list(requests.tokens),
+            values=[0.0] * len(requests),
+            policy_offsets=list(requests.legal_offsets),
+            policy_logits=[0.0] * len(requests.legal_actions),
+        )
+
+
+class CapturingSink:
+    def __init__(self) -> None:
+        self.samples: list[ReplaySample] = []
+        self.calls: list[dict[str, object]] = []
+
+    def append(self, samples: list[ReplaySample], **metadata: object) -> object:
+        self.samples.extend(samples)
+        self.calls.append(metadata)
+        return SimpleNamespace(sample_count=len(samples))
+
+
+@pytest.mark.parametrize("full", [False, True])
+def test_selfplay_retains_binary_targets_and_only_full_search_policy(
+    full: bool,
+) -> None:
+    sink = CapturingSink()
+    config = SelfPlayConfig(
+        rings=4,
+        batch_size=1,
+        games=1,
+        fast_probability=0.0 if full else 1.0,
+        full_probability=1.0 if full else 0.0,
+        fast_simulations=2,
+        full_simulations=4,
+        simulation_reference_rings=4,
+        max_considered=2,
+        shard_size=8,
+        seed=41,
+    )
+    actor = SelfPlayActor(OneMoveNative, SelfPlayEvaluator(), sink, config)
+    before_metrics = actor.metrics_snapshot()
+    summaries = actor.run()
+
+    assert len(summaries) == 1
+    assert summaries[0].model_version == "fake-v2"
+    assert summaries[0].winner == 0
+    assert summaries[0].terminal_value == 1.0
+    assert len(sink.samples) == 1
+    sample = sink.samples[0]
+    required = TARGET_OUTCOME | TARGET_SCORE_MARGIN | TARGET_OWNERSHIP | TARGET_ALIVE
+    assert sample.target_mask & required == required
+    assert bool(sample.target_mask & TARGET_POLICY) is full
+    assert sample.policy.shape == (get_topology(4).n,)
+    if full:
+        assert sample.policy[-1] == 1
+        assert "completed-q-full" in sample.policy_provenance
+    else:
+        assert not sample.policy.any()
+        assert sample.policy_provenance == "none"
+    assert sink.calls[0]["model_step"] == 7
+    metrics = actor.metrics_snapshot()
+    assert metrics.completed_decisions == 1
+    assert metrics.full_decisions == int(full)
+    assert metrics.fast_decisions == int(not full)
+    assert metrics.policy_entropy_count == int(full)
+    assert metrics.policy_entropy_sum == pytest.approx(0.0)
+    assert metrics.replay_append_calls == 1
+    assert metrics.replay_append_seconds >= 0
+    assert metrics.delta(before_metrics) == metrics
+
+
+def test_selfplay_randomization_is_seeded_and_board_scaled() -> None:
+    config = SelfPlayConfig(
+        rings=4,
+        batch_size=1,
+        games=1,
+        fast_probability=0.5,
+        full_probability=0.5,
+        fast_simulations=8,
+        full_simulations=32,
+        simulation_reference_rings=8,
+        simulation_ring_exponent=1.0,
+        max_considered=2,
+        seed=1234,
+    )
+    assert config.simulation_budget(full=False) == 4
+    assert config.simulation_budget(full=True) == 16
+    runs = []
+    for _ in range(2):
+        OneMoveSearchBatch.seeds.clear()
+        sink = CapturingSink()
+        SelfPlayActor(OneMoveNative, SelfPlayEvaluator(), sink, config).run()
+        runs.append(
+            (
+                list(OneMoveSearchBatch.seeds),
+                sink.samples[0].policy.copy(),
+                sink.samples[0].search_provenance,
+            )
+        )
+    assert runs[0][0] == runs[1][0]
+    np.testing.assert_array_equal(runs[0][1], runs[1][1])
+    assert runs[0][2] == runs[1][2]
+
+
+def test_selfplay_measures_replay_append_bytes_and_metric_monotonicity(
+    tmp_path,
+) -> None:
+    class SizedSink(CapturingSink):
+        def append(self, samples: list[ReplaySample], **metadata: object) -> object:
+            super().append(samples, **metadata)
+            path = tmp_path / "measured-shard.npz"
+            path.write_bytes(b"x" * 137)
+            return SimpleNamespace(sample_count=len(samples), path=path)
+
+    actor = SelfPlayActor(
+        OneMoveNative,
+        SelfPlayEvaluator(),
+        SizedSink(),
+        SelfPlayConfig.cpu_smoke(seed=42),
+    )
+    actor.run()
+    metrics = actor.metrics_snapshot()
+    assert metrics.replay_append_calls == 1
+    assert metrics.replay_append_bytes == 137
+    assert metrics.replay_append_seconds >= 0
+    with pytest.raises(ValueError, match="monotonic"):
+        SelfPlayMetrics().delta(metrics)

@@ -1,25 +1,25 @@
 from __future__ import annotations
 
-import math
-import random
 import threading
-from pathlib import Path
 from types import SimpleNamespace
+
+import pytest
 
 from startrain.arena import (
     ARENA_RESULT_SCHEMA_VERSION,
     ArenaPair,
     ArenaRunner,
-    WDL,
-    _pair_mean_exceeds,
-    _pair_sequential_state,
+    ArenaSearchBudget,
+    BinaryResults,
     internal_elo_target_assessment,
+    pair_confidence_sequence,
     promotion_assessment,
+    summarize_arena_pairs,
+    summarize_binary_results,
     summarize_pairs,
-    summarize_wdl,
     wilson_interval,
 )
-from startrain.config import ArenaConfig, load_config
+from startrain.config import ArenaConfig
 from startrain.inference import InferenceResponse
 from startrain.native import BITBOARD_WORDS
 
@@ -39,47 +39,36 @@ class RoleEvaluator:
     def __init__(self, model_version: str, selected_action: int) -> None:
         self.model_version = model_version
         self.selected_action = selected_action
-        self.calls = 0
         self.evaluator_calls = 0
         self.evaluator_rows = 0
 
     def evaluate(self, requests: FakeRequests) -> InferenceResponse:
-        self.calls += 1
         self.evaluator_calls += 1
         self.evaluator_rows += len(requests)
         logits = [0.0, 0.0]
         logits[self.selected_action] = 1.0
-        return InferenceResponse(
-            tokens=[1],
-            values=[0.0],
-            policy_offsets=[0, 2],
-            policy_logits=logits,
-        )
+        return InferenceResponse([1], [0.0], [0, 2], logits)
 
 
 class FakeStateBatch:
+    tied = False
+
     def __init__(self, rings: int, batch_size: int) -> None:
-        assert 3 <= rings <= 12
-        assert batch_size == 1
+        assert rings == 4 and batch_size == 1
         self.terminal = False
         self.to_move = 0
-        self.applied = 0
         self.winner = -1
+        self.search_started = False
 
     def apply_many(self, indices: list[int], actions: list[int]) -> None:
         assert indices == [0] and len(actions) == 1
-        self.applied += 1
-        if self.applied == 1:
-            self.to_move = 1
-        else:
-            self.winner = actions[0]
-            self.terminal = True
+        if not self.search_started:
+            return
+        self.winner = -1 if self.tied else actions[0]
+        self.terminal = True
 
     def data(self) -> object:
-        return SimpleNamespace(
-            terminal=[self.terminal],
-            to_move=[self.to_move],
-        )
+        return SimpleNamespace(terminal=[self.terminal], to_move=[self.to_move])
 
     def score_data(self) -> object:
         return SimpleNamespace(winner=[self.winner])
@@ -88,7 +77,8 @@ class FakeStateBatch:
 class FakeSearchBatch:
     def __init__(self, states: FakeStateBatch, **_options: object) -> None:
         self.states = states
-        self.selected = -2
+        self.states.search_started = True
+        self.selected = -1
         self.initialized = False
 
     def root_requests(self) -> FakeRequests:
@@ -108,16 +98,13 @@ class FakeSearchBatch:
         return self.initialized
 
     def next_requests(self) -> object:
-        raise AssertionError("fake search completes at root")
+        raise AssertionError("fake search completes at its root")
 
     def submit(self, *_buffers: object) -> None:
         raise AssertionError("fake search has no leaves")
 
     def results(self) -> object:
-        return SimpleNamespace(
-            terminal=[False],
-            selected_actions=[self.selected],
-        )
+        return SimpleNamespace(terminal=[False], selected_actions=[self.selected])
 
 
 class FakeNative:
@@ -125,30 +112,48 @@ class FakeNative:
     SearchBatch = FakeSearchBatch
 
 
-def test_arena_pairs_identical_openings_and_reverses_roles() -> None:
+def arena_config(**overrides: object) -> ArenaConfig:
+    values = {
+        "rings": (4,),
+        "pairs_per_ring": 2,
+        "simulations": 1,
+        "max_considered": 2,
+        "minimum_pairs_per_ring": 2,
+        "max_pairs_per_ring": 4,
+        "bootstrap_samples": 200,
+        "regression_floor_elo": -2_500.0,
+    }
+    values.update(overrides)
+    return ArenaConfig(**values)
+
+
+def test_arena_records_only_binary_results() -> None:
     candidate = RoleEvaluator("candidate", selected_action=1)
     baseline = RoleEvaluator("baseline", selected_action=0)
-    config = ArenaConfig(
-        pairs_per_ring=2,
-        simulations=1,
-        max_considered=2,
-        regression_floor_elo=-2_500.0,
-    )
     result = ArenaRunner(
         native_module=FakeNative,
         candidate=candidate,
         baseline=baseline,
-        config=config,
+        config=arena_config(
+            pairs_per_ring=4,
+            minimum_pairs_per_ring=4,
+            max_pairs_per_ring=4,
+            unforced_opening_fraction=0.5,
+        ),
     ).run()
+
     assert result["schema_version"] == ARENA_RESULT_SCHEMA_VERSION
-    assert result["aggregate"]["wins"] == 40
-    assert result["aggregate"]["losses"] == 0
-    assert candidate.calls == baseline.calls
-    assert candidate.calls > 0
+    assert result["aggregate"]["wins"] == 0
+    assert result["aggregate"]["losses"] == 8
+    assert "draws" not in result["aggregate"]
+    assert result["aggregate"]["pair_win_counts"] == {"0": 4, "1": 0, "2": 0}
+    assert all(game["outcome"] in (-1, 1) for game in result["games"])
+    assert candidate.evaluator_calls == baseline.evaluator_calls
+    assert candidate.evaluator_calls > 0
     games = result["games"]
     for index in range(0, len(games), 2):
         first, second = games[index : index + 2]
-        assert first["ring"] == second["ring"]
+        assert first["ring"] == second["ring"] == 4
         assert first["pair"] == second["pair"]
         assert first["opening_seed"] == second["opening_seed"]
         assert first["opening_action"] == second["opening_action"]
@@ -157,11 +162,89 @@ def test_arena_pairs_identical_openings_and_reverses_roles() -> None:
     assert any(pair["forced_opening"] for pair in result["pairs"])
     assert result["search"]["pie_rule"] is False
     assert result["search"]["deterministic"] is True
+    assert result["baseline_metadata"]["kind"] == "checkpoint"
     evaluation = result["evaluation_metrics"]
-    assert evaluation["candidate_evaluator_calls"] == candidate.calls
-    assert evaluation["baseline_evaluator_calls"] == baseline.calls
-    assert evaluation["total_evaluator_rows"] == candidate.calls + baseline.calls
+    assert evaluation["candidate_evaluator_calls"] == candidate.evaluator_calls
+    assert evaluation["baseline_evaluator_calls"] == baseline.evaluator_calls
+    assert evaluation["total_evaluator_rows"] == (
+        candidate.evaluator_rows + baseline.evaluator_rows
+    )
     assert evaluation["evaluator_rows_per_second"] > 0
+
+
+def test_arena_rejects_terminal_ties() -> None:
+    FakeStateBatch.tied = True
+    try:
+        with pytest.raises(RuntimeError, match="cannot be tied"):
+            ArenaRunner(
+                native_module=FakeNative,
+                candidate=RoleEvaluator("candidate", 1),
+                baseline=RoleEvaluator("baseline", 0),
+                config=arena_config(),
+            ).run()
+    finally:
+        FakeStateBatch.tied = False
+
+
+def test_binary_summary_and_pair_validation() -> None:
+    balanced = BinaryResults(wins=50, losses=50)
+    lower, upper = wilson_interval(balanced)
+    assert lower < 0.5 < upper
+    summary = summarize_binary_results(balanced, confidence=0.95)
+    assert summary["score_rate"] == 0.5
+    assert summary["elo_difference"] == 0.0
+    assert "draws" not in summary
+
+    with pytest.raises(ValueError, match="tied"):
+        ArenaPair(4, 0, 0, 0, True, (1, 0))
+    with pytest.raises(ValueError, match="binary"):
+        balanced.record(0)
+
+
+def test_pair_promotion_and_per_ring_regression_are_binary() -> None:
+    config = ArenaConfig(
+        rings=(4, 6, 8, 10),
+        pairs_per_ring=5,
+        simulations=1,
+        max_considered=2,
+        minimum_pairs_per_ring=10,
+        max_pairs_per_ring=20,
+        bootstrap_samples=200,
+        regression_floor_elo=-2_500.0,
+    )
+    per_ring = {
+        ring: [ArenaPair(ring, pair, pair, 0, True, (1, 1)) for pair in range(10)]
+        for ring in config.rings
+    }
+    aggregate = [pair for pairs in per_ring.values() for pair in pairs]
+    summary = summarize_pairs(
+        aggregate,
+        confidence=0.95,
+        bootstrap_samples=200,
+        seed=1,
+    )
+    assert summary["pair_win_counts"]["2"] == len(aggregate)
+    assert promotion_assessment(aggregate, per_ring, config)["decision"] == "promote"
+
+    regressed = dict(per_ring)
+    regressed[10] = [ArenaPair(10, pair, pair, 0, True, (-1, -1)) for pair in range(10)]
+    strict = ArenaConfig(
+        rings=(4, 6, 8, 10),
+        pairs_per_ring=5,
+        simulations=1,
+        max_considered=2,
+        minimum_pairs_per_ring=10,
+        max_pairs_per_ring=20,
+        bootstrap_samples=200,
+        regression_floor_elo=-100.0,
+    )
+    assessment = promotion_assessment(
+        [pair for pairs in regressed.values() for pair in pairs],
+        regressed,
+        strict,
+    )
+    assert assessment["decision"] == "reject_ring_regression"
+    assert assessment["ring_floors"]["10"]["passed"] is False
 
 
 def test_batched_arena_advances_candidate_and_baseline_groups_concurrently() -> None:
@@ -197,45 +280,59 @@ def test_batched_arena_advances_candidate_and_baseline_groups_concurrently() -> 
 
     class BatchStates:
         def __init__(self, rings: int, batch_size: int) -> None:
+            assert rings == 4
             self.rings = rings
             self.batch_size = batch_size
             self.terminal = [False] * batch_size
             self.to_move = [0] * batch_size
+            self.applied = [0] * batch_size
 
         @classmethod
         def from_semantic(
             cls,
             rings: int,
-            _zero_bits: list[int],
-            _one_bits: list[int],
+            zero_bits: list[int],
+            one_bits: list[int],
             to_move: list[int],
             _moves_left: list[int],
             _opening: list[bool],
-            _pass_streak: list[int],
         ) -> "BatchStates":
             states = cls(rings, len(to_move))
             states.to_move = list(to_move)
+            for row in range(len(to_move)):
+                start = row * BITBOARD_WORDS
+                end = start + BITBOARD_WORDS
+                states.applied[row] = int(
+                    any(zero_bits[start:end]) or any(one_bits[start:end])
+                )
             return states
 
         def data(self) -> object:
-            words = [0] * (self.batch_size * BITBOARD_WORDS)
+            zero_bits = [0] * (self.batch_size * BITBOARD_WORDS)
+            one_bits = [0] * (self.batch_size * BITBOARD_WORDS)
+            for row, applied in enumerate(self.applied):
+                if applied:
+                    zero_bits[row * BITBOARD_WORDS] = 1
             return SimpleNamespace(
                 rings=self.rings,
-                zero_bits=words,
-                one_bits=words,
+                zero_bits=zero_bits,
+                one_bits=one_bits,
                 to_move=list(self.to_move),
-                moves_left=[1] * self.batch_size,
-                opening=[False] * self.batch_size,
-                pass_streak=[0] * self.batch_size,
+                moves_left=[1 if value else 2 for value in self.applied],
+                opening=[not bool(value) for value in self.applied],
                 terminal=list(self.terminal),
             )
 
         def apply_many(self, rows: list[int], _actions: list[int]) -> None:
             for row in rows:
-                self.terminal[row] = True
+                self.applied[row] += 1
+                if self.applied[row] == 1:
+                    self.to_move[row] = 1
+                else:
+                    self.terminal[row] = True
 
         def score_data(self) -> object:
-            return SimpleNamespace(winner=[-1] * self.batch_size)
+            return SimpleNamespace(winner=[0] * self.batch_size)
 
     class BatchSearch:
         def __init__(self, states: BatchStates, **_options: object) -> None:
@@ -264,275 +361,36 @@ def test_batched_arena_advances_candidate_and_baseline_groups_concurrently() -> 
             )
 
     native = SimpleNamespace(StateBatch=BatchStates, SearchBatch=BatchSearch)
+    candidate = ConcurrentEvaluator("candidate")
+    baseline = ConcurrentEvaluator("baseline")
     result = ArenaRunner(
         native_module=native,
-        candidate=ConcurrentEvaluator("candidate"),
-        baseline=ConcurrentEvaluator("baseline"),
+        candidate=candidate,
+        baseline=baseline,
         config=ArenaConfig(
-            rings=(3,),
+            rings=(4,),
             pairs_per_ring=2,
             simulations=1,
             max_considered=1,
+            minimum_pairs_per_ring=2,
+            max_pairs_per_ring=4,
+            bootstrap_samples=200,
             regression_floor_elo=-2_500,
+            unforced_opening_fraction=0.5,
         ),
     ).run()
 
-    assert result["aggregate"]["draws"] == 4
-    assert result["evaluation_metrics"]["candidate_evaluator_calls"] == 1
-    assert result["evaluation_metrics"]["baseline_evaluator_calls"] == 1
+    assert result["aggregate"]["wins"] == result["aggregate"]["losses"] == 2
+    assert "draws" not in result["aggregate"]
+    assert candidate.evaluator_calls == baseline.evaluator_calls == 2
+    assert candidate.evaluator_rows == baseline.evaluator_rows == 3
 
 
-def test_pair_level_elo_and_e_process_promotion_with_anytime_ring_floors() -> None:
-    balanced = WDL(wins=40, draws=20, losses=40)
-    lower, upper = wilson_interval(balanced)
-    assert lower < 0.5 < upper
-    summary = summarize_wdl(balanced, confidence=0.95)
-    assert summary["elo_difference"] == 0.0
-    assert summary["wilson_elo_interval"][0] < 0
-    assert summary["wilson_elo_interval"][1] > 0
-
-    config = ArenaConfig(
-        pairs_per_ring=5,
-        simulations=1,
-        max_considered=2,
-        alternative_elo=35.0,
-        regression_floor_elo=-2_500.0,
-        minimum_pairs_per_ring=10,
-    )
-    per_ring = {
-        ring: [ArenaPair(ring, pair, pair, 0, True, (1, 1)) for pair in range(10)]
-        for ring in config.rings
-    }
-    aggregate = [pair for pairs in per_ring.values() for pair in pairs]
-    pair_summary = summarize_pairs(
-        aggregate,
-        confidence=0.95,
-        bootstrap_samples=200,
-        seed=1,
-    )
-    assert pair_summary["pairs"] == 100
-    assert pair_summary["pentanomial"]["2"] == 100
-    assessment = promotion_assessment(aggregate, per_ring, config)
-    assert assessment["sequential_state"] == "accept_alternative"
-    assert assessment["decision"] == "promote"
-    assert assessment["pair_model"] == "pair-level-mixture-betting-e-process-v1"
-    assert assessment["statistical_test"]["name"] == (
-        "bounded-mean-mixture-betting-e-process"
-    )
-
-    regressed = dict(per_ring)
-    regressed[12] = [ArenaPair(12, pair, pair, 0, True, (-1, -1)) for pair in range(10)]
-    assessment = promotion_assessment(
-        [pair for pairs in regressed.values() for pair in pairs],
-        regressed,
-        ArenaConfig(
-            pairs_per_ring=5,
-            simulations=1,
-            max_considered=2,
-            regression_floor_elo=-100.0,
-            minimum_pairs_per_ring=10,
-        ),
-    )
-    assert assessment["decision"] == "reject_ring_regression"
-    assert assessment["ring_floors"]["12"]["passed"] is False
-
-
-_REPRESENTATIVE_NULL_PENTANOMIAL = (0.08, 0.17, 0.50, 0.17, 0.08)
-# Exponentially tilt the symmetric null distribution to exactly +35 Elo. All
-# five pair-score cells remain populated, with variance 0.06126. This models
-# role-paired games with substantial draws/role cancellation without assuming
-# independence between the two games inside an opening pair.
-_REPRESENTATIVE_35_ELO_PENTANOMIAL = (
-    0.05202367115614806,
-    0.13568689989888738,
-    0.4898205401200923,
-    0.20440612242441344,
-    0.11806276640045883,
-)
-_PENTANOMIAL_SCORE_RATES = (0.0, 0.25, 0.5, 0.75, 1.0)
-
-
-def _configured_eligible_looks(config: ArenaConfig) -> tuple[int, ...]:
-    looks = []
-    pairs_per_ring = 0
-    while pairs_per_ring < config.max_pairs_per_ring:
-        pairs_per_ring = min(
-            pairs_per_ring + config.pairs_per_ring,
-            config.max_pairs_per_ring,
-        )
-        if pairs_per_ring >= config.minimum_pairs_per_ring:
-            looks.append(pairs_per_ring)
-    return tuple(looks)
-
-
-def _monte_carlo_promotion_rate(
-    config: ArenaConfig,
-    probabilities: tuple[float, ...],
-    *,
-    seed: int,
-    trials: int,
-) -> float:
-    rng = random.Random(seed)
-    categories = range(len(probabilities))
-    eligible_looks = _configured_eligible_looks(config)
-    null_score_rate = 1.0 / (1.0 + 10.0 ** (-config.null_elo / 400.0))
-    alternative_score_rate = 1.0 / (1.0 + 10.0 ** (-config.alternative_elo / 400.0))
-    floor_score_rates = [
-        1.0
-        / (
-            1.0
-            + 10.0
-            ** (
-                -config.per_ring_regression_floor_elo.get(
-                    ring, config.regression_floor_elo
-                )
-                / 400.0
-            )
-        )
-        for ring in config.rings
-    ]
-    floor_error_probability = (1.0 - config.confidence) / 2.0
-    promotions = 0
-    for _ in range(trials):
-        per_ring = [
-            rng.choices(
-                categories,
-                weights=probabilities,
-                k=config.max_pairs_per_ring,
-            )
-            for _ring in config.rings
-        ]
-        per_ring_counts = [[0] * len(probabilities) for _ring in config.rings]
-        counts = [0] * len(probabilities)
-        prior_look = 0
-        for look in eligible_looks:
-            for ring_counts, ring_categories in zip(
-                per_ring_counts, per_ring, strict=True
-            ):
-                for category in ring_categories[prior_look:look]:
-                    ring_counts[category] += 1
-                    counts[category] += 1
-            prior_look = look
-            state, _, _ = _pair_sequential_state(
-                counts,
-                null_score_rate=null_score_rate,
-                alternative_score_rate=alternative_score_rate,
-                alpha=config.alpha,
-                beta=config.beta,
-            )
-            floors_pass = all(
-                _pair_mean_exceeds(
-                    ring_counts,
-                    null_score_rate=floor_score_rate,
-                    error_probability=floor_error_probability,
-                )
-                for ring_counts, floor_score_rate in zip(
-                    per_ring_counts, floor_score_rates, strict=True
-                )
-            )
-            if state == "accept_alternative" and floors_pass:
-                promotions += 1
-                break
-            if state == "accept_null":
-                break
-            if not floors_pass:
-                break
-    return promotions / trials
-
-
-def test_configured_e_process_operating_characteristics() -> None:
-    config_root = Path(__file__).parents[1] / "configs"
-    four_gpu = load_config(config_root / "h100-4gpu.yaml").arena
-    eight_gpu = load_config(config_root / "h100-8gpu.yaml").arena
-    assert four_gpu == eight_gpu
-    assert _configured_eligible_looks(four_gpu) == (
-        50,
-        75,
-        100,
-        125,
-        150,
-        175,
-        200,
-    )
-    assert tuple(
-        look * len(four_gpu.rings) for look in _configured_eligible_looks(four_gpu)
-    ) == (500, 750, 1_000, 1_250, 1_500, 1_750, 2_000)
-
-    null_mean = sum(
-        probability * score
-        for probability, score in zip(
-            _REPRESENTATIVE_NULL_PENTANOMIAL,
-            _PENTANOMIAL_SCORE_RATES,
-            strict=True,
-        )
-    )
-    alternative_mean = sum(
-        probability * score
-        for probability, score in zip(
-            _REPRESENTATIVE_35_ELO_PENTANOMIAL,
-            _PENTANOMIAL_SCORE_RATES,
-            strict=True,
-        )
-    )
-    expected_alternative = 1.0 / (1.0 + 10.0 ** (-four_gpu.alternative_elo / 400.0))
-    assert abs(null_mean - 0.5) < 1e-12
-    assert abs(alternative_mean - expected_alternative) < 1e-12
-    maximum_pairs = len(four_gpu.rings) * four_gpu.max_pairs_per_ring
-    legacy_allocation = (
-        four_gpu.alpha * 6.0 / (math.pi * math.pi * maximum_pairs * maximum_pairs)
-    )
-    legacy_radius = math.sqrt(math.log(1.0 / legacy_allocation) / (2.0 * maximum_pairs))
-    assert alternative_mean - legacy_radius < null_mean
-
-    trials = 2_000
-    false_promotion_rate = _monte_carlo_promotion_rate(
-        four_gpu,
-        _REPRESENTATIVE_NULL_PENTANOMIAL,
-        seed=20260710,
-        trials=trials,
-    )
-    promotion_power = _monte_carlo_promotion_rate(
-        four_gpu,
-        _REPRESENTATIVE_35_ELO_PENTANOMIAL,
-        seed=20260711,
-        trials=trials,
-    )
-    # These deterministic Monte Carlo checks exercise both aggregate stopping
-    # boundaries and every per-ring anytime regression floor.
-    assert false_promotion_rate <= 0.05
-    assert promotion_power >= 0.80
-
-
-def test_configured_ring_floors_allow_representative_non_regression() -> None:
-    config = load_config(Path(__file__).parents[1] / "configs" / "h100-8gpu.yaml").arena
-    outcomes = ((-1, -1), (0, -1), (1, -1), (1, 0), (1, 1))
-    # Fifty pairs with all five cells represented and score rate 0.55.
-    category_counts = (3, 6, 25, 10, 6)
-    per_ring = {}
-    for ring in config.rings:
-        categories = [
-            category
-            for category, count in enumerate(category_counts)
-            for _ in range(count)
-        ]
-        per_ring[ring] = [
-            ArenaPair(ring, pair, pair, 0, True, outcomes[category])
-            for pair, category in enumerate(categories)
-        ]
-    aggregate = [pair for ring in config.rings for pair in per_ring[ring]]
-    assessment = promotion_assessment(aggregate, per_ring, config)
-    assert assessment["decision"] == "promote"
-    assert assessment["confidence_sequence"][0] > 0.5
-    evidence = assessment["statistical_test"]["promotion"]
-    assert evidence["e_value"] >= evidence["threshold"]
-    assert all(
-        floor["passed"] is True and floor["anytime_lower_elo"] >= floor["floor_elo"]
-        for floor in assessment["ring_floors"].values()
-    )
-
-
-def test_pair_summary_and_internal_target_use_anytime_valid_lower_bound() -> None:
+def test_pair_confidence_summary_and_internal_target_use_anytime_bounds() -> None:
     pairs = [ArenaPair(4, pair, pair, 0, True, (1, 1)) for pair in range(50)]
+    lower, upper = pair_confidence_sequence(pairs, error_probability=0.025)
+    assert lower > 0.5
+    assert upper == 1.0
     summary = summarize_pairs(
         pairs,
         confidence=0.95,
@@ -545,10 +403,10 @@ def test_pair_summary_and_internal_target_use_anytime_valid_lower_bound() -> Non
     result = {
         "per_ring": {
             str(ring): {
-                "anytime_elo_interval": [lower, 800.0],
+                "anytime_elo_interval": [lower_elo, 800.0],
                 "pairs": 50,
             }
-            for ring, lower in ((4, 450.0), (6, 425.0), (8, 399.0), (10, 500.0))
+            for ring, lower_elo in ((4, 450.0), (6, 425.0), (8, 399.0), (10, 500.0))
         }
     }
     assessment = internal_elo_target_assessment(
@@ -559,3 +417,29 @@ def test_pair_summary_and_internal_target_use_anytime_valid_lower_bound() -> Non
     assert assessment["status"] == "not_reached"
     assert assessment["passed"] is False
     assert assessment["per_ring"]["8"]["passed"] is False
+
+
+def test_arena_summary_requires_every_configured_ring_and_records_budget() -> None:
+    config = ArenaConfig(
+        rings=(4, 6),
+        pairs_per_ring=2,
+        simulations=3,
+        max_considered=5,
+        minimum_pairs_per_ring=2,
+        max_pairs_per_ring=4,
+        bootstrap_samples=200,
+    )
+    budget = ArenaSearchBudget.from_config(config)
+    assert budget.metadata() == {
+        "simulations": 3,
+        "max_considered": 5,
+        "c_visit": config.c_visit,
+        "c_scale": config.c_scale,
+    }
+    with pytest.raises(ValueError, match="at least one pair per ring"):
+        summarize_arena_pairs(
+            [ArenaPair(4, 0, 0, 0, True, (1, -1))],
+            config,
+        )
+    with pytest.raises(ValueError, match="positive integer"):
+        ArenaSearchBudget(False, 1, 1.0, 1.0)

@@ -62,20 +62,16 @@ def permute_actions(
     *,
     action_dim: int = -1,
 ) -> Tensor:
-    """Permute node actions while leaving the final pass action fixed."""
+    """Permute a node-only action tensor."""
 
     action_dim %= values.ndim
     node_count = source_to_destination.numel()
-    if values.shape[action_dim] != node_count + 1:
-        raise ValueError("action dimension must contain N node actions plus pass")
-    node_values = values.narrow(action_dim, 0, node_count)
-    pass_value = values.narrow(action_dim, node_count, 1)
-    return torch.cat(
-        (
-            permute_nodes(node_values, source_to_destination, node_dim=action_dim),
-            pass_value,
-        ),
-        dim=action_dim,
+    if values.shape[action_dim] != node_count:
+        raise ValueError("action dimension must contain exactly N node actions")
+    return permute_nodes(
+        values,
+        source_to_destination,
+        node_dim=action_dim,
     )
 
 

@@ -6,7 +6,7 @@ import { getBoard } from '@/lib/star/board';
 import { EMPTY } from '@/lib/star/scoring';
 import { StarBoard } from '../StarBoard';
 
-const board = getBoard(3);
+const board = getBoard(4);
 
 function emptyBoard(): Int8Array {
   return new Int8Array(board.n).fill(EMPTY);
@@ -79,7 +79,7 @@ describe('StarBoard', () => {
     expect(onPlace).toHaveBeenCalledOnce();
     expect(onPlace).toHaveBeenCalledWith(0);
 
-    fireEvent.mouseLeave(screen.getByRole('group', { name: /\*star board with 3 rings/i }));
+    fireEvent.mouseLeave(screen.getByRole('group', { name: /\*star board with 4 rings/i }));
     expect(onHover).toHaveBeenLastCalledWith(-1);
   });
 

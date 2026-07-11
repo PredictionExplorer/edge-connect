@@ -14,7 +14,7 @@ import { parseWorkerCommand, parseWorkerEvent } from '../worker-protocol';
 
 const request = buildAiRequest(
   {
-    rings: 3,
+    rings: 4,
     mode: 'double',
     pieRule: false,
     playerNames: ['A', 'B'],
@@ -25,32 +25,37 @@ const request = buildAiRequest(
 
 const manifest = {
   format: STAR_BROWSER_MODEL_MANIFEST_SCHEMA_ID,
-  schema_version: 1,
-  model_version: 'browser-smoke-v1',
+  schema_version: 2,
+  model_version: 'browser-smoke-v2',
   created_ns: 1_700_000_000_000_000_000,
   weights: 'ema',
   rules: {
-    schema_id: 'edgeconnect.star.rules.v1',
-    hash: 'fnv1a64:cdb34fb02be82843',
+    schema_id: 'edgeconnect.star.rules.v2',
+    hash: 'fnv1a64:2da3783519381453',
     mode: 'double',
     pie_rule: false,
-    rings: { minimum: 3, maximum: 12 },
+    rings: [4, 6, 8, 10],
   },
   features: {
-    schema_id: 'edgeconnect.star.model-features.external.v1',
-    version: 2,
+    schema_id: 'edgeconnect.star.model-features.external.v2',
+    version: 3,
     hash: STAR_FEATURE_SCHEMA_HASH,
     node_feature_count: 15,
-    global_feature_count: 18,
+    global_feature_count: 17,
   },
-  actions: { schema_id: 'edgeconnect.star.action-layout.nodes-then-pass.v1' },
+  actions: { schema_id: 'edgeconnect.star.action-layout.nodes-only.v1' },
+  outcome: {
+    classes: ['loss', 'win'],
+    value: 'P(win)-P(loss)',
+  },
   architecture: {
     name: 'GraphResTNet',
+    schema_version: 2,
     all_size: true,
     parameter_count: 12_345,
     config: {
       node_feature_dim: 15,
-      global_feature_dim: 18,
+      global_feature_dim: 17,
       width: 64,
       rrt_groups: 5,
       attention_heads: 8,
@@ -59,21 +64,21 @@ const manifest = {
       ff_multiplier: 2,
       dropout: 0,
       rms_norm_eps: 0.000001,
-      score_margin_min: -181,
-      score_margin_max: 181,
+      score_margin_min: -151,
+      score_margin_max: 151,
       soft_policy_temperature: 4,
     },
   },
   precision: 'float16',
   artifacts: {
     onnx: {
-      file: 'browser-smoke-v1.fp16.onnx',
+      file: 'browser-smoke-v2.fp16.onnx',
       sha256: 'a'.repeat(64),
       bytes: 123_456,
       opset: 18,
     },
     checkpoint: {
-      file: 'browser-smoke-v1.pt',
+      file: 'browser-smoke-v2.pt',
       sha256: 'b'.repeat(64),
       bytes: 234_567,
     },
@@ -81,20 +86,20 @@ const manifest = {
   tensors: {
     inputs: {
       node_features: { dtype: 'float16', shape: ['batch', 'nodes', 15] },
-      global_features: { dtype: 'float16', shape: ['batch', 18] },
+      global_features: { dtype: 'float16', shape: ['batch', 17] },
       neighbor_index: { dtype: 'int64', shape: ['batch', 'nodes', 'degree'] },
       neighbor_mask: { dtype: 'bool', shape: ['batch', 'nodes', 'degree'] },
       neighbor_edge_type: { dtype: 'int64', shape: ['batch', 'nodes', 'degree'] },
       node_mask: { dtype: 'bool', shape: ['batch', 'nodes'] },
-      legal_action_mask: { dtype: 'bool', shape: ['batch', 'nodes + 1'] },
+      legal_action_mask: { dtype: 'bool', shape: ['batch', 'nodes'] },
     },
     outputs: {
-      policy_logits: { dtype: 'float16', shape: ['batch', 'nodes + 1'] },
-      wdl_logits: { dtype: 'float16', shape: ['batch', 3] },
-      score_margin_logits: { dtype: 'float16', shape: ['batch', 363] },
+      policy_logits: { dtype: 'float16', shape: ['batch', 'nodes'] },
+      outcome_logits: { dtype: 'float16', shape: ['batch', 2] },
+      score_margin_logits: { dtype: 'float16', shape: ['batch', 303] },
       ownership_logits: { dtype: 'float16', shape: ['batch', 'nodes', 3] },
       alive_logits: { dtype: 'float16', shape: ['batch', 'nodes'] },
-      soft_policy_logits: { dtype: 'float16', shape: ['batch', 'nodes + 1'] },
+      soft_policy_logits: { dtype: 'float16', shape: ['batch', 'nodes'] },
     },
   },
   recommended_local_search: {
@@ -106,7 +111,7 @@ const manifest = {
   training: {
     steps: 10_000,
     replay_samples: 1_000_000,
-    teacher_model_version: 'teacher-v1',
+    teacher_model_version: 'teacher-v2',
     teacher_logit_kl: true,
   },
 };
@@ -132,10 +137,30 @@ describe('local worker protocol', () => {
     ).toThrow(/state hash/i);
   });
 
+  it('rejects removed state fields and negative action codes', () => {
+    expect(() =>
+      parseWorkerCommand({
+        type: 'choose',
+        taskId: 'worker-task',
+        request: {
+          ...request,
+          state: { ...request.state, passStreak: 0 },
+        },
+      }),
+    ).toThrow(/invalid semantic state/i);
+    expect(() =>
+      parseWorkerCommand({
+        type: 'choose',
+        taskId: 'worker-task',
+        request: { ...request, legalActions: [...request.legalActions, -1] },
+      }),
+    ).toThrow(/incompatible AI request/i);
+  });
+
   it('parses structured worker errors without trusting arbitrary codes', () => {
-    expect(parseWorkerEvent({ type: 'ready', protocolVersion: 1 })).toEqual({
+    expect(parseWorkerEvent({ type: 'ready', protocolVersion: 2 })).toEqual({
       type: 'ready',
-      protocolVersion: 1,
+      protocolVersion: 2,
     });
     expect(
       parseWorkerEvent({
@@ -155,8 +180,8 @@ describe('local worker protocol', () => {
 
   it('accepts only fully pinned browser model manifests', () => {
     expect(parseStarBrowserModelManifest(manifest)).toMatchObject({
-      rulesHash: 'fnv1a64:cdb34fb02be82843',
-      featureSchemaHash: '59a7da1c00bac4d2',
+      rulesHash: 'fnv1a64:2da3783519381453',
+      featureSchemaHash: STAR_FEATURE_SCHEMA_HASH,
       weights: 'ema',
       wasm: {
         moduleUrl: STAR_WASM_MODULE_PATH,
@@ -164,7 +189,7 @@ describe('local worker protocol', () => {
       },
       model: {
         precision: 'float16',
-        url: '/models/star/browser-smoke-v1.fp16.onnx',
+        url: '/models/star/browser-smoke-v2.fp16.onnx',
         sha256: `sha256:${'a'.repeat(64)}`,
         inputs: STAR_MODEL_INPUT_NAMES,
         outputs: STAR_MODEL_OUTPUT_NAMES,

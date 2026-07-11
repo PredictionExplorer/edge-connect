@@ -14,8 +14,22 @@ from typing import Iterator, Sequence
 from .contracts import FEATURE_SCHEMA_HASH, RULES_HASH, RULES_HASH_WIRE
 from .replay import ReplaySample, read_replay_shard, write_replay_shard
 from .runtime import RunIdentity, validate_identifier
+from .topology import SUPPORTED_RINGS, get_topology
 
-MANIFEST_SCHEMA_VERSION = 3
+MANIFEST_SCHEMA_VERSION = 4
+
+
+def _validated_rings(rings: Sequence[int]) -> tuple[int, ...]:
+    requested = tuple(rings)
+    if (
+        not requested
+        or any(type(ring) is not int for ring in requested)
+        or len(set(requested)) != len(requested)
+    ):
+        raise ValueError("rings must be a non-empty unique sequence of integers")
+    for ring in requested:
+        get_topology(ring)
+    return requested
 
 
 class DuplicateGameError(ValueError):
@@ -434,7 +448,7 @@ class ReplayStore:
             )
         ]
         candidates: list[ShardRecord] = []
-        for ring in range(3, 13):
+        for ring in SUPPORTED_RINGS:
             rows = self.connection.execute(
                 """
                 SELECT * FROM shards
@@ -707,10 +721,11 @@ class ReplayStore:
             validate_identifier("run_id", run_id),
             validate_identifier("generation_family", generation_family),
         ]
-        if rings:
-            placeholders = ",".join("?" for _ in rings)
+        if rings is not None:
+            requested = _validated_rings(rings)
+            placeholders = ",".join("?" for _ in requested)
             clauses.append(f"ring IN ({placeholders})")
-            parameters.extend(int(ring) for ring in rings)
+            parameters.extend(requested)
         if max_model_lag_steps is not None:
             if current_model_step is None or max_model_lag_steps < 0:
                 raise ValueError(
@@ -749,14 +764,12 @@ class ReplayStore:
 
     def sample_counts_by_ring(
         self,
-        rings: Sequence[int] = tuple(range(3, 13)),
+        rings: Sequence[int] = SUPPORTED_RINGS,
         *,
         run_id: str,
         generation_family: str,
     ) -> dict[int, int]:
-        requested = tuple(int(ring) for ring in rings)
-        if not requested or len(set(requested)) != len(requested):
-            raise ValueError("rings must be a non-empty unique sequence")
+        requested = _validated_rings(rings)
         placeholders = ",".join("?" for _ in requested)
         rows = self.connection.execute(
             f"""
@@ -871,9 +884,7 @@ class ReplayStore:
         current_model_step: int,
         max_model_lag_steps: int,
     ) -> dict[int, int]:
-        requested = tuple(int(ring) for ring in rings)
-        if not requested:
-            raise ValueError("rings must be non-empty")
+        requested = _validated_rings(rings)
         lower = max(0, current_model_step - max_model_lag_steps)
         placeholders = ",".join("?" for _ in requested)
         rows = self.connection.execute(
@@ -916,6 +927,7 @@ class ReplayStore:
     ) -> ReplaySelection:
         if per_ring_quota <= 0:
             raise ValueError("per_ring_quota must be positive")
+        requested = _validated_rings(rings)
         row = self.connection.execute(
             """
             SELECT COALESCE(MAX(id), 0) AS max_id FROM shards
@@ -934,7 +946,7 @@ class ReplayStore:
         maximum_shard_id = int(row["max_id"])
         spans: list[ReplaySpan] = []
         counts: dict[int, int] = {}
-        for ring in rings:
+        for ring in requested:
             records = self.recent_shards(
                 sample_window=per_ring_quota,
                 run_id=run_id,

@@ -28,6 +28,8 @@ from typing import Protocol
 
 import torch
 
+from startrain.topology import SUPPORTED_RINGS
+
 SCHEMA_VERSION = 1
 BENCHMARK_NAME = "h100-system-inference-sweep"
 EXIT_OK = 0
@@ -60,7 +62,7 @@ class ProcessExecutor(Protocol):
 class BenchmarkSettings:
     config: Path
     output_directory: Path
-    rings: tuple[int, ...] = (6, 12)
+    rings: tuple[int, ...] = (6, 10)
     batch_sizes: tuple[int, ...] = (64,)
     repeats: int = 3
     warmup: int = 10
@@ -81,7 +83,7 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--rings", type=int, nargs="+", default=[6, 12])
+    parser.add_argument("--rings", type=int, nargs="+", default=[6, 10])
     parser.add_argument("--batch-sizes", type=int, nargs="+", default=[64])
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--warmup", type=int, default=10)
@@ -151,8 +153,10 @@ def validate_settings(settings: BenchmarkSettings) -> None:
         raise BenchmarkHarnessError(
             f"refusing to overwrite existing output path: {settings.output_directory}"
         )
-    if not settings.rings or any(ring < 3 or ring > 12 for ring in settings.rings):
-        raise BenchmarkHarnessError("rings must contain integers in 3..12")
+    if not settings.rings or any(
+        type(ring) is not int or ring not in SUPPORTED_RINGS for ring in settings.rings
+    ):
+        raise BenchmarkHarnessError("rings must be selected from 4, 6, 8, and 10")
     if len(set(settings.rings)) != len(settings.rings):
         raise BenchmarkHarnessError("rings must not contain duplicates")
     if not settings.batch_sizes or any(size <= 0 for size in settings.batch_sizes):
@@ -721,8 +725,6 @@ _ACTOR_SERIES_NAMES = (
     "attempted_decisions",
     "full_decisions",
     "fast_decisions",
-    "pass_decisions",
-    "pass_decision_rate",
     "game_lengths",
     "policy_entropy_count",
     "policy_entropy_sum",
@@ -767,8 +769,6 @@ def _append_actor_record(
         "attempted_decisions": ("attempted_decisions",),
         "full_decisions": ("full_decisions", "full_search_decisions"),
         "fast_decisions": ("fast_decisions", "fast_search_decisions"),
-        "pass_decisions": ("pass_decisions",),
-        "pass_decision_rate": ("pass_decision_rate", "pass_rate"),
         "policy_entropy_count": (
             "policy_entropy_count",
             "policy_target_count",
@@ -880,10 +880,6 @@ def _actor_series_summary(series: dict[str, list[float]]) -> dict[str, object]:
         key = str(length)
         game_length_distribution[key] = game_length_distribution.get(key, 0) + 1
 
-    attempted = sum(series["attempted_decisions"])
-    if not series["attempted_decisions"]:
-        attempted = sum(series["full_decisions"]) + sum(series["fast_decisions"])
-    passes = sum(series["pass_decisions"])
     entropy_count = sum(series["policy_entropy_count"])
     entropy_sum = sum(series["policy_entropy_sum"])
     replay_bytes = sum(series["replay_append_bytes"])
@@ -907,9 +903,6 @@ def _actor_series_summary(series: dict[str, list[float]]) -> dict[str, object]:
             "attempted": _counter_summary(series["attempted_decisions"]),
             "full": _counter_summary(series["full_decisions"]),
             "fast": _counter_summary(series["fast_decisions"]),
-            "passes": _counter_summary(series["pass_decisions"]),
-            "pass_rate": passes / attempted if attempted else None,
-            "pass_rate_per_batch": _stats(series["pass_decision_rate"]),
         },
         "game_length": {
             "mean": (

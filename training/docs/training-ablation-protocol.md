@@ -66,7 +66,7 @@ Each report must retain:
 - learner examples/second and replay wait time;
 - policy-supervision rate and full/fast search mix;
 - candidate/champion role share and model lag;
-- pass rate, game length, search entropy, and ring distribution;
+- game length, search entropy, and ring distribution;
 - paired aggregate and per-ring Elo intervals;
 - peak memory, replay I/O, restarts, and failed/quarantined shards; and
 - final strength divided by GPU-hours and leaf evaluations.

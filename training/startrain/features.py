@@ -1,4 +1,4 @@
-"""Schema-v2 features that are a pure function of the Rust semantic key."""
+"""Schema-v3 features that are a pure function of the canonical semantic key."""
 
 from __future__ import annotations
 
@@ -9,8 +9,11 @@ import numpy as np
 import torch
 from torch import Tensor
 
-from .actions import relocate_sample_actions
-from .contracts import FEATURE_SCHEMA_HASH, FEATURE_SCHEMA_VERSION
+from .contracts import (
+    FEATURE_SCHEMA_HASH,
+    FEATURE_SCHEMA_VERSION,
+    SCORE_MARGIN_MAX,
+)
 from .scoring import EMPTY, ScoreResult, score_position
 from .topology import MAX_RINGS, StarTopology, get_topology
 
@@ -38,7 +41,6 @@ GLOBAL_FEATURE_NAMES = (
     "opponent_stone_fraction",
     "moves_left_fraction",
     "opening",
-    "pass_streak_fraction",
     "terminal",
     "current_total_scaled",
     "opponent_total_scaled",
@@ -73,9 +75,8 @@ def _plain_int(name: str, value: object) -> int:
 class DoubleStarPosition:
     """Exact Python form of ``star_engine::StateKey``.
 
-    Network inputs depend only on these seven fields: rings, stones, to_move,
-    moves_left, opening, pass_streak, and terminal. Terminal states are valid
-    data records but have no legal decision policy.
+    Network inputs depend only on rings, stones, to_move, moves_left, opening,
+    and terminal. Terminal states are valid data records but have no policy.
     """
 
     rings: int
@@ -83,7 +84,6 @@ class DoubleStarPosition:
     to_move: int
     moves_left: int
     opening: bool
-    pass_streak: int
     terminal: bool
 
     def __post_init__(self) -> None:
@@ -101,31 +101,23 @@ class DoubleStarPosition:
 
         to_move = _plain_int("to_move", self.to_move)
         moves_left = _plain_int("moves_left", self.moves_left)
-        pass_streak = _plain_int("pass_streak", self.pass_streak)
         if to_move not in (0, 1):
             raise ValueError("to_move must be 0 or 1")
         if moves_left not in (0, 1, 2):
             raise ValueError("moves_left must be in 0..2")
-        if pass_streak not in (0, 1, 2):
-            raise ValueError("pass_streak must be in 0..2")
         if type(self.opening) is not bool or type(self.terminal) is not bool:
             raise TypeError("opening and terminal must be bool")
 
         occupied = int((values != EMPTY).sum())
         board_full = occupied == topology.n
-        derived_terminal = board_full or pass_streak == 2
-        if self.terminal != derived_terminal:
-            raise ValueError("terminal must equal board-full or pass_streak == 2")
+        if self.terminal != board_full:
+            raise ValueError("terminal must equal board-full")
         if moves_left == 0 and not board_full:
             raise ValueError("moves_left == 0 is valid only on a full board")
         if board_full and moves_left > 1:
             raise ValueError("a full board may retain at most one placement")
         if self.opening and (
-            to_move != 0
-            or moves_left != 1
-            or pass_streak != 0
-            or occupied != 0
-            or self.terminal
+            to_move != 0 or moves_left != 1 or occupied != 0 or self.terminal
         ):
             raise ValueError("invalid one-stone opening metadata")
 
@@ -138,7 +130,6 @@ class DoubleStarPosition:
         to_move: int,
         moves_left: int,
         opening: bool,
-        pass_streak: int,
         terminal: bool,
     ) -> "DoubleStarPosition":
         raw = torch.as_tensor(stones)
@@ -155,7 +146,6 @@ class DoubleStarPosition:
             to_move=to_move,
             moves_left=moves_left,
             opening=opening,
-            pass_streak=pass_streak,
             terminal=terminal,
         )
 
@@ -169,7 +159,6 @@ class EncodedPosition:
     node_features: Tensor
     global_features: Tensor
     legal_node_mask: Tensor
-    legal_pass: Tensor
     score: ScoreResult
 
 
@@ -278,7 +267,7 @@ def encode_position(
     dtype: torch.dtype = torch.float32,
     device: torch.device | str | None = None,
 ) -> EncodedPosition:
-    """Encode schema v2 from the semantic key, with no history leakage."""
+    """Encode schema v3 from the semantic key, with no history leakage."""
 
     topology = get_topology(position.rings)
     stones = position.stones.detach().to(device="cpu", dtype=torch.int8)
@@ -323,7 +312,7 @@ def encode_position(
     opponent_count = int(opponent_stone.sum())
     current_score = score.players[current]
     opponent_score = score.players[opponent]
-    score_scale = 181.0
+    score_scale = float(SCORE_MARGIN_MAX)
     star_scale = max(1.0, topology.peri_count / 2.0)
     global_features = torch.tensor(
         (
@@ -333,7 +322,6 @@ def encode_position(
             opponent_count / topology.n,
             position.moves_left / 2.0,
             float(position.opening),
-            position.pass_streak / 2.0,
             float(position.terminal),
             current_score.total / score_scale,
             opponent_score.total / score_scale,
@@ -355,9 +343,6 @@ def encode_position(
         node_features=node_features.to(target_device),
         global_features=global_features.to(target_device),
         legal_node_mask=legal.to(target_device),
-        legal_pass=torch.tensor(
-            not position.terminal, dtype=torch.bool, device=target_device
-        ),
         score=score,
     )
 
@@ -392,7 +377,7 @@ def collate_encoded(positions: Sequence[EncodedPosition]) -> EncodedBatch:
     )
     node_mask = torch.zeros((batch_size, max_nodes), dtype=torch.bool, device=device)
     legal_action_mask = torch.zeros(
-        (batch_size, max_nodes + 1), dtype=torch.bool, device=device
+        (batch_size, max_nodes), dtype=torch.bool, device=device
     )
 
     for batch_index, position in enumerate(positions):
@@ -409,15 +394,7 @@ def collate_encoded(positions: Sequence[EncodedPosition]) -> EncodedBatch:
         neighbor_edge_type[batch_index, :nodes, :degree] = (
             position.topology.neighbor_edge_type.to(device)
         )
-        sample_legal = torch.cat(
-            (position.legal_node_mask, position.legal_pass.reshape(1))
-        )
-        legal_action_mask[batch_index] = relocate_sample_actions(
-            sample_legal,
-            sample_nodes=nodes,
-            batch_max_nodes=max_nodes,
-            fill_value=False,
-        )
+        legal_action_mask[batch_index, :nodes] = position.legal_node_mask
 
     return EncodedBatch(
         node_features=node_features,
@@ -449,5 +426,5 @@ def encode_batch(
     )
 
 
-assert FEATURE_SCHEMA_VERSION == 2
+assert FEATURE_SCHEMA_VERSION == 3
 assert FEATURE_SCHEMA_HASH != 0

@@ -17,6 +17,8 @@ from .contracts import (
 from .features import GLOBAL_FEATURE_DIM, NODE_FEATURE_DIM
 from .topology import EDGE_CLASS_COUNT
 
+MODEL_SCHEMA_VERSION = 2
+
 
 @dataclass(frozen=True, slots=True)
 class ModelConfig:
@@ -35,6 +37,11 @@ class ModelConfig:
     soft_policy_temperature: float = SOFT_POLICY_TEMPERATURE
 
     def __post_init__(self) -> None:
+        if (
+            self.node_feature_dim != NODE_FEATURE_DIM
+            or self.global_feature_dim != GLOBAL_FEATURE_DIM
+        ):
+            raise ValueError("model feature dimensions must match feature schema v3")
         if self.width <= 0:
             raise ValueError("width must be positive")
         if self.rrt_groups <= 0:
@@ -53,7 +60,7 @@ class ModelConfig:
             self.score_margin_min != SCORE_MARGIN_MIN
             or self.score_margin_max != SCORE_MARGIN_MAX
         ):
-            raise ValueError("score-margin support is fixed at [-181, 181]")
+            raise ValueError("score-margin support is fixed at [-151, 151]")
         if self.soft_policy_temperature != SOFT_POLICY_TEMPERATURE:
             raise ValueError("the single KataGo soft-policy temperature is fixed at 4")
 
@@ -64,7 +71,7 @@ class ModelConfig:
 
 class StarModelOutput(NamedTuple):
     policy_logits: Tensor
-    wdl_logits: Tensor
+    outcome_logits: Tensor
     score_margin_logits: Tensor
     ownership_logits: Tensor
     alive_logits: Tensor
@@ -250,7 +257,7 @@ def _mask_logits(logits: Tensor, legal_mask: Tensor) -> Tensor:
 
 
 class GraphResTNet(nn.Module):
-    """Shared model for rings 3..12 with five configurable-width RRT groups."""
+    """Shared model for rings 4, 6, 8, and 10."""
 
     def __init__(self, config: ModelConfig = ModelConfig()) -> None:
         super().__init__()
@@ -267,13 +274,11 @@ class GraphResTNet(nn.Module):
         self.final_token_norm = nn.RMSNorm(width, eps=config.rms_norm_eps)
 
         self.node_policy = nn.Linear(width, 1)
-        self.pass_policy = nn.Linear(width, 1)
-        self.wdl_head = nn.Linear(width, 3)
+        self.outcome_head = nn.Linear(width, 2)
         self.score_margin_head = nn.Linear(width, config.score_margin_bins)
         self.ownership_head = nn.Linear(width, 3)
         self.alive_head = nn.Linear(width, 1)
         self.soft_node_policy = nn.Linear(width, 1)
-        self.soft_pass_policy = nn.Linear(width, 1)
 
     def forward(
         self,
@@ -305,25 +310,15 @@ class GraphResTNet(nn.Module):
         nodes = self.final_node_norm(nodes) * mask_values
         pooled = self.final_token_norm(token[:, 0])
         policy_logits = _mask_logits(
-            torch.cat(
-                (self.node_policy(nodes).squeeze(-1), self.pass_policy(pooled)),
-                dim=1,
-            ),
-            legal_action_mask,
+            self.node_policy(nodes).squeeze(-1), legal_action_mask
         )
         soft_policy_logits = _mask_logits(
-            torch.cat(
-                (
-                    self.soft_node_policy(nodes).squeeze(-1),
-                    self.soft_pass_policy(pooled),
-                ),
-                dim=1,
-            ),
+            self.soft_node_policy(nodes).squeeze(-1),
             legal_action_mask,
         )
         return StarModelOutput(
             policy_logits=policy_logits,
-            wdl_logits=self.wdl_head(pooled),
+            outcome_logits=self.outcome_head(pooled),
             score_margin_logits=self.score_margin_head(pooled),
             ownership_logits=self.ownership_head(nodes),
             alive_logits=self.alive_head(nodes).squeeze(-1),

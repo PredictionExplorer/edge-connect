@@ -50,7 +50,7 @@ jobs:
       - run: uv run maturin develop --release --locked --manifest-path crates/star-py/Cargo.toml
       - run: uv run pytest --require-native -m "cuda and not multi_gpu and not soak"
       - run: uv run python scripts/hardware_preflight.py --config "configs/${PROFILE}.yaml" --rings 6
-      - run: uv run python scripts/hardware_preflight.py --config "configs/${PROFILE}.yaml" --rings 12
+      - run: uv run python scripts/hardware_preflight.py --config "configs/${PROFILE}.yaml" --rings 10
       - run: uv run torchrun --standalone --nproc-per-node 2 scripts/nccl_smoke.py --config "configs/${PROFILE}.yaml"
       - if: ${{ inputs.run_soak }}
         run: uv run pytest --require-native --run-soak -m soak

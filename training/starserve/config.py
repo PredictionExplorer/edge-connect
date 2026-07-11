@@ -18,7 +18,7 @@ from startrain.contracts import (
     RULES_SCHEMA_ID,
 )
 
-SERVER_CONFIG_SCHEMA_VERSION = 1
+SERVER_CONFIG_SCHEMA_VERSION = 2
 _T = TypeVar("_T")
 
 
@@ -136,7 +136,7 @@ class ServerConfig:
 
     def __post_init__(self) -> None:
         if self.schema_version != SERVER_CONFIG_SCHEMA_VERSION:
-            raise ServerConfigError("server configuration schema_version must be 1")
+            raise ServerConfigError("server configuration schema_version must be 2")
         expected = (
             (self.rules_schema_id, RULES_SCHEMA_ID, "rules schema"),
             (self.rules_hash, RULES_HASH_WIRE, "rules hash"),

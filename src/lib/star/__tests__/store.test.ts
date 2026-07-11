@@ -1,13 +1,17 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import {
+  APP_STORE_VERSION,
   DEFAULT_CONFIG,
+  migratePersistedState,
+  normalizeGameConfig,
+  parseGameAction,
   sanitizePersistedState,
   useAppStore,
 } from '../../store';
 import type { GameConfig } from '../game';
 
 const double: GameConfig = {
-  rings: 3,
+  rings: 6,
   mode: 'double',
   pieRule: false,
   playerNames: ['A', 'B'],
@@ -74,6 +78,15 @@ describe('persisted app-state validation', () => {
     expect(illegal.log).toEqual([]);
   });
 
+  it('has no legacy pass parser path', () => {
+    expect(parseGameAction({ type: 'pass' })).toBeNull();
+    expect(parseGameAction({ type: 'place', node: 2 })).toEqual({
+      type: 'place',
+      node: 2,
+    });
+    expect(parseGameAction({ type: 'swap' })).toEqual({ type: 'swap' });
+  });
+
   it('rejects incompatible configs instead of casting persisted values', () => {
     const result = sanitizePersistedState({
       phase: 'playing',
@@ -85,6 +98,54 @@ describe('persisted app-state validation', () => {
     expect(result.phase).toBe('setup');
     expect(result.config).toEqual(DEFAULT_CONFIG);
     expect(result.controllers).toEqual(['human', 'human']);
+  });
+
+  it('resets old games without replay migration and preserves valid preferences', () => {
+    const migrated = migratePersistedState(
+      {
+        phase: 'playing',
+        config: {
+          rings: 8,
+          mode: 'double',
+          pieRule: false,
+          playerNames: ['Ada', 'Grace'],
+        },
+        controllers: ['server', 'local'],
+        aiPaused: true,
+        log: [{ type: 'place', node: 0 }],
+        redoStack: [{ type: 'place', node: 1 }],
+      },
+      APP_STORE_VERSION - 1,
+    );
+    expect(migrated).toEqual({
+      phase: 'setup',
+      config: {
+        rings: 8,
+        mode: 'double',
+        pieRule: false,
+        playerNames: ['Ada', 'Grace'],
+      },
+      controllers: ['server', 'local'],
+      aiPaused: false,
+      log: [],
+      redoStack: [],
+    });
+  });
+
+  it('normalizes preferences independently and defaults an invalid ring to 6', () => {
+    expect(
+      normalizeGameConfig({
+        rings: 5,
+        mode: 'double',
+        pieRule: true,
+        playerNames: ['Ada', 17],
+      }),
+    ).toEqual({
+      rings: 6,
+      mode: 'double',
+      pieRule: true,
+      playerNames: ['Ada', 'Player 2'],
+    });
   });
 });
 
@@ -162,6 +223,14 @@ describe('gameplay store actions', () => {
       aiPaused: false,
       reviewing: false,
     });
+  });
+
+  it('refuses to start unsupported board sizes instead of coercing them', () => {
+    const before = useAppStore.getState();
+    expect(() =>
+      before.startGame({ ...double, rings: 9 }, ['human', 'human']),
+    ).toThrow(/unsupported configuration/i);
+    expect(useAppStore.getState().phase).toBe('setup');
   });
 
   it('normalizes unsupported AI controllers and ignores invalid controller slots', () => {

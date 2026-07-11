@@ -36,85 +36,70 @@ impl Player {
 pub enum Action {
     /// Place one stone at the dense node id.
     Place(NodeId),
-    /// Forfeit the rest of the current turn.
-    Pass,
 }
 
 impl Action {
-    /// Stable integer encoding used by foreign interfaces (`-1` is pass).
+    /// Stable integer encoding used by foreign interfaces.
     #[must_use]
     pub const fn code(self) -> i32 {
         match self {
             Self::Place(node) => node as i32,
-            Self::Pass => -1,
         }
     }
 
     /// Decodes a foreign-interface action code.
     pub fn from_code(code: i32) -> Result<Self, GameError> {
-        if code == -1 {
-            Ok(Self::Pass)
-        } else if let Ok(node) = NodeId::try_from(code) {
+        if let Ok(node) = NodeId::try_from(code) {
             Ok(Self::Place(node))
         } else {
             Err(GameError::InvalidActionCode(code))
         }
     }
 
-    /// Native model index: node `u` maps to `u`, pass maps to `node_count`.
+    /// Native model index: node `u` maps exactly to `u`.
     pub fn native_index(self, board: &Board) -> Result<usize, GameError> {
         match self {
             Self::Place(node) if node < board.node_count() => Ok(usize::from(node)),
             Self::Place(node) => Err(GameError::NodeOutOfBounds(node)),
-            Self::Pass => Ok(usize::from(board.node_count())),
         }
     }
 
-    /// Decodes the native nodes-then-pass model layout.
+    /// Decodes the native nodes-only model layout.
     pub fn from_native_index(index: usize, board: &Board) -> Result<Self, GameError> {
         if index < usize::from(board.node_count()) {
             Ok(Self::Place(
                 NodeId::try_from(index).expect("board node ids fit in u16"),
             ))
-        } else if index == usize::from(board.node_count()) {
-            Ok(Self::Pass)
         } else {
             Err(GameError::InvalidNativeActionIndex(index))
         }
     }
 }
 
-/// Placement mask plus the independent pass action.
+/// Placement mask for all legal atomic actions.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LegalActions {
     /// Empty nodes on which a stone may be placed.
     pub placements: BitBoard,
-    /// Whether pass is legal.
-    pub pass: bool,
 }
 
 impl LegalActions {
     /// Number of legal atomic actions.
     #[must_use]
     pub fn len(self) -> usize {
-        usize::from(self.placements.count()) + usize::from(self.pass)
+        usize::from(self.placements.count())
     }
 
     /// Whether no legal action exists.
     #[must_use]
     pub fn is_empty(self) -> bool {
-        self.placements.is_empty() && !self.pass
+        self.placements.is_empty()
     }
 
-    /// Materializes actions in stable node-id order, with pass last.
+    /// Materializes placements in ascending node-id order.
     #[must_use]
     pub fn to_vec(self) -> Vec<Action> {
-        let mut actions = Vec::with_capacity(self.len());
-        actions.extend(self.placements.iter().map(Action::Place));
-        if self.pass {
-            actions.push(Action::Pass);
-        }
-        actions
+        self.placements.iter().map(Action::Place).collect()
     }
 }
 
@@ -131,8 +116,6 @@ pub struct StateKey {
     pub moves_left: u8,
     /// Whether the special one-stone opening turn is active.
     pub opening: bool,
-    /// Consecutive pass count.
-    pub pass_streak: u8,
     /// Terminal marker, included defensively even though it is derivable.
     pub terminal: bool,
 }
@@ -146,9 +129,9 @@ pub enum GameError {
     NodeOutOfBounds(NodeId),
     /// A placement references an occupied node.
     Occupied(NodeId),
-    /// Foreign action code is neither pass nor a node id.
+    /// Foreign action code is not a node id.
     InvalidActionCode(i32),
-    /// Native action index is outside the nodes-then-pass layout.
+    /// Native action index is outside the nodes-only layout.
     InvalidNativeActionIndex(usize),
     /// Imported bitboards overlap.
     OverlappingStones,
@@ -199,7 +182,6 @@ pub struct Undo {
     to_move: Player,
     moves_left: u8,
     opening: bool,
-    pass_streak: u8,
     terminal: bool,
     stones_placed: u16,
     last_move: Option<NodeId>,
@@ -216,7 +198,6 @@ pub struct GameState {
     to_move: Player,
     moves_left: u8,
     opening: bool,
-    pass_streak: u8,
     terminal: bool,
     stones_placed: u16,
     last_move: Option<NodeId>,
@@ -235,7 +216,6 @@ impl GameState {
             to_move: Player::Zero,
             moves_left: 1,
             opening: true,
-            pass_streak: 0,
             terminal: false,
             stones_placed: 0,
             last_move: None,
@@ -252,7 +232,6 @@ impl GameState {
         to_move: Player,
         moves_left: u8,
         opening: bool,
-        pass_streak: u8,
     ) -> Result<Self, GameError> {
         if !stones[0].intersection(stones[1]).is_empty() {
             return Err(GameError::OverlappingStones);
@@ -265,16 +244,13 @@ impl GameState {
         }
         let stones_placed = stones[0].count() + stones[1].count();
         let board_full = stones_placed == board.node_count();
-        let terminal = pass_streak >= 2 || board_full;
+        let terminal = board_full;
         if moves_left > 2
             || (moves_left == 0 && !board_full)
             || (board_full && moves_left > 1)
-            || pass_streak > 2
-            || (pass_streak > 0 && (opening || board_full || moves_left != 2))
             || (opening
                 && (to_move != Player::Zero
                     || moves_left != 1
-                    || pass_streak != 0
                     || !stones[0].is_empty()
                     || !stones[1].is_empty()))
         {
@@ -287,7 +263,6 @@ impl GameState {
             to_move,
             moves_left,
             opening,
-            pass_streak,
             terminal,
             stones_placed,
             last_move: None,
@@ -357,12 +332,6 @@ impl GameState {
         self.opening
     }
 
-    /// Consecutive pass count.
-    #[must_use]
-    pub const fn pass_streak(&self) -> u8 {
-        self.pass_streak
-    }
-
     /// Whether no further action is legal.
     #[must_use]
     pub const fn is_terminal(&self) -> bool {
@@ -408,7 +377,6 @@ impl GameState {
             to_move: self.to_move,
             moves_left: self.moves_left,
             opening: self.opening,
-            pass_streak: self.pass_streak,
             terminal: self.terminal,
         }
     }
@@ -426,7 +394,6 @@ impl GameState {
         hash ^= splitmix64(0x7000_0000_0000_0000 ^ self.to_move as u64);
         hash ^= splitmix64(0x7100_0000_0000_0000 ^ u64::from(self.moves_left));
         hash ^= splitmix64(0x7200_0000_0000_0000 ^ u64::from(self.opening));
-        hash ^= splitmix64(0x7300_0000_0000_0000 ^ u64::from(self.pass_streak));
         hash ^= splitmix64(0x7400_0000_0000_0000 ^ u64::from(self.terminal));
         hash
     }
@@ -454,12 +421,10 @@ impl GameState {
         if self.terminal {
             LegalActions {
                 placements: BitBoard::empty(),
-                pass: false,
             }
         } else {
             LegalActions {
                 placements: self.board.node_mask().difference(self.occupied()),
-                pass: true,
             }
         }
     }
@@ -470,12 +435,8 @@ impl GameState {
         if self.terminal {
             return false;
         }
-        match action {
-            Action::Place(node) => {
-                node < self.board.node_count() && !self.occupied().contains(node)
-            }
-            Action::Pass => true,
-        }
+        let Action::Place(node) = action;
+        node < self.board.node_count() && !self.occupied().contains(node)
     }
 
     /// Applies one atomic action.
@@ -490,7 +451,6 @@ impl GameState {
             to_move: self.to_move,
             moves_left: self.moves_left,
             opening: self.opening,
-            pass_streak: self.pass_streak,
             terminal: self.terminal,
             stones_placed: self.stones_placed,
             last_move: self.last_move,
@@ -508,7 +468,6 @@ impl GameState {
         self.to_move = undo.to_move;
         self.moves_left = undo.moves_left;
         self.opening = undo.opening;
-        self.pass_streak = undo.pass_streak;
         self.terminal = undo.terminal;
         self.stones_placed = undo.stones_placed;
         self.last_move = undo.last_move;
@@ -522,36 +481,24 @@ impl GameState {
             return Err(GameError::GameOver);
         }
         let player_before = self.to_move;
-        match action {
-            Action::Place(node) => {
-                if node >= self.board.node_count() {
-                    return Err(GameError::NodeOutOfBounds(node));
-                }
-                if self.occupied().contains(node) {
-                    return Err(GameError::Occupied(node));
-                }
-                self.stones[self.to_move.index()].insert(node);
-                self.stones_placed += 1;
-                self.last_move = Some(node);
-                self.current_turn_moves[usize::from(self.current_turn_len)] = node;
-                self.current_turn_len += 1;
-                self.pass_streak = 0;
-                self.moves_left -= 1;
+        let Action::Place(node) = action;
+        if node >= self.board.node_count() {
+            return Err(GameError::NodeOutOfBounds(node));
+        }
+        if self.occupied().contains(node) {
+            return Err(GameError::Occupied(node));
+        }
+        self.stones[self.to_move.index()].insert(node);
+        self.stones_placed += 1;
+        self.last_move = Some(node);
+        self.current_turn_moves[usize::from(self.current_turn_len)] = node;
+        self.current_turn_len += 1;
+        self.moves_left -= 1;
 
-                if self.stones_placed == self.board.node_count() {
-                    self.terminal = true;
-                } else if self.moves_left == 0 {
-                    self.end_turn();
-                }
-            }
-            Action::Pass => {
-                self.pass_streak += 1;
-                if self.pass_streak >= 2 {
-                    self.terminal = true;
-                } else {
-                    self.end_turn();
-                }
-            }
+        if self.stones_placed == self.board.node_count() {
+            self.terminal = true;
+        } else if self.moves_left == 0 {
+            self.end_turn();
         }
 
         Ok(Transition {

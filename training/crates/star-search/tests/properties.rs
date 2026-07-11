@@ -5,7 +5,7 @@ use std::convert::Infallible;
 use std::sync::Arc;
 
 use proptest::prelude::*;
-use star_engine::{Action, Board, GameState, MAX_RINGS, MIN_RINGS};
+use star_engine::{Action, Board, GameState, SUPPORTED_RINGS};
 use star_search::{
     BatchEvaluator, Evaluation, EvaluationRequest, GumbelParameters, GumbelSequentialHalving,
     RootSearchConfig, SearchResult, gumbel_search_batch,
@@ -99,10 +99,8 @@ impl BatchEvaluator for ContractEvaluator {
                     .legal_actions
                     .iter()
                     .map(|action| {
-                        let action_key = match action {
-                            Action::Place(node) => u64::from(*node),
-                            Action::Pass => u64::MAX,
-                        };
+                        let Action::Place(node) = action;
+                        let action_key = u64::from(*node);
                         let bits =
                             splitmix64(state_hash ^ action_key.wrapping_mul(0x9e37_79b9_7f4a_7c15));
                         ((bits % 2001) as i32 - 1000) as f32 / 64.0
@@ -226,7 +224,7 @@ proptest! {
 
     #[test]
     fn randomized_searches_are_exact_deterministic_and_policy_normalized(
-        rings in MIN_RINGS..=MAX_RINGS,
+        rings in prop::sample::select(SUPPORTED_RINGS.to_vec()),
         placement_ranks in prop::collection::vec(any::<u16>(), 1..20),
         simulations in 1_u32..33,
         max_considered in 1_usize..65,

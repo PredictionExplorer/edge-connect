@@ -1,3 +1,4 @@
+from contextlib import nullcontext
 from dataclasses import replace
 from pathlib import Path
 
@@ -20,15 +21,16 @@ from startrain.optim import (
     build_optimizer,
     split_decay_parameters,
 )
-from startrain.replay import ReplaySample, collate_replay_samples
+from startrain.replay import ReplayBatch, ReplaySample, collate_replay_samples
 from startrain.sampling import RingStratifiedSampler
-from startrain.scoring import score_position
+from startrain.scoring import PlayerScore, ScoreResult
 from startrain.topology import get_topology
 from startrain.training import (
     DeviceBatchPrefetcher,
     build_scheduler,
     maybe_compile_model,
     train_step,
+    unwrap_model,
 )
 
 
@@ -46,26 +48,34 @@ def tiny_model() -> GraphResTNet:
     )
 
 
-def sample() -> ReplaySample:
-    topology = get_topology(3)
+def sample(rings: int = 4) -> ReplaySample:
+    topology = get_topology(rings)
     stones = torch.full((topology.n,), -1, dtype=torch.int8)
     stones[0] = 0
     position = DoubleStarPosition(
-        rings=3,
+        rings=rings,
         stones=stones,
         to_move=1,
         moves_left=2,
         opening=False,
-        pass_streak=0,
         terminal=False,
     )
-    legal = np.concatenate(((stones.numpy() == -1), np.asarray([True])))
+    legal = stones.numpy() == -1
     policy = legal.astype(np.float32)
     policy /= policy.sum()
     return ReplaySample.from_position(
         position,
         policy=policy,
-        final_score=score_position(topology, stones),
+        final_score=ScoreResult(
+            players=(
+                PlayerScore(10, 3, 1, 1, 0, 11),
+                PlayerScore(5, 2, 1, 0, 0, 5),
+            ),
+            node_owner=torch.zeros(topology.n, dtype=torch.int8),
+            alive_stone=torch.zeros(topology.n, dtype=torch.bool),
+            contested_peries=0,
+            leader=0,
+        ),
         search_provenance="mcts:test",
         policy_provenance="root-visits",
     )
@@ -74,7 +84,7 @@ def sample() -> ReplaySample:
 def test_yaml_configs_load_strictly() -> None:
     small = load_config(CONFIGS / "small.yaml")
     h100 = load_config(CONFIGS / "h100.yaml")
-    assert small.schema_version == h100.schema_version == 2
+    assert small.schema_version == h100.schema_version == 3
     assert small.model.rrt_groups == h100.model.rrt_groups == 5
     assert h100.model.kv_heads < h100.model.attention_heads
     assert small.train.precision == "fp32"
@@ -124,6 +134,19 @@ def test_yaml_parses_opt_in_learner_ring_mixture_curriculum(tmp_path) -> None:
 
     experiment = load_config(configured)
     assert experiment.learner.use_ring_mixture_curriculum is True
+
+
+def test_old_config_schema_and_noncanonical_rings_are_rejected(tmp_path) -> None:
+    source = (CONFIGS / "small.yaml").read_text(encoding="utf-8")
+    old = tmp_path / "old.yaml"
+    old.write_text(source.replace("schema_version: 3", "schema_version: 2", 1))
+    with pytest.raises(ConfigError, match="schema_version must be 3"):
+        load_config(old)
+
+    odd = tmp_path / "odd.yaml"
+    odd.write_text(source.replace("rings: 4", "rings: 5", 1))
+    with pytest.raises(ConfigError, match="one of"):
+        load_config(odd)
 
 
 def test_plateau_candidate_cadence_fits_replay_lag() -> None:
@@ -257,7 +280,7 @@ def test_bf16_compiled_train_step_scheduler_and_checkpoint(tmp_path) -> None:
         ema=ema,
         step=9,
         epoch=2,
-        config={"schema_version": 2},
+        config={"schema_version": 3},
     )
     restored = tiny_model()
     restored_optimizer = build_optimizer(restored, OptimizerConfig(kind="adamw"))
@@ -286,6 +309,13 @@ def test_bf16_compiled_train_step_scheduler_and_checkpoint(tmp_path) -> None:
     torch.save(payload, tampered_path)
     with pytest.raises(ValueError, match="rules hash"):
         load_checkpoint(tampered_path, model=tiny_model())
+
+    old_path = tmp_path / "old-checkpoint.pt"
+    payload = torch.load(path, weights_only=True)
+    payload["version"] = 2
+    torch.save(payload, old_path)
+    with pytest.raises(ValueError, match="checkpoint version"):
+        load_checkpoint(old_path, model=tiny_model())
 
 
 def test_public_train_step_validates_untrusted_target_weights() -> None:
@@ -347,6 +377,120 @@ def test_device_prefetcher_cpu_path_preserves_batches() -> None:
         torch.testing.assert_close(expected.targets.policy, actual.targets.policy)
 
 
+def test_prefetch_transfer_reuses_homogeneous_topology_and_handles_mixed_rings() -> (
+    None
+):
+    prefetcher = object.__new__(DeviceBatchPrefetcher)
+    prefetcher.device = torch.device("cpu")
+    prefetcher._topology_cache = {}
+
+    homogeneous = collate_replay_samples([sample(4), sample(4)])
+    first = prefetcher._to_device(homogeneous)
+    second = prefetcher._to_device(homogeneous)
+
+    assert len(prefetcher._topology_cache) == 1
+    assert (
+        first.inputs.neighbor_index.data_ptr()
+        == second.inputs.neighbor_index.data_ptr()
+    )
+    assert (
+        first.inputs.neighbor_mask.data_ptr() == second.inputs.neighbor_mask.data_ptr()
+    )
+    assert (
+        first.inputs.neighbor_edge_type.data_ptr()
+        == second.inputs.neighbor_edge_type.data_ptr()
+    )
+    assert first.inputs.node_mask.data_ptr() == second.inputs.node_mask.data_ptr()
+    torch.testing.assert_close(first.targets.policy, homogeneous.targets.policy)
+
+    mixed = collate_replay_samples([sample(4), sample(6)])
+    transferred = prefetcher._to_device(mixed)
+    assert transferred.inputs.rings.tolist() == [4, 6]
+    assert transferred.inputs.max_nodes == get_topology(6).n
+    assert len(prefetcher._topology_cache) == 1
+
+
+def test_async_prefetch_hands_off_events_and_exhausts_cleanly(monkeypatch) -> None:
+    class FakeEvent:
+        def __init__(self, *, enable_timing: bool) -> None:
+            assert enable_timing
+            self.recorded_on: list[object] = []
+
+        def record(self, stream: object) -> None:
+            self.recorded_on.append(stream)
+
+        def elapsed_time(self, _completed: object) -> float:
+            return 2.5
+
+    class FakeCurrentStream:
+        def __init__(self) -> None:
+            self.waited_for: list[object] = []
+
+        def wait_stream(self, stream: object) -> None:
+            self.waited_for.append(stream)
+
+    fake_copy_stream = object()
+    current_stream = FakeCurrentStream()
+    monkeypatch.setattr(torch.cuda, "Event", FakeEvent)
+    monkeypatch.setattr(torch.cuda, "stream", lambda stream: nullcontext(stream))
+    monkeypatch.setattr(
+        torch.cuda,
+        "current_stream",
+        lambda _device: current_stream,
+    )
+    recorded_batches: list[ReplayBatch] = []
+    monkeypatch.setattr(
+        ReplayBatch,
+        "record_stream",
+        lambda batch, _stream: recorded_batches.append(batch),
+    )
+    monkeypatch.setattr(
+        DeviceBatchPrefetcher,
+        "_to_device",
+        lambda _prefetcher, source: source,
+    )
+
+    sources = [
+        collate_replay_samples([sample()]),
+        collate_replay_samples([sample()]),
+    ]
+    prefetcher = object.__new__(DeviceBatchPrefetcher)
+    prefetcher._batches = iter(sources)
+    prefetcher.device = torch.device("cpu")
+    prefetcher._stream = fake_copy_stream
+    prefetcher._consumed_copy_events = []
+    prefetcher._next_copy_event = None
+    prefetcher._topology_cache = {}
+    prefetcher._next_batch = None
+    prefetcher._next_source = None
+    prefetcher._preload()
+
+    assert next(prefetcher) is sources[0]
+    assert next(prefetcher) is sources[1]
+    with pytest.raises(StopIteration):
+        next(prefetcher)
+    assert recorded_batches == sources
+    assert current_stream.waited_for == [fake_copy_stream, fake_copy_stream]
+    assert prefetcher.pop_copy_seconds() == pytest.approx(0.005)
+    assert prefetcher.pop_copy_events() == []
+
+
+def test_training_rejects_invalid_step_controls_and_unwraps_nested_models() -> None:
+    model = tiny_model()
+    wrapper = torch.nn.Module()
+    wrapper.module = model
+    outer = torch.nn.Module()
+    outer._orig_mod = wrapper
+    assert unwrap_model(outer) is model
+
+    optimizer = build_optimizer(model, OptimizerConfig(kind="adamw"))
+    batch = collate_replay_samples([sample()])
+    with pytest.raises(ValueError, match="precision"):
+        train_step(model, batch, optimizer, precision="fp16")
+    with pytest.raises(ValueError, match="gradient_clip_norm"):
+        train_step(model, batch, optimizer, gradient_clip_norm=0)
+
+
 @pytest.mark.cuda
 def test_cuda_prefetcher_reuses_ring_topology_and_tracks_copy_time() -> None:
     sources = [
@@ -398,10 +542,10 @@ def test_ema_foreach_update_matches_exact_lerp() -> None:
 
 
 def test_ring_stratified_sampler_remains_balanced() -> None:
-    rings = [3] * 8 + [12] * 2
+    rings = [4] * 8 + [10] * 2
     sampler = RingStratifiedSampler(rings, num_samples=20, seed=11)
     sampled = [rings[index] for index in sampler]
-    assert sampled.count(3) == sampled.count(12) == 10
+    assert sampled.count(4) == sampled.count(10) == 10
 
 
 def test_onnx_parity_when_runtime_is_available(tmp_path) -> None:
@@ -418,7 +562,6 @@ def test_onnx_parity_when_runtime_is_available(tmp_path) -> None:
         to_move=0,
         moves_left=2,
         opening=False,
-        pass_streak=0,
         terminal=False,
     )
     for inference_batch in (batch, encode_batch([position4])):

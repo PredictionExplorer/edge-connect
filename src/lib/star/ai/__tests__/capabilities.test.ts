@@ -4,6 +4,7 @@ import {
   checkServerAiCapability,
   localBrowserCapabilityIssue,
 } from '../capabilities';
+import { STAR_FEATURE_SCHEMA_HASH } from '../protocol';
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -12,24 +13,24 @@ afterEach(() => {
 describe('AI capability preflight', () => {
   it('validates the server health contract through the same-origin route', async () => {
     const fetchMock = vi.fn(async (url: string | URL | Request) => {
-      expect(String(url)).toBe('/v1/health');
+      expect(String(url)).toBe('/v2/health');
       return Response.json({
         status: 'ok',
         service_version: '1.0.0',
-        api_schema_version: 1,
+        api_schema_version: 2,
         model: { ready: true, model_version: 'test', model_step: 1 },
         rules: {
-          schema_id: 'edgeconnect.star.rules.v1',
-          version: 1,
-          hash: 'fnv1a64:cdb34fb02be82843',
+          schema_id: 'edgeconnect.star.rules.v2',
+          version: 2,
+          hash: 'fnv1a64:2da3783519381453',
         },
         features: {
-          schema_id: 'edgeconnect.star.model-features.external.v1',
-          version: 2,
-          hash: '59a7da1c00bac4d2',
+          schema_id: 'edgeconnect.star.model-features.external.v2',
+          version: 3,
+          hash: STAR_FEATURE_SCHEMA_HASH,
         },
         actions: {
-          schema_id: 'edgeconnect.star.action-layout.nodes-then-pass.v1',
+          schema_id: 'edgeconnect.star.action-layout.nodes-only.v1',
         },
       });
     });
@@ -46,10 +47,10 @@ describe('AI capability preflight', () => {
       vi.fn(async () =>
         Response.json({
           status: 'ok',
-          api_schema_version: 1,
+          api_schema_version: 2,
           model: { ready: true },
           rules: {
-            schema_id: 'edgeconnect.star.rules.v1',
+            schema_id: 'edgeconnect.star.rules.v2',
             hash: 'fnv1a64:wrong',
           },
           features: {},

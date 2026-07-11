@@ -9,7 +9,7 @@ from startrain.topology import get_topology
 from startrain.training import maybe_compile_model, unwrap_model
 
 
-def _batch(batch_size: int = 4, *, rings: int = 3):
+def _batch(batch_size: int = 4, *, rings: int = 4):
     topology = get_topology(rings)
     position = DoubleStarPosition(
         rings=rings,
@@ -17,7 +17,6 @@ def _batch(batch_size: int = 4, *, rings: int = 3):
         to_move=0,
         moves_left=1,
         opening=True,
-        pass_streak=0,
         terminal=False,
     )
     return encode_batch([position] * batch_size).to("cuda")
@@ -50,13 +49,13 @@ def test_cuda_bf16_compiled_forward_backward_is_finite() -> None:
     )
     assert unwrap_model(compiled) is model
     assert tuple(id(parameter) for parameter in model.parameters()) == parameter_ids
-    for rings in (*range(3, 13), *range(12, 2, -1)):
+    for rings in (4, 6, 8, 10, 10, 8, 6, 4):
         model.zero_grad(set_to_none=True)
         batch = _batch(batch_size=2, rings=rings)
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             output = compiled(*batch.model_args())
             loss = (
-                output.wdl_logits.float().square().mean()
+                output.outcome_logits.float().square().mean()
                 + output.score_margin_logits.float().square().mean()
                 + output.ownership_logits.float().square().mean()
             )
@@ -81,7 +80,7 @@ def test_cuda_repeated_inference_stays_finite_and_memory_bounded() -> None:
     ):
         for _ in range(500):
             output = model(*batch.model_args())
-            assert bool(torch.isfinite(output.wdl_logits).all())
+            assert bool(torch.isfinite(output.outcome_logits).all())
     torch.cuda.synchronize()
     peak = torch.cuda.max_memory_allocated()
     allocated = torch.cuda.memory_allocated()

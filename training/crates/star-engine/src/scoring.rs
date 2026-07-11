@@ -47,14 +47,13 @@ impl ScoreResult {
         }
     }
 
-    /// Zero-sum result from one player's perspective.
+    /// Decisive zero-sum result from one player's perspective.
+    ///
+    /// Arbitrary static positions may be tied and therefore return `None`.
     #[must_use]
-    pub fn outcome_for(&self, player: Player) -> f32 {
-        match self.leader {
-            Some(leader) if leader == player => 1.0,
-            Some(_) => -1.0,
-            None => 0.0,
-        }
+    pub fn outcome_for(&self, player: Player) -> Option<f32> {
+        self.leader
+            .map(|leader| if leader == player { 1.0 } else { -1.0 })
     }
 }
 
@@ -265,9 +264,11 @@ pub fn score_state(state: &GameState) -> ScoreResult {
 /// Terminal zero-sum value from the state's current-player perspective.
 #[must_use]
 pub fn terminal_value(state: &GameState) -> Option<f32> {
-    state
-        .is_terminal()
-        .then(|| score_state(state).outcome_for(state.to_move()))
+    state.is_terminal().then(|| {
+        score_state(state)
+            .outcome_for(state.to_move())
+            .expect("a full Double *Star board must have a decisive winner")
+    })
 }
 
 fn stone_owner(stones: [BitBoard; 2], node: NodeId) -> Option<Player> {

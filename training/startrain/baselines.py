@@ -14,7 +14,7 @@ from .native import BITBOARD_WORDS, NativeStateDataProtocol
 from .topology import StarTopology, get_topology
 
 _GREEDY_LOGIT_GAP: Final = 32.0
-_EVALUATOR_VERSION: Final = "native-static-score-greedy-v1"
+_EVALUATOR_VERSION: Final = "native-static-score-greedy-v2"
 
 
 @dataclass(frozen=True, slots=True)
@@ -37,7 +37,7 @@ class FrozenBaselineDefinition:
             "non_human": True,
             "algorithm": self.algorithm,
             "evaluator": (
-                "uniform-zero-v1" if self.evaluator == "uniform" else _EVALUATOR_VERSION
+                "uniform-zero-v2" if self.evaluator == "uniform" else _EVALUATOR_VERSION
             ),
             "search_budget": self.search_budget.metadata(),
         }
@@ -45,21 +45,21 @@ class FrozenBaselineDefinition:
 
 _UNIFORM = FrozenBaselineDefinition(
     name="uniform",
-    identity="frozen-uniform-random-v1-s1-k1-cv50-cs1",
+    identity="frozen-uniform-random-v2-s1-k1-cv50-cs1",
     evaluator="uniform",
     algorithm="deterministic-seeded-native-search-over-uniform-policy",
     search_budget=ArenaSearchBudget(1, 1, 50.0, 1.0),
 )
 _GREEDY = FrozenBaselineDefinition(
     name="greedy",
-    identity="frozen-greedy-native-score-v1-s1-k1-cv50-cs1",
+    identity="frozen-greedy-native-score-v2-s1-k1-cv50-cs1",
     evaluator="greedy",
     algorithm="native-one-ply-static-score-greedy",
     search_budget=ArenaSearchBudget(1, 1, 50.0, 1.0),
 )
 _SHALLOW_SEARCH = FrozenBaselineDefinition(
     name="shallow-search",
-    identity="frozen-shallow-native-score-v1-s64-k16-cv50-cs1",
+    identity="frozen-shallow-native-score-v2-s64-k16-cv50-cs1",
     evaluator="greedy",
     algorithm="native-gumbel-mcts-with-one-ply-static-score-heuristic",
     search_budget=ArenaSearchBudget(64, 16, 50.0, 1.0),
@@ -271,7 +271,6 @@ def _semantic_batch(
     to_move = _state_integers("to_move", states.to_move, rows)
     moves_left = _state_integers("moves_left", states.moves_left, rows)
     opening = _state_booleans("opening", states.opening, rows)
-    pass_streak = _state_integers("pass_streak", states.pass_streak, rows)
     return native_module.StateBatch.from_semantic(
         int(states.rings),
         duplicate_words("zero_bits"),
@@ -279,7 +278,6 @@ def _semantic_batch(
         [to_move[row] for row in parent_rows],
         [moves_left[row] for row in parent_rows],
         [opening[row] for row in parent_rows],
-        [pass_streak[row] for row in parent_rows],
     )
 
 
@@ -337,19 +335,6 @@ def _greedy_action_key(
     total_margin = components[actor * 6 + 5] - components[opponent * 6 + 5]
     quark_margin = components[actor * 6 + 1] - components[opponent * 6 + 1]
     peri_margin = components[actor * 6] - components[opponent * 6]
-    if action == -1:
-        return (
-            decisive,
-            total_margin,
-            quark_margin,
-            peri_margin,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-        )
     if not 0 <= action < topology.n:
         raise ValueError("baseline request contains an invalid native action")
 

@@ -1,4 +1,11 @@
-import { cleanup, render, screen, waitFor, within } from '@testing-library/react';
+import {
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { axe } from 'vitest-axe';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -60,6 +67,22 @@ describe('SetupScreen', () => {
     const playerTwo = screen.getByRole('textbox', { name: 'Player 2 name' });
     expect(playerOne).toHaveValue('Player 1');
     expect(playerTwo).toHaveValue('Player 2');
+    expect(screen.getByRole('slider', { name: 'Custom' })).toHaveAttribute(
+      'min',
+      '4',
+    );
+    expect(screen.getByRole('slider', { name: 'Custom' })).toHaveAttribute(
+      'max',
+      '10',
+    );
+    expect(screen.getByRole('slider', { name: 'Custom' })).toHaveAttribute(
+      'step',
+      '2',
+    );
+    fireEvent.change(screen.getByRole('slider', { name: 'Custom' }), {
+      target: { value: '9' },
+    });
+    expect(screen.getByRole('slider', { name: 'Custom' })).toHaveValue('6');
 
     await user.clear(playerOne);
     await user.clear(playerTwo);
@@ -108,7 +131,7 @@ describe('SetupScreen', () => {
   it('blocks setup until a selected controller is ready and supports rechecking', async () => {
     resetStore({
       config: {
-        rings: 3,
+        rings: 4,
         mode: 'double',
         pieRule: false,
         playerNames: ['Ada', 'Grace'],

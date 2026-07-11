@@ -34,11 +34,11 @@
  * Performance: one union-find pass over the CSR adjacency (path halving),
  * one flood fill for regions, one aggregation pass - all on preallocated
  * typed arrays with no hashing. O((N + E) * alpha(N)) total; the largest
- * board is 390 nodes / ~1000 edges, so a full evaluation costs on the order
+ * board is 275 nodes / 775 edges, so a full evaluation costs on the order
  * of microseconds and is run after every stone placement.
  */
 
-import type { Board } from './board';
+import { isSupportedRings, type Board } from './board';
 
 export const EMPTY = -1;
 
@@ -71,6 +71,13 @@ export interface ScoreResult {
   contestedPeries: number;
   /** Player ahead if scored now (0 | 1), or -1 for a dead tie. */
   leader: 0 | 1 | -1;
+}
+
+export interface TerminalWinnerResult {
+  score: ScoreResult & { leader: 0 | 1 };
+  winner: 0 | 1;
+  /** Player-zero total minus player-one total. */
+  margin: number;
 }
 
 /** Score a position. `stones[u]` is EMPTY (-1), 0, or 1. */
@@ -195,4 +202,56 @@ export function scorePosition(board: Board, stones: ArrayLike<number>): ScoreRes
   }
 
   return { players, nodeOwner, aliveStone, contestedPeries, leader };
+}
+
+/**
+ * Validate the invariants that make a completed supported game binary.
+ *
+ * Generic live-position scoring remains tie-capable; terminal consumers must
+ * cross this boundary before producing a winner or model outcome.
+ */
+export function validateTerminalWinner(
+  board: Board,
+  stones: ArrayLike<number>,
+): TerminalWinnerResult {
+  if (!isSupportedRings(board.rings)) {
+    throw new Error(`terminal board rings are unsupported: ${String(board.rings)}`);
+  }
+  if (stones.length !== board.n) {
+    throw new Error(`terminal stones length must be ${board.n}, got ${stones.length}`);
+  }
+  for (let node = 0; node < board.n; node++) {
+    if (stones[node] !== 0 && stones[node] !== 1) {
+      throw new Error(`terminal board must be full; invalid stone at node ${node}`);
+    }
+  }
+
+  const score = scorePosition(board, stones);
+  if (score.contestedPeries !== 0) {
+    throw new Error(
+      `terminal board must have zero contested peries, got ${score.contestedPeries}`,
+    );
+  }
+
+  const expectedTotal = 5 * board.rings + 1;
+  const combinedTotal = score.players[0].total + score.players[1].total;
+  if (combinedTotal !== expectedTotal) {
+    throw new Error(
+      `terminal score total must be ${expectedTotal}, got ${combinedTotal}`,
+    );
+  }
+
+  const margin = score.players[0].total - score.players[1].total;
+  if (margin === 0 || Math.abs(margin) % 2 !== 1) {
+    throw new Error(`terminal score margin must be odd and nonzero, got ${margin}`);
+  }
+  const winner: 0 | 1 = margin > 0 ? 0 : 1;
+  if (score.leader !== winner) {
+    throw new Error('terminal score leader is inconsistent with the score margin');
+  }
+  return {
+    score: score as ScoreResult & { leader: 0 | 1 },
+    winner,
+    margin,
+  };
 }

@@ -12,7 +12,10 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 from .checkpoint import sha256_file, verify_file
+from .contracts import RULES_HASH_HEX
 from .distill import BROWSER_MANIFEST_FORMAT, BROWSER_MANIFEST_SCHEMA_VERSION
+
+WASM_ASSET_DIRECTORY = f"wasm-{RULES_HASH_HEX}"
 
 
 def publish_browser_artifacts(
@@ -70,7 +73,7 @@ def publish_browser_artifacts(
     wasm_source = (
         Path(wasm_source_directory).resolve()
         if wasm_source_directory is not None
-        else target / "wasm"
+        else target / WASM_ASSET_DIRECTORY
     )
     wasm_sources = {
         "module": wasm_source / "star_wasm.js",
@@ -78,7 +81,7 @@ def publish_browser_artifacts(
     }
     _verify_wasm(wasm_sources["module"], wasm_sources["binary"])
 
-    wasm_target = target / "wasm"
+    wasm_target = target / WASM_ASSET_DIRECTORY
     wasm_target.mkdir(parents=True, exist_ok=True)
     destination_onnx = target / resolved["onnx"].name
     destination_manifest = target / "manifest.json"

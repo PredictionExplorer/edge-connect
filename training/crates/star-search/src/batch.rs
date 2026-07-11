@@ -403,9 +403,9 @@ mod tests {
                     let logits = request
                         .legal_actions
                         .iter()
-                        .map(|action| match action {
-                            Action::Place(node) => -f32::from(*node) / 100.0,
-                            Action::Pass => -10.0,
+                        .map(|action| {
+                            let Action::Place(node) = action;
+                            -f32::from(*node) / 100.0
                         })
                         .collect();
                     Evaluation {
@@ -424,7 +424,7 @@ mod tests {
 
     #[test]
     fn token_matching_rejects_duplicate_missing_and_unknown_rows() {
-        let board = Arc::new(Board::new(3).unwrap());
+        let board = Arc::new(Board::new(4).unwrap());
         let requests: Vec<_> = (0..2)
             .map(|opening| {
                 let mut state = GameState::new(Arc::clone(&board));
@@ -459,10 +459,11 @@ mod tests {
 
     #[test]
     fn native_runner_batches_active_roots_and_consumes_exact_budgets() {
-        let board = Arc::new(Board::new(3).unwrap());
+        let board = Arc::new(Board::new(4).unwrap());
         let mut terminal = GameState::new(Arc::clone(&board));
-        terminal.apply(Action::Pass).unwrap();
-        terminal.apply(Action::Pass).unwrap();
+        for node in 0..board.node_count() {
+            terminal.apply(Action::Place(node)).unwrap();
+        }
         let mut roots = vec![terminal];
         for opening in 0..4 {
             let mut state = GameState::new(Arc::clone(&board));
@@ -481,7 +482,6 @@ mod tests {
         assert!(results[0].selected_action.is_none());
         assert!(results[0].terminal_value.is_some());
         for result in &results[1..] {
-            assert_ne!(result.selected_action, Some(Action::Pass));
             assert_eq!(
                 result
                     .root_stats

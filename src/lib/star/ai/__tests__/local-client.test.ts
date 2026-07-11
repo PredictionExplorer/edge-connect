@@ -4,7 +4,7 @@ import { LocalStarAiClient } from '../local-client';
 import { buildAiRequest, makeAiResponse } from '../protocol';
 
 const config: GameConfig = {
-  rings: 3,
+  rings: 4,
   mode: 'double',
   pieRule: false,
   playerNames: ['A', 'B'],
@@ -41,7 +41,7 @@ describe('local worker construction lifecycle', () => {
 
     const result = client.request(request);
     expect(worker.messages).toEqual([]);
-    worker.emit({ type: 'ready', protocolVersion: 1 });
+    worker.emit({ type: 'ready', protocolVersion: 2 });
     await Promise.resolve();
     expect(worker.messages).toEqual([
       { type: 'choose', taskId: request.requestId, request },
@@ -70,7 +70,7 @@ describe('local worker construction lifecycle', () => {
     const firstRequest = buildAiRequest(config, [], 'local-cancel');
     const first = client.request(firstRequest, { signal: abort.signal });
     const active = workers[0];
-    active.emit({ type: 'ready', protocolVersion: 1 });
+    active.emit({ type: 'ready', protocolVersion: 2 });
     await Promise.resolve();
     abort.abort();
     await expect(first).rejects.toMatchObject({ code: 'cancelled' });
@@ -80,15 +80,15 @@ describe('local worker construction lifecycle', () => {
     const second = client.request(secondRequest);
     const replacement = workers[1];
     expect(replacement).not.toBe(active);
-    replacement.emit({ type: 'ready', protocolVersion: 1 });
+    replacement.emit({ type: 'ready', protocolVersion: 2 });
     await Promise.resolve();
     replacement.emit({
       type: 'result',
       taskId: secondRequest.requestId,
-      response: makeAiResponse(secondRequest, { type: 'pass' }),
+      response: makeAiResponse(secondRequest, { type: 'place', node: 0 }),
     });
     await expect(second).resolves.toEqual(
-      makeAiResponse(secondRequest, { type: 'pass' }),
+      makeAiResponse(secondRequest, { type: 'place', node: 0 }),
     );
     client.dispose();
   });
@@ -100,7 +100,7 @@ describe('local worker construction lifecycle', () => {
     const client = new LocalStarAiClient(() => worker as unknown as Worker);
     const request = buildAiRequest(config, [], 'local-timeout');
     const result = client.request(request, { timeoutMs: 100 });
-    worker.emit({ type: 'ready', protocolVersion: 1 });
+    worker.emit({ type: 'ready', protocolVersion: 2 });
     await Promise.resolve();
 
     const rejection = expect(result).rejects.toMatchObject({

@@ -28,8 +28,8 @@ jobs:
       - run: npm run typecheck
       - run: npm run lint
       - run: npm run test:coverage
-      - run: node scripts/export-star-conformance.mjs "$RUNNER_TEMP/conformance-v1.json"
-      - run: cmp testdata/star/conformance-v1.json "$RUNNER_TEMP/conformance-v1.json"
+      - run: node scripts/export-star-conformance.mjs "$RUNNER_TEMP/conformance-v2.json"
+      - run: cmp testdata/star/conformance-v2.json "$RUNNER_TEMP/conformance-v2.json"
       - run: STAR_BENCH_ITERATIONS=10000 npm run bench:scoring
       - run: npm run build
       - uses: actions/upload-artifact@v4

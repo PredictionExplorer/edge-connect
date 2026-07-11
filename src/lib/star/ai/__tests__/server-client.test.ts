@@ -16,7 +16,7 @@ import {
 } from '../server-client';
 
 const config: GameConfig = {
-  rings: 3,
+  rings: 4,
   mode: 'double',
   pieRule: false,
   playerNames: ['A', 'B'],
@@ -24,29 +24,29 @@ const config: GameConfig = {
 const request = buildAiRequest(config, [], 'starserve-test');
 
 function representativeAnalyzeResponse() {
-  const score = new Array<number>(363).fill(0);
-  score[181] = 1;
+  const score = new Array<number>(303).fill(0);
+  score[151] = 1;
   return {
-    schema_version: 1,
+    schema_version: 2,
     request_id: request.requestId,
     action: { code: 0, kind: 'place', node: 0 },
     root_actions: [
       { code: 0, kind: 'place', node: 0 },
-      { code: -1, kind: 'pass', node: null },
+      { code: 1, kind: 'place', node: 1 },
     ],
     root_policy: [0.75, 0.25],
     root_q: [0.2, -0.1],
     root_visits: [3, 1],
-    wdl: { loss: 0.2, draw: 0.3, win: 0.5 },
-    value: 0.3,
+    outcome: { loss: 0.2, win: 0.8 },
+    value: 0.6,
     search_value: 0.3,
     score_belief: {
-      support_min: -181,
-      support_max: 181,
+      support_min: -151,
+      support_max: 151,
       expected_margin: 0,
       probabilities: score,
     },
-    model_version: 'fake-v1',
+    model_version: 'fake-v2',
     model_step: 5,
     timing_ms: {
       queue: 0,
@@ -62,18 +62,20 @@ afterEach(() => {
   vi.unstubAllEnvs();
 });
 
-describe('starserve v1 adapter', () => {
-  it('converts the internal semantic request to strict snake_case AnalyzeRequest', () => {
-    const wire = toAnalyzeRequest(request, { simulations: 4, maxConsidered: 2 });
+describe('starserve v2 adapter', () => {
+  it('converts semantic state to strict placement-only snake_case', () => {
+    const wire = toAnalyzeRequest(request, {
+      simulations: 4,
+      maxConsidered: 2,
+    });
     expect(wire).toEqual({
-      schema_version: 1,
-      rules_hash: 'fnv1a64:cdb34fb02be82843',
-      rings: 3,
-      stones: new Array(30).fill(-1),
+      schema_version: 2,
+      rules_hash: 'fnv1a64:2da3783519381453',
+      rings: 4,
+      stones: new Array(50).fill(-1),
       to_move: 0,
       moves_left: 1,
       opening: true,
-      pass_streak: 0,
       terminal: false,
       search: {
         simulations: 4,
@@ -85,7 +87,7 @@ describe('starserve v1 adapter', () => {
     expect(JSON.parse(JSON.stringify(wire))).toEqual(wire);
   });
 
-  it('validates a representative AnalyzeResponse and maps its atomic action', () => {
+  it('validates binary outcomes and maps a placement response', () => {
     expect(
       parseAnalyzeResponse(
         request,
@@ -95,24 +97,50 @@ describe('starserve v1 adapter', () => {
     ).toEqual(makeAiResponse(request, { type: 'place', node: 0 }));
   });
 
-  it('rejects inconsistent or illegal starserve actions', () => {
+  it('rejects removed action and outcome shapes', () => {
+    expect(() =>
+      parseAnalyzeResponse(request, {
+        ...representativeAnalyzeResponse(),
+        action: { code: -1, kind: 'pass', node: null },
+      }),
+    ).toThrow(/valid atomic action|disagree/i);
+
+    const response = representativeAnalyzeResponse();
+    expect(() =>
+      parseAnalyzeResponse(request, {
+        ...response,
+        outcome: { ...response.outcome, draw: 0 },
+      }),
+    ).toThrow(/outcome belief/i);
+    expect(() =>
+      parseAnalyzeResponse(request, {
+        ...response,
+        value: 0,
+      }),
+    ).toThrow(/value belief/i);
+  });
+
+  it('rejects inconsistent, illegal, or stale actions', () => {
     const inconsistent = {
       ...representativeAnalyzeResponse(),
-      action: { code: 0, kind: 'pass', node: null },
+      action: { code: 0, kind: 'place', node: 1 },
     };
     expect(() => parseAnalyzeResponse(request, inconsistent)).toThrow(
       /code, kind, and node disagree/i,
     );
 
-    const illegalAction = { code: 30, kind: 'place', node: 30 };
-    const illegalBase = representativeAnalyzeResponse();
+    const illegalAction = { code: 50, kind: 'place', node: 50 };
     const illegal = {
-      ...illegalBase,
+      ...representativeAnalyzeResponse(),
       action: illegalAction,
-      root_actions: [illegalAction, ...illegalBase.root_actions.slice(1)],
+      root_actions: [illegalAction],
+      root_policy: [1],
+      root_q: [0],
+      root_visits: [1],
     };
-    expect(() => parseAnalyzeResponse(request, illegal)).toThrow(/illegal action/i);
-
+    expect(() => parseAnalyzeResponse(request, illegal)).toThrow(
+      /illegal action/i,
+    );
     expect(() =>
       parseAnalyzeResponse(
         request,
@@ -122,7 +150,7 @@ describe('starserve v1 adapter', () => {
     ).toThrow(/identity/i);
   });
 
-  it('bounds public defaults and rejects malformed explicit budgets', () => {
+  it('bounds defaults and rejects malformed explicit budgets', () => {
     expect(
       resolveServerSearchBudget(
         {},
@@ -146,49 +174,57 @@ describe('starserve v1 adapter', () => {
     ).toThrow(/max-considered/i);
   });
 
-  it('accepts a full move endpoint or appends it to a base URL', () => {
+  it('normalizes v2 move, analyze, base, and health URLs', () => {
     expect(resolveStarAiMoveUrl('https://ai.example')).toBe(
-      'https://ai.example/v1/move',
+      'https://ai.example/v2/move',
     );
     expect(resolveStarAiMoveUrl('https://ai.example/proxy/')).toBe(
-      'https://ai.example/proxy/v1/move',
+      'https://ai.example/proxy/v2/move',
     );
-    expect(resolveStarAiMoveUrl('https://ai.example/v1/move')).toBe(
-      'https://ai.example/v1/move',
+    expect(resolveStarAiMoveUrl('https://ai.example/v2/move')).toBe(
+      'https://ai.example/v2/move',
     );
-    expect(resolveStarAiMoveUrl('https://ai.example/v1/analyze')).toBe(
-      'https://ai.example/v1/move',
+    expect(resolveStarAiMoveUrl('https://ai.example/v2/analyze')).toBe(
+      'https://ai.example/v2/move',
     );
-    expect(resolveStarAiMoveUrl('/starserve')).toBe('/starserve/v1/move');
+    expect(resolveStarAiMoveUrl('https://ai.example/v2/health')).toBe(
+      'https://ai.example/v2/move',
+    );
+    expect(resolveStarAiMoveUrl('/starserve')).toBe('/starserve/v2/move');
     expect(resolveStarAiHealthUrl('https://ai.example/base')).toBe(
-      'https://ai.example/base/v1/health',
+      'https://ai.example/base/v2/health',
+    );
+    expect(() => resolveStarAiMoveUrl('https://ai.example/v1/move')).toThrow(
+      /v2 API/,
     );
   });
 
-  it('defaults browser traffic to the same-origin proxy', () => {
+  it('defaults browser traffic to the same-origin v2 proxy', () => {
     vi.stubEnv('NEXT_PUBLIC_STAR_AI_URL', '');
-    expect(configuredServerAiUrl()).toBe('/v1/move');
-    expect(configuredServerHealthUrl()).toBe('/v1/health');
+    expect(configuredServerAiUrl()).toBe('/v2/move');
+    expect(configuredServerHealthUrl()).toBe('/v2/health');
   });
 
-  it('posts the wire request with request identity and no browser bearer secret', async () => {
-    const fetchMock = vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
-      expect(String(url)).toBe('https://ai.example/v1/move');
-      const headers = new Headers(init?.headers);
-      expect(headers.get('X-Request-ID')).toBe(request.requestId);
-      expect(headers.has('Authorization')).toBe(false);
-      const body = JSON.parse(String(init?.body));
-      expect(body).toMatchObject({
-        schema_version: 1,
-        to_move: 0,
-        search: { simulations: 4, max_considered: 2 },
-      });
-      expect(body.requestId).toBeUndefined();
-      return new Response(JSON.stringify(representativeAnalyzeResponse()), {
-        status: 200,
-        headers: { 'X-Request-ID': request.requestId },
-      });
-    });
+  it('posts schema v2 with request identity and no browser bearer secret', async () => {
+    const fetchMock = vi.fn(
+      async (url: string | URL | Request, init?: RequestInit) => {
+        expect(String(url)).toBe('https://ai.example/v2/move');
+        const headers = new Headers(init?.headers);
+        expect(headers.get('X-Request-ID')).toBe(request.requestId);
+        expect(headers.has('Authorization')).toBe(false);
+        const body = JSON.parse(String(init?.body));
+        expect(body).toMatchObject({
+          schema_version: 2,
+          to_move: 0,
+          search: { simulations: 4, max_considered: 2 },
+        });
+        expect(body.pass_streak).toBeUndefined();
+        return new Response(JSON.stringify(representativeAnalyzeResponse()), {
+          status: 200,
+          headers: { 'X-Request-ID': request.requestId },
+        });
+      },
+    );
     vi.stubGlobal('fetch', fetchMock);
 
     await expect(

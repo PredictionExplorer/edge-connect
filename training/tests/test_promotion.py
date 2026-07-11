@@ -231,7 +231,7 @@ def test_promotion_supervisor_bootstraps_and_only_promotes_arena_pass(
     assert dry_gc["deleted_manifests"] == 0
 
 
-def test_inconclusive_candidate_persists_nonoverlapping_pairs_until_max(
+def test_old_arena_schema_is_rejected_before_new_candidate_evaluation(
     tmp_path,
     monkeypatch,
 ) -> None:
@@ -250,7 +250,7 @@ def test_inconclusive_candidate_persists_nonoverlapping_pairs_until_max(
             ),
         ),
         arena=ArenaConfig(
-            rings=(3,),
+            rings=(4,),
             pairs_per_ring=2,
             minimum_pairs_per_ring=4,
             max_pairs_per_ring=6,
@@ -316,7 +316,7 @@ def test_inconclusive_candidate_persists_nonoverlapping_pairs_until_max(
                 for pair in range(pair_starts[ring], pair_starts[ring] + count)
             ]
             return {
-                "schema_version": 1,
+                "schema_version": ARENA_RESULT_SCHEMA_VERSION,
                 "candidate": self.candidate.model_version,
                 "baseline": self.baseline.model_version,
                 "pairs": [asdict(pair) for pair in pairs],
@@ -339,37 +339,31 @@ def test_inconclusive_candidate_persists_nonoverlapping_pairs_until_max(
         / "arena"
         / f"{candidate.model_identity}-vs-{champion.model_identity}.json"
     )
-    newer = None
-    for expected_pairs in (2, 4):
-        assert supervisor.run(stop_requested=lambda: False, once=True) == 1
-        progress = json.loads(result_path.read_text())
-        assert progress["schema_version"] == ARENA_RESULT_SCHEMA_VERSION
-        assert progress["terminal"] is False
-        assert len(progress["pairs"]) == expected_pairs
-        if expected_pairs == 2:
-            with torch.no_grad():
-                next(model.parameters()).add_(0.01)
-            ema.update(model)
-            newer = publisher.publish(
-                model=model,
-                optimizer=optimizer,
-                scheduler=scheduler,
-                ema=ema,
-                step=2,
-                epoch=2,
-                config=experiment.as_dict(),
-            )
-            # Schema 1 stored the same pair records under the Hoeffding gate.
-            # A resumed evaluation must consume them and rewrite schema 2.
-            progress["schema_version"] = 1
-            result_path.write_text(json.dumps(progress))
     assert supervisor.run(stop_requested=lambda: False, once=True) == 1
-    terminal = json.loads(result_path.read_text())
-    assert terminal["terminal"] is True
-    assert terminal["promotion"]["decision"] == "reject_max_pairs"
-    assert sorted(pair["pair"] for pair in terminal["pairs"]) == list(range(6))
-    assert newer is not None
+    progress = json.loads(result_path.read_text())
+    assert progress["schema_version"] == ARENA_RESULT_SCHEMA_VERSION
+    assert progress["terminal"] is False
+    assert len(progress["pairs"]) == 2
+
+    with torch.no_grad():
+        next(model.parameters()).add_(0.01)
+    ema.update(model)
+    newer = publisher.publish(
+        model=model,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        ema=ema,
+        step=2,
+        epoch=2,
+        config=experiment.as_dict(),
+    )
+    progress["schema_version"] = ARENA_RESULT_SCHEMA_VERSION - 1
+    result_path.write_text(json.dumps(progress))
+
     assert supervisor.run(stop_requested=lambda: False, once=True) == 1
+    rejected_old = json.loads(result_path.read_text())
+    assert rejected_old["terminal"] is True
+    assert rejected_old["promotion"]["decision"] == "superseded"
     newer_path = (
         tmp_path / "arena" / f"{newer.model_identity}-vs-{champion.model_identity}.json"
     )

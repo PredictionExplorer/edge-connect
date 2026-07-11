@@ -6,8 +6,7 @@
  *   - double:   Double *Star — two stones per turn, except the very first
  *     turn of the game, when the first player places a single stone.
  *
- * The game ends when the board is full, or after two consecutive pass
- *  actions (the players agree the score is decided).
+ * The game ends only when the board is full.
  *
  * Optional pie rule: immediately after the game's first turn, the second
  * player may swap — the opening stone changes to their color and the first
@@ -32,7 +31,6 @@ export interface GameConfig {
 
 export type GameAction =
   | { type: 'place'; node: number }
-  | { type: 'pass' }
   | { type: 'swap' };
 
 export interface GameState {
@@ -47,8 +45,6 @@ export interface GameState {
   movesLeft: number;
   /** Whether the current player has already placed a stone this turn. */
   midTurn: boolean;
-  /** Consecutive pass actions. */
-  passStreak: number;
   over: boolean;
   /** True while the pie-rule swap is available (second player, first action). */
   canSwap: boolean;
@@ -76,7 +72,6 @@ export function initialState(config: GameConfig): GameState {
     toMove: 0,
     movesLeft: turnSize(config, 0),
     midTurn: false,
-    passStreak: 0,
     over: false,
     canSwap: false,
     swapped: false,
@@ -107,10 +102,10 @@ export function isLegalAction(state: GameState, action: GameAction): boolean {
         action.node < state.board.n &&
         state.stones[action.node] === EMPTY
       );
-    case 'pass':
-      return true;
     case 'swap':
       return state.canSwap;
+    default:
+      return false;
   }
 }
 
@@ -131,7 +126,6 @@ export function applyAction(prev: GameState, action: GameAction): GameState {
       state.stonesPlaced++;
       state.lastMove = action.node;
       state.currentTurnMoves.push(action.node);
-      state.passStreak = 0;
       state.movesLeft--;
       state.midTurn = state.movesLeft > 0;
       if (boardFull(state)) {
@@ -148,16 +142,6 @@ export function applyAction(prev: GameState, action: GameAction): GameState {
       }
       return state;
     }
-    case 'pass': {
-      state.passStreak++;
-      state.canSwap = false;
-      if (state.passStreak >= 2) {
-        state.over = true;
-        return state;
-      }
-      endTurn(state);
-      return state;
-    }
     case 'swap': {
       // Recolor the single opening stone; the swap consumes this player's
       // turn, so the opener moves again next.
@@ -166,7 +150,6 @@ export function applyAction(prev: GameState, action: GameAction): GameState {
       }
       state.swapped = true;
       state.canSwap = false;
-      state.passStreak = 0;
       state.toMove = 0;
       state.turnCount++;
       state.movesLeft = turnSize(state.config, state.turnCount);

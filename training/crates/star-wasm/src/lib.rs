@@ -37,11 +37,9 @@ mod bindings {
             })
         }
 
-        /// Applies one node id, or `-1` for pass.
-        pub fn apply(&mut self, action: i32) -> Result<(), JsValue> {
-            self.inner
-                .apply(Action::from_code(action).map_err(js_error)?)
-                .map_err(js_error)?;
+        /// Applies one dense node id.
+        pub fn apply(&mut self, node: u16) -> Result<(), JsValue> {
+            self.inner.apply(Action::Place(node)).map_err(js_error)?;
             Ok(())
         }
 
@@ -67,12 +65,6 @@ mod bindings {
             self.inner.moves_left()
         }
 
-        /// Consecutive pass count.
-        #[wasm_bindgen(getter)]
-        pub fn pass_streak(&self) -> u8 {
-            self.inner.pass_streak()
-        }
-
         /// Terminal marker.
         #[wasm_bindgen(getter)]
         pub fn terminal(&self) -> bool {
@@ -94,14 +86,9 @@ mod bindings {
             self.inner.legal_actions().placements.words().to_vec()
         }
 
-        /// Stable legal action codes, with pass last.
-        pub fn legal_actions(&self) -> Vec<i32> {
-            self.inner
-                .legal_actions()
-                .to_vec()
-                .into_iter()
-                .map(Action::code)
-                .collect()
+        /// Legal node ids in ascending order.
+        pub fn legal_actions(&self) -> Vec<u16> {
+            self.inner.legal_actions().placements.iter().collect()
         }
 
         /// Stable deterministic state hash.
@@ -124,7 +111,14 @@ mod bindings {
                 ]);
             }
             components.push(i32::from(score.contested_peries));
-            components.push(score.leader.map_or(-1, |player| player as i32));
+            components.push(if self.inner.is_terminal() {
+                score
+                    .leader
+                    .expect("a full Double *Star board must have a decisive winner")
+                    as i32
+            } else {
+                score.leader.map_or(-1, |player| player as i32)
+            });
             components
         }
 
@@ -173,15 +167,18 @@ mod bindings {
             })
         }
 
-        /// Stable root legal action codes required by `initialize_root`.
-        pub fn root_actions(&self) -> Result<Vec<i32>, JsValue> {
+        /// Stable root legal node ids required by `initialize_root`.
+        pub fn root_actions(&self) -> Result<Vec<u16>, JsValue> {
             Ok(self
                 .inner
                 .root_request()
                 .map_err(js_error)?
                 .legal_actions
                 .into_iter()
-                .map(Action::code)
+                .map(|action| {
+                    let Action::Place(node) = action;
+                    node
+                })
                 .collect())
         }
 
@@ -210,11 +207,11 @@ mod bindings {
         ///
         /// Returns `true` when leaf inference is required and `false` when an
         /// exact terminal value was backed up immediately.
-        pub fn start(&mut self, root_action: i32) -> Result<bool, JsValue> {
+        pub fn start(&mut self, root_action: u16) -> Result<bool, JsValue> {
             if self.pending.is_some() {
                 return Err(JsValue::from_str("finish the pending leaf first"));
             }
-            let action = Action::from_code(root_action).map_err(js_error)?;
+            let action = Action::Place(root_action);
             let edge = self
                 .inner
                 .root_edge(action)
@@ -245,7 +242,7 @@ mod bindings {
         }
 
         /// Stable pending legal actions required by `finish`.
-        pub fn pending_actions(&self) -> Result<Vec<i32>, JsValue> {
+        pub fn pending_actions(&self) -> Result<Vec<u16>, JsValue> {
             Ok(self
                 .pending
                 .as_ref()
@@ -253,7 +250,10 @@ mod bindings {
                 .legal_actions
                 .iter()
                 .copied()
-                .map(Action::code)
+                .map(|action| {
+                    let Action::Place(node) = action;
+                    node
+                })
                 .collect())
         }
 
@@ -284,12 +284,15 @@ mod bindings {
             Ok(())
         }
 
-        /// Root action codes in stable order.
-        pub fn actions(&self) -> Vec<i32> {
+        /// Root node ids in stable order.
+        pub fn actions(&self) -> Vec<u16> {
             self.inner
                 .root_stats()
                 .into_iter()
-                .map(|stats| stats.action.code())
+                .map(|stats| {
+                    let Action::Place(node) = stats.action;
+                    node
+                })
                 .collect()
         }
 
@@ -347,13 +350,15 @@ mod bindings {
             })
         }
 
-        /// Next forced root edge, or `-1` when complete.
-        pub fn next(&mut self, completed_q: Vec<f32>, visits: Vec<u32>) -> Result<i32, JsValue> {
-            Ok(self
-                .inner
+        /// Next forced root edge, or `None` when complete.
+        pub fn next(
+            &mut self,
+            completed_q: Vec<f32>,
+            visits: Vec<u32>,
+        ) -> Result<Option<usize>, JsValue> {
+            self.inner
                 .next_candidate(&completed_q, &visits)
-                .map_err(js_error)?
-                .map_or(-1, |candidate| candidate as i32))
+                .map_err(js_error)
         }
 
         /// Records one completed root-edge simulation.

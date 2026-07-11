@@ -8,8 +8,10 @@ from functools import lru_cache
 import torch
 from torch import Tensor
 
-MIN_RINGS = 3
-MAX_RINGS = 12
+SUPPORTED_RINGS = (4, 6, 8, 10)
+MIN_RINGS = SUPPORTED_RINGS[0]
+MAX_RINGS = SUPPORTED_RINGS[-1]
+MAX_NODES = 275
 SECTOR_CHARS = ("*", "S", "T", "A", "R")
 EDGE_TANGENTIAL = 0
 EDGE_RADIAL_DIAGONAL = 1
@@ -24,6 +26,11 @@ def ring_start(ring: int) -> int:
 
 
 def node_count(rings: int) -> int:
+    if isinstance(rings, bool) or not isinstance(rings, int):
+        raise TypeError("rings must be an integer")
+    if rings not in SUPPORTED_RINGS:
+        supported = ", ".join(str(value) for value in SUPPORTED_RINGS)
+        raise ValueError(f"rings must be one of {{{supported}}}, got {rings}")
     return ring_start(rings + 1)
 
 
@@ -90,16 +97,13 @@ def _ring_char(ring: int) -> str:
     return "0" if ring == 10 else str(ring)
 
 
-@lru_cache(maxsize=MAX_RINGS - MIN_RINGS + 1)
+@lru_cache(maxsize=len(SUPPORTED_RINGS))
 def get_topology(rings: int) -> StarTopology:
-    """Build and cache a board for ``rings`` in the supported 3..12 range."""
-
-    if isinstance(rings, bool) or not isinstance(rings, int):
-        raise TypeError("rings must be an integer")
-    if not MIN_RINGS <= rings <= MAX_RINGS:
-        raise ValueError(f"rings must be in {MIN_RINGS}..{MAX_RINGS}, got {rings}")
+    """Build and cache a board for one canonical supported ring count."""
 
     n = node_count(rings)
+    if n > MAX_NODES:
+        raise RuntimeError("canonical topology exceeds MAX_NODES")
     sector_of = torch.empty(n, dtype=torch.long)
     ring_of = torch.empty(n, dtype=torch.long)
     pos_of = torch.empty(n, dtype=torch.long)

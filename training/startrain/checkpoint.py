@@ -23,14 +23,16 @@ from .contracts import (
     RULES_HASH_WIRE,
     RULES_SCHEMA_ID,
 )
+from .model import MODEL_SCHEMA_VERSION
 from .runtime import atomic_json, validate_identifier
 
 CHECKPOINT_FORMAT = "startrain.checkpoint"
-CHECKPOINT_VERSION = 2
+CHECKPOINT_VERSION = 3
 EMA_VERSION = 1
 MODEL_MANIFEST_FORMAT = "startrain.model-manifest"
 MODEL_POINTER_FORMAT = "startrain.model-pointer"
-MODEL_MANIFEST_VERSION = 2
+MODEL_MANIFEST_VERSION = 3
+MODEL_POINTER_VERSION = 2
 
 
 @dataclass(frozen=True, slots=True)
@@ -181,6 +183,7 @@ def save_checkpoint(
         "rules_hash": RULES_HASH,
         "rules_hash_wire": RULES_HASH_WIRE,
         "feature_schema_hash": FEATURE_SCHEMA_HASH,
+        "model_schema_version": MODEL_SCHEMA_VERSION,
         "step": int(step),
         "epoch": int(epoch),
         "model": model.state_dict(),
@@ -313,7 +316,7 @@ def load_model_manifest(path: str | Path) -> ModelManifest:
     source = Path(path)
     payload = _read_json(source, "model publication")
     if payload.get("format") == MODEL_POINTER_FORMAT:
-        if payload.get("schema_version") != 1:
+        if payload.get("schema_version") != MODEL_POINTER_VERSION:
             raise ValueError("unsupported model pointer")
         role = payload.get("role")
         if role not in ("candidate", "champion"):
@@ -380,7 +383,7 @@ def write_model_pointer(
     )
     payload: dict[str, object] = {
         "format": MODEL_POINTER_FORMAT,
-        "schema_version": 1,
+        "schema_version": MODEL_POINTER_VERSION,
         "role": role,
         "manifest": os.path.relpath(
             artifact.resolve(), Path(destination).parent.resolve()
@@ -422,6 +425,8 @@ def _parse_model_manifest(
         raise ValueError("model manifest rules hash is incompatible")
     if payload.get("feature_schema_hash") != f"{FEATURE_SCHEMA_HASH:016x}":
         raise ValueError("model manifest feature schema is incompatible")
+    if payload.get("model_schema_version") != MODEL_SCHEMA_VERSION:
+        raise ValueError("model manifest schema is incompatible")
     if payload.get("weights") != "ema":
         raise ValueError("model manifest must explicitly publish EMA weights")
     model_identity = validate_identifier(
@@ -663,6 +668,8 @@ def _validate_checkpoint_payload(
         raise ValueError("checkpoint rules hash identifier is incompatible")
     if payload.get("feature_schema_hash") != FEATURE_SCHEMA_HASH:
         raise ValueError("checkpoint feature schema hash is incompatible")
+    if payload.get("model_schema_version") != MODEL_SCHEMA_VERSION:
+        raise ValueError("checkpoint model schema is incompatible")
     required = {
         "model",
         "optimizer",

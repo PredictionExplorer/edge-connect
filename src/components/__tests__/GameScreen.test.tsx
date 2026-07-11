@@ -31,7 +31,7 @@ vi.mock('@/lib/star/ai/server-client', async () => {
 });
 
 const config = {
-  rings: 3,
+  rings: 4,
   mode: 'double',
   pieRule: false,
   playerNames: ['Ada', 'Grace'],
@@ -184,6 +184,7 @@ describe('GameScreen AI lifecycle', () => {
     resetPlayingStore({ controllers: ['human', 'human'] });
     const { container } = render(<GameScreen />);
 
+    expect(screen.queryByRole('button', { name: 'Pass' })).not.toBeInTheDocument();
     expect((await axe(container)).violations).toEqual([]);
     expect(requestServerAiAction).not.toHaveBeenCalled();
   });

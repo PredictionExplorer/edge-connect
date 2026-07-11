@@ -243,28 +243,28 @@ def test_actor_lanes_expand_worker_specs_with_distinct_identity_and_affinity(
 def test_ring_scheduler_curriculum_then_favors_deficits() -> None:
     experiment = load_config(CONFIGS / "h100-8gpu.yaml")
     scheduler = RingMixtureScheduler(experiment.orchestration.ring_mixture, seed=11)
-    empty = {ring: 0 for ring in range(3, 13)}
-    assert {scheduler.choose(empty) for _ in range(100)} <= {3, 4}
+    empty = {ring: 0 for ring in (4, 6, 8, 10)}
+    assert {scheduler.choose(empty) for _ in range(100)} == {4}
 
-    mature = {ring: 200_000 for ring in range(3, 13)}
-    mature[12] = 0
-    draws = [scheduler.choose(mature) for _ in range(2_000)]
-    assert set(draws) == set(range(3, 13))
-    assert draws.count(12) > draws.count(3) * 2
+    mature = {ring: 400_000 for ring in (4, 6, 8, 10)}
+    mature[10] = 0
+    selections = [scheduler.choose(mature) for _ in range(2_000)]
+    assert set(selections) == {4, 6, 8, 10}
+    assert selections.count(10) > selections.count(4) * 2
 
 
 def test_ring_mixture_stage_selection_uses_aggregate_sample_boundaries() -> None:
     mixture = RingMixtureConfig(
         curriculum=(
-            CurriculumStage(until_samples=100, rings=(3, 4)),
-            CurriculumStage(until_samples=500, rings=(3, 4, 5, 6)),
+            CurriculumStage(until_samples=100, rings=(4,)),
+            CurriculumStage(until_samples=500, rings=(4, 6)),
         )
     )
-    assert mixture.active_rings(0) == (3, 4)
-    assert mixture.active_rings(99) == (3, 4)
-    assert mixture.active_rings(100) == (3, 4, 5, 6)
-    assert mixture.active_rings(499) == (3, 4, 5, 6)
-    assert mixture.active_rings(500) == tuple(range(3, 13))
+    assert mixture.active_rings(0) == (4,)
+    assert mixture.active_rings(99) == (4,)
+    assert mixture.active_rings(100) == (4, 6)
+    assert mixture.active_rings(499) == (4, 6)
+    assert mixture.active_rings(500) == (4, 6, 8, 10)
 
 
 def test_explicit_ddp_builds_one_torchrun_job_and_partitions_batches(

@@ -1,7 +1,7 @@
 # Double *Star AI operator guide
 
 This directory contains the implemented training, arena, serving and browser-export
-pipeline for no-pie Double *Star on 3–12 rings.
+pipeline for no-pie Double *Star on rings 4, 6, 8, and 10.
 
 **No trained model is checked into this repository.** The code and tests establish the
 pipeline contracts; they do not establish strong or superhuman play. `starserve` needs a
@@ -30,9 +30,14 @@ The measured 8-H100 host evidence, accepted treatments and current forecast are 
   inference.
 
 `GraphResTNet` alternates local edge-aware residual blocks with global grouped-query
-attention. It predicts policy, WDL, score margin, ownership, alive stones and a
-KataGo-style soft-policy auxiliary. Self-play searches atomic placements and pass
-actions, which preserves Double *Star's same-player first/second-placement semantics.
+attention. It predicts node policy, binary loss/win outcome, score margin, ownership,
+alive stones, and a node-only KataGo-style soft-policy auxiliary. Value is
+`P(win) - P(loss)`. Self-play searches placements only.
+
+The canonical gameplay contract is `edgeconnect.star.rules.v2` with fingerprint
+`fnv1a64:2da3783519381453`. Training uses feature schema v3, replay/data schema v4,
+config/checkpoint/model-manifest schema v3, browser manifest v2, and starserve API/config
+schema v2. Older artifacts are rejected; start fresh roots instead of converting them.
 
 Research inspirations:
 
@@ -148,7 +153,7 @@ from startrain.runtime import load_or_create_run_identity
 
 identity = load_or_create_run_identity(
     f"{os.environ['RUN']}/run.json",
-    requested_run_id="cpu-smoke-v1",
+    requested_run_id="cpu-smoke-v2",
 )
 print(identity)
 PY
@@ -160,7 +165,7 @@ startrain-selfplay \
   --actor-id cpu-smoke \
   --device cpu \
   --cpu-smoke \
-  --rings 3 \
+  --rings 4 \
   --games 4
 
 startrain-train \
@@ -241,13 +246,11 @@ For custom DDP, configure at least two learner GPU entries with equal CPU budget
 set `orchestration.distributed.enabled: true` with backend `nccl`. The coordinator then
 constructs the `torch.distributed.run` command and required run-identity arguments.
 
-The actor ring mixture already progresses from small to large boards. The shipped
-profiles intentionally keep `learner.use_ring_mixture_curriculum: false` as the
-historical control, so their stratified learner waits for the replay minimum on every
-ring. Set that field to `true` in a new frozen profile to make the learner use the same
-unlocked rings as the actors: it starts with rings 3–4, expands to 3–6, then trains on
-3–12. A stage transition waits only for the configured minimum on the newly active
-rings; checkpoints and the shared all-ring model remain compatible.
+The actor ring mixture progresses from small to large boards. The shipped profiles keep
+`learner.use_ring_mixture_curriculum: false` as a control, so their stratified learner
+waits for the replay minimum on all four supported rings. Set it to `true` in a new
+frozen profile to follow the actor schedule: ring 4, then rings 4 and 6, then
+4/6/8/10. A transition waits only for the newly active rings.
 
 ## Run files and model lifecycle
 
@@ -341,7 +344,7 @@ eight restarts. If it exits nonzero:
 
 `resume_latest` reloads the last candidate, replay reopening reconciles orphaned files,
 and committed corrupt/missing shards are quarantined. Do not delete or regenerate
-`run.json`, manually repoint candidate/champion files, or mix schema-v3 replay from
+`run.json`, manually repoint candidate/champion files, or mix replay schema v4 from
 different run identities. Use a new run root for an incompatible config or schema.
 
 Stop with SIGINT/SIGTERM and allow the configured grace period so complete cohorts and
@@ -370,7 +373,7 @@ and records the code, config and environment with every result:
 python scripts/h100_system_benchmark.py \
   --config "$PROFILE" \
   --output-dir "$RUN_ROOT/system-benchmark" \
-  --rings 6 12 \
+  --rings 6 10 \
   --batch-sizes 64 128 256 \
   --repeats 3 \
   --metrics-root "$RUN_ROOT"
@@ -398,8 +401,8 @@ python scripts/strength_efficiency_report.py \
 Before committing to a long run, use these planning gates:
 
 1. Sustain at least 5,000 realistic leaf evaluations/s/H100 with production batching.
-2. After 10,000 games, measure actual game length, pass rate, search mix, CPU saturation
-   and ring distribution; rescale the forecast from those measurements.
+2. After 10,000 games, measure actual game length, search mix, CPU saturation, and ring
+   distribution; rescale the forecast from those measurements.
 3. By 100,000 games, beat random/greedy nearly perfectly and fixed shallow search
    convincingly on every ring.
 4. By 500,000 games, run at least 200 paired arena games per ring and fit strength gain
@@ -453,7 +456,7 @@ npm run dev
 ```
 
 - `STAR_AI_SERVER_URL` and `STAR_AI_BEARER_TOKEN` are server-only Next.js variables.
-- Leave `NEXT_PUBLIC_STAR_AI_URL` unset to use `/v1/move` and `/v1/health`.
+- Leave `NEXT_PUBLIC_STAR_AI_URL` unset to use `/v2/move` and `/v2/health`.
 - Never put the token in a `NEXT_PUBLIC_*` variable or a URL.
 - Optional `NEXT_PUBLIC_STAR_AI_SIMULATIONS` and
   `NEXT_PUBLIC_STAR_AI_MAX_CONSIDERED` must not exceed the limits in
@@ -480,13 +483,13 @@ RUSTUP_TOOLCHAIN=1.93.0 npm run build:star-wasm
 
 cd training
 startrain-publish-browser \
-  --manifest runs/browser/star-browser-v1.browser.json \
+  --manifest runs/browser/star-browser-v2.browser.json \
   --target ../public/models/star \
-  --wasm-source ../public/models/star/wasm
+  --wasm-source ../public/models/star/wasm-2da3783519381453
 ```
 
-The sample config emits `star-browser-v1.pt`, `star-browser-v1.fp16.onnx` and
-`star-browser-v1.browser.json`. Publication verifies checkpoint, ONNX and WASM
+The sample config emits `star-browser-v2.pt`, `star-browser-v2.fp16.onnx` and
+`star-browser-v2.browser.json`. Publication verifies checkpoint, ONNX and WASM
 integrity, copies the immutable ONNX artifact, and replaces
 `public/models/star/manifest.json` last. The web app reports local AI unavailable until
 that canonical manifest and all referenced artifacts exist.

@@ -1,12 +1,11 @@
 /**
- * Deterministic cross-language conformance vectors for the *Star rules.
+ * Deterministic cross-language conformance vectors for the rules-v2 contract.
  *
- * The output intentionally uses only JSON primitives and arrays so a Rust
- * implementation can deserialize it without reproducing JavaScript typed
- * arrays or object-key conventions.
+ * The output intentionally uses JSON primitives and arrays so parity ports do
+ * not need to reproduce JavaScript typed-array or object-key conventions.
  */
 
-import { getBoard, MAX_RINGS, MIN_RINGS, type Board } from './board';
+import { getBoard, SUPPORTED_RINGS, type Board } from './board';
 import {
   applyAction,
   initialState,
@@ -18,7 +17,6 @@ import {
   STAR_ACTION_LAYOUT_SCHEMA_ID,
   STAR_CONFORMANCE_SCHEMA_ID,
   STAR_FEATURE_SCHEMA_ID,
-  STAR_PASS_ACTION_CODE,
   STAR_RULES_CANONICAL,
   STAR_RULES_CONTRACT,
   STAR_RULES_HASH,
@@ -26,7 +24,12 @@ import {
   STAR_RULES_SCHEMA_ID,
   STAR_RULES_VERSION,
 } from './rules';
-import { EMPTY, scorePosition } from './scoring';
+import {
+  EMPTY,
+  scorePosition,
+  validateTerminalWinner,
+  type ScoreResult,
+} from './scoring';
 import {
   D5_SYMMETRIES,
   getD5Maps,
@@ -35,19 +38,18 @@ import {
 
 function adjacentNodes(board: Board, node: number): number[] {
   const adjacent: number[] = [];
-  for (let e = board.adjOff[node]; e < board.adjOff[node + 1]; e++) {
-    adjacent.push(board.adj[e]);
+  for (let edge = board.adjOff[node]; edge < board.adjOff[node + 1]; edge++) {
+    adjacent.push(board.adj[edge]);
   }
-  adjacent.sort((a, b) => a - b);
-  return adjacent;
+  return adjacent.sort((left, right) => left - right);
 }
 
 function boardVector(board: Board) {
   let maximumDegree = 0;
-  for (let u = 0; u < board.n; u++) {
+  for (let node = 0; node < board.n; node++) {
     maximumDegree = Math.max(
       maximumDegree,
-      board.adjOff[u + 1] - board.adjOff[u],
+      board.adjOff[node + 1] - board.adjOff[node],
     );
   }
   return {
@@ -107,17 +109,18 @@ function deterministicPosition(
   occupancyPermille: number,
 ): Int8Array {
   const stones = new Int8Array(board.n).fill(EMPTY);
-  for (let u = 0; u < board.n; u++) {
-    const occupiedRoll = mix32(seed ^ Math.imul(u + 1, 0x9e3779b1)) % 1000;
+  for (let node = 0; node < board.n; node++) {
+    const occupiedRoll =
+      mix32(seed ^ Math.imul(node + 1, 0x9e3779b1)) % 1000;
     if (occupiedRoll < occupancyPermille) {
-      stones[u] = (mix32(seed ^ Math.imul(u + 1, 0x85ebca6b)) & 1) as 0 | 1;
+      stones[node] = (mix32(seed ^ Math.imul(node + 1, 0x85ebca6b)) &
+        1) as 0 | 1;
     }
   }
   return stones;
 }
 
-function scoreExpectation(board: Board, stones: ArrayLike<number>) {
-  const score = scorePosition(board, stones);
+function scoreExpectation(score: ScoreResult) {
   return {
     players: score.players,
     nodeOwner: Array.from(score.nodeOwner),
@@ -132,7 +135,7 @@ function scoreVector(id: string, board: Board, stones: Int8Array) {
     id,
     rings: board.rings,
     stones: Array.from(stones),
-    expected: scoreExpectation(board, stones),
+    expected: scoreExpectation(scorePosition(board, stones)),
   };
 }
 
@@ -145,7 +148,6 @@ function gameStateVector(afterActions: number, state: GameState) {
     toMove: state.toMove,
     movesLeft: state.movesLeft,
     midTurn: state.midTurn,
-    passStreak: state.passStreak,
     over: state.over,
     canSwap: state.canSwap,
     swapped: state.swapped,
@@ -156,67 +158,51 @@ function gameStateVector(afterActions: number, state: GameState) {
 }
 
 function actionCode(action: GameAction): number {
-  switch (action.type) {
-    case 'place':
-      return action.node;
-    case 'pass':
-      return STAR_PASS_ACTION_CODE;
-    case 'swap':
-      throw new Error('swap is outside the Double *Star parity contract');
+  if (action.type === 'swap') {
+    throw new Error('swap is outside the Double *Star parity contract');
   }
+  return action.node;
 }
 
-function outcomeFor(leader: 0 | 1 | -1, player: 0 | 1): -1 | 0 | 1 {
-  if (leader === -1) return 0;
-  return leader === player ? 1 : -1;
-}
-
-function terminalVector(
-  reason: 'board-full' | 'double-pass',
-  state: GameState,
-) {
+function terminalVector(state: GameState) {
   if (!state.over) throw new Error('terminal vector requires a terminal state');
-  const score = scoreExpectation(state.board, state.stones);
+  const terminal = validateTerminalWinner(state.board, state.stones);
   const valuesByPlayer = [
-    outcomeFor(score.leader, 0),
-    outcomeFor(score.leader, 1),
+    terminal.winner === 0 ? 1 : -1,
+    terminal.winner === 1 ? 1 : -1,
+  ] as const;
+  const outcomeClassesByPlayer = [
+    valuesByPlayer[0] === 1 ? 1 : 0,
+    valuesByPlayer[1] === 1 ? 1 : 0,
   ] as const;
   const scoreMarginsByPlayer = [
-    score.players[0].total - score.players[1].total,
-    score.players[1].total - score.players[0].total,
+    terminal.margin,
+    -terminal.margin,
   ] as const;
   const perspectivePlayer = state.toMove;
   return {
-    reason,
-    winner: score.leader,
-    score,
+    reason: 'board-full' as const,
+    winner: terminal.winner,
+    score: scoreExpectation(terminal.score),
     valuesByPlayer,
-    wdlClassByPlayer: [
-      valuesByPlayer[0] + 1,
-      valuesByPlayer[1] + 1,
-    ] as const,
+    outcomeClassesByPlayer,
     scoreMarginsByPlayer,
     valuePerspective: {
-      kind: 'toMove',
+      kind: 'toMove' as const,
       player: perspectivePlayer,
       value: valuesByPlayer[perspectivePlayer],
-      wdlClass: valuesByPlayer[perspectivePlayer] + 1,
+      outcomeClass: outcomeClassesByPlayer[perspectivePlayer],
       scoreMargin: scoreMarginsByPlayer[perspectivePlayer],
     },
   };
 }
 
-function gameTrace(
-  id: string,
-  config: GameConfig,
-  actions: GameAction[],
-  terminalReason: 'board-full' | 'double-pass',
-) {
+function gameTrace(id: string, config: GameConfig, actions: GameAction[]) {
   let state = initialState(config);
   const states = [gameStateVector(0, state)];
-  for (let i = 0; i < actions.length; i++) {
-    state = applyAction(state, actions[i]);
-    states.push(gameStateVector(i + 1, state));
+  for (let index = 0; index < actions.length; index++) {
+    state = applyAction(state, actions[index]);
+    states.push(gameStateVector(index + 1, state));
   }
   return {
     id,
@@ -224,38 +210,11 @@ function gameTrace(
     actions,
     actionCodes: actions.map(actionCode),
     states,
-    terminal: terminalVector(terminalReason, state),
+    terminal: terminalVector(state),
   };
 }
 
-function doublePassGameVector() {
-  const config: GameConfig = {
-    rings: 6,
-    mode: 'double',
-    pieRule: false,
-    playerNames: ['blue', 'red'],
-  };
-  const board = getBoard(config.rings);
-  const actions: GameAction[] = [
-    { type: 'place', node: board.idx(0, 6, 0) },
-    { type: 'place', node: board.idx(1, 2, 0) },
-    { type: 'place', node: board.idx(1, 2, 1) },
-    { type: 'place', node: board.idx(0, 6, 1) },
-    { type: 'pass' },
-    { type: 'place', node: board.idx(2, 3, 0) },
-    { type: 'place', node: board.idx(2, 3, 1) },
-    { type: 'pass' },
-    { type: 'pass' },
-  ];
-  return gameTrace(
-    'double-midturn-two-pass-terminal',
-    config,
-    actions,
-    'double-pass',
-  );
-}
-
-function boardFullGameVector(rings: number, residualMovesLeft: 0 | 1) {
+function boardFullGameVector(rings: (typeof SUPPORTED_RINGS)[number]) {
   const config: GameConfig = {
     rings,
     mode: 'double',
@@ -267,19 +226,7 @@ function boardFullGameVector(rings: number, residualMovesLeft: 0 | 1) {
     { length: board.n },
     (_, node) => ({ type: 'place', node }) as const,
   );
-  const trace = gameTrace(
-    `rings-${rings}-board-full-residual-${residualMovesLeft}`,
-    config,
-    actions,
-    'board-full',
-  );
-  const terminal = trace.states[trace.states.length - 1];
-  if (terminal.movesLeft !== residualMovesLeft) {
-    throw new Error(
-      `rings ${rings} ended with movesLeft ${terminal.movesLeft}, expected ${residualMovesLeft}`,
-    );
-  }
-  return trace;
+  return gameTrace(`rings-${rings}-board-full`, config, actions);
 }
 
 function applyLog(config: GameConfig, actions: GameAction[]): GameState {
@@ -297,7 +244,6 @@ function semanticStateVector(state: GameState) {
     movesLeft: state.movesLeft,
     opening: state.turnCount === 0,
     midTurn: state.midTurn,
-    passStreak: state.passStreak,
     terminal: state.over,
     currentTurnMoves: [...state.currentTurnMoves],
     turnCount: state.turnCount,
@@ -313,41 +259,42 @@ function pairEquivalenceVector() {
   };
   const board = getBoard(config.rings);
   const opening: GameAction = { type: 'place', node: board.idx(0, 4, 0) };
-  const a = board.idx(1, 3, 1);
-  const b = board.idx(3, 3, 1);
-  const abActions: GameAction[] = [
+  const first = board.idx(1, 3, 1);
+  const second = board.idx(3, 3, 1);
+  const firstThenSecond: GameAction[] = [
     opening,
-    { type: 'place', node: a },
-    { type: 'place', node: b },
+    { type: 'place', node: first },
+    { type: 'place', node: second },
   ];
-  const baActions: GameAction[] = [
+  const secondThenFirst: GameAction[] = [
     opening,
-    { type: 'place', node: b },
-    { type: 'place', node: a },
+    { type: 'place', node: second },
+    { type: 'place', node: first },
   ];
-  const afterAb = applyLog(config, abActions);
-  const afterBa = applyLog(config, baActions);
-  const semanticState = semanticStateVector(afterAb);
+  const afterFirstThenSecond = applyLog(config, firstThenSecond);
+  const afterSecondThenFirst = applyLog(config, secondThenFirst);
+  const semanticState = semanticStateVector(afterFirstThenSecond);
   if (
-    JSON.stringify(semanticState) !== JSON.stringify(semanticStateVector(afterBa))
+    JSON.stringify(semanticState) !==
+    JSON.stringify(semanticStateVector(afterSecondThenFirst))
   ) {
     throw new Error('AB and BA must produce the same semantic state');
   }
   return {
     id: 'complete-turn-ab-ba',
     config,
-    pair: { a, b },
+    pair: { a: first, b: second },
     ab: {
-      actions: abActions,
-      actionCodes: abActions.map(actionCode),
+      actions: firstThenSecond,
+      actionCodes: firstThenSecond.map(actionCode),
       semanticState,
-      lastMove: afterAb.lastMove,
+      lastMove: afterFirstThenSecond.lastMove,
     },
     ba: {
-      actions: baActions,
-      actionCodes: baActions.map(actionCode),
-      semanticState: semanticStateVector(afterBa),
-      lastMove: afterBa.lastMove,
+      actions: secondThenFirst,
+      actionCodes: secondThenFirst.map(actionCode),
+      semanticState: semanticStateVector(afterSecondThenFirst),
+      lastMove: afterSecondThenFirst.lastMove,
     },
     equivalentFields: Object.keys(semanticState),
     excludedPresentationFields: ['lastMove'],
@@ -360,48 +307,44 @@ function actionLayoutRow(rings: number, maximumNodes: number) {
     rings,
     nodeCount,
     native: {
-      actionCount: nodeCount + 1,
+      actionCount: nodeCount,
       placementSlots: [0, nodeCount - 1],
-      passSlot: nodeCount,
     },
     padded: {
-      actionCount: maximumNodes + 1,
+      actionCount: maximumNodes,
       placementSlots: [0, nodeCount - 1],
       paddingSlots:
         nodeCount === maximumNodes ? [] : [nodeCount, maximumNodes - 1],
-      passSlot: maximumNodes,
     },
     examples: [
       {
-        action: { type: 'place', node: 0 },
+        action: { type: 'place' as const, node: 0 },
         wireCode: 0,
         nativeIndex: 0,
         paddedIndex: 0,
       },
       {
-        action: { type: 'place', node: nodeCount - 1 },
+        action: { type: 'place' as const, node: nodeCount - 1 },
         wireCode: nodeCount - 1,
         nativeIndex: nodeCount - 1,
         paddedIndex: nodeCount - 1,
-      },
-      {
-        action: { type: 'pass' },
-        wireCode: STAR_PASS_ACTION_CODE,
-        nativeIndex: nodeCount,
-        paddedIndex: maximumNodes,
       },
     ],
   };
 }
 
-function mixedActionLayout(id: string, rings: number[]) {
-  const maximumNodes = Math.max(...rings.map((size) => getBoard(size).n));
+function supportedActionLayout() {
+  const maximumNodes = Math.max(
+    ...SUPPORTED_RINGS.map((rings) => getBoard(rings).n),
+  );
   return {
-    id,
-    rings,
+    id: 'supported-rings',
+    rings: [...SUPPORTED_RINGS],
     maximumNodes,
-    batchActionCount: maximumNodes + 1,
-    rows: rings.map((size) => actionLayoutRow(size, maximumNodes)),
+    batchActionCount: maximumNodes,
+    rows: SUPPORTED_RINGS.map((rings) =>
+      actionLayoutRow(rings, maximumNodes),
+    ),
   };
 }
 
@@ -410,7 +353,7 @@ export function createStarConformance() {
   const boards: ReturnType<typeof boardVector>[] = [];
   const scores: ReturnType<typeof scoreVector>[] = [];
 
-  for (let rings = MIN_RINGS; rings <= MAX_RINGS; rings++) {
+  for (const rings of SUPPORTED_RINGS) {
     const board = getBoard(rings);
     boards.push(boardVector(board));
 
@@ -449,22 +392,6 @@ export function createStarConformance() {
     );
   }
 
-  const twoPassGame = doublePassGameVector();
-  const games = [
-    twoPassGame,
-    boardFullGameVector(3, 1),
-    boardFullGameVector(5, 0),
-  ];
-  const terminal =
-    twoPassGame.states[twoPassGame.states.length - 1];
-  scores.push(
-    scoreVector(
-      'rings-6-pass-terminal',
-      getBoard(6),
-      Int8Array.from(terminal.stones),
-    ),
-  );
-
   return {
     schema: STAR_CONFORMANCE_SCHEMA_ID,
     schemas: {
@@ -480,23 +407,24 @@ export function createStarConformance() {
       canonical: STAR_RULES_CANONICAL,
       contract: STAR_RULES_CONTRACT,
     },
+    outcomeEncoding: {
+      loss: 0,
+      win: 1,
+      value: 'P(win)-P(loss)',
+    },
     actionEncoding: {
       placementCode: 'dense node id',
-      passCode: STAR_PASS_ACTION_CODE,
-      legalOrder: 'ascending legal placement node ids, then pass',
-      nativeLayout: 'node u at index u; pass at index nodeCount',
+      legalOrder: 'ascending legal placement node ids',
+      nativeLayout: 'node u at index u',
     },
     actionLayouts: {
       schema: STAR_ACTION_LAYOUT_SCHEMA_ID,
       modelFeatureSchema: STAR_FEATURE_SCHEMA_ID,
-      mixedBatches: [
-        mixedActionLayout('mini-medium', [3, 5]),
-        mixedActionLayout('small-large-full', [4, 6, 12]),
-      ],
+      mixedBatches: [supportedActionLayout()],
     },
     boards,
     scores,
-    games,
+    games: SUPPORTED_RINGS.map(boardFullGameVector),
     pairEquivalences: [pairEquivalenceVector()],
   };
 }

@@ -3,7 +3,7 @@ use core::fmt;
 use crate::{MAX_NODES, NodeId};
 
 /// Number of machine words reserved for every board mask.
-pub const BITBOARD_WORDS: usize = 7;
+pub const BITBOARD_WORDS: usize = 5;
 
 /// A fixed-width bitboard large enough for every supported board.
 #[derive(Clone, Copy, Default, Eq, Hash, PartialEq)]
@@ -36,13 +36,13 @@ impl BitBoard {
         Self(words)
     }
 
-    /// Builds a mask from its stable seven-word representation.
+    /// Builds a mask from its stable five-word representation.
     #[must_use]
     pub const fn from_words(words: [u64; BITBOARD_WORDS]) -> Self {
         Self(words)
     }
 
-    /// Exposes the stable seven-word representation.
+    /// Exposes the stable five-word representation.
     #[must_use]
     pub const fn words(self) -> [u64; BITBOARD_WORDS] {
         self.0

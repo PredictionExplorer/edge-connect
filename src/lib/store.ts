@@ -3,7 +3,7 @@
 import { useSyncExternalStore } from 'react';
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
-import { MAX_RINGS, MIN_RINGS } from './star/board';
+import { isSupportedRings } from './star/board';
 import {
   HUMAN_CONTROLLERS,
   isControllerType,
@@ -53,6 +53,7 @@ export const DEFAULT_CONFIG: GameConfig = {
 };
 
 export const DEFAULT_CONTROLLERS: PlayerControllers = [...HUMAN_CONTROLLERS];
+export const APP_STORE_VERSION = 4;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -71,9 +72,7 @@ export function parseGameConfig(value: unknown): GameConfig | null {
   const names = value.playerNames;
   if (
     typeof value.rings !== 'number' ||
-    !Number.isInteger(value.rings) ||
-    value.rings < MIN_RINGS ||
-    value.rings > MAX_RINGS ||
+    !isSupportedRings(value.rings) ||
     (value.mode !== 'classic' && value.mode !== 'double') ||
     typeof value.pieRule !== 'boolean' ||
     !Array.isArray(names) ||
@@ -92,18 +91,27 @@ export function parseGameConfig(value: unknown): GameConfig | null {
 }
 
 export function normalizeGameConfig(value: unknown): GameConfig {
-  return (
-    parseGameConfig(value) ?? {
-      ...DEFAULT_CONFIG,
-      playerNames: [...DEFAULT_CONFIG.playerNames],
-    }
-  );
+  const record = isRecord(value) ? value : {};
+  const names = Array.isArray(record.playerNames) ? record.playerNames : [];
+  return {
+    rings: isSupportedRings(record.rings) ? record.rings : DEFAULT_CONFIG.rings,
+    mode:
+      record.mode === 'classic' || record.mode === 'double'
+        ? record.mode
+        : DEFAULT_CONFIG.mode,
+    pieRule:
+      typeof record.pieRule === 'boolean' ? record.pieRule : DEFAULT_CONFIG.pieRule,
+    playerNames: [
+      typeof names[0] === 'string' ? names[0] : DEFAULT_CONFIG.playerNames[0],
+      typeof names[1] === 'string' ? names[1] : DEFAULT_CONFIG.playerNames[1],
+    ],
+  };
 }
 
 export function parseGameAction(value: unknown): GameAction | null {
   if (!isRecord(value) || typeof value.type !== 'string') return null;
-  if (value.type === 'pass' || value.type === 'swap') {
-    return hasExactKeys(value, ['type']) ? { type: value.type } : null;
+  if (value.type === 'swap') {
+    return hasExactKeys(value, ['type']) ? { type: 'swap' } : null;
   }
   if (
     value.type === 'place' &&
@@ -165,6 +173,19 @@ export function sanitizePersistedState(value: unknown): PersistedAppState {
   };
 }
 
+export function migratePersistedState(
+  value: unknown,
+  persistedVersion: number,
+): PersistedAppState {
+  if (persistedVersion >= APP_STORE_VERSION) {
+    return sanitizePersistedState(value);
+  }
+  const record = isRecord(value) ? value : {};
+  const config = normalizeGameConfig(record.config);
+  const controllers = normalizeControllers(config, record.controllers);
+  return setupSnapshot(config, controllers);
+}
+
 export const useAppStore = create<AppState>()(
   persist(
     (set) => ({
@@ -177,7 +198,10 @@ export const useAppStore = create<AppState>()(
       reviewing: false,
 
       startGame: (config, controllers) => {
-        const validConfig = normalizeGameConfig(config);
+        const validConfig = parseGameConfig(config);
+        if (!validConfig) {
+          throw new Error('cannot start a game with an unsupported configuration');
+        }
         set({
           phase: 'playing',
           config: validConfig,
@@ -241,8 +265,8 @@ export const useAppStore = create<AppState>()(
     }),
     {
       name: 'edgeconnect-star-v1',
-      version: 3,
-      migrate: (persistedState) => sanitizePersistedState(persistedState),
+      version: APP_STORE_VERSION,
+      migrate: migratePersistedState,
       merge: (persisted, current) => {
         const valid = sanitizePersistedState(persisted);
         return {

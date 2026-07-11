@@ -2,7 +2,12 @@
 
 import { useEffect, useMemo, useState } from 'react';
 import { Sparkles, Star, Users } from 'lucide-react';
-import { getBoard, MAX_RINGS, MIN_RINGS } from '@/lib/star/board';
+import {
+  getBoard,
+  isSupportedRings,
+  MAX_RINGS,
+  MIN_RINGS,
+} from '@/lib/star/board';
 import {
   INITIAL_AI_CAPABILITIES,
   capabilityForController,
@@ -188,8 +193,12 @@ export function SetupScreen() {
                 type="range"
                 min={MIN_RINGS}
                 max={MAX_RINGS}
+                step={2}
                 value={rings}
-                onChange={(e) => setRings(Number(e.target.value))}
+                onChange={(event) => {
+                  const nextRings = Number(event.target.value);
+                  if (isSupportedRings(nextRings)) setRings(nextRings);
+                }}
                 className="w-full accent-[#e8c48b]"
               />
               <span className="w-20 shrink-0 text-right text-sm text-ink">

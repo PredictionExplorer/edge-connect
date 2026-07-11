@@ -1,14 +1,14 @@
-schema_version: 1
+schema_version: 2
 experiment_config: h100.yaml
 model_manifest: ../runs/h100-8gpu/learner/champion.json
 device: cuda:0
 host: 0.0.0.0
 port: 8080
-rules_schema_id: edgeconnect.star.rules.v1
-rules_hash: fnv1a64:cdb34fb02be82843
-feature_schema_id: edgeconnect.star.model-features.external.v1
-feature_schema_hash: 59a7da1c00bac4d2
-action_schema_id: edgeconnect.star.action-layout.nodes-then-pass.v1
+rules_schema_id: edgeconnect.star.rules.v2
+rules_hash: fnv1a64:2da3783519381453
+feature_schema_id: edgeconnect.star.model-features.external.v2
+feature_schema_hash: 6b5b00f638e9c16b
+action_schema_id: edgeconnect.star.action-layout.nodes-only.v1
 
 search:
   default_simulations: 512

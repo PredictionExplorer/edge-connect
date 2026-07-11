@@ -17,7 +17,7 @@ def _settings(
     metrics_root: Path | None = None,
 ) -> benchmark.BenchmarkSettings:
     config = tmp_path / "profile.yaml"
-    config.write_text("schema_version: 2\n", encoding="utf-8")
+    config.write_text("schema_version: 3\n", encoding="utf-8")
     return benchmark.BenchmarkSettings(
         config=config,
         output_directory=tmp_path / "benchmark-output",
@@ -281,8 +281,6 @@ def test_orchestration_metrics_summary_covers_throughput_and_replay_waits(
             "attempted_decisions": 10,
             "full_decisions": 4,
             "fast_decisions": 6,
-            "pass_decisions": 2,
-            "pass_decision_rate": 0.2,
             "game_lengths": [4, 6],
             "policy_entropy_count": 4,
             "policy_entropy_sum": 2.0,
@@ -310,8 +308,6 @@ def test_orchestration_metrics_summary_covers_throughput_and_replay_waits(
             "attempted_decisions": 20,
             "full_decisions": 8,
             "fast_decisions": 12,
-            "pass_decisions": 3,
-            "pass_decision_rate": 0.25,
             "game_lengths": [5, 7],
             "policy_entropy_count": 6,
             "policy_entropy_sum": 4.2,
@@ -359,8 +355,6 @@ def test_orchestration_metrics_summary_covers_throughput_and_replay_waits(
     assert actors["decisions"]["attempted"]["total"] == 30
     assert actors["decisions"]["full"]["total"] == 12
     assert actors["decisions"]["fast"]["total"] == 18
-    assert actors["decisions"]["passes"]["total"] == 5
-    assert actors["decisions"]["pass_rate"] == 5 / 30
     assert actors["game_length"]["mean"] == 5.5
     assert actors["game_length"]["distribution"] == {
         "4": 1,

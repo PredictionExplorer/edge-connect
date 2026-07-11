@@ -28,9 +28,9 @@ from .features import (
     encode_batch,
 )
 from .scoring import PlayerScore, ScoreResult
-from .topology import get_topology
+from .topology import MAX_NODES, get_topology
 
-BITBOARD_WORDS = 7
+BITBOARD_WORDS = (MAX_NODES + 63) // 64
 _NATIVE_FEATURE_PATH_COUNTS: Counter[str] = Counter()
 
 
@@ -54,9 +54,7 @@ class NativeStateDataProtocol(Protocol):
     moves_left: Sequence[int]
     opening: Sequence[bool]
     mid_turn: Sequence[bool]
-    pass_streak: Sequence[int]
     terminal: Sequence[bool]
-    pass_legal: Sequence[bool]
 
 
 @runtime_checkable
@@ -68,9 +66,8 @@ class NativeScoreDataProtocol(Protocol):
     alive_bits: Sequence[int]
     winner: Sequence[int]
     terminal_value: Sequence[float]
-    wdl_class: Sequence[int]
+    outcome_class: Sequence[int]
     score_margin: Sequence[int]
-    terminal_reason: Sequence[int]
 
 
 @runtime_checkable
@@ -220,7 +217,7 @@ def positions_from_native(
     *,
     verify_legal_buffers: bool = True,
 ) -> list[DoubleStarPosition]:
-    """Convert one homogeneous native batch into schema-v2 semantic keys."""
+    """Convert one homogeneous native batch into schema-v3 semantic keys."""
 
     rings = _integer("rings", data.rings)
     topology = get_topology(rings)
@@ -237,11 +234,9 @@ def positions_from_native(
     stones_placed = _integers("stones_placed", data.stones_placed, batch_size)
     to_move = _integers("to_move", data.to_move, batch_size)
     moves_left = _integers("moves_left", data.moves_left, batch_size)
-    pass_streak = _integers("pass_streak", data.pass_streak, batch_size)
     opening = _booleans("opening", data.opening, batch_size)
     mid_turn = _booleans("mid_turn", data.mid_turn, batch_size)
     terminal = _booleans("terminal", data.terminal, batch_size)
-    pass_legal = _booleans("pass_legal", data.pass_legal, batch_size)
 
     positions: list[DoubleStarPosition] = []
     for row in range(batch_size):
@@ -262,7 +257,6 @@ def positions_from_native(
             to_move=to_move[row],
             moves_left=moves_left[row],
             opening=opening[row],
-            pass_streak=pass_streak[row],
             terminal=terminal[row],
         )
         if verify_legal_buffers:
@@ -271,10 +265,6 @@ def positions_from_native(
             if not torch.equal(native_legal, expected_legal):
                 raise NativeCompatibilityError(
                     "native legal placement buffer disagrees with semantic state"
-                )
-            if pass_legal[row] != (not terminal[row]):
-                raise NativeCompatibilityError(
-                    "native pass_legal disagrees with semantic state"
                 )
         positions.append(position)
     return positions
@@ -364,7 +354,7 @@ def encode_native_feature_data(
         "legal_action_mask",
         data.legal_action_mask,
         dtype=np.bool_,
-        shape=(batch_size, max_nodes + 1),
+        shape=(batch_size, max_nodes),
     )
     rings = rings_u8.to(dtype=torch.long)
 
@@ -373,12 +363,8 @@ def encode_native_feature_data(
         # topology as a view instead of allocating and filling three full
         # batch-sized tensors for every leaf-evaluation wave.
         topology = next(iter(topologies.values()))
-        neighbor_index = topology.neighbor_index.unsqueeze(0).expand(
-            batch_size, -1, -1
-        )
-        neighbor_mask = topology.neighbor_mask.unsqueeze(0).expand(
-            batch_size, -1, -1
-        )
+        neighbor_index = topology.neighbor_index.unsqueeze(0).expand(batch_size, -1, -1)
+        neighbor_mask = topology.neighbor_mask.unsqueeze(0).expand(batch_size, -1, -1)
         neighbor_edge_type = topology.neighbor_edge_type.unsqueeze(0).expand(
             batch_size, -1, -1
         )
@@ -482,7 +468,6 @@ def encode_native_semantic_batch(
     to_move: Sequence[int],
     moves_left: Sequence[int],
     opening: Sequence[bool],
-    pass_streak: Sequence[int],
     terminal: Sequence[bool],
     dtype: torch.dtype = torch.float32,
     device: torch.device | str | None = None,
@@ -497,12 +482,15 @@ def encode_native_semantic_batch(
         == len(to_move)
         == len(moves_left)
         == len(opening)
-        == len(pass_streak)
         == len(terminal)
         == rows
     ):
         raise NativeCompatibilityError("semantic feature fields disagree on row count")
-    module = load_star_native()
+    try:
+        module = load_star_native()
+    except NativeCompatibilityError:
+        _record_feature_path("python_semantic", rows)
+        return None
     encoder = getattr(module, "encode_semantic_features", None) if module else None
     if not callable(encoder):
         _record_feature_path("python_semantic", rows)
@@ -511,7 +499,6 @@ def encode_native_semantic_batch(
     ring_values = _integers("rings", rings, rows)
     to_move_values = _integers("to_move", to_move, rows)
     moves_left_values = _integers("moves_left", moves_left, rows)
-    pass_streak_values = _integers("pass_streak", pass_streak, rows)
     opening_values = _booleans("opening", opening, rows)
     terminal_values = _booleans("terminal", terminal, rows)
     topologies = [get_topology(ring_count) for ring_count in ring_values]
@@ -520,15 +507,12 @@ def encode_native_semantic_batch(
             raise NativeCompatibilityError(f"row {row} has invalid to_move")
         if moves_left_values[row] not in (0, 1, 2):
             raise NativeCompatibilityError(f"row {row} has invalid moves_left")
-        if pass_streak_values[row] not in (0, 1, 2):
-            raise NativeCompatibilityError(f"row {row} has invalid pass_streak")
     ring_array = np.asarray(ring_values, dtype=np.uint8)
-    metadata = np.empty((rows, 5), dtype=np.uint8)
+    metadata = np.empty((rows, 4), dtype=np.uint8)
     metadata[:, 0] = to_move_values
     metadata[:, 1] = moves_left_values
     metadata[:, 2] = opening_values
-    metadata[:, 3] = pass_streak_values
-    metadata[:, 4] = terminal_values
+    metadata[:, 3] = terminal_values
     stone_arrays: list[np.ndarray] = []
     for row, (topology, values) in enumerate(zip(topologies, stones, strict=True)):
         array = np.asarray(values)

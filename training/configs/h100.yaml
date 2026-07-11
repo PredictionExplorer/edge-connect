@@ -1,10 +1,9 @@
-schema_version: 2
+schema_version: 3
 profile: standalone-smoke
 game:
   mode: double
   pie_rule: false
-  min_rings: 3
-  max_rings: 12
+  rings: [4, 6, 8, 10]
 
 model:
   width: 384
@@ -15,13 +14,13 @@ model:
   ff_multiplier: 2.5
   dropout: 0.0
   rms_norm_eps: 0.000001
-  score_margin_min: -181
-  score_margin_max: 181
+  score_margin_min: -151
+  score_margin_max: 151
   soft_policy_temperature: 4.0
 
 loss:
   policy: 1.0
-  wdl: 1.0
+  outcome: 1.0
   score_margin: 0.25
   ownership: 0.25
   alive: 0.1
@@ -51,7 +50,7 @@ train:
     min_lr_ratio: 0.05
 
 data:
-  schema_version: 3
+  schema_version: 4
   ring_stratified: false
   d5_augmentation: true
   workers: 16
@@ -75,7 +74,6 @@ selfplay:
   record_fast_policy_targets: false
   c_visit: 50.0
   c_scale: 1.0
-  initial_pass_logit_penalty: 1.5
   score_utility_weight: 0.05
   shard_size: 4096
   seed: 17

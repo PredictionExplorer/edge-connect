@@ -1,5 +1,6 @@
 from dataclasses import fields
 
+import pytest
 import torch
 
 from startrain.contracts import (
@@ -9,13 +10,20 @@ from startrain.contracts import (
     RULES_HASH,
     fnv1a64,
 )
-from startrain.features import DoubleStarPosition, encode_position
+from startrain.features import (
+    GLOBAL_FEATURE_DIM,
+    GLOBAL_FEATURE_NAMES,
+    DoubleStarPosition,
+    encode_position,
+)
 from startrain.symmetry import D5Transform, permute_nodes, transform_position
 from startrain.topology import (
     EDGE_BRIDGE,
     EDGE_CLASS_COUNT,
+    MAX_NODES,
     MAX_RINGS,
     MIN_RINGS,
+    SUPPORTED_RINGS,
     get_topology,
 )
 
@@ -31,14 +39,15 @@ def live_position(rings: int) -> DoubleStarPosition:
         to_move=0,
         moves_left=1,
         opening=False,
-        pass_streak=0,
         terminal=False,
     )
 
 
-def test_schema_v2_is_exactly_the_rust_semantic_key() -> None:
-    assert FEATURE_SCHEMA_VERSION == 2
+def test_schema_v3_is_exactly_the_canonical_semantic_key() -> None:
+    assert FEATURE_SCHEMA_VERSION == 3
     assert FEATURE_SCHEMA_HASH != 0
+    assert GLOBAL_FEATURE_DIM == 17
+    assert all("pass" not in name for name in GLOBAL_FEATURE_NAMES)
     assert RULES_HASH == fnv1a64(RULES_CONTRACT)
     assert [field.name for field in fields(DoubleStarPosition)] == [
         "rings",
@@ -46,13 +55,13 @@ def test_schema_v2_is_exactly_the_rust_semantic_key() -> None:
         "to_move",
         "moves_left",
         "opening",
-        "pass_streak",
         "terminal",
     ]
 
 
 def test_topology_edge_classes_preserve_all_d5_actions_and_rings() -> None:
-    for rings in range(MIN_RINGS, MAX_RINGS + 1):
+    assert (MIN_RINGS, MAX_RINGS, MAX_NODES) == (4, 10, 275)
+    for rings in SUPPORTED_RINGS:
         topology = get_topology(rings)
         assert topology.n == 5 * rings * (rings + 1) // 2
         assert set(topology.edge_type.tolist()) == set(range(EDGE_CLASS_COUNT))
@@ -86,8 +95,8 @@ def test_topology_edge_classes_preserve_all_d5_actions_and_rings() -> None:
                 assert directed[transformed_edge] == edge_class
 
 
-def test_schema_v2_features_are_equivariant_for_every_ring_and_d5_action() -> None:
-    for rings in range(MIN_RINGS, MAX_RINGS + 1):
+def test_schema_v3_features_are_equivariant_for_every_ring_and_d5_action() -> None:
+    for rings in SUPPORTED_RINGS:
         source = live_position(rings)
         encoded = encode_position(source)
         topology = get_topology(rings)
@@ -110,31 +119,29 @@ def test_schema_v2_features_are_equivariant_for_every_ring_and_d5_action() -> No
             )
 
 
-def test_terminal_semantics_include_pass_and_full_board_states() -> None:
-    topology = get_topology(3)
-    by_passes = DoubleStarPosition(
-        rings=3,
-        stones=torch.full((topology.n,), -1, dtype=torch.int8),
-        to_move=1,
-        moves_left=2,
-        opening=False,
-        pass_streak=2,
-        terminal=True,
-    )
-    encoded = encode_position(by_passes)
-    assert not bool(encoded.legal_node_mask.any())
-    assert not bool(encoded.legal_pass)
-
+def test_terminal_semantics_are_full_board_only() -> None:
+    topology = get_topology(4)
     full = DoubleStarPosition(
-        rings=3,
+        rings=4,
         stones=torch.arange(topology.n, dtype=torch.int8) % 2,
         to_move=0,
         moves_left=0,
         opening=False,
-        pass_streak=0,
         terminal=True,
     )
-    assert encode_position(full).global_features[7].item() == 1.0
+    encoded = encode_position(full)
+    assert encoded.global_features[6].item() == 1.0
+    assert not bool(encoded.legal_node_mask.any())
+
+    with pytest.raises(ValueError, match="board-full"):
+        DoubleStarPosition(
+            rings=4,
+            stones=torch.full((topology.n,), -1, dtype=torch.int8),
+            to_move=1,
+            moves_left=2,
+            opening=False,
+            terminal=True,
+        )
 
 
 def test_color_swap_is_current_player_canonical() -> None:
@@ -148,7 +155,6 @@ def test_color_swap_is_current_player_canonical() -> None:
         to_move=1,
         moves_left=source.moves_left,
         opening=False,
-        pass_streak=source.pass_streak,
         terminal=False,
     )
     left = encode_position(source)

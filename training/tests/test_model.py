@@ -1,5 +1,6 @@
 from unittest.mock import patch
 
+import pytest
 import torch
 import torch.nn.functional as functional
 
@@ -25,7 +26,6 @@ def position(rings: int) -> DoubleStarPosition:
         to_move=0,
         moves_left=2,
         opening=False,
-        pass_streak=0,
         terminal=False,
     )
 
@@ -46,7 +46,7 @@ def test_approved_trunk_shapes_masks_and_single_soft_policy() -> None:
     model = tiny_model().eval()
     assert len(model.rrt_groups) == 5
     assert all(len(group.local_blocks) == 2 for group in model.rrt_groups)
-    batch = encode_batch([position(3), position(4)])
+    batch = encode_batch([position(4), position(6)])
     with patch.object(
         functional,
         "scaled_dot_product_attention",
@@ -54,10 +54,10 @@ def test_approved_trunk_shapes_masks_and_single_soft_policy() -> None:
     ) as fused_attention:
         output = model(*batch.model_args())
     assert fused_attention.call_count == 5
-    assert output.policy_logits.shape == (2, batch.max_nodes + 1)
-    assert output.soft_policy_logits.shape == (2, batch.max_nodes + 1)
-    assert output.wdl_logits.shape == (2, 3)
-    assert output.score_margin_logits.shape == (2, 363)
+    assert output.policy_logits.shape == (2, batch.max_nodes)
+    assert output.soft_policy_logits.shape == (2, batch.max_nodes)
+    assert output.outcome_logits.shape == (2, 2)
+    assert output.score_margin_logits.shape == (2, 303)
     assert output.ownership_logits.shape == (2, batch.max_nodes, 3)
     assert output.alive_logits.shape == (2, batch.max_nodes)
     illegal = ~batch.legal_action_mask
@@ -75,11 +75,11 @@ def test_approved_trunk_shapes_masks_and_single_soft_policy() -> None:
 def test_model_equivariance_and_invariance_for_all_d5_transforms() -> None:
     torch.manual_seed(7)
     model = tiny_model().eval()
-    source = position(3)
+    source = position(4)
     source_batch = encode_batch([source])
     with torch.no_grad():
         baseline = model(*source_batch.model_args())
-    topology = get_topology(3)
+    topology = get_topology(4)
     for transform_index in range(10):
         transform = D5Transform.from_index(transform_index)
         permutation = topology.d5_permutation(transform.rotation, transform.reflected)
@@ -111,7 +111,10 @@ def test_model_equivariance_and_invariance_for_all_d5_transforms() -> None:
             rtol=3e-5,
         )
         torch.testing.assert_close(
-            transformed.wdl_logits, baseline.wdl_logits, atol=3e-5, rtol=3e-5
+            transformed.outcome_logits,
+            baseline.outcome_logits,
+            atol=3e-5,
+            rtol=3e-5,
         )
         torch.testing.assert_close(
             transformed.score_margin_logits,
@@ -119,3 +122,29 @@ def test_model_equivariance_and_invariance_for_all_d5_transforms() -> None:
             atol=3e-5,
             rtol=3e-5,
         )
+
+
+@pytest.mark.parametrize(
+    ("changes", "message"),
+    [
+        ({"node_feature_dim": 16}, "feature dimensions"),
+        ({"width": 0}, "width must be positive"),
+        ({"rrt_groups": 0}, "rrt_groups"),
+        ({"width": 10, "attention_heads": 4}, "divisible by attention_heads"),
+        (
+            {"width": 12, "attention_heads": 4, "kv_heads": 3},
+            "attention_heads must be divisible",
+        ),
+        ({"bottleneck_ratio": 0.0}, "bottleneck_ratio"),
+        ({"ff_multiplier": 0.0}, "ff_multiplier"),
+        ({"dropout": 1.0}, "dropout"),
+        ({"score_margin_min": -150}, r"\[-151, 151\]"),
+        ({"soft_policy_temperature": 2.0}, "temperature is fixed at 4"),
+    ],
+)
+def test_model_config_enforces_v2_head_and_feature_contracts(
+    changes: dict[str, object],
+    message: str,
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        ModelConfig(**changes)

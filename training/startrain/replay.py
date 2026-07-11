@@ -1,4 +1,4 @@
-"""Validated schema-v3 replay samples and pickle-free heterogeneous shards."""
+"""Validated schema-v4 replay samples and pickle-free heterogeneous shards."""
 
 from __future__ import annotations
 
@@ -29,14 +29,13 @@ from .contracts import (
     SCORE_MARGIN_MIN,
     SOFT_POLICY_TEMPERATURE,
     TARGET_ALIVE,
+    TARGET_OUTCOME,
     TARGET_OWNERSHIP,
     TARGET_POLICY,
     TARGET_SCORE_MARGIN,
     TARGET_SOFT_POLICY,
-    TARGET_WDL,
-    WDL_DRAW,
-    WDL_LOSS,
-    WDL_WIN,
+    OUTCOME_LOSS,
+    OUTCOME_WIN,
 )
 from .features import (
     DoubleStarPosition,
@@ -50,26 +49,24 @@ from .scoring import ScoreResult
 from .symmetry import D5Transform
 from .topology import get_topology
 
-REPLAY_SCHEMA_VERSION = 3
+REPLAY_SCHEMA_VERSION = 4
 REPLAY_SHARD_FORMAT = "startrain.replay.npz"
-MISSING_LEADER = -2
+MISSING_OUTCOME = -1
 MISSING_OWNERSHIP = -100
 MISSING_ALIVE = 255
 
 _REPLAY_SAMPLE_ARRAY_NAMES = (
     "rings",
     "node_offsets",
-    "action_offsets",
     "stones",
     "to_move",
     "moves_left",
     "opening",
-    "pass_streak",
     "terminal",
     "policy",
     "soft_policy",
     "target_mask",
-    "final_leader",
+    "outcome",
     "final_scores",
     "final_quarks",
     "final_ownership",
@@ -87,8 +84,8 @@ _REPLAY_SAMPLE_ARRAY_NAMES = (
     "rules_hash",
     "feature_schema_hash",
     "weight",
+    "policy_weight",
 )
-_REPLAY_OPTIONAL_ARRAY_NAMES = ("policy_weight",)
 
 
 class ReplaySchemaError(ValueError):
@@ -167,12 +164,11 @@ class ReplaySample:
     to_move: int
     moves_left: int
     opening: bool
-    pass_streak: int
     terminal: bool
     policy: np.ndarray
     soft_policy: np.ndarray
     target_mask: int
-    final_leader: int
+    outcome: int
     final_scores: np.ndarray
     final_quarks: np.ndarray
     final_ownership: np.ndarray
@@ -206,7 +202,6 @@ class ReplaySample:
             raise ReplaySchemaError("stones must contain only -1, 0, or 1")
         to_move = _checked_int("to_move", self.to_move)
         moves_left = _checked_int("moves_left", self.moves_left)
-        pass_streak = _checked_int("pass_streak", self.pass_streak)
         opening = _checked_bool("opening", self.opening)
         terminal = _checked_bool("terminal", self.terminal)
 
@@ -217,18 +212,15 @@ class ReplaySample:
             to_move=to_move,
             moves_left=moves_left,
             opening=opening,
-            pass_streak=pass_streak,
             terminal=terminal,
         )
 
         target_mask = _checked_int("target_mask", self.target_mask)
         if target_mask < 0 or target_mask & ~ALL_TARGETS:
             raise ReplaySchemaError("target_mask contains unknown bits")
-        policy = _float_array("policy", self.policy, shape=(topology.n + 1,))
-        soft_policy = _float_array(
-            "soft_policy", self.soft_policy, shape=(topology.n + 1,)
-        )
-        final_leader = _checked_int("final_leader", self.final_leader)
+        policy = _float_array("policy", self.policy, shape=(topology.n,))
+        soft_policy = _float_array("soft_policy", self.soft_policy, shape=(topology.n,))
+        outcome = _checked_int("outcome", self.outcome)
         final_scores = _integer_array(
             "final_scores", self.final_scores, shape=(2,), dtype=np.dtype(np.int16)
         )
@@ -283,10 +275,9 @@ class ReplaySample:
                 "sample policy_weight must be finite and non-negative"
             )
 
-        legal = np.zeros(topology.n + 1, dtype=np.bool_)
+        legal = np.zeros(topology.n, dtype=np.bool_)
         if not terminal:
-            legal[: topology.n] = stones == -1
-            legal[topology.n] = True
+            legal[:] = stones == -1
         self._validate_policy(
             "policy", policy, legal, bool(target_mask & TARGET_POLICY)
         )
@@ -307,23 +298,30 @@ class ReplaySample:
         if terminal and target_mask & (TARGET_POLICY | TARGET_SOFT_POLICY):
             raise ReplaySchemaError("terminal samples cannot carry decision policies")
 
-        if target_mask & (TARGET_WDL | TARGET_SCORE_MARGIN):
-            if final_leader not in (-1, 0, 1):
-                raise ReplaySchemaError("final leader must be -1, 0, or 1")
+        if target_mask & (TARGET_OUTCOME | TARGET_SCORE_MARGIN):
+            if outcome not in (OUTCOME_LOSS, OUTCOME_WIN):
+                raise ReplaySchemaError("available outcome must be loss=0 or win=1")
             if not np.logical_and(final_quarks >= 0, final_quarks <= 5).all():
                 raise ReplaySchemaError("final quarks must be in 0..5")
             expected_leader = _leader_from_scores(final_scores, final_quarks)
-            if final_leader != expected_leader:
+            if expected_leader == -1:
+                raise ReplaySchemaError("terminal replay result cannot be tied")
+            expected_outcome = (
+                OUTCOME_WIN if expected_leader == to_move else OUTCOME_LOSS
+            )
+            if outcome != expected_outcome:
                 raise ReplaySchemaError(
-                    "final leader disagrees with totals and quark tiebreak"
+                    "outcome disagrees with totals and quark tiebreak"
                 )
-        elif final_leader != MISSING_LEADER:
-            raise ReplaySchemaError("unavailable final result must use missing leader")
+        elif outcome != MISSING_OUTCOME:
+            raise ReplaySchemaError("unavailable final result must use outcome=-1")
+        if terminal and not target_mask & TARGET_OUTCOME:
+            raise ReplaySchemaError("terminal replay samples require a binary outcome")
 
         if target_mask & TARGET_SCORE_MARGIN:
             margin = int(final_scores[to_move]) - int(final_scores[1 - to_move])
             if not SCORE_MARGIN_MIN <= margin <= SCORE_MARGIN_MAX:
-                raise ReplaySchemaError("score margin is outside [-181, 181]")
+                raise ReplaySchemaError("score margin is outside [-151, 151]")
         if target_mask & TARGET_OWNERSHIP:
             if not np.isin(final_ownership, (-1, 0, 1)).all():
                 raise ReplaySchemaError("final ownership must contain -1, 0, or 1")
@@ -340,12 +338,11 @@ class ReplaySample:
         self.to_move = to_move
         self.moves_left = moves_left
         self.opening = opening
-        self.pass_streak = pass_streak
         self.terminal = terminal
         self.policy = policy
         self.soft_policy = soft_policy
         self.target_mask = target_mask
-        self.final_leader = final_leader
+        self.outcome = outcome
         self.final_scores = final_scores
         self.final_quarks = final_quarks
         self.final_ownership = final_ownership
@@ -404,36 +401,35 @@ class ReplaySample:
         topology = get_topology(position.rings)
         target_mask = 0
         if policy is None:
-            policy_array = np.zeros(topology.n + 1, dtype=np.float32)
+            policy_array = np.zeros(topology.n, dtype=np.float32)
             soft_policy = np.zeros_like(policy_array)
         else:
             if position.terminal:
                 raise ReplaySchemaError("terminal positions cannot have policy targets")
             policy_array = np.asarray(policy, dtype=np.float32)
-            legal = np.concatenate(
-                (
-                    (position.stones.detach().cpu().numpy() == -1),
-                    np.asarray([True]),
-                )
-            )
+            legal = position.stones.detach().cpu().numpy() == -1
             soft_policy = katago_soft_policy_target(policy_array, legal)
             target_mask |= TARGET_POLICY | TARGET_SOFT_POLICY
 
         if final_score is None:
-            final_leader = MISSING_LEADER
+            outcome = MISSING_OUTCOME
             final_scores = np.zeros(2, dtype=np.int16)
             final_quarks = np.zeros(2, dtype=np.int8)
             final_ownership = np.full(topology.n, MISSING_OWNERSHIP, dtype=np.int8)
             final_alive = np.full(topology.n, MISSING_ALIVE, dtype=np.uint8)
         else:
-            final_leader = final_score.leader
+            if final_score.leader not in (0, 1):
+                raise ReplaySchemaError("final score cannot be tied")
+            outcome = (
+                OUTCOME_WIN if final_score.leader == position.to_move else OUTCOME_LOSS
+            )
             final_scores = np.asarray(
                 [player.total for player in final_score.players], dtype=np.int16
             )
             final_quarks = np.asarray(
                 [player.quarks for player in final_score.players], dtype=np.int8
             )
-            target_mask |= TARGET_WDL | TARGET_SCORE_MARGIN
+            target_mask |= TARGET_OUTCOME | TARGET_SCORE_MARGIN
             if include_spatial_targets:
                 final_ownership = final_score.node_owner.numpy()
                 final_alive = final_score.alive_stone.numpy().astype(np.uint8)
@@ -447,12 +443,11 @@ class ReplaySample:
             to_move=position.to_move,
             moves_left=position.moves_left,
             opening=position.opening,
-            pass_streak=position.pass_streak,
             terminal=position.terminal,
             policy=policy_array,
             soft_policy=soft_policy,
             target_mask=target_mask,
-            final_leader=final_leader,
+            outcome=outcome,
             final_scores=final_scores,
             final_quarks=final_quarks,
             final_ownership=final_ownership,
@@ -477,30 +472,18 @@ class ReplaySample:
             to_move=self.to_move,
             moves_left=self.moves_left,
             opening=self.opening,
-            pass_streak=self.pass_streak,
             terminal=self.terminal,
         )
 
     def outcome_targets(self) -> tuple[int, int]:
-        """Return current-player WDL and margin from absolute final data.
+        """Return current-player binary outcome and score margin."""
 
-        The WDL leader uses total score first and absolute quark count as the
-        authoritative tie-break. Therefore a zero score margin can still be a
-        win or loss when the final quark counts differ.
-        """
-
-        if not self.target_mask & (TARGET_WDL | TARGET_SCORE_MARGIN):
+        if not self.target_mask & (TARGET_OUTCOME | TARGET_SCORE_MARGIN):
             raise ReplaySchemaError("final outcome targets are unavailable")
-        if self.final_leader == -1:
-            wdl = WDL_DRAW
-        elif self.final_leader == self.to_move:
-            wdl = WDL_WIN
-        else:
-            wdl = WDL_LOSS
         margin = int(self.final_scores[self.to_move]) - int(
             self.final_scores[1 - self.to_move]
         )
-        return wdl, margin
+        return self.outcome, margin
 
 
 def _leader_from_scores(scores: np.ndarray, quarks: np.ndarray) -> int:
@@ -522,24 +505,17 @@ def augment_sample(sample: ReplaySample, transform: D5Transform) -> ReplaySample
         output[permutation] = values
         return output
 
-    def actions(values: np.ndarray) -> np.ndarray:
-        output = np.empty_like(values)
-        output[permutation] = values[: topology.n]
-        output[topology.n] = values[topology.n]
-        return output
-
     return ReplaySample(
         rings=sample.rings,
         stones=nodes(sample.stones),
         to_move=sample.to_move,
         moves_left=sample.moves_left,
         opening=sample.opening,
-        pass_streak=sample.pass_streak,
         terminal=sample.terminal,
-        policy=actions(sample.policy),
-        soft_policy=actions(sample.soft_policy),
+        policy=nodes(sample.policy),
+        soft_policy=nodes(sample.soft_policy),
         target_mask=sample.target_mask,
-        final_leader=sample.final_leader,
+        outcome=sample.outcome,
         final_scores=sample.final_scores.copy(),
         final_quarks=sample.final_quarks.copy(),
         final_ownership=nodes(sample.final_ownership),
@@ -575,7 +551,6 @@ def write_replay_shard(
     destination = Path(destination)
     destination.parent.mkdir(parents=True, exist_ok=True)
     node_offsets = _offsets([sample.stones.size for sample in samples])
-    action_offsets = _offsets([sample.policy.size for sample in samples])
     metadata = {
         "format": REPLAY_SHARD_FORMAT,
         "schema_version": REPLAY_SCHEMA_VERSION,
@@ -591,25 +566,19 @@ def write_replay_shard(
         "metadata": np.asarray(json.dumps(metadata, sort_keys=True)),
         "rings": np.asarray([sample.rings for sample in samples], dtype=np.int8),
         "node_offsets": node_offsets,
-        "action_offsets": action_offsets,
         "stones": np.concatenate([sample.stones for sample in samples]),
         "to_move": np.asarray([sample.to_move for sample in samples], dtype=np.int8),
         "moves_left": np.asarray(
             [sample.moves_left for sample in samples], dtype=np.int8
         ),
         "opening": np.asarray([sample.opening for sample in samples], dtype=np.bool_),
-        "pass_streak": np.asarray(
-            [sample.pass_streak for sample in samples], dtype=np.int8
-        ),
         "terminal": np.asarray([sample.terminal for sample in samples], dtype=np.bool_),
         "policy": np.concatenate([sample.policy for sample in samples]),
         "soft_policy": np.concatenate([sample.soft_policy for sample in samples]),
         "target_mask": np.asarray(
             [sample.target_mask for sample in samples], dtype=np.uint16
         ),
-        "final_leader": np.asarray(
-            [sample.final_leader for sample in samples], dtype=np.int8
-        ),
+        "outcome": np.asarray([sample.outcome for sample in samples], dtype=np.int8),
         "final_scores": np.stack([sample.final_scores for sample in samples]),
         "final_quarks": np.stack([sample.final_quarks for sample in samples]),
         "final_ownership": np.concatenate(
@@ -695,21 +664,18 @@ class DecodedReplayShard:
             raise IndexError(index)
         arrays = self.arrays
         node_offsets = arrays["node_offsets"]
-        action_offsets = arrays["action_offsets"]
         node_slice = slice(int(node_offsets[index]), int(node_offsets[index + 1]))
-        action_slice = slice(int(action_offsets[index]), int(action_offsets[index + 1]))
         return ReplaySample(
             rings=arrays["rings"][index],
             stones=arrays["stones"][node_slice].copy(),
             to_move=arrays["to_move"][index],
             moves_left=arrays["moves_left"][index],
             opening=arrays["opening"][index],
-            pass_streak=arrays["pass_streak"][index],
             terminal=arrays["terminal"][index],
-            policy=arrays["policy"][action_slice].copy(),
-            soft_policy=arrays["soft_policy"][action_slice].copy(),
+            policy=arrays["policy"][node_slice].copy(),
+            soft_policy=arrays["soft_policy"][node_slice].copy(),
             target_mask=arrays["target_mask"][index],
-            final_leader=arrays["final_leader"][index],
+            outcome=arrays["outcome"][index],
             final_scores=arrays["final_scores"][index].copy(),
             final_quarks=arrays["final_quarks"][index].copy(),
             final_ownership=arrays["final_ownership"][node_slice].copy(),
@@ -751,13 +717,6 @@ def decode_replay_shard(source: str | Path) -> DecodedReplayShard:
         # these columns here prevents each sample from reopening and inflating
         # the same compressed ZIP members.
         arrays = {name: shard[name] for name in _REPLAY_SAMPLE_ARRAY_NAMES}
-        arrays.update(
-            {
-                name: shard[name]
-                for name in _REPLAY_OPTIONAL_ARRAY_NAMES
-                if name in shard.files
-            }
-        )
 
     expected_metadata = {
         "format": REPLAY_SHARD_FORMAT,
@@ -775,8 +734,6 @@ def decode_replay_shard(source: str | Path) -> DecodedReplayShard:
     count = _checked_int("sample_count", metadata.get("sample_count"))
     if count <= 0:
         raise ReplaySchemaError("shard sample_count must be positive")
-    if "policy_weight" not in arrays:
-        arrays["policy_weight"] = np.ones(count, dtype=np.float32)
     _validate_decoded_shard_arrays(arrays, count=count)
     return DecodedReplayShard(path, metadata, arrays, count)
 
@@ -791,10 +748,9 @@ def _validate_decoded_shard_arrays(
         "to_move",
         "moves_left",
         "opening",
-        "pass_streak",
         "terminal",
         "target_mask",
-        "final_leader",
+        "outcome",
         "search_provenance",
         "policy_provenance",
         "run_id",
@@ -819,27 +775,18 @@ def _validate_decoded_shard_arrays(
         raise ReplaySchemaError("shard result columns have invalid shapes")
 
     node_offsets = arrays["node_offsets"]
-    action_offsets = arrays["action_offsets"]
-    if node_offsets.shape != (count + 1,) or action_offsets.shape != (count + 1,):
+    if node_offsets.shape != (count + 1,):
         raise ReplaySchemaError("shard offsets have invalid shapes")
-    if (
-        int(node_offsets[0]) != 0
-        or int(action_offsets[0]) != 0
-        or np.any(np.diff(node_offsets) < 0)
-        or np.any(np.diff(action_offsets) < 0)
-    ):
+    if int(node_offsets[0]) != 0 or np.any(np.diff(node_offsets) < 0):
         raise ReplaySchemaError("shard offsets must be monotonic and zero-based")
     node_values = int(node_offsets[-1])
-    action_values = int(action_offsets[-1])
     if any(
         arrays[name].shape != (node_values,)
         for name in ("stones", "final_ownership", "final_alive")
     ):
         raise ReplaySchemaError("shard node columns disagree with node offsets")
-    if any(
-        arrays[name].shape != (action_values,) for name in ("policy", "soft_policy")
-    ):
-        raise ReplaySchemaError("shard policy columns disagree with action offsets")
+    if any(arrays[name].shape != (node_values,) for name in ("policy", "soft_policy")):
+        raise ReplaySchemaError("shard policy columns disagree with node offsets")
     if len(np.unique(arrays["rings"])) != 1:
         raise ReplaySchemaError("replay shard must be ring-homogeneous")
 
@@ -921,7 +868,6 @@ def collate_replay_samples(
             to_move=[sample.to_move for sample in samples],
             moves_left=[sample.moves_left for sample in samples],
             opening=[sample.opening for sample in samples],
-            pass_streak=[sample.pass_streak for sample in samples],
             terminal=[sample.terminal for sample in samples],
         )
         if inputs is not None:
@@ -932,16 +878,16 @@ def collate_replay_samples(
         )
     batch_size = len(samples)
     max_nodes = inputs.max_nodes
-    policy = torch.zeros((batch_size, max_nodes + 1), dtype=torch.float32)
+    policy = torch.zeros((batch_size, max_nodes), dtype=torch.float32)
     soft_policy = torch.zeros_like(policy)
     ownership = torch.full((batch_size, max_nodes), -100, dtype=torch.long)
     alive = torch.full((batch_size, max_nodes), -1.0, dtype=torch.float32)
-    wdl = torch.zeros(batch_size, dtype=torch.long)
+    outcome = torch.zeros(batch_size, dtype=torch.long)
     margin = torch.zeros(batch_size, dtype=torch.long)
 
     masks = {
         "policy": torch.zeros(batch_size, dtype=torch.bool),
-        "wdl": torch.zeros(batch_size, dtype=torch.bool),
+        "outcome": torch.zeros(batch_size, dtype=torch.bool),
         "margin": torch.zeros(batch_size, dtype=torch.bool),
         "ownership": torch.zeros(batch_size, dtype=torch.bool),
         "alive": torch.zeros(batch_size, dtype=torch.bool),
@@ -963,11 +909,11 @@ def collate_replay_samples(
         )
         masks["policy"][index] = bool(sample.target_mask & TARGET_POLICY)
         masks["soft"][index] = bool(sample.target_mask & TARGET_SOFT_POLICY)
-        if sample.target_mask & (TARGET_WDL | TARGET_SCORE_MARGIN):
-            sample_wdl, sample_margin = sample.outcome_targets()
-            wdl[index] = sample_wdl
+        if sample.target_mask & (TARGET_OUTCOME | TARGET_SCORE_MARGIN):
+            sample_outcome, sample_margin = sample.outcome_targets()
+            outcome[index] = sample_outcome
             margin[index] = sample_margin
-        masks["wdl"][index] = bool(sample.target_mask & TARGET_WDL)
+        masks["outcome"][index] = bool(sample.target_mask & TARGET_OUTCOME)
         masks["margin"][index] = bool(sample.target_mask & TARGET_SCORE_MARGIN)
         if sample.target_mask & TARGET_OWNERSHIP:
             absolute_owner = torch.from_numpy(sample.final_ownership)
@@ -989,13 +935,13 @@ def collate_replay_samples(
         inputs=inputs,
         targets=TrainingTargets(
             policy=policy,
-            wdl=wdl,
+            outcome=outcome,
             score_margin=margin,
             ownership=ownership,
             alive=alive,
             soft_policy=soft_policy,
             policy_mask=masks["policy"],
-            wdl_mask=masks["wdl"],
+            outcome_mask=masks["outcome"],
             score_margin_mask=masks["margin"],
             ownership_mask=masks["ownership"],
             alive_mask=masks["alive"],

@@ -16,7 +16,7 @@ from .model import StarModelOutput
 @dataclass(frozen=True, slots=True)
 class LossWeights:
     policy: float = 1.0
-    wdl: float = 1.0
+    outcome: float = 1.0
     score_margin: float = 0.25
     ownership: float = 0.25
     alive: float = 0.1
@@ -25,7 +25,7 @@ class LossWeights:
     def __post_init__(self) -> None:
         values = (
             self.policy,
-            self.wdl,
+            self.outcome,
             self.score_margin,
             self.ownership,
             self.alive,
@@ -40,13 +40,13 @@ class LossWeights:
 @dataclass(frozen=True, slots=True)
 class TrainingTargets:
     policy: Tensor
-    wdl: Tensor
+    outcome: Tensor
     score_margin: Tensor
     ownership: Tensor
     alive: Tensor
     soft_policy: Tensor
     policy_mask: Tensor
-    wdl_mask: Tensor
+    outcome_mask: Tensor
     score_margin_mask: Tensor
     ownership_mask: Tensor
     alive_mask: Tensor
@@ -62,13 +62,13 @@ class TrainingTargets:
     ) -> "TrainingTargets":
         return TrainingTargets(
             policy=self.policy.to(device, non_blocking=non_blocking),
-            wdl=self.wdl.to(device, non_blocking=non_blocking),
+            outcome=self.outcome.to(device, non_blocking=non_blocking),
             score_margin=self.score_margin.to(device, non_blocking=non_blocking),
             ownership=self.ownership.to(device, non_blocking=non_blocking),
             alive=self.alive.to(device, non_blocking=non_blocking),
             soft_policy=self.soft_policy.to(device, non_blocking=non_blocking),
             policy_mask=self.policy_mask.to(device, non_blocking=non_blocking),
-            wdl_mask=self.wdl_mask.to(device, non_blocking=non_blocking),
+            outcome_mask=self.outcome_mask.to(device, non_blocking=non_blocking),
             score_margin_mask=self.score_margin_mask.to(
                 device, non_blocking=non_blocking
             ),
@@ -92,13 +92,13 @@ class TrainingTargets:
     def pin_memory(self) -> "TrainingTargets":
         return TrainingTargets(
             policy=self.policy.pin_memory(),
-            wdl=self.wdl.pin_memory(),
+            outcome=self.outcome.pin_memory(),
             score_margin=self.score_margin.pin_memory(),
             ownership=self.ownership.pin_memory(),
             alive=self.alive.pin_memory(),
             soft_policy=self.soft_policy.pin_memory(),
             policy_mask=self.policy_mask.pin_memory(),
-            wdl_mask=self.wdl_mask.pin_memory(),
+            outcome_mask=self.outcome_mask.pin_memory(),
             score_margin_mask=self.score_margin_mask.pin_memory(),
             ownership_mask=self.ownership_mask.pin_memory(),
             alive_mask=self.alive_mask.pin_memory(),
@@ -118,13 +118,13 @@ class TrainingTargets:
     def record_stream(self, stream: torch.Stream) -> None:
         tensors = (
             self.policy,
-            self.wdl,
+            self.outcome,
             self.score_margin,
             self.ownership,
             self.alive,
             self.soft_policy,
             self.policy_mask,
-            self.wdl_mask,
+            self.outcome_mask,
             self.score_margin_mask,
             self.ownership_mask,
             self.alive_mask,
@@ -179,6 +179,62 @@ def _soft_cross_entropy(
     return losses, valid
 
 
+def _validate_shapes(
+    output: StarModelOutput,
+    targets: TrainingTargets,
+    *,
+    legal_action_mask: Tensor,
+    node_mask: Tensor,
+    margin_bins: int,
+) -> None:
+    if legal_action_mask.ndim != 2 or node_mask.ndim != 2:
+        raise ValueError("legal and node masks must be rank-two tensors")
+    if legal_action_mask.dtype != torch.bool or node_mask.dtype != torch.bool:
+        raise ValueError("legal and node masks must be boolean")
+    batch_size, actions = legal_action_mask.shape
+    node_batch, nodes = node_mask.shape
+    if batch_size != node_batch:
+        raise ValueError("legal and node mask batch dimensions disagree")
+    expected_outputs = (
+        (output.policy_logits, (batch_size, actions), "policy logits"),
+        (output.outcome_logits, (batch_size, 2), "outcome logits"),
+        (
+            output.score_margin_logits,
+            (batch_size, margin_bins),
+            "score-margin logits",
+        ),
+        (output.ownership_logits, (batch_size, nodes, 3), "ownership logits"),
+        (output.alive_logits, (batch_size, nodes), "alive logits"),
+        (output.soft_policy_logits, (batch_size, actions), "soft-policy logits"),
+    )
+    for tensor, shape, name in expected_outputs:
+        if tensor.shape != shape:
+            raise ValueError(f"{name} must have shape {shape}")
+    expected_targets = (
+        (targets.policy, (batch_size, actions), "policy target"),
+        (targets.outcome, (batch_size,), "outcome target"),
+        (targets.score_margin, (batch_size,), "score-margin target"),
+        (targets.ownership, (batch_size, nodes), "ownership target"),
+        (targets.alive, (batch_size, nodes), "alive target"),
+        (targets.soft_policy, (batch_size, actions), "soft-policy target"),
+        (targets.policy_mask, (batch_size,), "policy mask"),
+        (targets.outcome_mask, (batch_size,), "outcome mask"),
+        (targets.score_margin_mask, (batch_size,), "score-margin mask"),
+        (targets.ownership_mask, (batch_size,), "ownership mask"),
+        (targets.alive_mask, (batch_size,), "alive mask"),
+        (targets.soft_policy_mask, (batch_size,), "soft-policy mask"),
+    )
+    for tensor, shape, name in expected_targets:
+        if tensor.shape != shape:
+            raise ValueError(f"{name} must have shape {shape}")
+    for weights, name in (
+        (targets.sample_weight, "sample weights"),
+        (targets.policy_weight, "policy weights"),
+    ):
+        if weights is not None and weights.shape != (batch_size,):
+            raise ValueError(f"{name} must have shape ({batch_size},)")
+
+
 def compute_losses(
     output: StarModelOutput,
     targets: TrainingTargets,
@@ -196,6 +252,14 @@ def compute_losses(
     by ``score_margin_mask=False`` and never by a colliding sentinel.
     """
 
+    margin_bins = score_margin_max - score_margin_min + 1
+    _validate_shapes(
+        output,
+        targets,
+        legal_action_mask=legal_action_mask,
+        node_mask=node_mask,
+        margin_bins=margin_bins,
+    )
     batch_size = output.policy_logits.shape[0]
     sample_weight = (
         targets.sample_weight
@@ -225,17 +289,19 @@ def compute_losses(
     policy_valid = policy_has_mass & targets.policy_mask.bool()
     policy_loss = _weighted_mean(policy_values, policy_valid, policy_sample_weight)
 
-    wdl_mask = targets.wdl_mask.bool()
+    outcome_mask = targets.outcome_mask.bool()
     if validate_targets:
         _require_tensor(
-            (targets.wdl[wdl_mask] >= 0) & (targets.wdl[wdl_mask] <= 2),
-            "available WDL labels must be in 0..2",
+            (targets.outcome[outcome_mask] >= 0) & (targets.outcome[outcome_mask] <= 1),
+            "available outcome labels must be loss=0 or win=1",
         )
-    safe_wdl = torch.where(wdl_mask, targets.wdl, torch.zeros_like(targets.wdl))
-    wdl_values = functional.cross_entropy(
-        output.wdl_logits.float(), safe_wdl.long(), reduction="none"
+    safe_outcome = torch.where(
+        outcome_mask, targets.outcome, torch.zeros_like(targets.outcome)
     )
-    wdl_loss = _weighted_mean(wdl_values, wdl_mask, sample_weight)
+    outcome_values = functional.cross_entropy(
+        output.outcome_logits.float(), safe_outcome.long(), reduction="none"
+    )
+    outcome_loss = _weighted_mean(outcome_values, outcome_mask, sample_weight)
 
     margin_mask = targets.score_margin_mask.bool()
     available_margin = targets.score_margin[margin_mask]
@@ -320,7 +386,7 @@ def compute_losses(
 
     total = (
         weights.policy * policy_loss
-        + weights.wdl * wdl_loss
+        + weights.outcome * outcome_loss
         + weights.score_margin * score_margin_loss
         + weights.ownership * ownership_loss
         + weights.alive * alive_loss
@@ -329,7 +395,7 @@ def compute_losses(
     return {
         "total": total,
         "policy": policy_loss,
-        "wdl": wdl_loss,
+        "outcome": outcome_loss,
         "score_margin": score_margin_loss,
         "ownership": ownership_loss,
         "alive": alive_loss,

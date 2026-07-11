@@ -11,6 +11,7 @@ from startrain.baselines import create_frozen_baseline
 from startrain.cli import arena_main
 from startrain.config import ArenaConfig
 from startrain.inference import InferenceResponse
+from startrain.native import BITBOARD_WORDS
 
 
 class GreedyStateBatch:
@@ -27,9 +28,8 @@ class GreedyStateBatch:
         to_move: list[int],
         _moves_left: list[int],
         _opening: list[bool],
-        _pass_streak: list[int],
     ) -> "GreedyStateBatch":
-        assert len(zero_bits) == len(to_move) * 7
+        assert len(zero_bits) == len(to_move) * BITBOARD_WORDS
         return cls(to_move)
 
     def apply_many(self, indices: list[int], actions: list[int]) -> None:
@@ -61,16 +61,15 @@ class GreedyRequests:
     def __init__(self) -> None:
         self.tokens = [101]
         self.legal_offsets = [0, 3]
-        self.legal_actions = [0, 1, -1]
+        self.legal_actions = [0, 1, 2]
         self.states = SimpleNamespace(
-            rings=3,
+            rings=4,
             batch_size=1,
-            zero_bits=[0] * 7,
-            one_bits=[0] * 7,
+            zero_bits=[0] * BITBOARD_WORDS,
+            one_bits=[0] * BITBOARD_WORDS,
             to_move=[0],
             moves_left=[2],
             opening=[False],
-            pass_streak=[0],
         )
 
     def __len__(self) -> int:
@@ -84,8 +83,8 @@ def test_frozen_evaluators_are_deterministic_and_versioned() -> None:
     assert first == second
     assert greedy.evaluator_calls == 2
     assert greedy.evaluator_rows == 2
-    assert first.policy_logits[1] == max(first.policy_logits)
-    assert greedy.model_version == "frozen-greedy-native-score-v1-s1-k1-cv50-cs1"
+    assert first.policy_logits[2] == max(first.policy_logits)
+    assert greedy.model_version == "frozen-greedy-native-score-v2-s1-k1-cv50-cs1"
 
     shallow = create_frozen_baseline("shallow-search", native_module=GreedyNative)
     assert shallow.search_budget.simulations == 64
@@ -109,7 +108,7 @@ def test_frozen_baselines_are_deterministic_with_native_search() -> None:
         baseline = create_frozen_baseline(name, native_module=native)
         selected = []
         for _ in range(2):
-            states = native.StateBatch(3, 1)
+            states = native.StateBatch(4, 1)
             budget = baseline.search_budget
             search = native.SearchBatch(
                 states,
@@ -131,7 +130,7 @@ def test_frozen_baselines_are_deterministic_with_native_search() -> None:
 
 class ArenaStateBatch:
     def __init__(self, rings: int, batch_size: int) -> None:
-        assert rings == 3
+        assert rings == 4
         assert batch_size == 1
         self.to_move = 0
         self.search_started = False
@@ -269,7 +268,7 @@ def _run_paired_uniform_arena() -> tuple[
         candidate=candidate,
         baseline=baseline,
         config=ArenaConfig(
-            rings=(3,),
+            rings=(4,),
             pairs_per_ring=2,
             simulations=7,
             max_considered=3,

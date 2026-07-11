@@ -108,7 +108,6 @@ impl D5Maps {
     pub fn action(&self, symmetry: Symmetry, action: Action) -> Action {
         match action {
             Action::Place(node) => Action::Place(self.node(symmetry, node)),
-            Action::Pass => Action::Pass,
         }
     }
 

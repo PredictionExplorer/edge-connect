@@ -15,34 +15,37 @@ import {
 import { buildAiRequest } from '../protocol';
 
 const config: GameConfig = {
-  rings: 3,
+  rings: 4,
   mode: 'double',
   pieRule: false,
   playerNames: ['A', 'B'],
 };
 
-describe('schema-v2 browser features', () => {
-  it('uses the exact node/global dimensions and nodes-then-pass action layout', () => {
+describe('schema-v3 browser features', () => {
+  it('uses exact feature dimensions and a nodes-only action layout', () => {
     const state = buildAiRequest(config, [], 'features').state;
     const encoded = encodeStarFeatures(state);
-    const board = getBoard(3);
+    const board = getBoard(4);
 
     expect(STAR_NODE_FEATURE_DIM).toBe(15);
-    expect(STAR_GLOBAL_FEATURE_DIM).toBe(18);
+    expect(STAR_GLOBAL_FEATURE_DIM).toBe(17);
     expect(encoded.nodeFeatures).toHaveLength(board.n * 15);
-    expect(encoded.globalFeatures).toHaveLength(18);
+    expect(encoded.globalFeatures).toHaveLength(17);
     expect(encoded.neighborIndex).toHaveLength(board.n * encoded.maxDegree);
-    expect(encoded.legalActionMask).toHaveLength(board.n + 1);
-    expect(Array.from(encoded.legalActionMask)).toEqual(new Array(board.n + 1).fill(1));
-    expect(actionCodeToModelIndex(-1, board.n)).toBe(board.n);
-    expect(modelIndexToActionCode(board.n, board.n)).toBe(-1);
+    expect(encoded.legalActionMask).toHaveLength(board.n);
+    expect(Array.from(encoded.legalActionMask)).toEqual(new Array(board.n).fill(1));
     expect(actionCodeToModelIndex(7, board.n)).toBe(7);
+    expect(modelIndexToActionCode(7, board.n)).toBe(7);
+    expect(() => actionCodeToModelIndex(-1, board.n)).toThrow(/nodes-only/);
+    expect(() => modelIndexToActionCode(board.n, board.n)).toThrow(
+      /outside the action layout/,
+    );
   });
 
   it('matches Python opening features and topology edge classes', () => {
     const state = buildAiRequest(config, [], 'opening-features').state;
     const encoded = encodeStarFeatures(state);
-    const board = getBoard(3);
+    const board = getBoard(4);
     const degree = board.adjOff[1] - board.adjOff[0];
 
     expect(Array.from(encoded.nodeFeatures.slice(0, 15))).toEqual([
@@ -56,20 +59,19 @@ describe('schema-v2 browser features', () => {
       0,
       0,
       0,
-      Math.fround(1 / 3),
+      Math.fround(1 / 4),
       0,
       Math.fround(degree / encoded.maxDegree),
       1,
       1,
     ]);
     expect(Array.from(encoded.globalFeatures)).toEqual([
-      3 / 12,
+      Math.fround(4 / 10),
       0,
       0,
       0,
       1 / 2,
       1,
-      0,
       0,
       0,
       0,
@@ -105,7 +107,25 @@ describe('schema-v2 browser features', () => {
     expect(encoded.legalActionMask[0]).toBe(0);
   });
 
-  it('converts schema-v2 floating features to browser FP16 tensors', () => {
+  it('normalizes terminal score support by 151 and masks every action', () => {
+    const board = getBoard(4);
+    const encoded = encodeStarFeatures({
+      rings: 4,
+      stones: new Array(board.n).fill(0),
+      toMove: 0,
+      movesLeft: 1,
+      opening: false,
+      terminal: true,
+    });
+    expect(Array.from(encoded.legalActionMask)).toEqual(
+      new Array(board.n).fill(0),
+    );
+    expect(encoded.globalFeatures[7]).toBeCloseTo(19 / 151);
+    expect(encoded.globalFeatures[8]).toBeCloseTo(2 / 151);
+    expect(encoded.globalFeatures[9]).toBeCloseTo(17 / 151);
+  });
+
+  it('converts schema-v3 floating features to browser FP16 tensors', () => {
     expect(numberToFloat16Bits(0)).toBe(0x0000);
     expect(numberToFloat16Bits(1)).toBe(0x3c00);
     expect(numberToFloat16Bits(-2)).toBe(0xc000);

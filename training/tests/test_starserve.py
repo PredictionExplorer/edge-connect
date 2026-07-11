@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
 
 from starserve.app import create_app
 from starserve.config import (
@@ -18,14 +19,22 @@ from starserve.config import (
     ServerConfigError,
 )
 from starserve.runtime import (
+    AnalysisError,
     AtomicModelManager,
     LoadedModel,
     ModelLease,
     NativeAnalysisService,
+    SearchCancelled,
 )
-from starserve.schemas import AnalyzeRequest
+from starserve.schemas import AnalyzeRequest, AnalyzeResponse, AtomicAction, ScoreBelief
 from startrain.checkpoint import ModelManifest
-from startrain.contracts import RULES_HASH_WIRE
+from startrain.contracts import (
+    ACTION_LAYOUT_SCHEMA_ID,
+    RULES_HASH_WIRE,
+    SCORE_MARGIN_MAX,
+    SCORE_MARGIN_MIN,
+)
+from startrain.features import GLOBAL_FEATURE_DIM, NODE_FEATURE_DIM
 from startrain.inference import (
     DetailedInferenceResponse,
     GraphInferenceAdapter,
@@ -36,8 +45,8 @@ from startrain.native import BITBOARD_WORDS
 from startrain.topology import get_topology
 
 
-def server_config(tmp_path, **changes) -> ServerConfig:
-    values = {
+def server_config(tmp_path, **changes: object) -> ServerConfig:
+    values: dict[str, object] = {
         "experiment_config": tmp_path / "experiment.yaml",
         "model_manifest": tmp_path / "champion.json",
         "device": "cpu",
@@ -60,42 +69,41 @@ def server_config(tmp_path, **changes) -> ServerConfig:
 
 def request_payload() -> dict[str, object]:
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "rules_hash": RULES_HASH_WIRE,
-        "rings": 3,
-        "stones": [-1] * get_topology(3).n,
+        "rings": 4,
+        "stones": [-1] * get_topology(4).n,
         "to_move": 0,
         "moves_left": 1,
         "opening": True,
-        "pass_streak": 0,
         "terminal": False,
         "search": {"simulations": 4, "max_considered": 2, "seed": 7},
     }
 
 
 def response_payload() -> dict[str, object]:
-    score = [0.0] * 363
-    score[181] = 1.0
+    score = [0.0] * (SCORE_MARGIN_MAX - SCORE_MARGIN_MIN + 1)
+    score[-SCORE_MARGIN_MIN] = 1.0
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "action": {"code": 0, "kind": "place", "node": 0},
         "root_actions": [
             {"code": 0, "kind": "place", "node": 0},
-            {"code": -1, "kind": "pass", "node": None},
+            {"code": 1, "kind": "place", "node": 1},
         ],
         "root_policy": [0.75, 0.25],
         "root_q": [0.2, -0.1],
         "root_visits": [3, 1],
-        "wdl": {"loss": 0.2, "draw": 0.3, "win": 0.5},
-        "value": 0.3,
+        "outcome": {"loss": 0.2, "win": 0.8},
+        "value": 0.6,
         "search_value": 0.3,
         "score_belief": {
-            "support_min": -181,
-            "support_max": 181,
+            "support_min": SCORE_MARGIN_MIN,
+            "support_max": SCORE_MARGIN_MAX,
             "expected_margin": 0.0,
             "probabilities": score,
         },
-        "model_version": "fake-v1",
+        "model_version": "fake-v2",
         "model_step": 5,
         "timing_ms": {
             "queue": 0.0,
@@ -116,19 +124,19 @@ class FakeService:
     def health(self) -> dict[str, object]:
         return {
             "ready": self.started,
-            "model_version": "fake-v1",
+            "model_version": "fake-v2",
             "model_step": 5,
         }
 
     def analyze(
         self, request: AnalyzeRequest, cancellation: threading.Event
     ) -> dict[str, object]:
-        assert request.rings == 3
+        assert request.rings == 4
         assert not cancellation.is_set()
         return response_payload()
 
 
-def test_fastapi_health_auth_validation_and_analysis(tmp_path, monkeypatch) -> None:
+def test_v2_api_health_auth_and_binary_response(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("TEST_STARSERVE_TOKEN", "correct-secret")
     config = server_config(
         tmp_path,
@@ -138,48 +146,108 @@ def test_fastapi_health_auth_validation_and_analysis(tmp_path, monkeypatch) -> N
         ),
     )
     with TestClient(create_app(config, service=FakeService())) as client:
-        health = client.get("/healthz")
+        health = client.get("/v2/health")
         assert health.status_code == 200
-        assert health.json()["rules"]["hash"] == RULES_HASH_WIRE
-        assert health.json()["model"]["model_version"] == "fake-v1"
-        preflight = client.options(
-            "/v1/analyze",
-            headers={
-                "Origin": "https://play.example",
-                "Access-Control-Request-Method": "POST",
-            },
-        )
-        assert preflight.status_code == 200
-        assert (
-            preflight.headers["access-control-allow-origin"] == "https://play.example"
-        )
-
-        assert client.post("/v1/analyze", json=request_payload()).status_code == 401
-        headers = {"Authorization": "Bearer correct-secret"}
-        response = client.post("/v1/analyze", json=request_payload(), headers=headers)
-        assert response.status_code == 200
-        assert response.json()["action"] == {"code": 0, "kind": "place", "node": 0}
-        assert response.json()["model_version"] == "fake-v1"
-        assert response.headers["cache-control"] == "no-store"
-
-        invalid = request_payload()
-        invalid["rules_hash"] = "fnv1a64:0000000000000000"
-        rejected = client.post("/v1/analyze", json=invalid, headers=headers)
-        assert rejected.status_code == 422
-        assert rejected.json()["error"]["code"] == "invalid_request"
-
-        over_budget = request_payload()
-        over_budget["search"] = {
-            "simulations": 17,
-            "max_considered": 2,
-            "seed": 7,
+        assert health.json()["api_schema_version"] == 2
+        assert health.json()["server_config_schema_version"] == 2
+        assert health.json()["model_schema_version"] == 2
+        assert health.json()["actions"] == {
+            "schema_id": ACTION_LAYOUT_SCHEMA_ID,
+            "types": ["place"],
         }
-        rejected = client.post("/v1/analyze", json=over_budget, headers=headers)
-        assert rejected.status_code == 422
-        assert rejected.json()["error"]["code"] == "search_budget_exceeded"
+        assert health.json()["outcomes"]["classes"] == ["loss", "win"]
+
+        assert client.post("/v2/analyze", json=request_payload()).status_code == 401
+        headers = {"Authorization": "Bearer correct-secret"}
+        response = client.post("/v2/analyze", json=request_payload(), headers=headers)
+        assert response.status_code == 200
+        body = response.json()
+        assert body["schema_version"] == 2
+        assert body["outcome"] == {"loss": 0.2, "win": 0.8}
+        assert body["value"] == pytest.approx(0.6)
+        assert all(action["kind"] == "place" for action in body["root_actions"])
+        assert client.post("/v1/analyze", json=request_payload()).status_code == 404
 
 
-def test_server_config_rejects_contract_and_cors_drift(tmp_path) -> None:
+def test_request_rejects_old_schema_pass_fields_and_unsupported_rings() -> None:
+    old = request_payload()
+    old["schema_version"] = 1
+    with pytest.raises(ValidationError):
+        AnalyzeRequest.model_validate(old)
+
+    legacy_action = request_payload()
+    legacy_action["pass_streak"] = 0
+    with pytest.raises(ValidationError, match="pass_streak"):
+        AnalyzeRequest.model_validate(legacy_action)
+
+    for rings in (3, 5, 7, 9, 11, 12):
+        invalid = request_payload()
+        invalid["rings"] = rings
+        invalid["stones"] = []
+        with pytest.raises(ValidationError):
+            AnalyzeRequest.model_validate(invalid)
+
+
+def test_response_schema_is_placement_only_and_binary() -> None:
+    validated = AnalyzeResponse.model_validate(
+        {**response_payload(), "request_id": "request-1"}
+    )
+    assert validated.outcome.loss + validated.outcome.win == pytest.approx(1.0)
+
+    legacy = {**response_payload(), "request_id": "request-1"}
+    legacy["root_actions"] = [{"code": -1, "kind": "pass", "node": None}]
+    with pytest.raises(ValidationError):
+        AnalyzeResponse.model_validate(legacy)
+
+    wrong_outcome = {**response_payload(), "request_id": "request-1"}
+    wrong_outcome["outcome"] = {"loss": 0.2, "win": 0.7}
+    with pytest.raises(ValidationError, match="sum to one"):
+        AnalyzeResponse.model_validate(wrong_outcome)
+
+    wrong_score = {**response_payload(), "request_id": "request-1"}
+    wrong_score["score_belief"] = {
+        **wrong_score["score_belief"],
+        "probabilities": [1.0],
+    }
+    with pytest.raises(ValidationError, match="303 bins"):
+        AnalyzeResponse.model_validate(wrong_score)
+
+
+def test_runtime_payload_rejects_negative_native_actions() -> None:
+    score = [0.0] * (SCORE_MARGIN_MAX - SCORE_MARGIN_MIN + 1)
+    score[-SCORE_MARGIN_MIN] = 1.0
+    detailed = DetailedInferenceResponse(
+        response=InferenceResponse([1], [0.6], [0, 1], [0.0]),
+        outcome_probabilities=[[0.2, 0.8]],
+        outcome_values=[0.6],
+        score_expectations=[0.0],
+        score_probabilities=[score],
+    )
+    evaluator = SimpleNamespace(model_version="v2", model_step=1)
+    malformed = SimpleNamespace(
+        action_offsets=[0, 1],
+        actions=[-1],
+        policy_target=[1.0],
+        q_values=[0.0],
+        visits=[1],
+        selected_actions=[-1],
+        terminal=[False],
+    )
+    with pytest.raises(AnalysisError, match="malformed"):
+        NativeAnalysisService._response_payload(
+            malformed,
+            detailed,
+            evaluator=evaluator,
+            reload_ms=0.0,
+            search_ms=1.0,
+            total_ms=1.0,
+            node_count=50,
+        )
+
+
+def test_server_config_and_request_size_fail_closed(tmp_path) -> None:
+    with pytest.raises(ServerConfigError, match="schema_version"):
+        server_config(tmp_path, schema_version=1)
     with pytest.raises(ServerConfigError, match="rules hash"):
         server_config(tmp_path, rules_hash="fnv1a64:0000000000000000")
     with pytest.raises(ServerConfigError, match="wildcard"):
@@ -188,8 +256,6 @@ def test_server_config_rejects_contract_and_cors_drift(tmp_path) -> None:
             security=SecurityConfig(cors_allow_origins=("*",)),
         )
 
-
-def test_request_size_limit_is_structured(tmp_path) -> None:
     config = server_config(
         tmp_path,
         limits=LimitConfig(
@@ -201,20 +267,99 @@ def test_request_size_limit_is_structured(tmp_path) -> None:
     )
     with TestClient(create_app(config, service=FakeService())) as client:
         response = client.post(
-            "/v1/analyze",
+            "/v2/analyze",
             content=json.dumps(request_payload()),
-            headers={"Content-Type": "application/json"},
-        )
-        chunked = client.post(
-            "/v1/analyze",
-            content=(chunk for chunk in (b"{" + b"x" * 40, b"x" * 40 + b"}")),
             headers={"Content-Type": "application/json"},
         )
     assert response.status_code == 413
     assert response.json()["error"]["code"] == "request_too_large"
-    assert response.json()["error"]["request_id"]
-    assert chunked.status_code == 413
-    assert chunked.json()["error"]["code"] == "request_too_large"
+
+
+def test_v2_api_cors_validation_budgets_and_request_ids(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("TEST_STARSERVE_TOKEN", "correct-secret")
+    config = server_config(
+        tmp_path,
+        security=SecurityConfig(
+            cors_allow_origins=("https://play.example",),
+            bearer_token_env="TEST_STARSERVE_TOKEN",
+        ),
+    )
+    headers = {
+        "Authorization": "Bearer correct-secret",
+        "X-Request-ID": "analysis-request.7",
+    }
+    with TestClient(create_app(config, service=FakeService())) as client:
+        preflight = client.options(
+            "/v2/analyze",
+            headers={
+                "Origin": "https://play.example",
+                "Access-Control-Request-Method": "POST",
+            },
+        )
+        assert preflight.status_code == 200
+        assert (
+            preflight.headers["access-control-allow-origin"] == "https://play.example"
+        )
+
+        invalid = request_payload()
+        invalid["rules_hash"] = "fnv1a64:0000000000000000"
+        rejected = client.post("/v2/analyze", json=invalid, headers=headers)
+        assert rejected.status_code == 422
+        assert rejected.json()["error"]["code"] == "invalid_request"
+        assert rejected.headers["x-request-id"] == "analysis-request.7"
+
+        too_many_simulations = request_payload()
+        too_many_simulations["search"] = {
+            "simulations": 17,
+            "max_considered": 2,
+            "seed": 7,
+        }
+        rejected = client.post(
+            "/v2/analyze", json=too_many_simulations, headers=headers
+        )
+        assert rejected.status_code == 422
+        assert rejected.json()["error"] == {
+            "code": "search_budget_exceeded",
+            "message": "simulations exceed the configured maximum",
+            "details": {"maximum_simulations": 16},
+            "request_id": "analysis-request.7",
+        }
+
+        too_many_candidates = request_payload()
+        too_many_candidates["search"] = {
+            "simulations": 4,
+            "max_considered": 65,
+            "seed": 7,
+        }
+        rejected = client.post("/v2/move", json=too_many_candidates, headers=headers)
+        assert rejected.status_code == 422
+        assert rejected.json()["error"]["details"] == {
+            "maximum_max_considered": config.search.maximum_max_considered
+        }
+
+
+def test_request_size_limit_rejects_streamed_body(tmp_path) -> None:
+    config = server_config(
+        tmp_path,
+        limits=LimitConfig(
+            max_concurrency=1,
+            max_request_bytes=64,
+            request_timeout_seconds=1,
+            queue_timeout_seconds=1,
+        ),
+    )
+    with TestClient(create_app(config, service=FakeService())) as client:
+        response = client.post(
+            "/v2/analyze",
+            content=(chunk for chunk in (b"{" + b"x" * 40, b"x" * 40 + b"}")),
+            headers={
+                "Content-Type": "application/json",
+                "X-Request-ID": "stream-too-large",
+            },
+        )
+    assert response.status_code == 413
+    assert response.json()["error"]["code"] == "request_too_large"
+    assert response.json()["error"]["request_id"] == "stream-too-large"
 
 
 class SlowService(FakeService):
@@ -243,10 +388,28 @@ def test_timeout_signals_cooperative_cancellation(tmp_path) -> None:
         ),
     )
     with TestClient(create_app(config, service=service)) as client:
-        response = client.post("/v1/analyze", json=request_payload())
+        response = client.post("/v2/analyze", json=request_payload())
         assert response.status_code == 504
         assert response.json()["error"]["code"] == "analysis_timeout"
         assert service.cancelled.wait(1)
+
+
+class BrokenService(FakeService):
+    def analyze(
+        self, request: AnalyzeRequest, cancellation: threading.Event
+    ) -> dict[str, object]:
+        raise RuntimeError("private failure detail")
+
+
+def test_unexpected_service_errors_are_redacted(tmp_path) -> None:
+    with TestClient(
+        create_app(server_config(tmp_path), service=BrokenService()),
+        raise_server_exceptions=False,
+    ) as client:
+        response = client.post("/v2/analyze", json=request_payload())
+    assert response.status_code == 500
+    assert response.json()["error"]["code"] == "internal_error"
+    assert "private failure detail" not in response.text
 
 
 def test_atomic_model_manager_reloads_only_between_leases(tmp_path) -> None:
@@ -271,11 +434,15 @@ def test_atomic_model_manager_reloads_only_between_leases(tmp_path) -> None:
     manager = AtomicModelManager(
         server_config(tmp_path),
         experiment=SimpleNamespace(
-            model=SimpleNamespace(node_feature_dim=15, global_feature_dim=18)
+            model=SimpleNamespace(
+                node_feature_dim=NODE_FEATURE_DIM,
+                global_feature_dim=GLOBAL_FEATURE_DIM,
+            )
         ),
         manifest_reader=reader,
         bundle_loader=loader,
     )
+    assert manager.health()["ready"] is False
     with manager.lease() as first:
         assert first.model.manifest.model_version == "v1"
         with manager.lease() as overlapping:
@@ -285,10 +452,23 @@ def test_atomic_model_manager_reloads_only_between_leases(tmp_path) -> None:
         assert second.model.manifest.model_version == "v2"
     with manager.lease() as retained:
         assert retained.model.manifest.model_version == "v2"
-    assert manager.health()["last_reload_error"] == "ValueError: bad publication"
+    health = manager.health()
+    assert health["last_reload_error"] == "ValueError: bad publication"
+    assert health["active_requests"] == 0
 
 
-def test_atomic_model_manager_rejects_candidate_pointer(tmp_path) -> None:
+def test_atomic_model_manager_rejects_candidate_and_bad_dimensions(tmp_path) -> None:
+    with pytest.raises(ValueError, match="feature schema"):
+        AtomicModelManager(
+            server_config(tmp_path),
+            experiment=SimpleNamespace(
+                model=SimpleNamespace(
+                    node_feature_dim=NODE_FEATURE_DIM + 1,
+                    global_feature_dim=GLOBAL_FEATURE_DIM,
+                )
+            ),
+        )
+
     candidate = ModelManifest(
         tmp_path / "candidate.json",
         tmp_path / "model.pt",
@@ -301,7 +481,10 @@ def test_atomic_model_manager_rejects_candidate_pointer(tmp_path) -> None:
     manager = AtomicModelManager(
         server_config(tmp_path),
         experiment=SimpleNamespace(
-            model=SimpleNamespace(node_feature_dim=15, global_feature_dim=18)
+            model=SimpleNamespace(
+                node_feature_dim=NODE_FEATURE_DIM,
+                global_feature_dim=GLOBAL_FEATURE_DIM,
+            )
         ),
         manifest_reader=lambda _path: candidate,
         bundle_loader=lambda manifest, _experiment, _device: LoadedModel(
@@ -324,7 +507,6 @@ class FakeStateBatch:
         to_move,
         moves_left,
         opening,
-        pass_streak,
     ):
         nodes = get_topology(rings).n
         occupied = sum(word.bit_count() for word in zero_bits + one_bits)
@@ -348,9 +530,7 @@ class FakeStateBatch:
             moves_left=moves_left,
             opening=opening,
             mid_turn=[not opening[0] and moves_left[0] == 1],
-            pass_streak=pass_streak,
             terminal=[False],
-            pass_legal=[True],
         )
         return FakeStateBatch(data)
 
@@ -362,7 +542,7 @@ class FakeRootBatch:
     def __init__(self, states) -> None:
         self.states = states.data()
         self.tokens = [1]
-        self.legal_actions = list(range(self.states.node_count)) + [-1]
+        self.legal_actions = list(range(self.states.node_count))
         self.legal_offsets = [0, len(self.legal_actions)]
 
     def __len__(self):
@@ -390,20 +570,20 @@ class FakeSearchBatch:
         raise AssertionError("fake search has no leaves")
 
     def results(self):
-        actions = list(range(30)) + [-1]
+        actions = [0, 1]
         return SimpleNamespace(
             action_offsets=[0, len(actions)],
             actions=actions,
-            policy_target=[1.0] + [0.0] * (len(actions) - 1),
-            q_values=[0.1] * len(actions),
-            visits=[4] + [0] * (len(actions) - 1),
+            policy_target=[0.75, 0.25],
+            q_values=[0.1, -0.1],
+            visits=[3, 1],
             selected_actions=[0],
             terminal=[False],
         )
 
 
 class FakeEvaluator:
-    model_version = "fake-native-v1"
+    model_version = "fake-native-v2"
     model_step = 8
 
     def evaluate_detailed(self, roots):
@@ -413,12 +593,12 @@ class FakeEvaluator:
             policy_offsets=roots.legal_offsets,
             policy_logits=[0.0] * len(roots.legal_actions),
         )
-        score = [0.0] * 363
-        score[181] = 1.0
+        score = [0.0] * (SCORE_MARGIN_MAX - SCORE_MARGIN_MIN + 1)
+        score[-SCORE_MARGIN_MIN] = 1.0
         return DetailedInferenceResponse(
             response=response,
-            wdl_probabilities=[[0.2, 0.4, 0.4]],
-            wdl_values=[0.2],
+            outcome_probabilities=[[0.2, 0.8]],
+            outcome_values=[0.6],
             score_expectations=[0.0],
             score_probabilities=[score],
         )
@@ -432,14 +612,14 @@ class FakeManager:
         pass
 
     def health(self):
-        return {"ready": True, "model_version": "fake-native-v1", "model_step": 8}
+        return {"ready": True, "model_version": "fake-native-v2", "model_step": 8}
 
     @contextmanager
     def lease(self):
         manifest = ModelManifest(
             SimpleNamespace(),
             SimpleNamespace(),
-            "fake-native-v1",
+            "fake-native-v2",
             8,
             time.time_ns(),
             role="champion",
@@ -447,7 +627,7 @@ class FakeManager:
         yield ModelLease(LoadedModel(manifest, FakeEvaluator()), 0.0)
 
 
-def test_native_analysis_path_imports_semantic_state_and_returns_root(tmp_path) -> None:
+def test_native_analysis_imports_v2_state_and_returns_node_only_root(tmp_path) -> None:
     native = SimpleNamespace(StateBatch=FakeStateBatch, SearchBatch=FakeSearchBatch)
     service = NativeAnalysisService(
         server_config(tmp_path),
@@ -458,11 +638,45 @@ def test_native_analysis_path_imports_semantic_state_and_returns_root(tmp_path) 
         AnalyzeRequest.model_validate(request_payload()),
         threading.Event(),
     )
+    assert result["schema_version"] == 2
     assert result["action"] == {"code": 0, "kind": "place", "node": 0}
-    assert result["root_visits"][0] == 4
-    assert result["model_version"] == "fake-native-v1"
+    assert result["root_actions"] == [
+        {"code": 0, "kind": "place", "node": 0},
+        {"code": 1, "kind": "place", "node": 1},
+    ]
+    assert result["outcome"] == {"loss": 0.2, "win": 0.8}
+    assert result["score_belief"]["support_min"] == -151
+    assert result["score_belief"]["support_max"] == 151
+    assert result["model_version"] == "fake-native-v2"
 
 
+def test_native_analysis_rejects_incompatible_import_and_cancellation(tmp_path) -> None:
+    request = AnalyzeRequest.model_validate(request_payload())
+    missing_importer = NativeAnalysisService(
+        server_config(tmp_path),
+        native_module=SimpleNamespace(StateBatch=object, SearchBatch=FakeSearchBatch),
+        model_manager=FakeManager(),
+    )
+    with pytest.raises(AnalysisError, match="from_semantic") as error:
+        missing_importer.analyze(request, threading.Event())
+    assert error.value.code == "native_incompatible"
+
+    service = NativeAnalysisService(
+        server_config(tmp_path),
+        native_module=SimpleNamespace(
+            StateBatch=FakeStateBatch,
+            SearchBatch=FakeSearchBatch,
+        ),
+        model_manager=FakeManager(),
+    )
+    cancellation = threading.Event()
+    cancellation.set()
+    with pytest.raises(SearchCancelled) as error:
+        service.analyze(request, cancellation)
+    assert error.value.status_code == 499
+
+
+@pytest.mark.native
 def test_true_native_server_search_when_available(tmp_path) -> None:
     native = pytest.importorskip("star_native")
     evaluator = GraphInferenceAdapter(
@@ -474,7 +688,7 @@ def test_true_native_server_search_when_available(tmp_path) -> None:
                 kv_heads=1,
             )
         ).eval(),
-        model_version="native-server-smoke",
+        model_version="native-server-v2",
         model_step=1,
     )
 
@@ -512,6 +726,46 @@ def test_true_native_server_search_when_available(tmp_path) -> None:
         AnalyzeRequest.model_validate(payload),
         threading.Event(),
     )
-    assert result["action"]["code"] in list(range(30)) + [-1]
+    assert 0 <= result["action"]["code"] < get_topology(4).n
     assert sum(result["root_policy"]) == pytest.approx(1.0)
-    assert result["model_version"] == "native-server-smoke"
+    assert result["model_version"] == "native-server-v2"
+
+
+def test_v2_schema_cross_field_validation_is_strict() -> None:
+    request = request_payload()
+    request["stones"] = [0] * get_topology(4).n
+    with pytest.raises(ValidationError, match="terminal must equal board-full"):
+        AnalyzeRequest.model_validate(request)
+
+    request = request_payload()
+    request["stones"] = request["stones"][:-1]
+    with pytest.raises(ValidationError, match="exactly 50"):
+        AnalyzeRequest.model_validate(request)
+
+    with pytest.raises(ValidationError, match="must match"):
+        AtomicAction.model_validate({"code": 1, "kind": "place", "node": 2})
+
+    score = response_payload()["score_belief"]
+    assert isinstance(score, dict)
+    with pytest.raises(ValidationError, match="sum to one"):
+        ScoreBelief.model_validate(
+            {
+                **score,
+                "probabilities": [0.0] * (SCORE_MARGIN_MAX - SCORE_MARGIN_MIN + 1),
+            }
+        )
+
+    malformed = {**response_payload(), "request_id": "request-1"}
+    malformed["root_visits"] = [1]
+    with pytest.raises(ValidationError, match="inconsistent shapes"):
+        AnalyzeResponse.model_validate(malformed)
+
+    malformed = {**response_payload(), "request_id": "request-1"}
+    malformed["action"] = {"code": 3, "kind": "place", "node": 3}
+    with pytest.raises(ValidationError, match="selected action"):
+        AnalyzeResponse.model_validate(malformed)
+
+    malformed = {**response_payload(), "request_id": "request-1"}
+    malformed["value"] = 0.5
+    with pytest.raises(ValidationError, match=r"P\(win\)-P\(loss\)"):
+        AnalyzeResponse.model_validate(malformed)

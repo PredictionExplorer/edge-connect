@@ -22,189 +22,151 @@ function play(state: GameState, ...nodes: number[]): GameState {
   return state;
 }
 
-describe('classic protocol', () => {
-  it('alternates single placements', () => {
-    let s = initialState(base);
-    expect(s.toMove).toBe(0);
-    expect(s.movesLeft).toBe(1);
-    s = play(s, 0);
-    expect(s.stones[0]).toBe(0);
-    expect(s.toMove).toBe(1);
-    s = play(s, 1);
-    expect(s.stones[1]).toBe(1);
-    expect(s.toMove).toBe(0);
+function fill(state: GameState, count = state.board.n): GameState {
+  for (let node = 0; node < count; node++) state = play(state, node);
+  return state;
+}
+
+describe('placement-only game protocol', () => {
+  it('alternates classic placements and rejects illegal nodes', () => {
+    let state = initialState(base);
+    expect(state.toMove).toBe(0);
+    expect(state.movesLeft).toBe(1);
+    state = play(state, 0, 1);
+    expect(Array.from(state.stones.slice(0, 2))).toEqual([0, 1]);
+    expect(state.toMove).toBe(0);
+    expect(isLegalAction(state, { type: 'place', node: 0 })).toBe(false);
+    expect(isLegalAction(state, { type: 'place', node: -1 })).toBe(false);
+    expect(isLegalAction(state, { type: 'place', node: state.board.n })).toBe(
+      false,
+    );
+    expect(() => applyAction(state, { type: 'place', node: 0 })).toThrow(
+      /illegal action/,
+    );
   });
 
-  it('rejects occupied nodes and out-of-range nodes', () => {
-    let s = initialState(base);
-    s = play(s, 5);
-    expect(isLegalAction(s, { type: 'place', node: 5 })).toBe(false);
-    expect(() => applyAction(s, { type: 'place', node: 5 })).toThrow();
-    expect(isLegalAction(s, { type: 'place', node: -1 })).toBe(false);
-    expect(isLegalAction(s, { type: 'place', node: s.board.n })).toBe(false);
+  it('has no pass action or state and rejects legacy input at runtime', () => {
+    const state = initialState(base);
+    const legacy = { type: 'pass' } as unknown as GameAction;
+    expect('passStreak' in state).toBe(false);
+    expect(isLegalAction(state, legacy)).toBe(false);
+    expect(() => applyAction(state, legacy)).toThrow(/illegal action/);
   });
 
-  it('ends after two consecutive passes and rejects further actions', () => {
-    let s = initialState(base);
-    s = play(s, 0, 1);
-    s = applyAction(s, { type: 'pass' });
-    expect(s.over).toBe(false);
-    // A placement resets the streak.
-    s = play(s, 2);
-    s = applyAction(s, { type: 'pass' });
-    s = applyAction(s, { type: 'pass' });
-    expect(s.over).toBe(true);
-    expect(isLegalAction(s, { type: 'place', node: 3 })).toBe(false);
-    expect(isLegalAction(s, { type: 'pass' })).toBe(false);
+  it('is terminal exactly when the board becomes full', () => {
+    let state = initialState(base);
+    state = fill(state, state.board.n - 1);
+    expect(state.over).toBe(false);
+    expect(state.stonesPlaced).toBe(state.board.n - 1);
+    state = play(state, state.board.n - 1);
+    expect(state.over).toBe(true);
+    expect(state.stonesPlaced).toBe(state.board.n);
+    expect(isLegalAction(state, { type: 'place', node: 0 })).toBe(false);
   });
 
-  it('ends when the board fills up', () => {
-    let s = initialState({ ...base, rings: 3 });
-    for (let u = 0; u < s.board.n; u++) s = play(s, u);
-    expect(s.over).toBe(true);
-    expect(s.stonesPlaced).toBe(s.board.n);
-  });
+  it.each([3, 5, 7, 9, 11, 12, 4.5])(
+    'rejects unsupported ring count %s',
+    (rings) => {
+      expect(() => initialState({ ...base, rings })).toThrow(/one of 4, 6, 8, 10/);
+    },
+  );
 });
 
 describe('Double *Star protocol', () => {
-  const dbl: GameConfig = { ...base, mode: 'double' };
+  const double: GameConfig = { ...base, mode: 'double' };
 
-  it('gives the first player one stone, then two per turn', () => {
-    let s = initialState(dbl);
-    expect(s.movesLeft).toBe(1);
-    s = play(s, 0); // P0 single opening stone
-    expect(s.toMove).toBe(1);
-    expect(s.movesLeft).toBe(2);
-    s = play(s, 1);
-    expect(s.toMove).toBe(1); // still P1, mid-turn
-    expect(s.movesLeft).toBe(1);
-    expect(s.midTurn).toBe(true);
-    s = play(s, 2);
-    expect(s.toMove).toBe(0);
-    expect(s.movesLeft).toBe(2);
-    const colors = [s.stones[0], s.stones[1], s.stones[2]];
-    expect(colors).toEqual([0, 1, 1]);
+  it('gives the opener one stone and later turns two', () => {
+    let state = initialState(double);
+    expect(state.movesLeft).toBe(1);
+    state = play(state, 0);
+    expect(state.toMove).toBe(1);
+    expect(state.movesLeft).toBe(2);
+    state = play(state, 1);
+    expect(state.toMove).toBe(1);
+    expect(state.movesLeft).toBe(1);
+    expect(state.midTurn).toBe(true);
+    state = play(state, 2);
+    expect(state.toMove).toBe(0);
+    expect(state.movesLeft).toBe(2);
+    expect(Array.from(state.stones.slice(0, 3))).toEqual([0, 1, 1]);
   });
 
-  it('ends mid-turn when the last node is filled', () => {
-    let s = initialState({ ...dbl, rings: 3 });
-    const n = s.board.n; // 30 nodes: 1 + 14*2 + 1 leaves one dangling stone
-    for (let u = 0; u < n; u++) s = play(s, u);
-    expect(s.over).toBe(true);
-    expect(s.stonesPlaced).toBe(n);
-    expect(s.movesLeft).toBe(1);
-    expect(s.midTurn).toBe(true);
-    expect(s.passStreak).toBe(0);
+  it('preserves the final partial-turn residual on 4 rings', () => {
+    const state = fill(initialState(double));
+    expect(state.over).toBe(true);
+    expect(state.movesLeft).toBe(1);
+    expect(state.midTurn).toBe(true);
+    expect(state.currentTurnMoves).toEqual([state.board.n - 1]);
   });
 
-  it('preserves zero residual moves when a full board ends on a pair', () => {
-    let s = initialState({ ...dbl, rings: 5 });
-    for (let u = 0; u < s.board.n; u++) s = play(s, u);
-    expect(s.over).toBe(true);
-    expect(s.stonesPlaced).toBe(s.board.n);
-    expect(s.movesLeft).toBe(0);
-    expect(s.midTurn).toBe(false);
-    expect(s.passStreak).toBe(0);
-  });
-
-  it('a pass forfeits the remainder of the turn', () => {
-    let s = initialState(dbl);
-    s = play(s, 0);
-    s = play(s, 1); // P1 places one of two...
-    s = applyAction(s, { type: 'pass' }); // ...then passes the second
-    expect(s.toMove).toBe(0);
-    expect(s.movesLeft).toBe(2);
-    expect(s.over).toBe(false);
-  });
-
-  it('retains passStreak 2 and movesLeft 2 after a terminal double pass', () => {
-    let s = initialState(dbl);
-    s = applyAction(s, { type: 'pass' });
-    expect(s.passStreak).toBe(1);
-    expect(s.movesLeft).toBe(2);
-    s = applyAction(s, { type: 'pass' });
-    expect(s.over).toBe(true);
-    expect(s.passStreak).toBe(2);
-    expect(s.movesLeft).toBe(2);
-    expect(s.toMove).toBe(1);
+  it('preserves zero residual moves after a final pair on 6 rings', () => {
+    const state = fill(initialState({ ...double, rings: 6 }));
+    expect(state.over).toBe(true);
+    expect(state.movesLeft).toBe(0);
+    expect(state.midTurn).toBe(false);
+    expect(state.currentTurnMoves).toEqual([
+      state.board.n - 2,
+      state.board.n - 1,
+    ]);
   });
 });
 
-describe('pie rule', () => {
-  it('lets the second player steal the opening stone', () => {
-    const cfg: GameConfig = { ...base, pieRule: true };
-    let s = initialState(cfg);
-    s = play(s, 7);
-    expect(s.canSwap).toBe(true);
-    s = applyAction(s, { type: 'swap' });
-    expect(s.stones[7]).toBe(1); // recolored to player 1
-    expect(s.toMove).toBe(0);
-    expect(s.swapped).toBe(true);
-    expect(s.canSwap).toBe(false);
-    // No second swap ever.
-    s = play(s, 8);
-    expect(s.canSwap).toBe(false);
+describe('web-only pie rule', () => {
+  it('lets the second player steal only the opening stone', () => {
+    let state = initialState({ ...base, pieRule: true });
+    state = play(state, 7);
+    expect(state.canSwap).toBe(true);
+    state = applyAction(state, { type: 'swap' });
+    expect(state.stones[7]).toBe(1);
+    expect(state.toMove).toBe(0);
+    expect(state.swapped).toBe(true);
+    expect(state.canSwap).toBe(false);
+    state = play(state, 8);
+    expect(isLegalAction(state, { type: 'swap' })).toBe(false);
   });
 
-  it('expires if the second player places instead', () => {
-    const cfg: GameConfig = { ...base, pieRule: true };
-    let s = initialState(cfg);
-    s = play(s, 7);
-    expect(s.canSwap).toBe(true);
-    s = play(s, 8);
-    expect(s.canSwap).toBe(false);
-    expect(isLegalAction(s, { type: 'swap' })).toBe(false);
+  it('expires when the second player places', () => {
+    let state = initialState({ ...base, pieRule: true });
+    state = play(state, 7, 8);
+    expect(state.canSwap).toBe(false);
   });
 
-  it('is unavailable when disabled', () => {
-    let s = initialState(base);
-    s = play(s, 7);
-    expect(s.canSwap).toBe(false);
-  });
-
-  it('in double mode, swap consumes the turn and the opener gets two stones', () => {
-    const cfg: GameConfig = { ...base, mode: 'double', pieRule: true };
-    let s = initialState(cfg);
-    s = play(s, 7); // single opening stone
-    expect(s.canSwap).toBe(true);
-    s = applyAction(s, { type: 'swap' });
-    expect(s.toMove).toBe(0);
-    expect(s.movesLeft).toBe(2);
-    s = play(s, 8, 9);
-    expect(s.toMove).toBe(1);
-    expect(s.movesLeft).toBe(2);
+  it('preserves Double *Star turn size after a swap', () => {
+    const config: GameConfig = { ...base, mode: 'double', pieRule: true };
+    let state = play(initialState(config), 7);
+    state = applyAction(state, { type: 'swap' });
+    expect(state.toMove).toBe(0);
+    expect(state.movesLeft).toBe(2);
+    state = play(state, 8, 9);
+    expect(state.toMove).toBe(1);
   });
 });
 
-describe('replay (undo/redo backbone)', () => {
-  it('rebuilds identical state from the action log', () => {
-    const cfg: GameConfig = { ...base, mode: 'double', pieRule: true };
+describe('replay', () => {
+  it('rebuilds placement and swap logs exactly', () => {
+    const config: GameConfig = { ...base, mode: 'double', pieRule: true };
     const log: GameAction[] = [
       { type: 'place', node: 3 },
       { type: 'swap' },
       { type: 'place', node: 10 },
       { type: 'place', node: 11 },
       { type: 'place', node: 20 },
-      { type: 'pass' },
+      { type: 'place', node: 21 },
       { type: 'place', node: 30 },
     ];
-    let stepped = initialState(cfg);
-    for (const a of log) stepped = applyAction(stepped, a);
-    const replayed = replay(cfg, log);
-    expect(Array.from(replayed.stones)).toEqual(Array.from(stepped.stones));
-    expect(replayed.toMove).toBe(stepped.toMove);
-    expect(replayed.movesLeft).toBe(stepped.movesLeft);
-    expect(replayed.over).toBe(stepped.over);
-    expect(replayed.turnCount).toBe(stepped.turnCount);
-    // Undo = replaying a truncated log. The final stone was the first of
-    // player 0's two-stone turn, so undoing it stays on player 0 but restores
-    // both moves.
-    const undone = replay(cfg, log.slice(0, -1));
+    let stepped = initialState(config);
+    for (const action of log) stepped = applyAction(stepped, action);
+    const rebuilt = replay(config, log);
+    expect(Array.from(rebuilt.stones)).toEqual(Array.from(stepped.stones));
+    expect(rebuilt).toMatchObject({
+      toMove: stepped.toMove,
+      movesLeft: stepped.movesLeft,
+      over: stepped.over,
+      turnCount: stepped.turnCount,
+    });
+
+    const undone = replay(config, log.slice(0, -1));
     expect(undone.stones[30]).toBe(EMPTY);
-    expect(stepped.toMove).toBe(0);
-    expect(stepped.movesLeft).toBe(1);
-    expect(undone.toMove).toBe(0);
     expect(undone.movesLeft).toBe(2);
-    expect(undone.midTurn).toBe(false);
   });
 });

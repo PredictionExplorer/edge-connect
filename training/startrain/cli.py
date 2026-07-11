@@ -91,7 +91,6 @@ def selfplay_main(argv: list[str] | None = None) -> None:
         config=InferenceConfig(
             precision="fp32" if arguments.cpu_smoke else experiment.train.precision,
             score_utility_weight=selfplay_config.score_utility_weight,
-            initial_pass_logit_penalty=selfplay_config.initial_pass_logit_penalty,
         ),
         model_version=model_version,
         model_step=model_step,

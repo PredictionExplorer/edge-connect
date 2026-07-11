@@ -27,7 +27,6 @@ export const STAR_GLOBAL_FEATURE_NAMES = [
   'opponent_stone_fraction',
   'moves_left_fraction',
   'opening',
-  'pass_streak_fraction',
   'terminal',
   'current_total_scaled',
   'opponent_total_scaled',
@@ -53,7 +52,7 @@ export const STAR_MODEL_INPUT_NAMES = [
 
 export const STAR_MODEL_OUTPUT_NAMES = [
   'policy_logits',
-  'wdl_logits',
+  'outcome_logits',
   'score_margin_logits',
   'ownership_logits',
   'alive_logits',
@@ -94,12 +93,11 @@ function validateSemanticState(state: StarAiSemanticState): Board {
   }
   if (state.toMove !== 0 && state.toMove !== 1) throw new Error('toMove must be 0 or 1');
   if (![0, 1, 2].includes(state.movesLeft)) throw new Error('movesLeft must be in 0..2');
-  if (![0, 1, 2].includes(state.passStreak)) throw new Error('passStreak must be in 0..2');
 
   const occupied = state.stones.filter((stone) => stone !== EMPTY).length;
   const boardFull = occupied === board.n;
-  if (state.terminal !== (boardFull || state.passStreak === 2)) {
-    throw new Error('terminal must equal board-full or passStreak == 2');
+  if (state.terminal !== boardFull) {
+    throw new Error('terminal must equal board-full');
   }
   if (state.movesLeft === 0 && !boardFull) {
     throw new Error('movesLeft == 0 is valid only on a full board');
@@ -111,7 +109,6 @@ function validateSemanticState(state: StarAiSemanticState): Board {
     state.opening &&
     (state.toMove !== 0 ||
       state.movesLeft !== 1 ||
-      state.passStreak !== 0 ||
       occupied !== 0 ||
       state.terminal)
   ) {
@@ -135,16 +132,15 @@ export function topologyEdgeType(board: Board, first: number, second: number): 0
 }
 
 export function actionCodeToModelIndex(action: number, nodeCount: number): number {
-  if (action === -1) return nodeCount;
   if (Number.isInteger(action) && action >= 0 && action < nodeCount) return action;
-  throw new Error(`action ${String(action)} is outside the nodes-then-pass layout`);
+  throw new Error(`action ${String(action)} is outside the nodes-only layout`);
 }
 
 export function modelIndexToActionCode(index: number, nodeCount: number): number {
-  if (!Number.isInteger(index) || index < 0 || index > nodeCount) {
+  if (!Number.isInteger(index) || index < 0 || index >= nodeCount) {
     throw new Error(`model action index ${String(index)} is outside the action layout`);
   }
-  return index === nodeCount ? -1 : index;
+  return index;
 }
 
 export function numberToFloat16Bits(value: number): number {
@@ -191,7 +187,7 @@ export function float16ToFloat32Array(values: ArrayLike<number>): Float32Array {
   return Float32Array.from(values, float16BitsToNumber);
 }
 
-/** Exact browser port of training/startrain/features.py schema v2. */
+/** Exact browser port of training/startrain/features.py schema v3. */
 export function encodeStarFeatures(state: StarAiSemanticState): EncodedStarFeatures {
   const board = validateSemanticState(state);
   const score = scorePosition(board, state.stones);
@@ -203,7 +199,7 @@ export function encodeStarFeatures(state: StarAiSemanticState): EncodedStarFeatu
   const neighborMask = new Uint8Array(board.n * maxDegree);
   const neighborEdgeType = new BigInt64Array(board.n * maxDegree);
   const nodeMask = new Uint8Array(board.n).fill(1);
-  const legalActionMask = new Uint8Array(board.n + 1);
+  const legalActionMask = new Uint8Array(board.n);
 
   let currentCount = 0;
   let opponentCount = 0;
@@ -248,12 +244,10 @@ export function encodeStarFeatures(state: StarAiSemanticState): EncodedStarFeatu
       neighborEdgeType[target] = BigInt(topologyEdgeType(board, node, neighbor));
     }
   }
-  legalActionMask[board.n] = bool(!state.terminal);
-
   const occupied = currentCount + opponentCount;
   const currentScore = score.players[current];
   const opponentScore = score.players[opponent];
-  const scoreScale = 181;
+  const scoreScale = 151;
   const starScale = Math.max(1, board.periCount / 2);
   const globalFeatures = new Float32Array([
     state.rings / MAX_RINGS,
@@ -262,7 +256,6 @@ export function encodeStarFeatures(state: StarAiSemanticState): EncodedStarFeatu
     opponentCount / board.n,
     state.movesLeft / 2,
     bool(state.opening),
-    state.passStreak / 2,
     bool(state.terminal),
     currentScore.total / scoreScale,
     opponentScore.total / scoreScale,

@@ -90,7 +90,6 @@ def test_actor_supervisor_refreshes_only_at_batch_boundaries_and_emits_metrics(
                 completed_decisions=3,
                 full_decisions=1,
                 fast_decisions=2,
-                pass_decisions=1,
                 policy_entropy_count=2,
                 policy_entropy_sum=1.25,
                 policy_weight_sum=0.5,
@@ -130,7 +129,7 @@ def test_actor_supervisor_refreshes_only_at_batch_boundaries_and_emits_metrics(
     assert provider_events == ["initial", "initial", "refresh"]
     assert len(actor_events) == 1
     ring, generation = actor_events[0]
-    assert 3 <= ring <= 12
+    assert ring in (4, 6, 8, 10)
     assert generation == 0
 
     metric = json.loads((tmp_path / "metrics.jsonl").read_text().strip())
@@ -148,8 +147,7 @@ def test_actor_supervisor_refreshes_only_at_batch_boundaries_and_emits_metrics(
     assert metric["attempted_decisions"] == 3
     assert metric["full_decisions"] == 1
     assert metric["fast_decisions"] == 2
-    assert metric["pass_decisions"] == 1
-    assert metric["pass_decision_rate"] == 1 / 3
+    assert "pass_decisions" not in metric
     assert metric["game_lengths"] == [3]
     assert metric["game_length_distribution"] == {"3": 1}
     assert metric["mean_game_length"] == 3
@@ -247,7 +245,6 @@ def test_actor_supervisor_records_interrupted_cohort_metrics(
             return SelfPlayMetrics(
                 full_decisions=3,
                 fast_decisions=4,
-                pass_decisions=2,
                 interrupted_cohorts=1,
                 dropped_games=2,
                 dropped_decisions=7,
@@ -291,7 +288,7 @@ def test_actor_supervisor_records_interrupted_cohort_metrics(
     assert metric["evaluator_calls"] == 3
     assert metric["evaluator_rows"] == 75
     assert metric["attempted_decisions"] == 7
-    assert metric["pass_decision_rate"] == 2 / 7
+    assert "pass_decision_rate" not in metric
     assert metric["interrupted_cohorts"] == 1
     assert metric["dropped_games"] == 2
     assert metric["dropped_decisions"] == 7

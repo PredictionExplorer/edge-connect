@@ -26,10 +26,22 @@
  * scoring engine can traverse it with zero allocation.
  */
 
+import { STAR_RULES_CONTRACT } from './rules';
+
 export const SECTOR_CHARS = ['*', 'S', 'T', 'A', 'R'] as const;
 
-export const MIN_RINGS = 3;
-export const MAX_RINGS = 12;
+export const SUPPORTED_RINGS = STAR_RULES_CONTRACT.board.supportedRings;
+export type SupportedRings = (typeof SUPPORTED_RINGS)[number];
+export const MIN_RINGS = SUPPORTED_RINGS[0];
+export const MAX_RINGS = SUPPORTED_RINGS[SUPPORTED_RINGS.length - 1];
+
+export function isSupportedRings(value: unknown): value is SupportedRings {
+  return (
+    typeof value === 'number' &&
+    Number.isInteger(value) &&
+    SUPPORTED_RINGS.includes(value as SupportedRings)
+  );
+}
 
 export interface Board {
   rings: number;
@@ -69,8 +81,10 @@ function ringChar(x: number): string {
 const boardCache = new Map<number, Board>();
 
 export function getBoard(rings: number): Board {
-  if (!Number.isInteger(rings) || rings < MIN_RINGS || rings > MAX_RINGS) {
-    throw new Error(`rings must be an integer in ${MIN_RINGS}..${MAX_RINGS}, got ${rings}`);
+  if (!isSupportedRings(rings)) {
+    throw new Error(
+      `rings must be one of ${SUPPORTED_RINGS.join(', ')}, got ${String(rings)}`,
+    );
   }
   const cached = boardCache.get(rings);
   if (cached) return cached;
@@ -118,7 +132,7 @@ function buildBoard(rings: number): Board {
   const addEdge = (a: number, b: number) => {
     const lo = Math.min(a, b);
     const hi = Math.max(a, b);
-    const key = lo * 512 + hi; // n ≤ 390 < 512
+    const key = lo * 512 + hi; // n ≤ 275 < 512
     if (edgeKeys.has(key)) return;
     edgeKeys.add(key);
     edges.push(lo, hi);

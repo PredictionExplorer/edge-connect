@@ -18,7 +18,7 @@ export function supportsAiControllers(
 }
 
 /**
- * Persistence and setup both pass through this boundary. Invalid values, and
+ * Persistence and setup both flow through this boundary. Invalid values, and
  * AI values attached to unsupported variants, become human controllers.
  */
 export function normalizeControllers(

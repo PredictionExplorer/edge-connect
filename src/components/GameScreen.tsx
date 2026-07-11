@@ -4,7 +4,6 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   BookOpenText,
   Eye,
-  Flag,
   Redo2,
   Replace,
   Settings2,
@@ -26,7 +25,7 @@ import {
 } from '@/lib/star/ai/protocol';
 import { requestServerAiAction } from '@/lib/star/ai/server-client';
 import { replay } from '@/lib/star/game';
-import { scorePosition } from '@/lib/star/scoring';
+import { scorePosition, validateTerminalWinner } from '@/lib/star/scoring';
 import { useAppStore } from '@/lib/store';
 import { GameOverOverlay } from './GameOverOverlay';
 import { RulesDialog } from './RulesDialog';
@@ -360,7 +359,7 @@ export function GameScreen() {
         <div className="flex min-w-0 flex-col gap-4">
           {/* Turn banner */}
           <div
-            key={game.over ? 'over' : `${game.toMove}-${game.movesLeft}-${game.passStreak}`}
+            key={game.over ? 'over' : `${game.toMove}-${game.movesLeft}`}
             className="fade-in rounded-2xl border px-4 py-3 text-center text-sm"
             style={{
               borderColor: game.over ? 'rgba(232,196,139,0.5)' : activeColor.base + '66',
@@ -374,7 +373,6 @@ export function GameScreen() {
                 {config.playerNames[game.toMove]} to play
                 {config.mode === 'double' &&
                   ` — ${game.movesLeft} stone${game.movesLeft > 1 ? 's' : ''} left`}
-                {game.passStreak === 1 && ' · a pass now ends the game'}
               </span>
             )}
           </div>
@@ -459,17 +457,7 @@ export function GameScreen() {
           <ScorePanel game={game} score={score} />
 
           {/* Actions */}
-          <div className="grid grid-cols-3 gap-2">
-            <button
-              type="button"
-              disabled={game.over || !humanCanAct}
-              onClick={() => {
-                if (humanCanAct) act({ type: 'pass' });
-              }}
-              className="flex items-center justify-center gap-2 rounded-xl border border-white/15 px-3 py-2.5 text-sm text-ink transition-colors enabled:hover:border-danger/60 enabled:hover:text-danger disabled:opacity-35"
-            >
-              <Flag className="h-4 w-4" aria-hidden /> Pass
-            </button>
+          <div className="grid grid-cols-2 gap-2">
             <button
               type="button"
               disabled={log.length === 0}
@@ -509,14 +497,17 @@ export function GameScreen() {
       </div>
 
       <RulesDialog open={rulesOpen} onClose={() => setRulesOpen(false)} />
-      <GameOverOverlay
-        open={game.over && !reviewing}
-        game={game}
-        score={score}
-        onReview={() => setReviewing(true)}
-        onRematch={rematchAction}
-        onSetup={leaveGame}
-      />
+      {game.over && (
+        <GameOverOverlay
+          open={!reviewing}
+          game={game}
+          score={score}
+          winner={validateTerminalWinner(game.board, game.stones).winner}
+          onReview={() => setReviewing(true)}
+          onRematch={rematchAction}
+          onSetup={leaveGame}
+        />
+      )}
     </main>
   );
 }

@@ -4,12 +4,12 @@ use std::sync::{Arc, LazyLock};
 
 use serde::Deserialize;
 use star_engine::{
-    ACTION_LAYOUT_SCHEMA, Action, BitBoard, Board, CONFORMANCE_SCHEMA, D5Maps, GameState, Player,
-    PlayerScore, RULES_HASH, RULES_HASH_VALUE, RULES_SCHEMA, ScoreResult, ScoringScratch, Symmetry,
-    rules_hash, terminal_value,
+    ACTION_LAYOUT_SCHEMA, Action, BitBoard, Board, CONFORMANCE_SCHEMA, D5Maps, FEATURE_SCHEMA,
+    GameState, Player, PlayerScore, RULES_HASH, RULES_HASH_VALUE, RULES_SCHEMA, RULES_VERSION,
+    SUPPORTED_RINGS, ScoreResult, ScoringScratch, Symmetry, rules_hash, terminal_value,
 };
 
-const FIXTURE_JSON: &str = include_str!("../../../../testdata/star/conformance-v1.json");
+const FIXTURE_JSON: &str = include_str!("../../../../testdata/star/conformance-v2.json");
 
 static FIXTURE: LazyLock<ConformanceFixture> = LazyLock::new(|| {
     serde_json::from_str(FIXTURE_JSON).expect("generated conformance fixture must deserialize")
@@ -21,6 +21,7 @@ struct ConformanceFixture {
     schema: String,
     schemas: SchemasFixture,
     rules: RulesFixture,
+    outcome_encoding: OutcomeEncodingFixture,
     action_encoding: ActionEncodingFixture,
     action_layouts: ActionLayoutsFixture,
     boards: Vec<BoardFixture>,
@@ -45,21 +46,20 @@ struct RulesFixture {
     hash_algorithm: String,
     hash: String,
     canonical: String,
-    contract: RulesContractFixture,
+    contract: serde_json::Value,
 }
 
 #[derive(Deserialize)]
-struct RulesContractFixture {
-    schema: String,
-    version: u32,
-    variant: String,
+struct OutcomeEncodingFixture {
+    loss: u8,
+    win: u8,
+    value: String,
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ActionEncodingFixture {
     placement_code: String,
-    pass_code: i32,
     legal_order: String,
     native_layout: String,
 }
@@ -96,7 +96,6 @@ struct ActionLayoutRowFixture {
 struct NativeLayoutFixture {
     action_count: usize,
     placement_slots: Vec<usize>,
-    pass_slot: usize,
 }
 
 #[derive(Deserialize)]
@@ -105,7 +104,6 @@ struct PaddedLayoutFixture {
     action_count: usize,
     placement_slots: Vec<usize>,
     padding_slots: Vec<usize>,
-    pass_slot: usize,
 }
 
 #[derive(Deserialize)]
@@ -213,14 +211,18 @@ struct GameConfigFixture {
 #[serde(tag = "type", rename_all = "lowercase")]
 enum ActionFixture {
     Place { node: u16 },
-    Pass,
 }
 
 impl ActionFixture {
     fn to_native(&self) -> Action {
         match self {
             Self::Place { node } => Action::Place(*node),
-            Self::Pass => Action::Pass,
+        }
+    }
+
+    fn node(&self) -> u16 {
+        match self {
+            Self::Place { node } => *node,
         }
     }
 }
@@ -235,7 +237,6 @@ struct TraceStateFixture {
     to_move: u8,
     moves_left: u8,
     mid_turn: bool,
-    pass_streak: u8,
     over: bool,
     can_swap: bool,
     swapped: bool,
@@ -251,7 +252,7 @@ struct TerminalFixture {
     winner: i8,
     score: ScoreExpected,
     values_by_player: Vec<i8>,
-    wdl_class_by_player: Vec<u8>,
+    outcome_classes_by_player: Vec<u8>,
     score_margins_by_player: Vec<i16>,
     value_perspective: ValuePerspectiveFixture,
 }
@@ -262,7 +263,7 @@ struct ValuePerspectiveFixture {
     kind: String,
     player: u8,
     value: i8,
-    wdl_class: u8,
+    outcome_class: u8,
     score_margin: i16,
 }
 
@@ -302,22 +303,23 @@ struct SemanticStateFixture {
     moves_left: u8,
     opening: bool,
     mid_turn: bool,
-    pass_streak: u8,
     terminal: bool,
     current_turn_moves: Vec<u16>,
     turn_count: u32,
 }
 
 #[test]
-fn finalized_schema_and_hash_match_runtime_constants() {
+fn finalized_v2_schema_hash_and_encodings_match_runtime_constants() {
     let fixture = &*FIXTURE;
     assert_eq!(fixture.schema, CONFORMANCE_SCHEMA);
     assert_eq!(fixture.schemas.conformance, CONFORMANCE_SCHEMA);
     assert_eq!(fixture.schemas.rules, RULES_SCHEMA);
-    assert_eq!(fixture.rules.contract.schema, RULES_SCHEMA);
-    assert_eq!(fixture.rules.version, 1);
-    assert_eq!(fixture.rules.contract.version, 1);
-    assert_eq!(fixture.rules.contract.variant, "double-star");
+    assert_eq!(fixture.schemas.model_features, FEATURE_SCHEMA);
+    assert_eq!(fixture.schemas.action_layout, ACTION_LAYOUT_SCHEMA);
+    assert_eq!(fixture.rules.version, RULES_VERSION);
+    assert_eq!(fixture.rules.contract["schema"], RULES_SCHEMA);
+    assert_eq!(fixture.rules.contract["version"], RULES_VERSION);
+    assert_eq!(fixture.rules.contract["variant"], "double-star");
     assert_eq!(fixture.rules.hash_algorithm, "fnv1a64");
     assert_eq!(fixture.rules.hash, RULES_HASH);
     assert_eq!(
@@ -325,66 +327,56 @@ fn finalized_schema_and_hash_match_runtime_constants() {
         RULES_HASH_VALUE
     );
     assert_eq!(rules_hash(), RULES_HASH_VALUE);
-    assert_eq!(fixture.schemas.action_layout, ACTION_LAYOUT_SCHEMA);
-    assert_eq!(fixture.action_layouts.schema, ACTION_LAYOUT_SCHEMA);
-    assert_eq!(
-        fixture.action_layouts.model_feature_schema,
-        fixture.schemas.model_features
-    );
-}
-
-#[test]
-fn generated_action_layouts_match_wire_and_native_order() {
-    let fixture = &*FIXTURE;
-    assert_eq!(fixture.action_encoding.pass_code, Action::Pass.code());
+    assert_eq!(fixture.outcome_encoding.loss, 0);
+    assert_eq!(fixture.outcome_encoding.win, 1);
+    assert_eq!(fixture.outcome_encoding.value, "P(win)-P(loss)");
     assert_eq!(fixture.action_encoding.placement_code, "dense node id");
     assert_eq!(
         fixture.action_encoding.legal_order,
-        "ascending legal placement node ids, then pass"
+        "ascending legal placement node ids"
     );
-    assert_eq!(
-        fixture.action_encoding.native_layout,
-        "node u at index u; pass at index nodeCount"
-    );
+    assert_eq!(fixture.action_encoding.native_layout, "node u at index u");
+    assert_eq!(fixture.action_layouts.schema, ACTION_LAYOUT_SCHEMA);
+    assert_eq!(fixture.action_layouts.model_feature_schema, FEATURE_SCHEMA);
+}
 
-    for batch in &fixture.action_layouts.mixed_batches {
-        assert_eq!(batch.batch_action_count, batch.maximum_nodes + 1);
-        assert_eq!(
-            batch.rings,
-            batch.rows.iter().map(|row| row.rings).collect::<Vec<_>>()
-        );
-        for row in &batch.rows {
-            let board = Board::new(row.rings).unwrap();
-            let node_count = usize::from(board.node_count());
-            assert_eq!(row.node_count, node_count);
-            assert_eq!(row.native.action_count, node_count + 1);
-            assert_eq!(row.native.placement_slots, [0, node_count - 1]);
-            assert_eq!(row.native.pass_slot, node_count);
-            assert_eq!(row.padded.action_count, batch.batch_action_count);
-            assert_eq!(row.padded.placement_slots, [0, node_count - 1]);
-            assert_eq!(row.padded.pass_slot, batch.maximum_nodes);
-            if node_count == batch.maximum_nodes {
-                assert!(row.padded.padding_slots.is_empty());
-            } else {
-                assert_eq!(
-                    row.padded.padding_slots,
-                    [node_count, batch.maximum_nodes - 1]
-                );
-            }
-            for example in &row.examples {
-                let action = example.action.to_native();
-                assert_eq!(action.code(), example.wire_code);
-                assert_eq!(action.native_index(&board).unwrap(), example.native_index);
-                assert_eq!(
-                    Action::from_native_index(example.native_index, &board).unwrap(),
-                    action
-                );
-                let padded_index = match action {
-                    Action::Place(node) => usize::from(node),
-                    Action::Pass => batch.maximum_nodes,
-                };
-                assert_eq!(padded_index, example.padded_index);
-            }
+#[test]
+fn generated_nodes_only_action_layouts_match_wire_and_native_order() {
+    let fixture = &*FIXTURE;
+    assert_eq!(fixture.action_layouts.mixed_batches.len(), 1);
+    let batch = &fixture.action_layouts.mixed_batches[0];
+    assert_eq!(batch.rings, SUPPORTED_RINGS);
+    assert_eq!(batch.batch_action_count, batch.maximum_nodes);
+    assert_eq!(
+        batch.rings,
+        batch.rows.iter().map(|row| row.rings).collect::<Vec<_>>()
+    );
+    for row in &batch.rows {
+        let board = Board::new(row.rings).unwrap();
+        let node_count = usize::from(board.node_count());
+        assert_eq!(row.node_count, node_count);
+        assert_eq!(row.native.action_count, node_count);
+        assert_eq!(row.native.placement_slots, [0, node_count - 1]);
+        assert_eq!(row.padded.action_count, batch.maximum_nodes);
+        assert_eq!(row.padded.placement_slots, [0, node_count - 1]);
+        if node_count == batch.maximum_nodes {
+            assert!(row.padded.padding_slots.is_empty());
+        } else {
+            assert_eq!(
+                row.padded.padding_slots,
+                [node_count, batch.maximum_nodes - 1]
+            );
+        }
+        for example in &row.examples {
+            let action = example.action.to_native();
+            assert_eq!(action.code(), example.wire_code);
+            assert_eq!(action.native_index(&board).unwrap(), example.native_index);
+            assert_eq!(
+                Action::from_native_index(example.native_index, &board).unwrap(),
+                action
+            );
+            let Action::Place(node) = action;
+            assert_eq!(usize::from(node), example.padded_index);
         }
     }
 }
@@ -392,8 +384,8 @@ fn generated_action_layouts_match_wire_and_native_order() {
 #[test]
 fn all_generated_board_and_d5_vectors_match() {
     let fixture = &*FIXTURE;
-    assert_eq!(fixture.boards.len(), 10);
-    for (expected_rings, expected) in (3_u8..=12).zip(&fixture.boards) {
+    assert_eq!(fixture.boards.len(), SUPPORTED_RINGS.len());
+    for (&expected_rings, expected) in SUPPORTED_RINGS.iter().zip(&fixture.boards) {
         assert_eq!(expected.rings, expected_rings);
         let board = Board::new(expected.rings).unwrap();
         let maps = D5Maps::new(&board);
@@ -479,7 +471,7 @@ fn all_generated_board_and_d5_vectors_match() {
 #[test]
 fn every_generated_scoring_vector_matches() {
     let fixture = &*FIXTURE;
-    assert_eq!(fixture.scores.len(), 61);
+    assert_eq!(fixture.scores.len(), 6 * SUPPORTED_RINGS.len());
     let mut scratch = ScoringScratch::default();
     for vector in &fixture.scores {
         let board = Board::new(vector.rings).unwrap();
@@ -490,15 +482,17 @@ fn every_generated_scoring_vector_matches() {
 }
 
 #[test]
-fn every_generated_game_trace_and_terminal_value_matches() {
+fn every_generated_full_board_game_and_binary_terminal_value_matches() {
     let fixture = &*FIXTURE;
-    assert_eq!(fixture.games.len(), 3);
-    for trace in &fixture.games {
+    assert_eq!(fixture.games.len(), SUPPORTED_RINGS.len());
+    for (&rings, trace) in SUPPORTED_RINGS.iter().zip(&fixture.games) {
+        assert_eq!(trace.config.rings, rings);
         assert_eq!(trace.config.mode, "double");
         assert!(!trace.config.pie_rule);
+        assert_eq!(trace.id, format!("rings-{rings}-board-full"));
         assert_eq!(trace.actions.len(), trace.action_codes.len());
         assert_eq!(trace.states.len(), trace.actions.len() + 1);
-        let board = Arc::new(Board::new(trace.config.rings).unwrap());
+        let board = Arc::new(Board::new(rings).unwrap());
         let mut state = GameState::new(board);
 
         for (step, expected_state) in trace.states.iter().enumerate() {
@@ -515,12 +509,7 @@ fn every_generated_game_trace_and_terminal_value_matches() {
 
         assert!(state.is_terminal());
         assert!(state.legal_actions().is_empty());
-        let reason = if state.stones_placed() == state.board().node_count() {
-            "board-full"
-        } else {
-            "double-pass"
-        };
-        assert_eq!(trace.terminal.reason, reason);
+        assert_eq!(trace.terminal.reason, "board-full");
         let score = ScoringScratch::default().score_state(&state);
         assert_score(
             &trace.id,
@@ -528,16 +517,19 @@ fn every_generated_game_trace_and_terminal_value_matches() {
             &trace.terminal.score,
             state.board().node_count(),
         );
-        assert_eq!(
-            trace.terminal.winner,
-            score.leader.map_or(-1, |player| player as i8)
-        );
+        let winner = score
+            .leader
+            .expect("generated full boards must have decisive winners");
+        assert_eq!(trace.terminal.winner, winner as i8);
         for player in [Player::Zero, Player::One] {
             let index = player.index();
-            let value = score.outcome_for(player) as i8;
+            let value = score.outcome_for(player).unwrap() as i8;
             let margin = score.players[index].total - score.players[1 - index].total;
             assert_eq!(trace.terminal.values_by_player[index], value);
-            assert_eq!(trace.terminal.wdl_class_by_player[index], wdl_class(value));
+            assert_eq!(
+                trace.terminal.outcome_classes_by_player[index],
+                outcome_class(value)
+            );
             assert_eq!(trace.terminal.score_margins_by_player[index], margin);
         }
         let perspective = &trace.terminal.value_perspective;
@@ -546,29 +538,10 @@ fn every_generated_game_trace_and_terminal_value_matches() {
         let value = terminal_value(&state).unwrap() as i8;
         let player = state.to_move().index();
         let margin = score.players[player].total - score.players[1 - player].total;
+        assert!(matches!(value, -1 | 1));
         assert_eq!(perspective.value, value);
-        assert_eq!(perspective.wdl_class, wdl_class(value));
+        assert_eq!(perspective.outcome_class, outcome_class(value));
         assert_eq!(perspective.score_margin, margin);
-
-        match trace.id.as_str() {
-            "double-midturn-two-pass-terminal" => {
-                assert_eq!(state.pass_streak(), 2);
-                assert_eq!(state.moves_left(), 2);
-                assert!(!state.is_mid_turn());
-                assert!(state.current_turn_moves().is_empty());
-            }
-            "rings-3-board-full-residual-1" => {
-                assert_eq!(state.moves_left(), 1);
-                assert!(state.is_mid_turn());
-                assert_eq!(state.current_turn_moves().len(), 1);
-            }
-            "rings-5-board-full-residual-0" => {
-                assert_eq!(state.moves_left(), 0);
-                assert!(!state.is_mid_turn());
-                assert_eq!(state.current_turn_moves().len(), 2);
-            }
-            other => panic!("unexpected generated game trace {other}"),
-        }
     }
 }
 
@@ -589,7 +562,6 @@ fn generated_ab_ba_paths_share_the_semantic_key() {
                 "movesLeft",
                 "opening",
                 "midTurn",
-                "passStreak",
                 "terminal",
                 "currentTurnMoves",
                 "turnCount",
@@ -598,22 +570,13 @@ fn generated_ab_ba_paths_share_the_semantic_key() {
         assert_eq!(pair.excluded_presentation_fields, ["lastMove"]);
         let ab = replay_pair_path(pair.config.rings, &pair.ab);
         let ba = replay_pair_path(pair.config.rings, &pair.ba);
-        assert_eq!(pair.pair.a, pair.ab.actions[1].to_native_node());
-        assert_eq!(pair.pair.b, pair.ab.actions[2].to_native_node());
+        assert_eq!(pair.pair.a, pair.ab.actions[1].node());
+        assert_eq!(pair.pair.b, pair.ab.actions[2].node());
         assert_eq!(ab.key(), ba.key());
         assert_eq!(ab.hash64(), ba.hash64());
         assert_eq!(ab.last_move(), Some(pair.ab.last_move));
         assert_eq!(ba.last_move(), Some(pair.ba.last_move));
         assert_ne!(ab.last_move(), ba.last_move());
-    }
-}
-
-impl ActionFixture {
-    fn to_native_node(&self) -> u16 {
-        match self {
-            Self::Place { node } => *node,
-            Self::Pass => panic!("expected a placement"),
-        }
     }
 }
 
@@ -631,14 +594,12 @@ fn replay_pair_path(rings: u8, path: &PairPathFixture) -> GameState {
 }
 
 fn assert_trace_state(id: &str, state: &GameState, expected: &TraceStateFixture) {
-    assert_eq!(state.board().rings(), expected_board_rings(expected));
     assert_stones(id, state, &expected.stones);
     assert_eq!(state.stones_placed(), expected.stones_placed, "{id}");
     assert_eq!(state.to_move() as u8, expected.to_move, "{id}");
     assert_eq!(state.moves_left(), expected.moves_left, "{id}");
     assert_eq!(state.is_opening(), expected.opening, "{id}");
     assert_eq!(state.is_mid_turn(), expected.mid_turn, "{id}");
-    assert_eq!(state.pass_streak(), expected.pass_streak, "{id}");
     assert_eq!(state.is_terminal(), expected.over, "{id}");
     assert!(!expected.can_swap, "{id}");
     assert!(!expected.swapped, "{id}");
@@ -655,13 +616,6 @@ fn assert_trace_state(id: &str, state: &GameState, expected: &TraceStateFixture)
     assert_eq!(state.turn_count(), expected.turn_count, "{id}");
 }
 
-fn expected_board_rings(expected: &TraceStateFixture) -> u8 {
-    let node_count = expected.stones.len();
-    (3_u8..=12)
-        .find(|rings| 5 * usize::from(*rings) * (usize::from(*rings) + 1) / 2 == node_count)
-        .expect("fixture state has a supported node count")
-}
-
 fn assert_semantic_state(state: &GameState, expected: &SemanticStateFixture) {
     assert_eq!(state.board().rings(), expected.rings);
     assert_stones("pair-equivalence", state, &expected.stones);
@@ -670,7 +624,6 @@ fn assert_semantic_state(state: &GameState, expected: &SemanticStateFixture) {
     assert_eq!(state.moves_left(), expected.moves_left);
     assert_eq!(state.is_opening(), expected.opening);
     assert_eq!(state.is_mid_turn(), expected.mid_turn);
-    assert_eq!(state.pass_streak(), expected.pass_streak);
     assert_eq!(state.is_terminal(), expected.terminal);
     assert_eq!(state.current_turn_moves(), expected.current_turn_moves);
     assert_eq!(state.turn_count(), expected.turn_count);
@@ -696,27 +649,20 @@ fn assert_legal_action_contract(state: &GameState) {
         assert!(actions.is_empty());
         return;
     }
-    assert_eq!(actions.last(), Some(&Action::Pass));
-    let mut previous = None;
-    for action in &actions[..actions.len() - 1] {
-        let Action::Place(node) = action else {
-            panic!("pass must appear only at the end");
-        };
-        assert!(state.stone_at(*node).is_none());
-        if let Some(previous) = previous {
-            assert!(previous < *node);
-        }
-        previous = Some(*node);
-        assert_eq!(action.code(), i32::from(*node));
+    for (expected_node, action) in state.legal_actions().placements.iter().zip(&actions) {
+        let Action::Place(node) = *action;
+        assert_eq!(node, expected_node);
+        assert!(state.stone_at(node).is_none());
+        assert_eq!(action.code(), i32::from(node));
         assert_eq!(
             action.native_index(state.board()).unwrap(),
-            usize::from(*node)
+            usize::from(node)
         );
     }
-    assert_eq!(Action::Pass.code(), -1);
-    assert_eq!(
-        Action::Pass.native_index(state.board()).unwrap(),
-        usize::from(state.board().node_count())
+    assert!(
+        actions
+            .windows(2)
+            .all(|window| window[0].code() < window[1].code())
     );
 }
 
@@ -770,12 +716,11 @@ fn assert_score(id: &str, actual: &ScoreResult, expected: &ScoreExpected, node_c
     );
 }
 
-const fn wdl_class(value: i8) -> u8 {
+const fn outcome_class(value: i8) -> u8 {
     match value {
         -1 => 0,
-        0 => 1,
-        1 => 2,
-        _ => panic!("terminal value must be -1, 0, or 1"),
+        1 => 1,
+        _ => panic!("terminal value must be -1 or 1"),
     }
 }
 

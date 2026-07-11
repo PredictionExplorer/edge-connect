@@ -23,7 +23,8 @@ test('the primary flow remains within a narrow mobile viewport', async ({ page }
   expect(setupOverflow).toBeLessThanOrEqual(1);
 
   await page.getByRole('button', { name: 'Begin the game' }).click();
-  await expect(page.getByRole('button', { name: 'Pass' })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Undo' })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Pass' })).toHaveCount(0);
   const gameOverflow = await page.evaluate(
     () => document.documentElement.scrollWidth - document.documentElement.clientWidth,
   );

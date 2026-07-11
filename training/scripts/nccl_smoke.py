@@ -15,7 +15,7 @@ from torch.nn.parallel import DistributedDataParallel
 from startrain.config import load_config
 from startrain.features import DoubleStarPosition, encode_batch
 from startrain.model import GraphResTNet
-from startrain.topology import get_topology
+from startrain.topology import SUPPORTED_RINGS, get_topology
 from startrain.training import maybe_compile_model
 
 
@@ -26,7 +26,7 @@ def main() -> int:
     parser.add_argument(
         "--all-rings",
         action="store_true",
-        help="compile ten rank-shifted ring shapes before verifying agreement",
+        help="compile all four rank-shifted ring shapes before verifying agreement",
     )
     arguments = parser.parse_args()
     if arguments.batch_size <= 0:
@@ -62,10 +62,14 @@ def main() -> int:
         )
         optimizer = torch.optim.AdamW(model.parameters(), lr=1e-5)
 
-        steps = 10 if arguments.all_rings else 1
+        steps = len(SUPPORTED_RINGS) if arguments.all_rings else 1
         loss = torch.zeros((), device=device)
         for step in range(steps):
-            rings = 3 + ((step + rank) % 10) if arguments.all_rings else 3
+            rings = (
+                SUPPORTED_RINGS[(step + rank) % len(SUPPORTED_RINGS)]
+                if arguments.all_rings
+                else SUPPORTED_RINGS[0]
+            )
             topology = get_topology(rings)
             position = DoubleStarPosition(
                 rings=rings,
@@ -73,7 +77,6 @@ def main() -> int:
                 to_move=0,
                 moves_left=1,
                 opening=True,
-                pass_streak=0,
                 terminal=False,
             )
             batch = encode_batch([position] * arguments.batch_size).to(device)
@@ -81,7 +84,7 @@ def main() -> int:
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 output = wrapped(*batch.model_args())
                 loss = (
-                    output.wdl_logits.float().square().mean()
+                    output.outcome_logits.float().square().mean()
                     + output.score_margin_logits.float().square().mean()
                     + output.ownership_logits.float().square().mean()
                     + output.alive_logits.float().square().mean()
@@ -111,7 +114,9 @@ def main() -> int:
                         "all_rings": arguments.all_rings,
                         "rank_ring_sequences": {
                             str(other_rank): [
-                                3 + ((step + other_rank) % 10)
+                                SUPPORTED_RINGS[
+                                    (step + other_rank) % len(SUPPORTED_RINGS)
+                                ]
                                 for step in range(steps)
                             ]
                             for other_rank in range(world_size)

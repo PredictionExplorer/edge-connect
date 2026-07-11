@@ -7,11 +7,13 @@ import torch
 from startrain.actions import extract_sample_actions, relocate_sample_actions
 from startrain.contracts import (
     FEATURE_SCHEMA_HASH,
+    OUTCOME_LOSS,
+    OUTCOME_WIN,
     RULES_HASH,
     SOFT_POLICY_TEMPERATURE,
+    TARGET_OUTCOME,
     TARGET_POLICY,
     TARGET_SOFT_POLICY,
-    WDL_LOSS,
 )
 from startrain.features import DoubleStarPosition
 from startrain.replay import (
@@ -24,12 +26,12 @@ from startrain.replay import (
     read_replay_shard,
     write_replay_shard,
 )
-from startrain.scoring import PlayerScore, ScoreResult, score_position
+from startrain.scoring import PlayerScore, ScoreResult
 from startrain.symmetry import D5Transform
 from startrain.topology import get_topology
 
 
-def live_position(rings: int) -> DoubleStarPosition:
+def live_position(rings: int = 4) -> DoubleStarPosition:
     topology = get_topology(rings)
     stones = torch.full((topology.n,), -1, dtype=torch.int8)
     stones[0] = 0
@@ -37,59 +39,73 @@ def live_position(rings: int) -> DoubleStarPosition:
         rings=rings,
         stones=stones,
         to_move=1,
-        moves_left=1,
+        moves_left=2,
         opening=False,
-        pass_streak=0,
         terminal=False,
     )
 
 
-def normalized_policy(position: DoubleStarPosition) -> np.ndarray:
+def decisive_score(position: DoubleStarPosition, *, winner: int = 0) -> ScoreResult:
     topology = get_topology(position.rings)
-    legal = np.concatenate(
-        ((position.stones.numpy() == -1), np.asarray([not position.terminal]))
+    loser = 1 - winner
+    players = [PlayerScore(5, 2, 1, 0, 0, 5) for _ in range(2)]
+    players[winner] = PlayerScore(10, 3, 1, 1, 0, 11)
+    owner = torch.full((topology.n,), loser, dtype=torch.int8)
+    owner[: topology.peri_count] = winner
+    return ScoreResult(
+        players=(players[0], players[1]),
+        node_owner=owner,
+        alive_stone=torch.zeros(topology.n, dtype=torch.bool),
+        contested_peries=0,
+        leader=winner,
     )
+
+
+def normalized_policy(position: DoubleStarPosition) -> np.ndarray:
+    legal = position.stones.numpy() == -1
     policy = legal.astype(np.float32)
     policy /= policy.sum()
-    assert policy.shape == (topology.n + 1,)
     return policy
 
 
-def sample_for(rings: int) -> ReplaySample:
+def sample_for(rings: int = 4) -> ReplaySample:
     position = live_position(rings)
     return ReplaySample.from_position(
         position,
         policy=normalized_policy(position),
-        final_score=score_position(get_topology(rings), position.stones),
-        search_provenance="mcts:puct-v1:sims=64",
-        policy_provenance="root-visit-counts",
+        final_score=decisive_score(position),
+        search_provenance="gumbel-completed-q:test",
+        policy_provenance="completed-q",
     )
 
 
-def test_schema_v2_soft_policy_provenance_and_hashes() -> None:
-    sample = sample_for(3)
-    assert sample.schema_version == REPLAY_SCHEMA_VERSION == 3
+def test_schema_v4_is_node_only_and_binary() -> None:
+    sample = sample_for()
+    topology = get_topology(4)
+    assert sample.schema_version == REPLAY_SCHEMA_VERSION == 4
     assert sample.rules_hash == RULES_HASH
     assert sample.feature_schema_hash == FEATURE_SCHEMA_HASH
     assert sample.soft_policy_temperature == SOFT_POLICY_TEMPERATURE == 4
+    assert sample.policy.shape == sample.soft_policy.shape == (topology.n,)
     assert sample.target_mask & TARGET_POLICY
     assert sample.target_mask & TARGET_SOFT_POLICY
-    expected = np.power(sample.policy, 0.25)
-    expected /= expected.sum()
-    np.testing.assert_allclose(sample.soft_policy, expected, atol=2e-6)
-    assert sample.search_provenance.startswith("mcts:")
-    assert sample.policy_provenance == "root-visit-counts"
+    assert sample.target_mask & TARGET_OUTCOME
+    assert sample.outcome == OUTCOME_LOSS
+
+    batch = collate_replay_samples([sample])
+    assert batch.targets.policy.shape == (1, topology.n)
+    assert batch.targets.outcome.shape == (1,)
+    assert batch.targets.outcome.tolist() == [OUTCOME_LOSS]
 
 
-def test_absolute_quark_tiebreak_defines_wdl_but_not_margin() -> None:
-    position = live_position(3)
-    topology = get_topology(3)
-    players = (
-        PlayerScore(5, 3, 1, 1, 0, 6),
-        PlayerScore(6, 2, 1, 0, 0, 6),
-    )
+def test_zero_margin_quark_tiebreak_still_has_binary_outcome() -> None:
+    position = live_position()
+    topology = get_topology(4)
     final = ScoreResult(
-        players=players,
+        players=(
+            PlayerScore(5, 3, 1, 1, 0, 6),
+            PlayerScore(6, 2, 1, 0, 0, 6),
+        ),
         node_owner=torch.full((topology.n,), -1, dtype=torch.int8),
         alive_stone=torch.zeros(topology.n, dtype=torch.bool),
         contested_peries=topology.peri_count,
@@ -99,71 +115,80 @@ def test_absolute_quark_tiebreak_defines_wdl_but_not_margin() -> None:
         position,
         policy=normalized_policy(position),
         final_score=final,
-        search_provenance="mcts:test",
-        policy_provenance="visits",
+        search_provenance="test",
+        policy_provenance="test",
     )
-    wdl, margin = sample.outcome_targets()
-    assert position.to_move == 1
-    assert wdl == WDL_LOSS
+    outcome, margin = sample.outcome_targets()
+    assert outcome == OUTCOME_LOSS
     assert margin == 0
 
 
-def test_terminal_and_opening_states_round_trip_in_one_shard(tmp_path) -> None:
-    topology = get_topology(3)
+def test_opening_and_terminal_samples_round_trip(tmp_path) -> None:
+    topology = get_topology(4)
     opening = DoubleStarPosition(
-        rings=3,
+        rings=4,
         stones=torch.full((topology.n,), -1, dtype=torch.int8),
         to_move=0,
         moves_left=1,
         opening=True,
-        pass_streak=0,
         terminal=False,
     )
-    opening_sample = ReplaySample.from_position(
-        opening,
-        policy=normalized_policy(opening),
-        final_score=score_position(topology, opening.stones),
-        search_provenance="mcts:opening",
-        policy_provenance="visits",
-    )
-    terminal = DoubleStarPosition(
-        rings=3,
-        stones=torch.full((topology.n,), -1, dtype=torch.int8),
+    full = DoubleStarPosition(
+        rings=4,
+        stones=torch.arange(topology.n, dtype=torch.int8) % 2,
         to_move=1,
-        moves_left=2,
+        moves_left=0,
         opening=False,
-        pass_streak=2,
         terminal=True,
     )
-    terminal_sample = ReplaySample.from_position(
-        terminal,
-        policy=None,
-        final_score=score_position(topology, terminal.stones),
-        search_provenance="terminal:no-search",
-        policy_provenance="none",
-    )
-    path = write_replay_shard(
-        tmp_path / "schema-v2.npz", [opening_sample, terminal_sample]
-    )
+    samples = [
+        ReplaySample.from_position(
+            opening,
+            policy=normalized_policy(opening),
+            final_score=decisive_score(opening, winner=1),
+            search_provenance="opening",
+            policy_provenance="completed-q",
+        ),
+        ReplaySample.from_position(
+            full,
+            policy=None,
+            final_score=decisive_score(full, winner=1),
+            search_provenance="terminal",
+            policy_provenance="none",
+        ),
+    ]
+    path = write_replay_shard(tmp_path / "v4.npz", samples)
     loaded = read_replay_shard(path)
     assert loaded[0].opening and not loaded[0].terminal
-    assert loaded[1].terminal and loaded[1].pass_streak == 2
+    assert loaded[1].terminal and loaded[1].outcome == OUTCOME_WIN
     assert not loaded[1].target_mask & (TARGET_POLICY | TARGET_SOFT_POLICY)
-    np.testing.assert_array_equal(
-        loaded[1].final_ownership, terminal_sample.final_ownership
-    )
-    batch = collate_replay_samples(loaded)
-    assert batch.targets.policy_mask.tolist() == [True, False]
-    assert not bool(batch.inputs.legal_action_mask[1].any())
+    assert not bool(collate_replay_samples(loaded).inputs.legal_action_mask[1].any())
 
 
-def test_decode_materializes_each_npz_member_exactly_once(
-    tmp_path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    path = write_replay_shard(
-        tmp_path / "decode-once.npz",
-        [sample_for(4), sample_for(4), sample_for(4)],
+def test_old_or_incomplete_shards_are_rejected(tmp_path) -> None:
+    path = write_replay_shard(tmp_path / "current.npz", [sample_for()])
+    with np.load(path, allow_pickle=False) as archive:
+        arrays = {name: archive[name] for name in archive.files}
+
+    metadata = arrays["metadata"].item()
+    arrays["metadata"] = np.asarray(
+        str(metadata).replace('"schema_version": 4', '"schema_version": 3')
     )
+    old = tmp_path / "old.npz"
+    np.savez_compressed(old, **arrays)
+    with pytest.raises(ReplaySchemaError, match="schema_version"):
+        read_replay_shard(old)
+
+    arrays.pop("policy_weight")
+    missing = tmp_path / "missing.npz"
+    np.savez_compressed(missing, **arrays)
+    with pytest.raises(ReplaySchemaError, match="missing arrays"):
+        read_replay_shard(missing)
+
+
+def test_decode_materializes_each_v4_npz_member_once(tmp_path, monkeypatch) -> None:
+    expected = [sample_for(), sample_for(), sample_for()]
+    path = write_replay_shard(tmp_path / "decode-once.npz", expected)
     with np.load(path, allow_pickle=False) as archive:
         archive_type = type(archive)
     original_getitem = archive_type.__getitem__
@@ -179,87 +204,71 @@ def test_decode_materializes_each_npz_member_exactly_once(
     assert len(decoded) == 3
     assert set(calls) == {"metadata", *decoded.arrays}
     assert set(calls.values()) == {1}
-    np.testing.assert_array_equal(decoded.sample(1).stones, sample_for(4).stones)
+    np.testing.assert_array_equal(decoded.sample(1).stones, expected[1].stones)
     with pytest.raises(IndexError):
         decoded.sample(3)
 
 
-def test_policy_confidence_weight_round_trips_and_legacy_shards_default_to_one(
-    tmp_path,
-) -> None:
-    weighted = replace(sample_for(3), policy_weight=0.25)
-    path = write_replay_shard(tmp_path / "weighted.npz", [weighted])
-
-    loaded = read_replay_shard(path)
-
-    assert loaded[0].policy_weight == pytest.approx(0.25)
-    batch = collate_replay_samples(loaded)
-    assert batch.targets.policy_weight is not None
-    assert batch.targets.policy_weight.tolist() == pytest.approx([0.25])
-
-    with np.load(path, allow_pickle=False) as archive:
-        legacy_arrays = {
-            name: archive[name] for name in archive.files if name != "policy_weight"
-        }
-    legacy_path = tmp_path / "legacy-without-policy-weight.npz"
-    np.savez_compressed(legacy_path, **legacy_arrays)
-    assert read_replay_shard(legacy_path)[0].policy_weight == 1.0
-
-
-def test_action_relocation_has_one_pass_and_sentinel_gap() -> None:
-    sample_nodes = 30
-    batch_nodes = 75
-    values = torch.arange(sample_nodes + 1)
-    relocated = relocate_sample_actions(
-        values,
-        sample_nodes=sample_nodes,
-        batch_max_nodes=batch_nodes,
-        fill_value=-777,
-    )
-    assert torch.equal(relocated[:sample_nodes], values[:sample_nodes])
-    assert torch.equal(
-        relocated[sample_nodes:batch_nodes],
-        torch.full((batch_nodes - sample_nodes,), -777),
-    )
-    assert relocated[batch_nodes] == values[sample_nodes]
-    assert torch.equal(
-        extract_sample_actions(
-            relocated, sample_nodes=sample_nodes, batch_max_nodes=batch_nodes
-        ),
-        values,
-    )
-
-    small, large = sample_for(3), sample_for(5)
-    small.policy[-1] = 0.25
-    small.policy[:-1] *= 0.75 / small.policy[:-1].sum()
-    legal = np.concatenate(((small.stones == -1), np.asarray([True])))
-    small.soft_policy = np.power(np.where(legal, small.policy, 0), 0.25)
-    small.soft_policy /= small.soft_policy.sum()
-    small.__post_init__()
-    batch = collate_replay_samples([small, large])
-    assert batch.targets.policy[0, 30] == 0
-    assert batch.targets.policy[0, batch.inputs.max_nodes] == pytest.approx(0.25)
-    assert not bool(batch.inputs.legal_action_mask[0, 30])
-    assert bool(batch.inputs.legal_action_mask[0, batch.inputs.max_nodes])
-
-
-def test_validation_occurs_before_integer_cast_and_checks_policy_support() -> None:
-    sample = sample_for(3)
-    with pytest.raises(ReplaySchemaError, match="rules hash"):
-        replace(sample, rules_hash=1)
+def test_replay_validation_checks_types_shapes_and_integer_ranges_before_cast() -> None:
+    sample = sample_for()
+    with pytest.raises(ReplaySchemaError, match="integer before conversion"):
+        replace(sample, schema_version=True)
+    with pytest.raises(ReplaySchemaError, match="opening must be bool"):
+        replace(sample, opening=1)
+    with pytest.raises(ReplaySchemaError, match="stones must contain integers"):
+        replace(sample, stones=sample.stones.astype(np.float32))
+    with pytest.raises(ReplaySchemaError, match="stones must have shape"):
+        replace(sample, stones=sample.stones[:-1])
     with pytest.raises(ReplaySchemaError, match="cannot be represented"):
         replace(
             sample,
             stones=np.full(sample.stones.shape, 255, dtype=np.uint16),
         )
-    bad_policy = sample.policy.copy() * 0.9
-    bad_policy[0] = 0.1
+    with pytest.raises(ReplaySchemaError, match="policy must be numeric"):
+        replace(sample, policy=np.full(sample.policy.shape, "invalid"))
+
+
+def test_node_only_action_padding_has_no_reserved_slot() -> None:
+    values = torch.arange(70)
+    padded = relocate_sample_actions(
+        values,
+        sample_nodes=70,
+        batch_max_nodes=105,
+        fill_value=-777,
+    )
+    assert padded.shape == (105,)
+    assert torch.equal(padded[:70], values)
+    assert torch.equal(padded[70:], torch.full((35,), -777))
+    assert torch.equal(
+        extract_sample_actions(padded, sample_nodes=70, batch_max_nodes=105),
+        values,
+    )
+
+
+def test_replay_rejects_ties_invalid_rings_and_illegal_policy_support() -> None:
+    position = live_position()
+    tied = replace(decisive_score(position), leader=-1)
+    with pytest.raises(ReplaySchemaError, match="tied"):
+        ReplaySample.from_position(
+            position,
+            policy=normalized_policy(position),
+            final_score=tied,
+            search_provenance="test",
+            policy_provenance="test",
+        )
+    with pytest.raises(ValueError, match="one of"):
+        live_position(5)
+
+    sample = sample_for()
+    illegal = sample.policy.copy()
+    illegal[0] = 0.1
+    illegal[1:] *= 0.9 / illegal[1:].sum()
     with pytest.raises(ReplaySchemaError, match="illegal action"):
-        replace(sample, policy=bad_policy)
+        replace(sample, policy=illegal)
 
 
 def test_replay_augmentation_round_trips_all_d5_transforms() -> None:
-    sample = sample_for(4)
+    sample = sample_for(6)
     for index in range(10):
         transform = D5Transform.from_index(index)
         inverse = (
@@ -271,4 +280,3 @@ def test_replay_augmentation_round_trips_all_d5_transforms() -> None:
         np.testing.assert_array_equal(restored.stones, sample.stones)
         np.testing.assert_allclose(restored.policy, sample.policy)
         np.testing.assert_allclose(restored.soft_policy, sample.soft_policy)
-        np.testing.assert_array_equal(restored.final_ownership, sample.final_ownership)

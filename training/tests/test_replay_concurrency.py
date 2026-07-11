@@ -10,7 +10,7 @@ from startrain.features import DoubleStarPosition
 from startrain.replay import ReplaySample
 from startrain.replay_store import ReplayStore
 from startrain.runtime import RunIdentity
-from startrain.scoring import score_position
+from startrain.scoring import PlayerScore, ScoreResult
 from startrain.topology import get_topology
 
 
@@ -48,23 +48,31 @@ def _sample(
     generation: int,
     game_id: str,
 ) -> ReplaySample:
-    topology = get_topology(3)
+    topology = get_topology(4)
     stones = torch.full((topology.n,), -1, dtype=torch.int8)
     position = DoubleStarPosition(
-        rings=3,
+        rings=4,
         stones=stones,
         to_move=0,
         moves_left=1,
         opening=True,
-        pass_streak=0,
         terminal=False,
     )
-    policy = np.ones(topology.n + 1, dtype=np.float32)
+    policy = np.ones(topology.n, dtype=np.float32)
     policy /= policy.sum()
     return ReplaySample.from_position(
         position,
         policy=policy,
-        final_score=score_position(topology, stones),
+        final_score=ScoreResult(
+            players=(
+                PlayerScore(10, 3, 1, 1, 0, 11),
+                PlayerScore(5, 2, 1, 0, 0, 5),
+            ),
+            node_owner=torch.zeros(topology.n, dtype=torch.int8),
+            alive_stone=torch.zeros(topology.n, dtype=torch.bool),
+            contested_peries=0,
+            leader=0,
+        ),
         search_provenance="concurrency-test",
         policy_provenance="completed-q",
         run_id=identity.run_id,

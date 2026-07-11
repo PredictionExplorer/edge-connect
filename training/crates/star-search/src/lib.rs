@@ -1,6 +1,6 @@
 //! Evaluator-agnostic MCTS foundations for Double *Star.
 //!
-//! Search edges are atomic placements or pass actions. Values are stored in
+//! Search edges are atomic placements. Values are stored in
 //! each node's current-player perspective, so a backup changes sign exactly
 //! when `to_move` changes—not after every atomic stone. Exact semantic keys
 //! turn the tree into a DAG and reuse `{a,b}` / `{b,a}` completed-turn states.

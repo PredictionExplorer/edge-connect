@@ -1,4 +1,5 @@
 import { expect, test, type Page } from '@playwright/test';
+import { fillFourRingGame } from './helpers';
 
 async function startFreshGame(page: Page) {
   await page.goto('/');
@@ -6,6 +7,7 @@ async function startFreshGame(page: Page) {
   await page.reload();
   await page.getByRole('textbox', { name: 'Player 1 name' }).fill('Ada');
   await page.getByRole('textbox', { name: 'Player 2 name' }).fill('Grace');
+  await page.getByRole('button', { name: 'Mini, 4 rings' }).click();
   await page.getByRole('button', { name: 'Begin the game' }).click();
   await expect(page.getByText('Ada to play')).toBeVisible();
 }
@@ -28,9 +30,8 @@ test('opens and closes the rules dialog through named controls', async ({ page }
 });
 
 test('reviews, reopens, and rematches from the game-over dialog', async ({ page }) => {
-  await page.getByRole('button', { name: 'Pass' }).click();
-  await expect(page.getByText('Grace to play')).toBeVisible();
-  await page.getByRole('button', { name: 'Pass' }).click();
+  await expect(page.getByRole('button', { name: 'Pass' })).toHaveCount(0);
+  await fillFourRingGame(page);
 
   const dialog = page.getByRole('dialog', { name: 'Game over' });
   await expect(dialog).toBeVisible();
@@ -47,5 +48,5 @@ test('reviews, reopens, and rematches from the game-over dialog', async ({ page 
 
   await expect(dialog).toBeHidden();
   await expect(page.getByText('Ada to play')).toBeVisible();
-  await expect(page.getByRole('button', { name: 'Pass' })).toBeEnabled();
+  await expect(page.getByRole('button', { name: 'Pass' })).toHaveCount(0);
 });

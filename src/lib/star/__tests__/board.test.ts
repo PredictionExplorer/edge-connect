@@ -1,5 +1,11 @@
 import { describe, expect, it } from 'vitest';
-import { getBoard, parseLabel, perimeterCycle, MIN_RINGS, MAX_RINGS } from '../board';
+import {
+  getBoard,
+  isSupportedRings,
+  parseLabel,
+  perimeterCycle,
+  SUPPORTED_RINGS,
+} from '../board';
 
 function edgeCount(rings: number): number {
   // cycles: sum 5x = 5r(r+1)/2; inter-ring: sum_{x=2..r} 5(2x-1) = 5(r^2-1);
@@ -18,7 +24,7 @@ describe('board construction', () => {
   });
 
   it('has correct counts, degrees and symmetry for all sizes', () => {
-    for (let r = MIN_RINGS; r <= MAX_RINGS; r++) {
+    for (const r of SUPPORTED_RINGS) {
       const b = getBoard(r);
       expect(b.n).toBe((5 * r * (r + 1)) / 2);
       let peris = 0;
@@ -106,9 +112,15 @@ describe('board construction', () => {
     expect(b.minEdge).toBeGreaterThan(0);
   });
 
-  it('rejects out-of-range sizes', () => {
-    expect(() => getBoard(2)).toThrow();
-    expect(() => getBoard(13)).toThrow();
-    expect(() => getBoard(4.5)).toThrow();
+  it('accepts exactly the four supported ring counts', () => {
+    expect(SUPPORTED_RINGS).toEqual([4, 6, 8, 10]);
+    for (const rings of SUPPORTED_RINGS) {
+      expect(isSupportedRings(rings)).toBe(true);
+      expect(getBoard(rings).rings).toBe(rings);
+    }
+    for (const rings of [2, 3, 5, 7, 9, 11, 12, 4.5, Number.NaN]) {
+      expect(isSupportedRings(rings)).toBe(false);
+      expect(() => getBoard(rings)).toThrow(/one of 4, 6, 8, 10/);
+    }
   });
 });

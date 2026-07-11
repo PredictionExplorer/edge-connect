@@ -17,7 +17,7 @@ from .native import BITBOARD_WORDS
 from .topology import get_topology
 
 
-ARENA_RESULT_SCHEMA_VERSION = 2
+ARENA_RESULT_SCHEMA_VERSION = 3
 
 
 class ArenaEvaluatorProtocol(Protocol):
@@ -71,11 +71,9 @@ class ArenaSearchBudget:
         }
 
 
-# A complete role-reversed pair has 0, 0.5, 1, 1.5, or 2 candidate points.
-# The sequential test works on the corresponding [0, 1] score rates. Each
-# betting fraction is mixed with equal initial capital, so no data-dependent
-# tuning or multiplicity correction is needed.
-_PAIR_SCORE_RATES = (0.0, 0.25, 0.5, 0.75, 1.0)
+# A complete role-reversed pair has 0, 1, or 2 candidate wins. The sequential
+# test works on corresponding score rates 0, 0.5, and 1.
+_PAIR_SCORE_RATES = (0.0, 0.5, 1.0)
 _PAIR_BETTING_FRACTIONS = (
     1.0 / 32.0,
     1.0 / 16.0,
@@ -92,34 +90,38 @@ _PAIR_BETTING_FRACTIONS = (
 
 
 @dataclass(slots=True)
-class WDL:
+class BinaryResults:
     wins: int = 0
-    draws: int = 0
     losses: int = 0
+
+    def __post_init__(self) -> None:
+        if any(
+            type(value) is not int or value < 0 for value in (self.wins, self.losses)
+        ):
+            raise ValueError("binary result counts must be non-negative integers")
 
     @property
     def games(self) -> int:
-        return self.wins + self.draws + self.losses
+        return self.wins + self.losses
 
     @property
     def score(self) -> float:
-        return self.wins + 0.5 * self.draws
+        return float(self.wins)
 
     @property
     def score_rate(self) -> float:
         return self.score / self.games if self.games else 0.5
 
     def record(self, outcome: int) -> None:
-        if outcome > 0:
+        if outcome == 1:
             self.wins += 1
-        elif outcome < 0:
+        elif outcome == -1:
             self.losses += 1
         else:
-            self.draws += 1
+            raise ValueError("arena outcomes must be binary: -1 or 1")
 
-    def add(self, other: "WDL") -> None:
+    def add(self, other: "BinaryResults") -> None:
         self.wins += other.wins
-        self.draws += other.draws
         self.losses += other.losses
 
 
@@ -135,6 +137,36 @@ class ArenaGame:
     outcome: int
     searched_moves: int
 
+    def __post_init__(self) -> None:
+        topology = get_topology(self.ring)
+        if (
+            type(self.candidate_player) is not int
+            or self.candidate_player not in (0, 1)
+            or type(self.winner) is not int
+            or self.winner not in (0, 1)
+        ):
+            raise ValueError("arena players and winner must be binary")
+        expected = 1 if self.winner == self.candidate_player else -1
+        if type(self.outcome) is not int or self.outcome != expected:
+            raise ValueError("arena outcome disagrees with its decisive winner")
+        if (
+            type(self.pair) is not int
+            or self.pair < 0
+            or type(self.opening_seed) is not int
+            or self.opening_seed < 0
+            or type(self.searched_moves) is not int
+            or self.searched_moves < 0
+        ):
+            raise ValueError("arena game counters must be non-negative integers")
+        if self.opening_action is not None and not (
+            type(self.opening_action) is int and 0 <= self.opening_action < topology.n
+        ):
+            raise ValueError("arena opening action is invalid")
+        if type(self.forced_opening) is not bool or self.forced_opening != (
+            self.opening_action is not None
+        ):
+            raise ValueError("arena opening metadata is inconsistent")
+
 
 @dataclass(frozen=True, slots=True)
 class ArenaPair:
@@ -145,18 +177,41 @@ class ArenaPair:
     forced_opening: bool
     outcomes: tuple[int, int]
 
+    def __post_init__(self) -> None:
+        topology = get_topology(self.ring)
+        if any(
+            type(outcome) is not int or outcome not in (-1, 1)
+            for outcome in self.outcomes
+        ):
+            raise ValueError("arena pairs cannot contain tied outcomes")
+        if (
+            type(self.pair) is not int
+            or self.pair < 0
+            or type(self.opening_seed) is not int
+            or self.opening_seed < 0
+        ):
+            raise ValueError("arena pair counters must be non-negative integers")
+        if self.opening_action is not None and not (
+            type(self.opening_action) is int and 0 <= self.opening_action < topology.n
+        ):
+            raise ValueError("arena pair opening action is invalid")
+        if type(self.forced_opening) is not bool or self.forced_opening != (
+            self.opening_action is not None
+        ):
+            raise ValueError("arena pair opening metadata is inconsistent")
+
     @property
     def points(self) -> float:
-        return sum(
-            1.0 if value > 0 else 0.5 if value == 0 else 0.0 for value in self.outcomes
-        )
+        return float(sum(value == 1 for value in self.outcomes))
 
     @property
     def score_rate(self) -> float:
         return self.points / 2.0
 
 
-def wilson_interval(result: WDL, *, confidence: float = 0.95) -> tuple[float, float]:
+def wilson_interval(
+    result: BinaryResults, *, confidence: float = 0.95
+) -> tuple[float, float]:
     if result.games <= 0:
         raise ValueError("Wilson interval requires at least one game")
     if not 0 < confidence < 1:
@@ -179,7 +234,9 @@ def elo_from_probability(probability: float) -> float:
     return 400.0 * math.log10(clipped / (1.0 - clipped))
 
 
-def summarize_wdl(result: WDL, *, confidence: float) -> dict[str, object]:
+def summarize_binary_results(
+    result: BinaryResults, *, confidence: float
+) -> dict[str, object]:
     lower, upper = wilson_interval(result, confidence=confidence)
     return {
         **asdict(result),
@@ -203,10 +260,10 @@ def summarize_pairs(
 ) -> dict[str, object]:
     if not pairs:
         raise ValueError("paired summary requires at least one pair")
-    wdl = WDL()
+    binary = BinaryResults()
     for pair in pairs:
         for outcome in pair.outcomes:
-            wdl.record(outcome)
+            binary.record(outcome)
     lower, upper = _paired_bootstrap_interval(
         pairs,
         confidence=confidence,
@@ -218,13 +275,13 @@ def summarize_pairs(
         pairs,
         error_probability=error_probability,
     )
-    counts = _pentanomial_counts(pairs)
+    counts = _pair_score_counts(pairs)
     return {
-        **asdict(wdl),
-        "games": wdl.games,
+        **asdict(binary),
+        "games": binary.games,
         "pairs": len(pairs),
-        "score_rate": wdl.score_rate,
-        "elo_difference": elo_from_probability(wdl.score_rate),
+        "score_rate": binary.score_rate,
+        "elo_difference": elo_from_probability(binary.score_rate),
         "paired_bootstrap_score_interval": [lower, upper],
         "paired_bootstrap_elo_interval": [
             elo_from_probability(lower),
@@ -236,12 +293,10 @@ def summarize_pairs(
             elo_from_probability(anytime_upper),
         ],
         "anytime_error_probability_per_side": error_probability,
-        "pentanomial": {
+        "pair_win_counts": {
             "0": counts[0],
-            "0.5": counts[1],
-            "1": counts[2],
-            "1.5": counts[3],
-            "2": counts[4],
+            "1": counts[1],
+            "2": counts[2],
         },
     }
 
@@ -309,7 +364,7 @@ def promotion_assessment(
     _, upper = pair_confidence_sequence(aggregate, error_probability=config.beta)
     probability_null = _expected_score(config.null_elo)
     probability_alternative = _expected_score(config.alternative_elo)
-    counts = _pentanomial_counts(aggregate)
+    counts = _pair_score_counts(aggregate)
     (
         sequential_state,
         promotion_log_e_value,
@@ -360,7 +415,7 @@ def promotion_assessment(
         )
         floor_score_rate = _expected_score(floor)
         passed = _pair_mean_exceeds(
-            _pentanomial_counts(result),
+            _pair_score_counts(result),
             null_score_rate=floor_score_rate,
             error_probability=floor_error_probability,
         )
@@ -414,11 +469,6 @@ def promotion_assessment(
     }
 
 
-# Retained only as an import-compatibility alias. The implemented method is an
-# e-process, not a sequential probability ratio test.
-sprt_assessment = promotion_assessment
-
-
 def pair_confidence_sequence(
     pairs: Sequence[ArenaPair], *, error_probability: float
 ) -> tuple[float, float]:
@@ -433,7 +483,7 @@ def pair_confidence_sequence(
     """
     if not pairs or not 0 < error_probability < 1:
         raise ValueError("pair confidence sequence inputs are invalid")
-    counts = _pentanomial_counts(pairs)
+    counts = _pair_score_counts(pairs)
     log_threshold = math.log(1.0 / error_probability)
     epsilon = 1e-12
 
@@ -583,10 +633,10 @@ def _reported_e_value(log_e_value: float) -> float:
     return math.exp(min(log_e_value, math.log(1e300)))
 
 
-def _pentanomial_counts(pairs: Sequence[ArenaPair]) -> tuple[int, ...]:
-    counts = [0, 0, 0, 0, 0]
+def _pair_score_counts(pairs: Sequence[ArenaPair]) -> tuple[int, ...]:
+    counts = [0, 0, 0]
     for pair in pairs:
-        counts[int(round(pair.points * 2))] += 1
+        counts[int(pair.points)] += 1
     return tuple(counts)
 
 
@@ -808,7 +858,7 @@ class ArenaRunner:
             )
         searched_moves = [0] * len(specifications)
         wave = 0
-        maximum_moves = 2 * get_topology(ring).n + 2
+        maximum_moves = get_topology(ring).n
         with ThreadPoolExecutor(
             max_workers=2,
             thread_name_prefix="arena-search",
@@ -879,7 +929,9 @@ class ArenaRunner:
         for row, specification in enumerate(specifications):
             pair, candidate_player, opening_seed, opening_action = specification
             winner = winners[row]
-            outcome = 0 if winner == -1 else 1 if winner == candidate_player else -1
+            if winner not in (0, 1):
+                raise RuntimeError("arena terminal result cannot be tied")
+            outcome = 1 if winner == candidate_player else -1
             output.append(
                 ArenaGame(
                     ring=ring,
@@ -929,8 +981,8 @@ class ArenaRunner:
         actions = [int(value) for value in results.selected_actions]
         if len(actions) != len(rows):
             raise RuntimeError("batched arena search returned the wrong row count")
-        if any(action == -2 for action in actions):
-            raise RuntimeError("active batched arena row became terminal")
+        if any(action < 0 for action in actions):
+            raise RuntimeError("active batched arena row returned invalid placement")
         return list(rows), actions
 
     def _semantic_subset(self, data: Any, rows: Sequence[int]) -> Any:
@@ -949,7 +1001,6 @@ class ArenaRunner:
             [int(data.to_move[row]) for row in rows],
             [int(data.moves_left[row]) for row in rows],
             [bool(data.opening[row]) for row in rows],
-            [int(data.pass_streak[row]) for row in rows],
         )
 
     def _play_game(
@@ -967,9 +1018,7 @@ class ArenaRunner:
         if opening_action is not None:
             states.apply_many([0], [opening_action])
         moves = 0
-        # A placement can be preceded by a non-terminal pass; two consecutive
-        # passes end the game, so this remains a strict finite upper bound.
-        maximum_moves = 2 * get_topology(ring).n + 2
+        maximum_moves = get_topology(ring).n
         while True:
             state_data = states.data()
             if bool(state_data.terminal[0]):
@@ -1003,14 +1052,16 @@ class ArenaRunner:
                 response = evaluator.evaluate(requests)
                 search.submit(*response.submit_args())
             results = search.results()
-            if bool(results.terminal[0]) or int(results.selected_actions[0]) == -2:
+            if bool(results.terminal[0]) or int(results.selected_actions[0]) < 0:
                 raise RuntimeError("arena search marked an active state terminal")
             states.apply_many([0], [int(results.selected_actions[0])])
             moves += 1
             if moves > maximum_moves:
                 raise RuntimeError("arena game exceeded the no-pie move bound")
         winner = int(states.score_data().winner[0])
-        outcome = 0 if winner == -1 else (1 if winner == candidate_player else -1)
+        if winner not in (0, 1):
+            raise RuntimeError("arena terminal result cannot be tied")
+        outcome = 1 if winner == candidate_player else -1
         return ArenaGame(
             ring=ring,
             pair=pair,

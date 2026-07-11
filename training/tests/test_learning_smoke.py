@@ -8,33 +8,41 @@ from startrain.losses import LossWeights, compute_losses
 from startrain.model import GraphResTNet, ModelConfig
 from startrain.optim import OptimizerConfig, build_optimizer
 from startrain.replay import ReplaySample, collate_replay_samples
-from startrain.scoring import score_position
+from startrain.scoring import PlayerScore, ScoreResult
 from startrain.topology import get_topology
 from startrain.training import train_step
 
 
 def test_tiny_model_overfits_a_fixed_search_target() -> None:
     torch.manual_seed(23)
-    topology = get_topology(3)
+    topology = get_topology(4)
     stones = torch.full((topology.n,), -1, dtype=torch.int8)
     stones[0] = 0
     position = DoubleStarPosition(
-        rings=3,
+        rings=4,
         stones=stones,
         to_move=1,
         moves_left=2,
         opening=False,
-        pass_streak=0,
         terminal=False,
     )
-    policy = np.zeros(topology.n + 1, dtype=np.float32)
+    policy = np.zeros(topology.n, dtype=np.float32)
     # Ring-2 node 5 lies on the reflection axis fixed by the existing stone,
     # so the exact D5-equivariant model can distinguish this target uniquely.
     policy[5] = 1.0
     sample = ReplaySample.from_position(
         position,
         policy=policy,
-        final_score=score_position(topology, stones),
+        final_score=ScoreResult(
+            players=(
+                PlayerScore(10, 3, 1, 1, 0, 11),
+                PlayerScore(5, 2, 1, 0, 0, 5),
+            ),
+            node_owner=torch.zeros(topology.n, dtype=torch.int8),
+            alive_stone=torch.zeros(topology.n, dtype=torch.bool),
+            contested_peries=0,
+            leader=0,
+        ),
         search_provenance="learning-smoke",
         policy_provenance="completed-q",
     )

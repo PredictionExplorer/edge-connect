@@ -10,7 +10,8 @@ import { fileURLToPath } from 'node:url';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const crate = resolve(root, 'training/crates/star-wasm');
-const output = resolve(root, 'public/models/star/wasm');
+const wasmDirectory = 'wasm-2da3783519381453';
+const output = resolve(root, `public/models/star/${wasmDirectory}`);
 const outputFromCrate = relative(crate, output);
 
 if (!existsSync(resolve(crate, 'Cargo.toml'))) {
@@ -61,11 +62,11 @@ writeFileSync(
   resolve(output, 'contract.json'),
   `${JSON.stringify(
     {
-      schema: 'edgeconnect.star.browser-wasm-build.v1',
-      rulesSchema: 'edgeconnect.star.rules.v1',
-      rulesHash: 'fnv1a64:cdb34fb02be82843',
-      moduleUrl: '/models/star/wasm/star_wasm.js',
-      binaryUrl: '/models/star/wasm/star_wasm_bg.wasm',
+      schema: 'edgeconnect.star.browser-wasm-build.v2',
+      rulesSchema: 'edgeconnect.star.rules.v2',
+      rulesHash: 'fnv1a64:2da3783519381453',
+      moduleUrl: `/models/star/${wasmDirectory}/star_wasm.js`,
+      binaryUrl: `/models/star/${wasmDirectory}/star_wasm_bg.wasm`,
       modelManifestUrl: '/models/star/manifest.json',
     },
     null,
@@ -73,5 +74,5 @@ writeFileSync(
   )}\n`,
 );
 
-console.log('Built Star WASM assets in public/models/star/wasm');
+console.log(`Built Star WASM assets in public/models/star/${wasmDirectory}`);
 console.log('Browser model manifest convention: public/models/star/manifest.json');

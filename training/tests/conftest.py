@@ -1,10 +1,24 @@
 from __future__ import annotations
 
 import importlib.util
+import importlib
 import os
 
 import pytest
 import torch
+
+_RULES_HASH = 0x2DA3783519381453
+
+
+def _native_compatible() -> bool:
+    if importlib.util.find_spec("star_native") is None:
+        return False
+    try:
+        native = importlib.import_module("star_native")
+        fingerprint = getattr(native, "native_rules_hash", None)
+        return callable(fingerprint) and int(fingerprint()) == _RULES_HASH
+    except (ImportError, TypeError, ValueError):
+        return False
 
 
 def pytest_addoption(parser: pytest.Parser) -> None:
@@ -22,19 +36,17 @@ def pytest_addoption(parser: pytest.Parser) -> None:
 
 
 def pytest_configure(config: pytest.Config) -> None:
-    if (
-        config.getoption("--require-native")
-        and importlib.util.find_spec("star_native") is None
-    ):
+    if config.getoption("--require-native") and not _native_compatible():
         raise pytest.UsageError(
-            "--require-native was set but the star_native extension is not importable"
+            "--require-native was set but the rules-v2 star_native extension "
+            "is not importable"
         )
 
 
 def pytest_collection_modifyitems(
     config: pytest.Config, items: list[pytest.Item]
 ) -> None:
-    native_available = importlib.util.find_spec("star_native") is not None
+    native_available = _native_compatible()
     cuda_devices = torch.cuda.device_count() if torch.cuda.is_available() else 0
     run_soak = bool(config.getoption("--run-soak"))
 

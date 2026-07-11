@@ -1,5 +1,6 @@
-export const STAR_AI_PROXY_MOVE_PATH = '/v1/move' as const;
-export const STAR_AI_PROXY_HEALTH_PATH = '/v1/health' as const;
+export const STAR_AI_PROXY_MOVE_PATH = '/v2/move' as const;
+export const STAR_AI_PROXY_ANALYZE_PATH = '/v2/analyze' as const;
+export const STAR_AI_PROXY_HEALTH_PATH = '/v2/health' as const;
 export const STAR_AI_PROXY_REQUEST_BYTES = 64 * 1024;
 export const STAR_AI_PROXY_RESPONSE_BYTES = 1024 * 1024;
 export const STAR_AI_PROXY_MOVE_TIMEOUT_MS = 60_000;
@@ -59,11 +60,11 @@ function isJsonContentType(value: string | null): boolean {
 function endpointBase(pathname: string): string {
   const normalized = pathname.replace(/\/+$/, '');
   for (const suffix of [
-    '/v1/move',
-    '/v1/analyze',
-    '/v1/health',
+    '/v2/move',
+    '/v2/analyze',
+    '/v2/health',
     '/healthz',
-    '/v1',
+    '/v2',
   ]) {
     if (normalized.endsWith(suffix)) return normalized.slice(0, -suffix.length);
   }
@@ -85,6 +86,12 @@ export function resolveStarAiUpstreamUrl(serverUrl: string, endpoint: string): s
     target.hash
   ) {
     throw new Error('STAR_AI_SERVER_URL must be an HTTP(S) URL without credentials');
+  }
+  if (
+    /(?:^|\/)v\d+(?:\/|$)/.test(target.pathname) &&
+    !/(?:^|\/)v2(?:\/|$)/.test(target.pathname)
+  ) {
+    throw new Error('STAR_AI_SERVER_URL must use the v2 API');
   }
   target.pathname = `${endpointBase(target.pathname)}${endpoint}`;
   return target.toString();
@@ -132,7 +139,10 @@ async function readLimitedBody(
 
 export async function proxyStarAiRequest(
   request: Request,
-  endpoint: typeof STAR_AI_PROXY_MOVE_PATH | typeof STAR_AI_PROXY_HEALTH_PATH,
+  endpoint:
+    | typeof STAR_AI_PROXY_MOVE_PATH
+    | typeof STAR_AI_PROXY_ANALYZE_PATH
+    | typeof STAR_AI_PROXY_HEALTH_PATH,
   config: StarAiProxyConfig = {
     serverUrl: process.env.STAR_AI_SERVER_URL,
     bearerToken: process.env.STAR_AI_BEARER_TOKEN,
@@ -163,7 +173,7 @@ export async function proxyStarAiRequest(
   }
 
   let body: Uint8Array | undefined;
-  if (endpoint === STAR_AI_PROXY_MOVE_PATH) {
+  if (endpoint !== STAR_AI_PROXY_HEALTH_PATH) {
     if (!isJsonContentType(request.headers.get('Content-Type'))) {
       return proxyError(
         requestId,
@@ -192,9 +202,9 @@ export async function proxyStarAiRequest(
   }
 
   const timeoutMs =
-    endpoint === STAR_AI_PROXY_MOVE_PATH
-      ? (config.moveTimeoutMs ?? STAR_AI_PROXY_MOVE_TIMEOUT_MS)
-      : (config.healthTimeoutMs ?? STAR_AI_PROXY_HEALTH_TIMEOUT_MS);
+    endpoint === STAR_AI_PROXY_HEALTH_PATH
+      ? (config.healthTimeoutMs ?? STAR_AI_PROXY_HEALTH_TIMEOUT_MS)
+      : (config.moveTimeoutMs ?? STAR_AI_PROXY_MOVE_TIMEOUT_MS);
   const controller = new AbortController();
   let timedOut = false;
   const abortFromClient = () => controller.abort(request.signal.reason);
@@ -214,7 +224,7 @@ export async function proxyStarAiRequest(
     const upstreamBody = body ? Uint8Array.from(body).buffer : undefined;
 
     const upstream = await fetch(target, {
-      method: endpoint === STAR_AI_PROXY_MOVE_PATH ? 'POST' : 'GET',
+      method: endpoint === STAR_AI_PROXY_HEALTH_PATH ? 'GET' : 'POST',
       body: upstreamBody,
       headers,
       cache: 'no-store',

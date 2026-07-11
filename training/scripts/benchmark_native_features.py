@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare Rust-native schema-v2 batches with the Python oracle path."""
+"""Compare Rust-native schema-v3 batches with the Python oracle path."""
 
 from __future__ import annotations
 
@@ -17,6 +17,7 @@ from startrain.native import (
     load_star_native,
     positions_from_native,
 )
+from startrain.topology import SUPPORTED_RINGS
 
 
 def _time(operation, iterations: int) -> list[float]:
@@ -46,7 +47,7 @@ def main() -> int:
     parser.add_argument("--iterations", type=int, default=10)
     arguments = parser.parse_args()
     if (
-        not 3 <= arguments.rings <= 12
+        arguments.rings not in SUPPORTED_RINGS
         or arguments.batch_size <= 0
         or arguments.warmup < 0
         or arguments.iterations <= 0
@@ -74,7 +75,7 @@ def main() -> int:
     python_median = statistics.median(python)
     result = {
         "schema_version": 1,
-        "benchmark": "native-schema-v2-feature-batch",
+        "benchmark": "native-schema-v3-feature-batch",
         "rings": arguments.rings,
         "batch_size": arguments.batch_size,
         "iterations": arguments.iterations,

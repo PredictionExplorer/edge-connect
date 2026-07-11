@@ -79,7 +79,6 @@ def load_manifest_evaluator(
         config=InferenceConfig(
             precision=experiment.train.precision,
             score_utility_weight=experiment.selfplay.score_utility_weight,
-            initial_pass_logit_penalty=(experiment.selfplay.initial_pass_logit_penalty),
         ),
         model_version=manifest.model_version,
         model_step=manifest.model_step,
@@ -759,7 +758,7 @@ class PromotionSupervisor:
             return None
         valid = (
             isinstance(payload, dict)
-            and payload.get("schema_version") in (1, ARENA_RESULT_SCHEMA_VERSION)
+            and payload.get("schema_version") == ARENA_RESULT_SCHEMA_VERSION
             and payload.get("candidate") == candidate.model_identity
             and payload.get("baseline") == champion.model_identity
             and isinstance(payload.get("promotion"), dict)

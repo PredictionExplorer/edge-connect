@@ -11,14 +11,14 @@ from startrain.selfplay import SelfPlayActor, SelfPlayConfig
 
 def test_candidate_limit_scaling_is_explicit_and_capped() -> None:
     baseline = SelfPlayConfig(
-        rings=12,
+        rings=10,
         max_considered=16,
         max_considered_ring_exponent=0.0,
         max_considered_cap=64,
     )
     assert baseline.considered_actions() == 16
     scaled = SelfPlayConfig(
-        rings=12,
+        rings=10,
         simulation_reference_rings=6,
         max_considered=16,
         max_considered_ring_exponent=1.0,
@@ -58,14 +58,14 @@ def test_fast_policy_target_ablation_records_completed_q_when_enabled() -> None:
 
     sink = Sink()
     config = SelfPlayConfig(
-        rings=3,
+        rings=4,
         batch_size=1,
         games=1,
         fast_probability=1.0,
         full_probability=0.0,
         fast_simulations=2,
         full_simulations=2,
-        simulation_reference_rings=3,
+        simulation_reference_rings=4,
         max_considered=2,
         record_fast_policy_targets=True,
         fast_policy_weight=0.3,

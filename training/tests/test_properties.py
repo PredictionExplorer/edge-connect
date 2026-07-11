@@ -11,22 +11,14 @@ from startrain.model import StarModelOutput
 
 @settings(max_examples=100, deadline=None)
 @given(
-    sample_nodes=st.integers(min_value=0, max_value=390),
-    extra_nodes=st.integers(min_value=0, max_value=390),
-    pass_value=st.floats(
-        min_value=-1_000,
-        max_value=1_000,
-        allow_nan=False,
-        allow_infinity=False,
-        width=32,
-    ),
+    sample_nodes=st.integers(min_value=0, max_value=275),
+    extra_nodes=st.integers(min_value=0, max_value=275),
 )
 def test_action_relocation_is_an_exact_inverse(
-    sample_nodes: int, extra_nodes: int, pass_value: float
+    sample_nodes: int, extra_nodes: int
 ) -> None:
     batch_nodes = sample_nodes + extra_nodes
-    values = torch.arange(sample_nodes + 1, dtype=torch.float32)
-    values[-1] = pass_value
+    values = torch.arange(sample_nodes, dtype=torch.float32)
     relocated = relocate_sample_actions(
         values,
         sample_nodes=sample_nodes,
@@ -52,7 +44,7 @@ def test_action_relocation_is_an_exact_inverse(
 def test_masked_policy_loss_is_finite_and_never_trains_illegal_logits(
     batch_size: int, actions: int, target_action: int
 ) -> None:
-    nodes = actions - 1
+    nodes = actions
     selected = target_action % actions
     policy_logits = torch.randn(batch_size, actions, requires_grad=True)
     legal = torch.zeros(batch_size, actions, dtype=torch.bool)
@@ -61,8 +53,8 @@ def test_masked_policy_loss_is_finite_and_never_trains_illegal_logits(
     policy[:, selected] = 1.0
     output = StarModelOutput(
         policy_logits=policy_logits,
-        wdl_logits=torch.zeros(batch_size, 3, requires_grad=True),
-        score_margin_logits=torch.zeros(batch_size, 363, requires_grad=True),
+        outcome_logits=torch.zeros(batch_size, 2, requires_grad=True),
+        score_margin_logits=torch.zeros(batch_size, 303, requires_grad=True),
         ownership_logits=torch.zeros(batch_size, nodes, 3, requires_grad=True),
         alive_logits=torch.zeros(batch_size, nodes, requires_grad=True),
         soft_policy_logits=policy_logits.clone(),
@@ -70,13 +62,13 @@ def test_masked_policy_loss_is_finite_and_never_trains_illegal_logits(
     unavailable = torch.zeros(batch_size, dtype=torch.bool)
     targets = TrainingTargets(
         policy=policy,
-        wdl=torch.zeros(batch_size, dtype=torch.long),
+        outcome=torch.zeros(batch_size, dtype=torch.long),
         score_margin=torch.zeros(batch_size, dtype=torch.long),
         ownership=torch.full((batch_size, nodes), -100, dtype=torch.long),
         alive=torch.full((batch_size, nodes), -1.0),
         soft_policy=policy,
         policy_mask=torch.ones(batch_size, dtype=torch.bool),
-        wdl_mask=unavailable,
+        outcome_mask=unavailable,
         score_margin_mask=unavailable,
         ownership_mask=unavailable,
         alive_mask=unavailable,

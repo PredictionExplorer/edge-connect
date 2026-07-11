@@ -1,10 +1,9 @@
-schema_version: 2
+schema_version: 3
 profile: continuous
 game:
   mode: double
   pie_rule: false
-  min_rings: 3
-  max_rings: 12
+  rings: [4, 6, 8, 10]
 
 model:
   width: 384
@@ -15,13 +14,13 @@ model:
   ff_multiplier: 2.5
   dropout: 0.0
   rms_norm_eps: 0.000001
-  score_margin_min: -181
-  score_margin_max: 181
+  score_margin_min: -151
+  score_margin_max: 151
   soft_policy_temperature: 4.0
 
 loss:
   policy: 1.0
-  wdl: 1.0
+  outcome: 1.0
   score_margin: 0.25
   ownership: 0.25
   alive: 0.1
@@ -51,7 +50,7 @@ train:
     min_lr_ratio: 0.05
 
 data:
-  schema_version: 3
+  schema_version: 4
   ring_stratified: true
   d5_augmentation: true
   workers: 16
@@ -60,7 +59,7 @@ data:
   shard_cache_size: 2
 
 selfplay:
-  rings: 3
+  rings: 4
   batch_size: 64
   games: 64
   fast_probability: 0.75
@@ -75,7 +74,6 @@ selfplay:
   record_fast_policy_targets: false
   c_visit: 50.0
   c_scale: 1.0
-  initial_pass_logit_penalty: 1.5
   score_utility_weight: 0.05
   shard_size: 4096
   seed: 17
@@ -106,12 +104,12 @@ orchestration:
     - {gpu_id: 6, role: actor, cpu_threads: 8, actor_batch_size: 64}
   actor_games_per_batch: 64
   ring_mixture:
-    rings: [3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+    rings: [4, 6, 8, 10]
     curriculum:
-      - {until_samples: 100000, rings: [3, 4]}
-      - {until_samples: 1000000, rings: [3, 4, 5, 6]}
+      - {until_samples: 100000, rings: [4]}
+      - {until_samples: 1000000, rings: [4, 6]}
     uniform_weight: 1.0
-    deficit_weights: [1.0, 1.0, 1.0, 1.0, 1.25, 1.25, 1.5, 1.5, 2.0, 2.0]
+    deficit_weights: [1.0, 1.25, 1.5, 2.0]
   model_refresh:
     manifest_poll_seconds: 2.0
     startup_timeout_seconds: 900.0
@@ -163,7 +161,7 @@ orchestration:
     gc_interval_windows: 10
 
 arena:
-  rings: [3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+  rings: [4, 6, 8, 10]
   pairs_per_ring: 25
   simulations: 1024
   max_considered: 32

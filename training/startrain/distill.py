@@ -24,7 +24,7 @@ from .checkpoint import (
     load_model_manifest,
     save_checkpoint,
 )
-from .config import GameConfig, load_config
+from .config import CONFIG_SCHEMA_VERSION, GameConfig, load_config
 from .contracts import (
     ACTION_LAYOUT_SCHEMA_ID,
     EXTERNAL_FEATURE_SCHEMA_ID,
@@ -41,7 +41,7 @@ from .features import (
     encode_batch,
 )
 from .losses import LossWeights, compute_losses
-from .model import GraphResTNet, ModelConfig, StarModelOutput
+from .model import MODEL_SCHEMA_VERSION, GraphResTNet, ModelConfig, StarModelOutput
 from .replay import (
     ReplayBatch,
     ReplaySample,
@@ -51,10 +51,10 @@ from .replay import (
 )
 from .runtime import atomic_json
 from .symmetry import deterministic_transform
-from .topology import get_topology
+from .topology import SUPPORTED_RINGS, get_topology
 
-DISTILL_CONFIG_SCHEMA_VERSION = 1
-BROWSER_MANIFEST_SCHEMA_VERSION = 1
+DISTILL_CONFIG_SCHEMA_VERSION = 2
+BROWSER_MANIFEST_SCHEMA_VERSION = 2
 BROWSER_MANIFEST_FORMAT = "startrain.browser-model"
 _MODEL_VERSION = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _T = TypeVar("_T")
@@ -131,12 +131,12 @@ class DistillationTrainConfig:
 @dataclass(frozen=True, slots=True)
 class DistillationLossConfig:
     policy: float = 1.0
-    wdl: float = 1.0
+    outcome: float = 1.0
     score_margin: float = 0.25
     ownership: float = 0.25
     alive: float = 0.1
     teacher_policy_kl: float = 0.0
-    teacher_wdl_kl: float = 0.0
+    teacher_outcome_kl: float = 0.0
     teacher_score_margin_kl: float = 0.0
     teacher_ownership_kl: float = 0.0
     teacher_alive_kl: float = 0.0
@@ -145,12 +145,12 @@ class DistillationLossConfig:
     def __post_init__(self) -> None:
         values = (
             self.policy,
-            self.wdl,
+            self.outcome,
             self.score_margin,
             self.ownership,
             self.alive,
             self.teacher_policy_kl,
-            self.teacher_wdl_kl,
+            self.teacher_outcome_kl,
             self.teacher_score_margin_kl,
             self.teacher_ownership_kl,
             self.teacher_alive_kl,
@@ -171,7 +171,7 @@ class DistillationLossConfig:
         return any(
             (
                 self.teacher_policy_kl,
-                self.teacher_wdl_kl,
+                self.teacher_outcome_kl,
                 self.teacher_score_margin_kl,
                 self.teacher_ownership_kl,
                 self.teacher_alive_kl,
@@ -181,7 +181,7 @@ class DistillationLossConfig:
     def hard_target_weights(self) -> LossWeights:
         return LossWeights(
             policy=self.policy,
-            wdl=self.wdl,
+            outcome=self.outcome,
             score_margin=self.score_margin,
             ownership=self.ownership,
             alive=self.alive,
@@ -236,7 +236,7 @@ class DistillationConfig:
 
     def __post_init__(self) -> None:
         if self.schema_version != DISTILL_CONFIG_SCHEMA_VERSION:
-            raise DistillationConfigError("distillation schema_version must be 1")
+            raise DistillationConfigError("distillation schema_version must be 2")
         if (
             self.student.node_feature_dim != NODE_FEATURE_DIM
             or self.student.global_feature_dim != GLOBAL_FEATURE_DIM
@@ -417,7 +417,7 @@ class DistillationRunner:
 
         output.mkdir(parents=True, exist_ok=True)
         serialized = {
-            "schema_version": 1,
+            "schema_version": CONFIG_SCHEMA_VERSION,
             "game": asdict(GameConfig()),
             "model": asdict(self.config.student),
             "distillation": {
@@ -611,7 +611,7 @@ class DistillationRunner:
                 "hash": RULES_HASH_WIRE,
                 "mode": "double",
                 "pie_rule": False,
-                "rings": {"minimum": 3, "maximum": 12},
+                "rings": list(SUPPORTED_RINGS),
             },
             "features": {
                 "schema_id": EXTERNAL_FEATURE_SCHEMA_ID,
@@ -621,8 +621,13 @@ class DistillationRunner:
                 "global_feature_count": GLOBAL_FEATURE_DIM,
             },
             "actions": {"schema_id": ACTION_LAYOUT_SCHEMA_ID},
+            "outcome": {
+                "classes": ["loss", "win"],
+                "value": "P(win)-P(loss)",
+            },
             "architecture": {
                 "name": "GraphResTNet",
+                "schema_version": MODEL_SCHEMA_VERSION,
                 "all_size": True,
                 "parameter_count": parameter_count,
                 "config": asdict(model),
@@ -650,7 +655,7 @@ class DistillationRunner:
 def _teacher_weights(config: DistillationLossConfig) -> dict[str, float]:
     return {
         "policy_kl": config.teacher_policy_kl,
-        "wdl_kl": config.teacher_wdl_kl,
+        "outcome_kl": config.teacher_outcome_kl,
         "score_margin_kl": config.teacher_score_margin_kl,
         "ownership_kl": config.teacher_ownership_kl,
         "alive_kl": config.teacher_alive_kl,
@@ -672,9 +677,9 @@ def _teacher_kl_losses(
             valid=legal_action_mask,
             temperature=temperature,
         ),
-        "wdl_kl": _categorical_kl(
-            student.wdl_logits,
-            teacher.wdl_logits,
+        "outcome_kl": _categorical_kl(
+            student.outcome_logits,
+            teacher.outcome_logits,
             valid=None,
             temperature=temperature,
         ),
@@ -753,14 +758,13 @@ def _bernoulli_kl(
 
 
 def _browser_example_batch() -> Any:
-    topology = get_topology(3)
+    topology = get_topology(4)
     position = DoubleStarPosition(
-        rings=3,
+        rings=4,
         stones=torch.full((topology.n,), -1, dtype=torch.int8),
         to_move=0,
         moves_left=1,
         opening=True,
-        pass_streak=0,
         terminal=False,
     )
     return encode_batch([position], dtype=torch.float16)
@@ -818,11 +822,11 @@ def _browser_tensor_schema(model: ModelConfig) -> dict[str, object]:
         ONNX_INPUT_NAMES[3]: {"dtype": "bool", "shape": ["batch", "nodes", "degree"]},
         ONNX_INPUT_NAMES[4]: {"dtype": "int64", "shape": ["batch", "nodes", "degree"]},
         ONNX_INPUT_NAMES[5]: {"dtype": "bool", "shape": ["batch", "nodes"]},
-        ONNX_INPUT_NAMES[6]: {"dtype": "bool", "shape": ["batch", "nodes + 1"]},
+        ONNX_INPUT_NAMES[6]: {"dtype": "bool", "shape": ["batch", "nodes"]},
     }
     outputs = {
-        ONNX_OUTPUT_NAMES[0]: {"dtype": "float16", "shape": ["batch", "nodes + 1"]},
-        ONNX_OUTPUT_NAMES[1]: {"dtype": "float16", "shape": ["batch", 3]},
+        ONNX_OUTPUT_NAMES[0]: {"dtype": "float16", "shape": ["batch", "nodes"]},
+        ONNX_OUTPUT_NAMES[1]: {"dtype": "float16", "shape": ["batch", 2]},
         ONNX_OUTPUT_NAMES[2]: {
             "dtype": "float16",
             "shape": ["batch", model.score_margin_bins],
@@ -832,7 +836,7 @@ def _browser_tensor_schema(model: ModelConfig) -> dict[str, object]:
             "shape": ["batch", "nodes", 3],
         },
         ONNX_OUTPUT_NAMES[4]: {"dtype": "float16", "shape": ["batch", "nodes"]},
-        ONNX_OUTPUT_NAMES[5]: {"dtype": "float16", "shape": ["batch", "nodes + 1"]},
+        ONNX_OUTPUT_NAMES[5]: {"dtype": "float16", "shape": ["batch", "nodes"]},
     }
     return {"inputs": inputs, "outputs": outputs}
 

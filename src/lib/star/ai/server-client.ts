@@ -8,8 +8,8 @@ import {
 } from './protocol';
 
 export const DEFAULT_STAR_AI_TIMEOUT_MS = 65_000;
-export const DEFAULT_STAR_AI_MOVE_URL = '/v1/move' as const;
-export const DEFAULT_STAR_AI_HEALTH_URL = '/v1/health' as const;
+export const DEFAULT_STAR_AI_MOVE_URL = '/v2/move' as const;
+export const DEFAULT_STAR_AI_HEALTH_URL = '/v2/health' as const;
 export const DEFAULT_SERVER_AI_SIMULATIONS = 4_096;
 export const MAX_SERVER_AI_SIMULATIONS = 16_384;
 export const DEFAULT_SERVER_AI_MAX_CONSIDERED = 32;
@@ -20,15 +20,14 @@ export interface ServerSearchBudget {
   maxConsidered: number;
 }
 
-export interface AnalyzeRequestV1 {
-  schema_version: 1;
+export interface AnalyzeRequestV2 {
+  schema_version: 2;
   rules_hash: StarAiRequest['rulesHash'];
   rings: number;
   stones: number[];
   to_move: 0 | 1;
   moves_left: number;
   opening: boolean;
-  pass_streak: number;
   terminal: false;
   search: {
     simulations: number;
@@ -125,7 +124,7 @@ export function deterministicServerSeed(stateHash: string): number {
 export function toAnalyzeRequest(
   request: StarAiRequest,
   search: ServerSearchBudget = resolveServerSearchBudget(),
-): AnalyzeRequestV1 {
+): AnalyzeRequestV2 {
   const simulations = strictBudgetInteger(
     'Server AI simulations',
     search.simulations,
@@ -143,14 +142,13 @@ export function toAnalyzeRequest(
     throw new StarAiError('protocol', 'Internal AI state hash is inconsistent.');
   }
   return {
-    schema_version: 1,
+    schema_version: 2,
     rules_hash: request.rulesHash,
     rings: request.state.rings,
     stones: [...request.state.stones],
     to_move: request.state.toMove,
     moves_left: request.state.movesLeft,
     opening: request.state.opening,
-    pass_streak: request.state.passStreak,
     terminal: false,
     search: {
       simulations,
@@ -162,21 +160,30 @@ export function toAnalyzeRequest(
 
 function endpointPath(pathname: string): string {
   const normalized = pathname.replace(/\/+$/, '');
-  if (normalized.endsWith('/v1/move')) return normalized || '/v1/move';
-  if (normalized.endsWith('/v1/analyze')) {
+  if (normalized.endsWith('/v2/move')) return normalized || '/v2/move';
+  if (normalized.endsWith('/v2/analyze')) {
     return `${normalized.slice(0, -'/analyze'.length)}/move`;
   }
-  if (normalized.endsWith('/v1')) return `${normalized}/move`;
-  return `${normalized}/v1/move` || '/v1/move';
+  if (normalized.endsWith('/v2/health')) {
+    return `${normalized.slice(0, -'/health'.length)}/move`;
+  }
+  if (normalized.endsWith('/v2')) return `${normalized}/move`;
+  return `${normalized}/v2/move` || '/v2/move';
 }
 
 /**
- * NEXT_PUBLIC_STAR_AI_URL may be the full /v1/move URL or a deployment base.
+ * NEXT_PUBLIC_STAR_AI_URL may be the full /v2/move URL or a deployment base.
  * Browser clients intentionally never read or send bearer-token environment values.
  */
 export function resolveStarAiMoveUrl(value: string): string {
   const normalized = value.trim();
   if (!normalized) throw new StarAiError('unavailable', 'Server AI URL is empty.');
+  if (
+    /(?:^|\/)v\d+(?:\/|$)/.test(normalized) &&
+    !/(?:^|\/)v2(?:\/|$)/.test(normalized)
+  ) {
+    throw new StarAiError('protocol', 'Server AI URL must use the v2 API.');
+  }
   if (normalized.startsWith('/')) {
     if (normalized.includes('?') || normalized.includes('#')) {
       throw new StarAiError('protocol', 'Server AI URL must not contain a query or fragment.');
@@ -209,10 +216,10 @@ export function resolveStarAiMoveUrl(value: string): string {
 export function resolveStarAiHealthUrl(value: string): string {
   const moveUrl = resolveStarAiMoveUrl(value);
   if (moveUrl.startsWith('/')) {
-    return moveUrl.replace(/\/v1\/move$/, '/v1/health');
+    return moveUrl.replace(/\/v2\/move$/, '/v2/health');
   }
   const url = new URL(moveUrl);
-  url.pathname = url.pathname.replace(/\/v1\/move$/, '/v1/health');
+  url.pathname = url.pathname.replace(/\/v2\/move$/, '/v2/health');
   return url.toString();
 }
 
@@ -228,8 +235,8 @@ export function configuredServerHealthUrl(): string {
 
 interface ParsedAtomicAction {
   code: number;
-  kind: 'place' | 'pass';
-  node: number | null;
+  kind: 'place';
+  node: number;
 }
 
 function parseAtomicAction(value: unknown, label: string): ParsedAtomicAction {
@@ -240,9 +247,6 @@ function parseAtomicAction(value: unknown, label: string): ParsedAtomicAction {
     !Number.isInteger(value.code)
   ) {
     throw new StarAiError('protocol', `${label} is not a valid atomic action.`);
-  }
-  if (value.kind === 'pass' && value.code === -1 && value.node === null) {
-    return { code: -1, kind: 'pass', node: null };
   }
   if (
     value.kind === 'place' &&
@@ -289,7 +293,7 @@ export function parseAnalyzeResponse(
     'root_policy',
     'root_q',
     'root_visits',
-    'wdl',
+    'outcome',
     'value',
     'search_value',
     'score_belief',
@@ -297,7 +301,7 @@ export function parseAnalyzeResponse(
     'model_step',
     'timing_ms',
   ] as const;
-  if (!isRecord(payload) || !hasExactKeys(payload, responseKeys) || payload.schema_version !== 1) {
+  if (!isRecord(payload) || !hasExactKeys(payload, responseKeys) || payload.schema_version !== 2) {
     throw new StarAiError('protocol', 'Starserve response schema is incompatible.');
   }
   if (
@@ -352,18 +356,22 @@ export function parseAnalyzeResponse(
   }
 
   if (
-    !isRecord(payload.wdl) ||
-    !hasExactKeys(payload.wdl, ['loss', 'draw', 'win'])
+    !isRecord(payload.outcome) ||
+    !hasExactKeys(payload.outcome, ['loss', 'win'])
   ) {
-    throw new StarAiError('protocol', 'Starserve WDL belief is invalid.');
+    throw new StarAiError('protocol', 'Starserve outcome belief is invalid.');
   }
-  const wdl = [payload.wdl.loss, payload.wdl.draw, payload.wdl.win];
+  const outcome = [payload.outcome.loss, payload.outcome.win];
   if (
-    wdl.some((item) => !finiteNumber(item) || item < 0) ||
-    !approximatelyOne(wdl as number[], 1e-5) ||
+    outcome.some((item) => !finiteNumber(item) || item < 0) ||
+    !approximatelyOne(outcome as number[], 1e-5) ||
     !finiteNumber(payload.value) ||
     payload.value < -1 ||
     payload.value > 1 ||
+    Math.abs(
+      payload.value -
+        ((payload.outcome.win as number) - (payload.outcome.loss as number)),
+    ) > 1e-5 ||
     !finiteNumber(payload.search_value) ||
     payload.search_value < -1 ||
     payload.search_value > 1
@@ -379,16 +387,18 @@ export function parseAnalyzeResponse(
       'expected_margin',
       'probabilities',
     ]) ||
-    payload.score_belief.support_min !== -181 ||
-    payload.score_belief.support_max !== 181 ||
-    !finiteNumber(payload.score_belief.expected_margin)
+    payload.score_belief.support_min !== -151 ||
+    payload.score_belief.support_max !== 151 ||
+    !finiteNumber(payload.score_belief.expected_margin) ||
+    payload.score_belief.expected_margin < -151 ||
+    payload.score_belief.expected_margin > 151
   ) {
     throw new StarAiError('protocol', 'Starserve score belief is invalid.');
   }
   const scoreProbabilities = parseFiniteArray(
     payload.score_belief.probabilities,
     'Starserve score probabilities',
-    363,
+    303,
     (item) => item >= 0,
   );
   if (!approximatelyOne(scoreProbabilities, 1e-5)) {

@@ -9,7 +9,7 @@ from .config import (
     load_server_config,
 )
 
-__version__ = "1.0.0"
+__version__ = "2.0.0"
 
 __all__ = [
     "LimitConfig",

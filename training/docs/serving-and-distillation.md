@@ -54,7 +54,8 @@ complete game batches. The coordinator-managed arena supervisor
 bootstraps the first `champion.json` only when
 `promotion.bootstrap_initial_champion` is explicitly enabled. Every later
 candidate is compared with the immutable champion using role-paired games,
-pentanomial summaries, diagnostic paired bootstrap intervals, anytime-valid
+binary game outcomes, pair win-count summaries, diagnostic paired bootstrap intervals,
+anytime-valid
 ring floors, and both forced and unforced openings. Promotion uses a
 pair-level mixture-betting e-process with Ville thresholds. Its observation
 unit is the complete role-reversed pair, so arbitrary correlation inside each
@@ -112,9 +113,9 @@ small window by replacement. Rank 0 fixes and broadcasts the exact replay spans
 and maximum shard ID to all DDP ranks. Batches are shard-local, so a 512-sample
 batch decompresses one selected shard rather than hundreds.
 
-Replay schema v3 and WAL manifest schema v3 are intentionally not compatible
-with pre-audit replay. Start a new run directory rather than mixing legacy
-shards that lack run, generation, game, ply, and immutable-model provenance.
+Replay schema v4 and WAL manifest schema v4 are intentionally incompatible with
+all older replay. Policies are node-only and outcomes are binary loss/win labels.
+Start a new run directory; there is no converter or compatibility loader.
 Committed missing or corrupt shards are quarantined and reported; they are not
 silently deleted. Replay and model GC honor active replay watermarks and
 candidate/champion references. Shipped retention is dry-run until operators
@@ -126,26 +127,27 @@ profile and cannot wait for absent rings. Use `h100-4gpu.yaml` or
 
 ## API
 
-`GET /healthz` and `GET /v1/health` report service, model, rules, feature, and
-action schema versions. `POST /v1/analyze` is the documented endpoint;
-`POST /v1/move` is an equivalent compatibility route. Health is intentionally
+`GET /healthz` and `GET /v2/health` report service, model, rules, feature,
+action, and binary-outcome schemas. `POST /v2/analyze` is the documented endpoint;
+`POST /v2/move` exposes the same v2 schema. Health is intentionally
 unauthenticated for container orchestration.
 
-The v1 request is strict: unknown fields, coercions, terminal states, incompatible
+The v2 request is strict: unknown fields, coercions, terminal states, incompatible
 hashes, malformed semantic states, and over-budget searches are rejected.
 
 ```json
 {
-  "schema_version": 1,
-  "rules_hash": "fnv1a64:cdb34fb02be82843",
-  "rings": 3,
+  "schema_version": 2,
+  "rules_hash": "fnv1a64:2da3783519381453",
+  "rings": 4,
   "stones": [-1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+             -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+             -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
              -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
              -1, -1, -1, -1, -1, -1, -1, -1, -1, -1],
   "to_move": 0,
   "moves_left": 1,
   "opening": true,
-  "pass_streak": 0,
   "terminal": false,
   "search": {
     "simulations": 4096,
@@ -157,8 +159,9 @@ hashes, malformed semantic states, and over-budget searches are rejected.
 
 The state is imported through `star_native.StateBatch.from_semantic`; Python
 does not replay or reinterpret moves. The response contains one atomic
-placement/pass, completed-Q root policy, root Q and visits, WDL and value,
-the 363-bin score belief, EMA model identity, and timing.
+placement, completed-Q root policy, root Q and visits, `{loss, win}` probabilities,
+`P(win) - P(loss)`, the 303-bin `[-151, 151]` score belief, EMA model identity,
+and timing.
 
 If `security.bearer_token_env` is configured, send
 `Authorization: Bearer <token>`. The token is read only from that environment
@@ -169,7 +172,7 @@ cancellation signal and keeps its concurrency slot until the worker stops.
 
 ## Private same-origin proxy
 
-The web app defaults to its own `/v1/move` and `/v1/health` route handlers. Keep
+The web app defaults to its own `/v2/move` and `/v2/health` route handlers. Keep
 `starserve` private and configure the Next.js server with:
 
 ```bash
@@ -203,7 +206,7 @@ Adjust manifest paths in the mounted server YAML for the container layout.
 `startrain-distill` trains a newly initialized, configurable smaller
 `GraphResTNet` from validated replay search/outcome/spatial targets. When a
 teacher EMA manifest is configured, per-head logit KL can be enabled for policy,
-WDL, score margin, ownership, and alive beliefs.
+binary outcome, score margin, ownership, and alive beliefs.
 
 ```bash
 startrain-distill --config configs/distill-browser.yaml
@@ -227,9 +230,9 @@ cd ..
 RUSTUP_TOOLCHAIN=1.93.0 npm run build:star-wasm
 cd training
 startrain-publish-browser \
-  --manifest runs/browser/star-browser-v1.browser.json \
+  --manifest runs/browser/star-browser-v2.browser.json \
   --target ../public/models/star \
-  --wasm-source ../public/models/star/wasm
+  --wasm-source ../public/models/star/wasm-2da3783519381453
 ```
 
 The release command verifies SHA-256 and byte length for both the Python
@@ -239,10 +242,10 @@ run as the same verified release step:
 
 ```bash
 startrain-publish-browser \
-  --manifest runs/browser/star-browser-v1.browser.json \
+  --manifest runs/browser/star-browser-v2.browser.json \
   --target ../public/models/star \
   --wasm-cwd .. \
-  --wasm-source ../public/models/star/wasm \
+  --wasm-source ../public/models/star/wasm-2da3783519381453 \
   --wasm-build npm run build:star-wasm
 ```
 

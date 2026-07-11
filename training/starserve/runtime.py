@@ -96,7 +96,7 @@ class AtomicModelManager:
 
     def startup(self) -> None:
         with self.lease():
-            pass
+            return
 
     @contextmanager
     def lease(self) -> Iterator[ModelLease]:
@@ -239,9 +239,6 @@ class AtomicModelManager:
             config=InferenceConfig(
                 precision=experiment.train.precision,
                 score_utility_weight=experiment.selfplay.score_utility_weight,
-                initial_pass_logit_penalty=(
-                    experiment.selfplay.initial_pass_logit_penalty
-                ),
             ),
             model_version=manifest.model_version,
             model_step=manifest.model_step,
@@ -352,7 +349,6 @@ class NativeAnalysisService:
                 [request.to_move],
                 [request.moves_left],
                 [request.opening],
-                [request.pass_streak],
             )
             imported = positions_from_native(states.data())
         except (TypeError, ValueError) as exc:
@@ -375,7 +371,6 @@ class NativeAnalysisService:
             or position.to_move != request.to_move
             or position.moves_left != request.moves_left
             or position.opening != request.opening
-            or position.pass_streak != request.pass_streak
         ):
             raise AnalysisError(
                 "native_incompatible",
@@ -410,7 +405,7 @@ class NativeAnalysisService:
             or len(selected) != 1
             or terminal != [False]
             or selected[0] not in actions
-            or any(action < -1 or action >= node_count for action in actions)
+            or any(action < 0 or action >= node_count for action in actions)
         ):
             raise AnalysisError(
                 "native_search_error",
@@ -433,7 +428,7 @@ class NativeAnalysisService:
                 "native root policy or visits are invalid",
             )
         if (
-            len(detailed.wdl_probabilities) != 1
+            len(detailed.outcome_probabilities) != 1
             or len(detailed.score_probabilities) != 1
             or len(detailed.response.values) != 1
         ):
@@ -441,25 +436,25 @@ class NativeAnalysisService:
                 "model_output_error",
                 "root model output has an invalid batch shape",
             )
-        wdl = detailed.wdl_probabilities[0]
+        outcome = detailed.outcome_probabilities[0]
         scores = detailed.score_probabilities[0]
-        if len(wdl) != 3 or len(scores) != SCORE_MARGIN_MAX - SCORE_MARGIN_MIN + 1:
+        if len(outcome) != 2 or len(scores) != SCORE_MARGIN_MAX - SCORE_MARGIN_MIN + 1:
             raise AnalysisError(
                 "model_output_error",
                 "root belief support has an invalid shape",
             )
-        beliefs = [*wdl, *scores]
+        beliefs = [*outcome, *scores]
         values = [
-            detailed.wdl_values[0],
+            detailed.outcome_values[0],
             detailed.response.values[0],
             detailed.score_expectations[0],
         ]
         if (
             any(not math.isfinite(value) or value < 0 for value in beliefs)
-            or not math.isclose(sum(wdl), 1.0, rel_tol=1e-5, abs_tol=1e-5)
+            or not math.isclose(sum(outcome), 1.0, rel_tol=1e-5, abs_tol=1e-5)
             or not math.isclose(sum(scores), 1.0, rel_tol=1e-5, abs_tol=1e-5)
             or any(not math.isfinite(value) for value in values)
-            or not -1.0 <= detailed.wdl_values[0] <= 1.0
+            or not -1.0 <= detailed.outcome_values[0] <= 1.0
             or not -1.0 <= detailed.response.values[0] <= 1.0
         ):
             raise AnalysisError(
@@ -467,14 +462,14 @@ class NativeAnalysisService:
                 "root model beliefs contain invalid probabilities or values",
             )
         return {
-            "schema_version": 1,
+            "schema_version": 2,
             "action": _action_payload(selected[0]),
             "root_actions": [_action_payload(action) for action in actions],
             "root_policy": policy,
             "root_q": q_values,
             "root_visits": visits,
-            "wdl": {"loss": wdl[0], "draw": wdl[1], "win": wdl[2]},
-            "value": detailed.wdl_values[0],
+            "outcome": {"loss": outcome[0], "win": outcome[1]},
+            "value": detailed.outcome_values[0],
             "search_value": detailed.response.values[0],
             "score_belief": {
                 "support_min": SCORE_MARGIN_MIN,
@@ -502,8 +497,6 @@ def _pack_stones(stones: Sequence[int], *, player: int) -> list[int]:
 
 
 def _action_payload(code: int) -> dict[str, object]:
-    if code == -1:
-        return {"code": -1, "kind": "pass", "node": None}
     if code < 0:
         raise AnalysisError(
             "native_search_error",

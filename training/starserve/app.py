@@ -28,12 +28,13 @@ from startrain.contracts import (
     RULES_SCHEMA_ID,
     RULES_VERSION,
 )
+from startrain.model import MODEL_SCHEMA_VERSION
 
-from .config import ServerConfig, load_server_config
+from .config import SERVER_CONFIG_SCHEMA_VERSION, ServerConfig, load_server_config
 from .runtime import AnalysisError, NativeAnalysisService
 from .schemas import AnalyzeRequest, AnalyzeResponse
 
-SERVICE_VERSION = "1.0.0"
+SERVICE_VERSION = "2.0.0"
 _LOGGER = logging.getLogger("starserve")
 _REQUEST_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 
@@ -146,7 +147,7 @@ def _request_id_from_headers(headers: dict[bytes, bytes]) -> str:
         try:
             supplied = raw.decode("ascii")
         except UnicodeDecodeError:
-            pass
+            supplied = ""
         else:
             if _REQUEST_ID.fullmatch(supplied):
                 return supplied
@@ -177,7 +178,7 @@ def create_app(
         lifespan=lifespan,
         docs_url=None,
         redoc_url=None,
-        openapi_url="/v1/openapi.json",
+        openapi_url="/v2/openapi.json",
     )
     app.state.config = settings
     app.state.analysis_service = analysis_service
@@ -232,7 +233,7 @@ def create_app(
         if (
             bearer_token is not None
             and request.method == "POST"
-            and request.url.path in ("/v1/analyze", "/v1/move")
+            and request.url.path in ("/v2/analyze", "/v2/move")
         ):
             authorization = request.headers.get("authorization")
             candidate = (
@@ -284,7 +285,7 @@ def create_app(
             request,
             status_code=422,
             code="invalid_request",
-            message="request does not match the v1 analysis schema",
+            message="request does not match the v2 analysis schema",
             details=details,
         )
 
@@ -304,7 +305,7 @@ def create_app(
         )
 
     @app.get("/healthz")
-    @app.get("/v1/health")
+    @app.get("/v2/health")
     async def health() -> JSONResponse:
         model_health = analysis_service.health()
         ready = bool(model_health.get("ready", True))
@@ -312,7 +313,9 @@ def create_app(
         payload = {
             "status": "degraded" if degraded else ("ok" if ready else "starting"),
             "service_version": SERVICE_VERSION,
-            "api_schema_version": 1,
+            "api_schema_version": 2,
+            "server_config_schema_version": SERVER_CONFIG_SCHEMA_VERSION,
+            "model_schema_version": MODEL_SCHEMA_VERSION,
             "model": model_health,
             "rules": {
                 "schema_id": RULES_SCHEMA_ID,
@@ -324,7 +327,14 @@ def create_app(
                 "version": FEATURE_SCHEMA_VERSION,
                 "hash": f"{FEATURE_SCHEMA_HASH:016x}",
             },
-            "actions": {"schema_id": ACTION_LAYOUT_SCHEMA_ID},
+            "actions": {
+                "schema_id": ACTION_LAYOUT_SCHEMA_ID,
+                "types": ["place"],
+            },
+            "outcomes": {
+                "classes": ["loss", "win"],
+                "value": "P(win)-P(loss)",
+            },
         }
         return JSONResponse(payload, status_code=200 if ready else 503)
 
@@ -381,12 +391,12 @@ def create_app(
         return AnalyzeResponse.model_validate(result)
 
     app.post(
-        "/v1/analyze",
+        "/v2/analyze",
         response_model=AnalyzeResponse,
         response_model_exclude_none=False,
     )(analyze)
     app.post(
-        "/v1/move",
+        "/v2/move",
         response_model=AnalyzeResponse,
         response_model_exclude_none=False,
         include_in_schema=False,

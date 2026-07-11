@@ -140,7 +140,7 @@ export function transformStones(
   return transformed;
 }
 
-/** Transform a game action; pass and swap have no board coordinate. */
+/** Transform a game action; swap has no board coordinate. */
 export function transformAction(
   board: Board,
   action: GameAction,
@@ -149,8 +149,6 @@ export function transformAction(
   switch (action.type) {
     case 'place':
       return { type: 'place', node: transformNode(board, action.node, symmetry) };
-    case 'pass':
-      return { type: 'pass' };
     case 'swap':
       return { type: 'swap' };
   }

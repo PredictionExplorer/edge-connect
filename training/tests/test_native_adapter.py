@@ -38,32 +38,28 @@ class FakeStateData:
     moves_left: list[int]
     opening: list[bool]
     mid_turn: list[bool]
-    pass_streak: list[int]
     terminal: list[bool]
-    pass_legal: list[bool]
 
 
 def fake_native_data() -> tuple[FakeStateData, list[DoubleStarPosition]]:
-    topology = get_topology(3)
+    topology = get_topology(4)
     opening = DoubleStarPosition(
-        rings=3,
+        rings=4,
         stones=torch.full((topology.n,), -1, dtype=torch.int8),
         to_move=0,
         moves_left=1,
         opening=True,
-        pass_streak=0,
         terminal=False,
     )
     stones = torch.full((topology.n,), -1, dtype=torch.int8)
     stones[0] = 0
     stones[7] = 1
     live = DoubleStarPosition(
-        rings=3,
+        rings=4,
         stones=stones,
         to_move=1,
         moves_left=1,
         opening=False,
-        pass_streak=0,
         terminal=False,
     )
     positions = [opening, live]
@@ -76,7 +72,7 @@ def fake_native_data() -> tuple[FakeStateData, list[DoubleStarPosition]]:
         legal_bits.extend(pack_mask(position.stones == -1))
     return (
         FakeStateData(
-            rings=3,
+            rings=4,
             node_count=topology.n,
             batch_size=2,
             zero_bits=zero_bits,
@@ -91,9 +87,7 @@ def fake_native_data() -> tuple[FakeStateData, list[DoubleStarPosition]]:
                 not position.opening and position.moves_left == 1
                 for position in positions
             ],
-            pass_streak=[position.pass_streak for position in positions],
             terminal=[position.terminal for position in positions],
-            pass_legal=[True, True],
         ),
         positions,
     )

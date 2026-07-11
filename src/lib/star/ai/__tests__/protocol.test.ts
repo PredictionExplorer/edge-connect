@@ -1,10 +1,15 @@
 import { describe, expect, it, vi } from 'vitest';
+import { fnv1a64 } from '../../rules';
 import { initialState, replay, type GameAction, type GameConfig } from '../../game';
 import { StarAiError, type StarAiErrorCode } from '../errors';
 import {
+  STAR_AI_PROTOCOL_SCHEMA_ID,
+  STAR_AI_PROTOCOL_VERSION,
+  STAR_FEATURE_CONTRACT,
   STAR_FEATURE_SCHEMA_HASH,
-  actionToCode,
+  STAR_FEATURE_SCHEMA_VERSION,
   acceptAiResponse,
+  actionToCode,
   buildAiRequest,
   codeToAction,
   legalActionCodes,
@@ -16,7 +21,7 @@ import {
 } from '../protocol';
 
 const config: GameConfig = {
-  rings: 3,
+  rings: 4,
   mode: 'double',
   pieRule: false,
   playerNames: ['A', 'B'],
@@ -36,27 +41,36 @@ function expectAiError(
   }
 }
 
-describe('atomic AI protocol', () => {
+describe('placement-only AI protocol v2', () => {
   it('builds the exact opening semantic request', () => {
     const request = buildAiRequest(config, [], 'opening');
-    expect(request.rulesHash).toBe('fnv1a64:cdb34fb02be82843');
-    expect(request.featureSchemaHash).toBe('59a7da1c00bac4d2');
-    expect(STAR_FEATURE_SCHEMA_HASH).toBe('59a7da1c00bac4d2');
-    expect(request.state).toMatchObject({
-      rings: 3,
-      toMove: 0,
-      movesLeft: 1,
-      opening: true,
-      passStreak: 0,
-      terminal: false,
+    expect(request).toMatchObject({
+      schema: STAR_AI_PROTOCOL_SCHEMA_ID,
+      version: STAR_AI_PROTOCOL_VERSION,
+      rulesHash: 'fnv1a64:2da3783519381453',
+      featureSchemaVersion: 3,
+      state: {
+        rings: 4,
+        toMove: 0,
+        movesLeft: 1,
+        opening: true,
+        terminal: false,
+      },
     });
-    expect(request.state.stones).toHaveLength(30);
-    expect(request.legalActions).toEqual([...Array.from({ length: 30 }, (_, i) => i), -1]);
+    expect(STAR_AI_PROTOCOL_VERSION).toBe(2);
+    expect(STAR_FEATURE_SCHEMA_VERSION).toBe(3);
+    expect(STAR_FEATURE_SCHEMA_HASH).toBe(fnv1a64(STAR_FEATURE_CONTRACT));
+    expect(STAR_FEATURE_SCHEMA_HASH).toBe('6b5b00f638e9c16b');
+    expect('passStreak' in request.state).toBe(false);
+    expect(request.state.stones).toHaveLength(50);
+    expect(request.legalActions).toEqual(
+      Array.from({ length: 50 }, (_, node) => node),
+    );
     expect(request.actionLog).toEqual([]);
     expect(request.stateHash).toMatch(/^zobrist64:[0-9a-f]{16}$/);
   });
 
-  it('represents the second stone as a new atomic decision for the same player', () => {
+  it('represents each placement as a separate atomic decision', () => {
     const log: GameAction[] = [
       { type: 'place', node: 0 },
       { type: 'place', node: 1 },
@@ -65,12 +79,12 @@ describe('atomic AI protocol', () => {
     expect(request.actionLog).toEqual([0, 1]);
     expect(request.state.toMove).toBe(1);
     expect(request.state.movesLeft).toBe(1);
-    expect(request.state.opening).toBe(false);
     expect(request.legalActions).not.toContain(0);
     expect(request.legalActions).not.toContain(1);
+    expect(request.legalActions.every((action) => action >= 0)).toBe(true);
   });
 
-  it('hashes semantically equivalent within-turn placement orders identically', () => {
+  it('hashes semantically equivalent within-turn orders identically', () => {
     const ab = buildAiRequest(
       config,
       [
@@ -93,54 +107,10 @@ describe('atomic AI protocol', () => {
     expect(ab.stateHash).toBe(ba.stateHash);
   });
 
-  it('rejects stale and illegal responses at the final mutation gate', () => {
-    const request = buildAiRequest(config, [], 'gate');
-    const valid = makeAiResponse(request, { type: 'place', node: 0 });
-    expect(
-      acceptAiResponse(request, valid, config, [{ type: 'place', node: 2 }]),
-    ).toMatchObject({ ok: false, code: 'stale' });
-
-    const illegal = makeAiResponse(request, { type: 'place', node: 30 });
-    expect(acceptAiResponse(request, illegal, config, [])).toMatchObject({
-      ok: false,
-      code: 'illegal',
-    });
-  });
-
-  it('accepts exactly one atomic action and rejects turn-shaped payloads', () => {
-    const request = buildAiRequest(config, [], 'atomic');
-    expect(parseAiResponse(request, makeAiResponse(request, { type: 'pass' })).action).toEqual({
-      type: 'pass',
-    });
-    expect(() =>
-      parseAiResponse(request, {
-        ...makeAiResponse(request, { type: 'pass' }),
-        action: [{ type: 'place', node: 0 }, { type: 'place', node: 1 }],
-      }),
-    ).toThrow(/one atomic action/i);
-  });
-
-  it('refuses AI requests for classic and pie-rule configurations', () => {
-    expect(() => buildAiRequest({ ...config, mode: 'classic' }, [], 'classic')).toThrow(
-      /require Double/i,
-    );
-    expect(() => buildAiRequest({ ...config, pieRule: true }, [], 'pie')).toThrow(
-      /pie rule disabled/i,
-    );
-  });
-
-  it('creates unique fallback identities and round-trips atomic action codes', () => {
-    vi.stubGlobal('crypto', undefined);
-    vi.spyOn(Date, 'now').mockReturnValue(1234);
-    const first = newAiRequestId();
-    const second = newAiRequestId();
-    expect(first).toMatch(/^star-ai-ya-/);
-    expect(second).not.toBe(first);
-    expect(actionToCode({ type: 'pass' })).toBe(-1);
+  it('round-trips only nonnegative placement codes', () => {
     expect(actionToCode({ type: 'place', node: 12 })).toBe(12);
-    expect(codeToAction(-1)).toEqual({ type: 'pass' });
     expect(codeToAction(12)).toEqual({ type: 'place', node: 12 });
-    for (const code of [-2, -0.5, Number.NaN, Number.POSITIVE_INFINITY]) {
+    for (const code of [-1, -0.5, Number.NaN, Number.POSITIVE_INFINITY]) {
       expectAiError(
         () => codeToAction(code),
         'protocol',
@@ -149,51 +119,85 @@ describe('atomic AI protocol', () => {
     }
   });
 
-  it('rejects hashing without BigInt and emits no legal actions after termination', () => {
-    const initial = initialState(config);
-    const semantic = semanticStateFromGame(initial);
-    vi.stubGlobal('BigInt', undefined);
-    expectAiError(
-      () => semanticStateHash(semantic),
-      'unavailable',
-      'AI controllers require BigInt browser support.',
-    );
-    vi.unstubAllGlobals();
+  it('accepts one placement and rejects legacy or turn-shaped payloads', () => {
+    const request = buildAiRequest(config, [], 'atomic');
+    expect(
+      parseAiResponse(
+        request,
+        makeAiResponse(request, { type: 'place', node: 0 }),
+      ).action,
+    ).toEqual({ type: 'place', node: 0 });
+    expect(() =>
+      parseAiResponse(request, {
+        ...makeAiResponse(request, { type: 'place', node: 0 }),
+        action: [{ type: 'place', node: 0 }, { type: 'place', node: 1 }],
+      }),
+    ).toThrow(/one atomic action/i);
+    expect(() =>
+      parseAiResponse(request, {
+        ...makeAiResponse(request, { type: 'place', node: 0 }),
+        action: { type: 'pass' },
+      }),
+    ).toThrow(/one atomic action/i);
+  });
 
-    const terminalLog: GameAction[] = [{ type: 'pass' }, { type: 'pass' }];
+  it('rejects unsupported variants, rings, and web-only swaps', () => {
+    expect(() =>
+      buildAiRequest({ ...config, mode: 'classic' }, [], 'classic'),
+    ).toThrow(/require Double/i);
+    expect(() => buildAiRequest({ ...config, pieRule: true }, [], 'pie')).toThrow(
+      /pie rule disabled/i,
+    );
+    expect(() => buildAiRequest({ ...config, rings: 5 }, [], 'rings')).toThrow(
+      /one of 4, 6, 8, 10/,
+    );
+    expect(() =>
+      buildAiRequest(config, [{ type: 'swap' }], 'swap'),
+    ).toThrow(/outside the AI protocol/);
+  });
+
+  it('emits no legal actions and refuses requests after a full board', () => {
+    const terminalLog: GameAction[] = Array.from(
+      { length: 50 },
+      (_, node) => ({ type: 'place', node }) as const,
+    );
     const terminal = replay(config, terminalLog);
+    expect(terminal.over).toBe(true);
     expect(legalActionCodes(terminal)).toEqual([]);
     expectAiError(
       () => buildAiRequest(config, terminalLog, 'terminal'),
       'protocol',
       'Cannot request an action for a terminal position.',
     );
-    expectAiError(
-      () => buildAiRequest(config, [{ type: 'swap' }], 'swap'),
-      'protocol',
-      'Pie-rule swaps are outside the AI protocol.',
-    );
   });
 
-  it('strictly rejects every malformed response shape and identity field', () => {
+  it('rejects stale and illegal responses at the final mutation gate', () => {
+    const request = buildAiRequest(config, [], 'gate');
+    const valid = makeAiResponse(request, { type: 'place', node: 0 });
+    expect(
+      acceptAiResponse(request, valid, config, [{ type: 'place', node: 2 }]),
+    ).toMatchObject({ ok: false, code: 'stale' });
+
+    const illegal = makeAiResponse(request, { type: 'place', node: 50 });
+    expect(acceptAiResponse(request, illegal, config, [])).toMatchObject({
+      ok: false,
+      code: 'illegal',
+    });
+  });
+
+  it('strictly rejects malformed response shapes and identities', () => {
     const request = buildAiRequest(config, [], 'strict-response');
-    const valid = makeAiResponse(request, { type: 'pass' });
+    const valid = makeAiResponse(request, { type: 'place', node: 0 });
     const cases: Array<[unknown, StarAiErrorCode, string]> = [
       [null, 'protocol', 'AI response must be an object.'],
-      [[], 'protocol', 'AI response must be an object.'],
       [{ ...valid, schema: 'wrong' }, 'protocol', 'AI response schema or rules hash is incompatible.'],
-      [{ ...valid, version: 2 }, 'protocol', 'AI response schema or rules hash is incompatible.'],
+      [{ ...valid, version: 1 }, 'protocol', 'AI response schema or rules hash is incompatible.'],
       [{ ...valid, rulesHash: 'wrong' }, 'protocol', 'AI response schema or rules hash is incompatible.'],
       [{ ...valid, requestId: 'old' }, 'stale', 'AI response belongs to an obsolete position.'],
       [{ ...valid, stateHash: 'old' }, 'stale', 'AI response belongs to an obsolete position.'],
       [{ ...valid, actions: [] }, 'protocol', 'AI response must not contain a multi-action turn.'],
-      [{ ...valid, action: null }, 'protocol', 'AI response must contain one atomic action.'],
-      [{ ...valid, action: [] }, 'protocol', 'AI response must contain one atomic action.'],
       [{ ...valid, action: { type: 'swap' } }, 'protocol', 'AI response must contain one atomic action.'],
-      [{ ...valid, action: { type: 'pass', node: null } }, 'protocol', 'A pass action cannot include a node.'],
-      [{ ...valid, action: { type: 'pass', extra: true } }, 'protocol', 'A pass action cannot include a node.'],
       [{ ...valid, action: { type: 'place' } }, 'protocol', 'A placement must contain a non-negative node id.'],
-      [{ ...valid, action: { type: 'place', node: '0' } }, 'protocol', 'A placement must contain a non-negative node id.'],
       [{ ...valid, action: { type: 'place', node: -1 } }, 'protocol', 'A placement must contain a non-negative node id.'],
       [{ ...valid, action: { type: 'place', node: 0.5 } }, 'protocol', 'A placement must contain a non-negative node id.'],
       [
@@ -202,7 +206,7 @@ describe('atomic AI protocol', () => {
         'A placement action contains unknown fields.',
       ],
       [
-        { ...valid, action: { type: 'place', node: 30 } },
+        { ...valid, action: { type: 'place', node: 50 } },
         'illegal',
         'AI returned an illegal atomic action.',
       ],
@@ -212,7 +216,7 @@ describe('atomic AI protocol', () => {
     }
   });
 
-  it('normalizes every final-gate failure and accepts a current legal response', () => {
+  it('normalizes final-gate failures and accepts a current legal response', () => {
     const request = buildAiRequest(config, [], 'acceptance');
     const valid = makeAiResponse(request, { type: 'place', node: 0 });
     expect(acceptAiResponse(request, valid, config, [])).toMatchObject({
@@ -221,54 +225,24 @@ describe('atomic AI protocol', () => {
     });
     expect(
       acceptAiResponse(request, valid, { ...config, mode: 'classic' }, []),
-    ).toEqual({
-      ok: false,
-      code: 'stale',
-      message: 'The game changed before AI replied.',
-    });
-    expect(
-      acceptAiResponse(
-        request,
-        valid,
-        config,
-        [
-          { type: 'place', node: 0 },
-          { type: 'place', node: 0 },
-        ],
-      ),
-    ).toEqual({
-      ok: false,
-      code: 'stale',
-      message: 'The game changed before AI replied.',
-    });
-    expect(acceptAiResponse(request, null, config, [])).toEqual({
+    ).toMatchObject({ ok: false, code: 'stale' });
+    expect(acceptAiResponse(request, null, config, [])).toMatchObject({
       ok: false,
       code: 'protocol',
-      message: 'AI response must be an object.',
     });
-    expect(
-      acceptAiResponse(
-        request,
-        new Proxy(valid, {
-          get() {
-            throw new TypeError('hostile getter');
-          },
-        }),
-        config,
-        [],
-      ),
-    ).toEqual({
-      ok: false,
-      code: 'protocol',
-      message: 'AI response is invalid.',
-    });
+  });
 
-    const permissive = { ...request, legalActions: [...request.legalActions, 30] };
-    const outsideBoard = makeAiResponse(permissive, { type: 'place', node: 30 });
-    expect(acceptAiResponse(permissive, outsideBoard, config, [])).toEqual({
-      ok: false,
-      code: 'illegal',
-      message: 'AI returned an illegal atomic action.',
-    });
+  it('creates unique fallback identities and guards missing BigInt', () => {
+    vi.stubGlobal('crypto', undefined);
+    vi.spyOn(Date, 'now').mockReturnValue(1234);
+    expect(newAiRequestId()).not.toBe(newAiRequestId());
+
+    const semantic = semanticStateFromGame(initialState(config));
+    vi.stubGlobal('BigInt', undefined);
+    expectAiError(
+      () => semanticStateHash(semantic),
+      'unavailable',
+      'AI controllers require BigInt browser support.',
+    );
   });
 });

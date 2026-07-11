@@ -48,9 +48,10 @@ export function RulesDialog({ open, onClose }: RulesDialogProps) {
           <p>
             Two players take turns placing stones on empty nodes — one stone per turn in{' '}
             <em>*Star</em>, two per turn in <em>Double *Star</em> (the first player places just
-            one stone on the game&apos;s very first turn). Stones never move. The star-shaped{' '}
-            <strong className="text-gold">bridge</strong> in the center cannot be played, but it
-            connects all five innermost nodes for <em>both</em> players.
+            one stone on the game&apos;s very first turn). A placement is mandatory while an
+            empty node remains, and stones never move. Boards use 4, 6, 8, or 10 rings. The
+            star-shaped <strong className="text-gold">bridge</strong> in the center cannot be
+            played, but it connects all five innermost nodes for <em>both</em> players.
           </p>
           <p>
             Every node on the perimeter holds a <strong className="text-gold">peri</strong>,
@@ -81,13 +82,12 @@ export function RulesDialog({ open, onClose }: RulesDialogProps) {
           <p>
             So two stones grabbing two peries look like two points, but as a separate star they
             cancel out — unless they split the opponent or claim a decisive quark. Connect
-            everything; waste nothing. Ties in points go to whoever holds more quarks, and on a
-            finished board the two totals always sum to the number of peries plus one — so
-            someone always wins.
+            everything; waste nothing. Live totals may be tied, but on a full board the two
+            totals sum to the number of peries plus one. That sum is odd on every supported
+            board, so the final margin is nonzero and someone always wins.
           </p>
           <p>
-            The game ends when the board is full or when both players pass in succession,
-            agreeing nothing more can change.
+            The game ends only when the board is full.
           </p>
         </div>
       </article>

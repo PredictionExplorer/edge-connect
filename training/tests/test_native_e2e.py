@@ -13,6 +13,7 @@ from startrain.selfplay import SelfPlayActor, SelfPlayConfig, SelfPlayIdentity
 from startrain.training import train_step
 
 
+@pytest.mark.native
 def test_true_native_tiny_game_replay_and_train_step_when_available(tmp_path) -> None:
     native = pytest.importorskip("star_native")
     validate_native_module(native)
@@ -26,10 +27,7 @@ def test_true_native_tiny_game_replay_and_train_step_when_available(tmp_path) ->
     )
     evaluator = GraphInferenceAdapter(
         model,
-        config=InferenceConfig(
-            precision="fp32",
-            initial_pass_logit_penalty=3.0,
-        ),
+        config=InferenceConfig(precision="fp32"),
         model_version="sha256-" + "a" * 64,
         model_step=0,
         model_identity="sha256-" + "a" * 64,
@@ -71,6 +69,7 @@ def test_true_native_tiny_game_replay_and_train_step_when_available(tmp_path) ->
         assert result.losses["total"] >= 0
 
 
+@pytest.mark.native
 def test_true_native_tiny_paired_arena_when_available() -> None:
     native = pytest.importorskip("star_native")
     validate_native_module(native)
@@ -94,7 +93,7 @@ def test_true_native_tiny_paired_arena_when_available() -> None:
         candidate=evaluator,
         baseline=evaluator,
         config=ArenaConfig(
-            rings=(3,),
+            rings=(4,),
             pairs_per_ring=2,
             simulations=1,
             max_considered=2,

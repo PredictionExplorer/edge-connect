@@ -8,7 +8,7 @@ from collections.abc import Iterator, Sequence
 import torch
 from torch.utils.data import Sampler
 
-from .topology import MAX_RINGS, MIN_RINGS
+from .topology import SUPPORTED_RINGS
 
 
 class RingStratifiedSampler(Sampler[int]):
@@ -32,9 +32,11 @@ class RingStratifiedSampler(Sampler[int]):
             raise ValueError("rings cannot be empty")
         if world_size < 1 or not 0 <= rank < world_size:
             raise ValueError("rank must be in 0..world_size-1")
-        self.rings = [int(ring) for ring in rings]
-        if any(not MIN_RINGS <= ring <= MAX_RINGS for ring in self.rings):
-            raise ValueError(f"rings must be in {MIN_RINGS}..{MAX_RINGS}")
+        self.rings = list(rings)
+        if any(
+            type(ring) is not int or ring not in SUPPORTED_RINGS for ring in self.rings
+        ):
+            raise ValueError("rings must be selected from (4, 6, 8, 10)")
         self.num_samples = int(num_samples if num_samples is not None else len(rings))
         if self.num_samples < 1:
             raise ValueError("num_samples must be positive")

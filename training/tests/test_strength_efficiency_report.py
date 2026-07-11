@@ -25,7 +25,7 @@ def _arena_result(*, completed_ns: int, elo: float, lower: float) -> dict:
     return {
         "schema_version": 2,
         "candidate": f"candidate-{completed_ns}",
-        "baseline": "frozen-shallow-v1",
+        "baseline": "frozen-shallow-v2",
         "baseline_metadata": {"kind": "shallow-search"},
         "started_ns": completed_ns - 100,
         "completed_ns": completed_ns,
@@ -123,7 +123,7 @@ def test_report_joins_wall_throughput_policy_weight_and_arena_strength(
     assert actors["worker_count"] == 1
     assert actors["aggregate_samples_per_second"] == 20
     assert actors["mean_policy_weight"] == 0.25
-    trend = report["arena"]["by_baseline"]["frozen-shallow-v1"]
+    trend = report["arena"]["by_baseline"]["frozen-shallow-v2"]
     assert trend["evaluations"] == 2
     assert trend["delta_elo"] == 20
     assert trend["delta_elo_per_gpu_hour"] > 0

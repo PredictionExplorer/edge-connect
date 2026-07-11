@@ -4,6 +4,7 @@ import {
   STAR_RULES_HASH,
   STAR_RULES_SCHEMA_ID,
 } from '../rules';
+import { getBoard, isSupportedRings } from '../board';
 import { StarAiError, asStarAiError, type StarAiErrorCode } from './errors';
 import {
   STAR_ACTION_LAYOUT_VERSION,
@@ -22,7 +23,7 @@ export type StarAiWorkerCommand =
   | { type: 'cancel'; taskId: string };
 
 export type StarAiWorkerEvent =
-  | { type: 'ready'; protocolVersion: 1 }
+  | { type: 'ready'; protocolVersion: 2 }
   | { type: 'result'; taskId: string; response: StarAiResponse }
   | {
       type: 'error';
@@ -38,6 +39,15 @@ function isTaskId(value: unknown): value is string {
   return typeof value === 'string' && value.length > 0 && value.length <= 200;
 }
 
+function hasExactKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
+  const actual = Object.keys(value).sort();
+  const expected = [...keys].sort();
+  return (
+    actual.length === expected.length &&
+    actual.every((key, index) => key === expected[index])
+  );
+}
+
 function isIntegerArray(value: unknown, minimum: number): value is number[] {
   return (
     Array.isArray(value) &&
@@ -50,22 +60,24 @@ function isIntegerArray(value: unknown, minimum: number): value is number[] {
 function parseSemanticState(value: unknown): StarAiSemanticState {
   if (
     !isRecord(value) ||
-    typeof value.rings !== 'number' ||
-    !Number.isInteger(value.rings) ||
-    value.rings < 3 ||
-    value.rings > 12 ||
+    !hasExactKeys(value, [
+      'rings',
+      'stones',
+      'toMove',
+      'movesLeft',
+      'opening',
+      'terminal',
+    ]) ||
+    !isSupportedRings(value.rings) ||
     !isIntegerArray(value.stones, -1) ||
     value.stones.some((stone) => stone > 1) ||
+    value.stones.length !== getBoard(value.rings).n ||
     (value.toMove !== 0 && value.toMove !== 1) ||
     typeof value.movesLeft !== 'number' ||
     !Number.isInteger(value.movesLeft) ||
     value.movesLeft < 0 ||
     value.movesLeft > 2 ||
     typeof value.opening !== 'boolean' ||
-    typeof value.passStreak !== 'number' ||
-    !Number.isInteger(value.passStreak) ||
-    value.passStreak < 0 ||
-    value.passStreak > 2 ||
     typeof value.terminal !== 'boolean'
   ) {
     throw new StarAiError('protocol', 'Worker received an invalid semantic state.');
@@ -76,7 +88,6 @@ function parseSemanticState(value: unknown): StarAiSemanticState {
     toMove: value.toMove,
     movesLeft: value.movesLeft,
     opening: value.opening,
-    passStreak: value.passStreak,
     terminal: value.terminal,
   };
 }
@@ -84,6 +95,22 @@ function parseSemanticState(value: unknown): StarAiSemanticState {
 function parseRequest(value: unknown): StarAiRequest {
   if (
     !isRecord(value) ||
+    !hasExactKeys(value, [
+      'schema',
+      'version',
+      'requestId',
+      'rulesSchema',
+      'rulesHash',
+      'featureSchema',
+      'featureSchemaVersion',
+      'featureSchemaHash',
+      'actionLayout',
+      'actionLayoutVersion',
+      'stateHash',
+      'state',
+      'actionLog',
+      'legalActions',
+    ]) ||
     value.schema !== STAR_AI_PROTOCOL_SCHEMA_ID ||
     value.version !== STAR_AI_PROTOCOL_VERSION ||
     !isTaskId(value.requestId) ||
@@ -95,8 +122,8 @@ function parseRequest(value: unknown): StarAiRequest {
     value.actionLayout !== STAR_ACTION_LAYOUT_SCHEMA_ID ||
     value.actionLayoutVersion !== STAR_ACTION_LAYOUT_VERSION ||
     typeof value.stateHash !== 'string' ||
-    !isIntegerArray(value.actionLog, -1) ||
-    !isIntegerArray(value.legalActions, -1)
+    !isIntegerArray(value.actionLog, 0) ||
+    !isIntegerArray(value.legalActions, 0)
   ) {
     throw new StarAiError('protocol', 'Worker received an incompatible AI request.');
   }
@@ -137,8 +164,8 @@ export function parseWorkerEvent(value: unknown): StarAiWorkerEvent {
   if (!isRecord(value)) {
     throw new StarAiError('protocol', 'Local AI worker returned an invalid message.');
   }
-  if (value.type === 'ready' && value.protocolVersion === 1) {
-    return { type: 'ready', protocolVersion: 1 };
+  if (value.type === 'ready' && value.protocolVersion === 2) {
+    return { type: 'ready', protocolVersion: 2 };
   }
   if (!isTaskId(value.taskId)) {
     throw new StarAiError('protocol', 'Local AI worker returned an invalid message.');

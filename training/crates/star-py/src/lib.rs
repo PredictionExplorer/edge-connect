@@ -24,11 +24,12 @@ use star_search::{
 };
 
 const NODE_FEATURE_DIM: usize = 15;
-const GLOBAL_FEATURE_DIM: usize = 18;
+const GLOBAL_FEATURE_DIM: usize = 17;
 const SCORE_COMPONENT_DIM: usize = 14;
-const SEMANTIC_METADATA_DIM: usize = 5;
-const FEATURE_SCHEMA_VERSION: u8 = 2;
-const FEATURE_SCHEMA_HASH: u64 = 0x59a7_da1c_00ba_c4d2;
+const SEMANTIC_METADATA_DIM: usize = 4;
+const FEATURE_SCHEMA_VERSION: u8 = 3;
+const FEATURE_SCHEMA_HASH: u64 = 0x6b5b_00f6_38e9_c16b;
+const SCORE_MARGIN_SUPPORT: i16 = 151;
 
 #[pyclass(name = "StateData", frozen, skip_from_py_object)]
 #[derive(Clone)]
@@ -45,9 +46,7 @@ struct PyStateData {
     moves_left: Vec<u8>,
     opening: Vec<bool>,
     mid_turn: Vec<bool>,
-    pass_streak: Vec<u8>,
     terminal: Vec<bool>,
-    pass_legal: Vec<bool>,
 }
 
 struct PackedStateRow {
@@ -60,9 +59,7 @@ struct PackedStateRow {
     moves_left: u8,
     opening: bool,
     mid_turn: bool,
-    pass_streak: u8,
     terminal: bool,
-    pass_legal: bool,
 }
 
 #[pymethods]
@@ -128,21 +125,11 @@ impl PyStateData {
     }
 
     #[getter]
-    fn pass_streak(&self) -> Vec<u8> {
-        self.pass_streak.clone()
-    }
-
-    #[getter]
     fn terminal(&self) -> Vec<bool> {
         self.terminal.clone()
     }
 
-    #[getter]
-    fn pass_legal(&self) -> Vec<bool> {
-        self.pass_legal.clone()
-    }
-
-    /// Builds the schema-v2 features and score buffers without Python unpacking.
+    /// Builds the schema-v3 features and score buffers without Python unpacking.
     fn feature_data(&self, py: Python<'_>) -> PyResult<PyFeatureData> {
         let board = Arc::new(Board::new(self.rings).map_err(value_error)?);
         let zero_bits = self.zero_bits.clone();
@@ -150,18 +137,10 @@ impl PyStateData {
         let to_move = self.to_move.clone();
         let moves_left = self.moves_left.clone();
         let opening = self.opening.clone();
-        let pass_streak = self.pass_streak.clone();
         py.detach(move || {
-            let states = decode_semantic_states(
-                board,
-                zero_bits,
-                one_bits,
-                to_move,
-                moves_left,
-                opening,
-                pass_streak,
-            )
-            .map_err(PyValueError::new_err)?;
+            let states =
+                decode_semantic_states(board, zero_bits, one_bits, to_move, moves_left, opening)
+                    .map_err(PyValueError::new_err)?;
             Ok(pack_feature_states(&states))
         })
     }
@@ -216,9 +195,8 @@ struct PyScoreData {
     alive_bits: Vec<u64>,
     winner: Vec<i8>,
     terminal_value: Vec<f32>,
-    wdl_class: Vec<u8>,
+    outcome_class: Vec<u8>,
     score_margin: Vec<i16>,
-    terminal_reason: Vec<u8>,
 }
 
 #[pymethods]
@@ -245,7 +223,7 @@ impl PyScoreData {
         self.node_owner.clone()
     }
 
-    /// Seven alive-stone words per row.
+    /// Five alive-stone words per row.
     #[getter]
     fn alive_bits(&self) -> Vec<u64> {
         self.alive_bits.clone()
@@ -263,22 +241,16 @@ impl PyScoreData {
         self.terminal_value.clone()
     }
 
-    /// WDL class (`0/1/2`); nonterminal rows contain `255`.
+    /// Binary outcome class (`loss=0`, `win=1`); nonterminal rows contain `255`.
     #[getter]
-    fn wdl_class(&self) -> Vec<u8> {
-        self.wdl_class.clone()
+    fn outcome_class(&self) -> Vec<u8> {
+        self.outcome_class.clone()
     }
 
     /// Current-player conventional score margin.
     #[getter]
     fn score_margin(&self) -> Vec<i16> {
         self.score_margin.clone()
-    }
-
-    /// Terminal reason: `0` active, `1` full board, `2` double pass.
-    #[getter]
-    fn terminal_reason(&self) -> Vec<u8> {
-        self.terminal_reason.clone()
     }
 }
 
@@ -293,7 +265,7 @@ struct FeatureBuffers {
     alive_stones: Vec<u8>,
 }
 
-/// Contiguous schema-v2 model features plus the exact native score annotations.
+/// Contiguous schema-v3 model features plus the exact native score annotations.
 #[pyclass(name = "FeatureData", frozen, skip_from_py_object)]
 #[derive(Clone)]
 struct PyFeatureData {
@@ -351,7 +323,7 @@ impl PyFeatureData {
         PyByteArray::new(py, &self.buffers.node_features)
     }
 
-    /// Native-endian `float32[batch_size, 18]`.
+    /// Native-endian `float32[batch_size, 17]`.
     #[getter]
     fn global_features<'py>(&self, py: Python<'py>) -> Bound<'py, PyByteArray> {
         PyByteArray::new(py, &self.buffers.global_features)
@@ -363,7 +335,7 @@ impl PyFeatureData {
         PyByteArray::new(py, &self.buffers.node_mask)
     }
 
-    /// `uint8[batch_size, max_nodes + 1]` in nodes-then-pass layout.
+    /// `uint8[batch_size, max_nodes]` in the nodes-only layout.
     #[getter]
     fn legal_action_mask<'py>(&self, py: Python<'py>) -> Bound<'py, PyByteArray> {
         PyByteArray::new(py, &self.buffers.legal_action_mask)
@@ -394,7 +366,6 @@ struct FeatureState {
     to_move: Player,
     moves_left: u8,
     opening: bool,
-    pass_streak: u8,
     terminal: bool,
 }
 
@@ -404,7 +375,6 @@ struct PackedFeatureRow {
     node_features: Vec<f32>,
     global_features: [f32; GLOBAL_FEATURE_DIM],
     legal_nodes: Vec<u8>,
-    pass_legal: bool,
     score_components: [i32; SCORE_COMPONENT_DIM],
     node_owner: Vec<i8>,
     alive_stones: Vec<u8>,
@@ -443,21 +413,12 @@ impl PyStateBatch {
         to_move: Vec<u8>,
         moves_left: Vec<u8>,
         opening: Vec<bool>,
-        pass_streak: Vec<u8>,
     ) -> PyResult<Self> {
         let board = Arc::new(Board::new(rings).map_err(value_error)?);
         let shared = Arc::clone(&board);
         let states = py
             .detach(move || {
-                decode_semantic_states(
-                    shared,
-                    zero_bits,
-                    one_bits,
-                    to_move,
-                    moves_left,
-                    opening,
-                    pass_streak,
-                )
+                decode_semantic_states(shared, zero_bits, one_bits, to_move, moves_left, opening)
             })
             .map_err(PyValueError::new_err)?;
         if states.is_empty() {
@@ -529,20 +490,11 @@ impl PyStateBatch {
         to_move: Vec<u8>,
         moves_left: Vec<u8>,
         opening: Vec<bool>,
-        pass_streak: Vec<u8>,
     ) -> PyResult<()> {
         let board = Arc::clone(&self.board);
         let replacements = py
             .detach(|| {
-                decode_semantic_states(
-                    board,
-                    zero_bits,
-                    one_bits,
-                    to_move,
-                    moves_left,
-                    opening,
-                    pass_streak,
-                )
+                decode_semantic_states(board, zero_bits, one_bits, to_move, moves_left, opening)
             })
             .map_err(PyValueError::new_err)?;
         let replacements = py
@@ -570,7 +522,7 @@ impl PyStateBatch {
         py.detach(|| score_states(&self.states, self.board.node_count()))
     }
 
-    /// Contiguous schema-v2 model features and exact score annotations.
+    /// Contiguous schema-v3 model features and exact score annotations.
     fn feature_data(&self, py: Python<'_>) -> PyFeatureData {
         py.detach(|| pack_feature_states(&self.states))
     }
@@ -635,7 +587,7 @@ impl PyEvalBatch {
         self.legal_offsets.clone()
     }
 
-    /// Flattened stable action codes; pass is `-1`.
+    /// Flattened legal node ids in ascending order per row.
     #[getter]
     fn legal_actions(&self) -> Vec<i32> {
         self.legal_actions.clone()
@@ -1088,9 +1040,8 @@ fn score_states(states: &[GameState], node_count: u16) -> PyScoreData {
     let mut alive_bits = Vec::with_capacity(states.len() * BITBOARD_WORDS);
     let mut winner = Vec::with_capacity(states.len());
     let mut terminal_values = Vec::with_capacity(states.len());
-    let mut wdl_classes = Vec::with_capacity(states.len());
+    let mut outcome_classes = Vec::with_capacity(states.len());
     let mut score_margins = Vec::with_capacity(states.len());
-    let mut terminal_reasons = Vec::with_capacity(states.len());
     for (state, score) in states.iter().zip(&scores) {
         for player in score.players {
             components.extend([
@@ -1106,22 +1057,27 @@ fn score_states(states: &[GameState], node_count: u16) -> PyScoreData {
         components.push(score.leader.map_or(-1, |player| player as i32));
         node_owner.extend_from_slice(&score.node_owner[..usize::from(node_count)]);
         alive_bits.extend(score.alive_stones.words());
-        winner.push(score.leader.map_or(-1, |player| player as i8));
+        let leader = if state.is_terminal() {
+            Some(
+                score
+                    .leader
+                    .expect("a full Double *Star board must have a decisive winner"),
+            )
+        } else {
+            score.leader
+        };
+        winner.push(leader.map_or(-1, |player| player as i8));
         let player = state.to_move().index();
         score_margins.push(score.players[player].total - score.players[1 - player].total);
         if state.is_terminal() {
-            let value = score.outcome_for(state.to_move());
+            let value = score
+                .outcome_for(state.to_move())
+                .expect("a full Double *Star board must have a decisive winner");
             terminal_values.push(value);
-            wdl_classes.push(wdl_class(value));
-            terminal_reasons.push(if state.stones_placed() == node_count {
-                1
-            } else {
-                2
-            });
+            outcome_classes.push(outcome_class(value));
         } else {
             terminal_values.push(0.0);
-            wdl_classes.push(u8::MAX);
-            terminal_reasons.push(0);
+            outcome_classes.push(u8::MAX);
         }
     }
     PyScoreData {
@@ -1132,9 +1088,8 @@ fn score_states(states: &[GameState], node_count: u16) -> PyScoreData {
         alive_bits,
         winner,
         terminal_value: terminal_values,
-        wdl_class: wdl_classes,
+        outcome_class: outcome_classes,
         score_margin: score_margins,
-        terminal_reason: terminal_reasons,
     }
 }
 
@@ -1149,7 +1104,6 @@ fn pack_feature_states(states: &[GameState]) -> PyFeatureData {
                 state.to_move(),
                 state.moves_left(),
                 state.is_opening(),
-                state.pass_streak(),
                 state.is_terminal(),
                 score,
             )
@@ -1169,7 +1123,6 @@ fn pack_semantic_feature_states(states: &[FeatureState]) -> PyFeatureData {
                 state.to_move,
                 state.moves_left,
                 state.opening,
-                state.pass_streak,
                 state.terminal,
                 score,
             )
@@ -1185,7 +1138,6 @@ fn pack_feature_row(
     to_move: Player,
     moves_left: u8,
     opening: bool,
-    pass_streak: u8,
     terminal: bool,
     score: ScoreResult,
 ) -> PackedFeatureRow {
@@ -1238,16 +1190,15 @@ fn pack_feature_row(
     let opponent_count = stones[opponent].count();
     let current_score = score.players[current];
     let opponent_score = score.players[opponent];
-    let score_scale = 181.0_f64;
+    let score_scale = f64::from(SCORE_MARGIN_SUPPORT);
     let star_scale = (f64::from(board.peri_count()) / 2.0).max(1.0);
     let global_features = [
-        (f64::from(board.rings()) / 12.0) as f32,
+        (f64::from(board.rings()) / 10.0) as f32,
         (f64::from(occupied) / f64::from(board.node_count())) as f32,
         (f64::from(current_count) / f64::from(board.node_count())) as f32,
         (f64::from(opponent_count) / f64::from(board.node_count())) as f32,
         (f64::from(moves_left) / 2.0) as f32,
         binary_feature(opening),
-        (f64::from(pass_streak) / 2.0) as f32,
         binary_feature(terminal),
         (f64::from(current_score.total) / score_scale) as f32,
         (f64::from(opponent_score.total) / score_scale) as f32,
@@ -1267,7 +1218,6 @@ fn pack_feature_row(
         node_features,
         global_features,
         legal_nodes,
-        pass_legal: !terminal,
         score_components,
         node_owner,
         alive_stones,
@@ -1281,7 +1231,7 @@ fn pack_feature_rows(rows: Vec<PackedFeatureRow>) -> PyFeatureData {
     let mut node_features = vec![0.0_f32; batch_size * max_nodes * NODE_FEATURE_DIM];
     let mut global_features = Vec::with_capacity(batch_size * GLOBAL_FEATURE_DIM);
     let mut node_mask = vec![0_u8; batch_size * max_nodes];
-    let mut legal_action_mask = vec![0_u8; batch_size * (max_nodes + 1)];
+    let mut legal_action_mask = vec![0_u8; batch_size * max_nodes];
     let mut score_components = Vec::with_capacity(batch_size * SCORE_COMPONENT_DIM);
     let mut node_owner = vec![-1_i8; batch_size * max_nodes];
     let mut alive_stones = vec![0_u8; batch_size * max_nodes];
@@ -1296,10 +1246,9 @@ fn pack_feature_rows(rows: Vec<PackedFeatureRow>) -> PyFeatureData {
         node_mask[node_start..node_end].fill(1);
         node_owner[node_start..node_end].copy_from_slice(&row.node_owner);
         alive_stones[node_start..node_end].copy_from_slice(&row.alive_stones);
-        let action_start = row_index * (max_nodes + 1);
+        let action_start = row_index * max_nodes;
         legal_action_mask[action_start..action_start + row.node_count]
             .copy_from_slice(&row.legal_nodes);
-        legal_action_mask[action_start + max_nodes] = u8::from(row.pass_legal);
         score_components.extend_from_slice(&row.score_components);
     }
     PyFeatureData {
@@ -1363,13 +1312,11 @@ fn i8_buffer(values: &[i8]) -> Vec<u8> {
     values.iter().map(|value| value.to_ne_bytes()[0]).collect()
 }
 
-fn wdl_class(value: f32) -> u8 {
-    if value > 0.0 {
-        2
-    } else if value < 0.0 {
-        0
-    } else {
-        1
+fn outcome_class(value: f32) -> u8 {
+    match value {
+        1.0 => 1,
+        -1.0 => 0,
+        _ => panic!("terminal value must be exactly -1 or 1"),
     }
 }
 
@@ -1390,9 +1337,7 @@ fn pack_states(states: &[GameState]) -> PyStateData {
                 moves_left: state.moves_left(),
                 opening: state.is_opening(),
                 mid_turn: state.is_mid_turn(),
-                pass_streak: state.pass_streak(),
                 terminal: state.is_terminal(),
-                pass_legal: legal.pass,
             }
         })
         .collect();
@@ -1405,9 +1350,7 @@ fn pack_states(states: &[GameState]) -> PyStateData {
     let mut moves_left = Vec::with_capacity(states.len());
     let mut opening = Vec::with_capacity(states.len());
     let mut mid_turn = Vec::with_capacity(states.len());
-    let mut pass_streak = Vec::with_capacity(states.len());
     let mut terminal = Vec::with_capacity(states.len());
-    let mut pass_legal = Vec::with_capacity(states.len());
     for row in rows {
         zero_bits.extend(row.zero_bits);
         one_bits.extend(row.one_bits);
@@ -1418,9 +1361,7 @@ fn pack_states(states: &[GameState]) -> PyStateData {
         moves_left.push(row.moves_left);
         opening.push(row.opening);
         mid_turn.push(row.mid_turn);
-        pass_streak.push(row.pass_streak);
         terminal.push(row.terminal);
-        pass_legal.push(row.pass_legal);
     }
     PyStateData {
         rings,
@@ -1435,9 +1376,7 @@ fn pack_states(states: &[GameState]) -> PyStateData {
         moves_left,
         opening,
         mid_turn,
-        pass_streak,
         terminal,
-        pass_legal,
     }
 }
 
@@ -1470,14 +1409,12 @@ fn decode_semantic_states(
     to_move: Vec<u8>,
     moves_left: Vec<u8>,
     opening: Vec<bool>,
-    pass_streak: Vec<u8>,
 ) -> Result<Vec<GameState>, String> {
     let rows = to_move.len();
     if zero_bits.len() != rows * BITBOARD_WORDS
         || one_bits.len() != rows * BITBOARD_WORDS
         || moves_left.len() != rows
         || opening.len() != rows
-        || pass_streak.len() != rows
     {
         return Err(format!("semantic buffers disagree on row count {rows}"));
     }
@@ -1507,7 +1444,6 @@ fn decode_semantic_states(
                 player,
                 moves_left[row],
                 opening[row],
-                pass_streak[row],
             )
             .map_err(|error| format!("row {row}: {error}"))
         })
@@ -1577,25 +1513,14 @@ fn decode_semantic_feature_states(
         };
         let moves_left = metadata[base + 1];
         let opening = semantic_bool("opening", row, metadata[base + 2])?;
-        let pass_streak = metadata[base + 3];
-        let terminal = semantic_bool("terminal", row, metadata[base + 4])?;
-        validate_feature_semantics(
-            row,
-            &board,
-            stones,
-            to_move,
-            moves_left,
-            opening,
-            pass_streak,
-            terminal,
-        )?;
+        let terminal = semantic_bool("terminal", row, metadata[base + 3])?;
+        validate_feature_semantics(row, &board, stones, to_move, moves_left, opening, terminal)?;
         states.push(FeatureState {
             board,
             stones,
             to_move,
             moves_left,
             opening,
-            pass_streak,
             terminal,
         });
     }
@@ -1616,7 +1541,6 @@ fn validate_feature_semantics(
     to_move: Player,
     moves_left: u8,
     opening: bool,
-    pass_streak: u8,
     terminal: bool,
 ) -> Result<(), String> {
     let occupied = stones[0].count() + stones[1].count();
@@ -1624,13 +1548,8 @@ fn validate_feature_semantics(
     if moves_left > 2 {
         return Err(format!("row {row} has moves_left outside 0..2"));
     }
-    if pass_streak > 2 {
-        return Err(format!("row {row} has pass_streak outside 0..2"));
-    }
-    if terminal != (board_full || pass_streak == 2) {
-        return Err(format!(
-            "row {row} terminal must equal board-full or pass_streak == 2"
-        ));
+    if terminal != board_full {
+        return Err(format!("row {row} terminal must equal board-full"));
     }
     if moves_left == 0 && !board_full {
         return Err(format!(
@@ -1642,13 +1561,7 @@ fn validate_feature_semantics(
             "row {row} full board retains more than one placement"
         ));
     }
-    if opening
-        && (to_move != Player::Zero
-            || moves_left != 1
-            || pass_streak != 0
-            || occupied != 0
-            || terminal)
-    {
+    if opening && (to_move != Player::Zero || moves_left != 1 || occupied != 0 || terminal) {
         return Err(format!("row {row} has invalid opening metadata"));
     }
     Ok(())
@@ -1905,8 +1818,8 @@ fn value_error(error: impl std::fmt::Display) -> PyErr {
 
 /// Encodes a heterogeneous semantic-key batch from three contiguous byte buffers.
 ///
-/// `rings` is `uint8[B]`; `metadata` is `uint8[B, 5]` in
-/// `(to_move, moves_left, opening, pass_streak, terminal)` order; and `stones`
+/// `rings` is `uint8[B]`; `metadata` is `uint8[B, 4]` in
+/// `(to_move, moves_left, opening, terminal)` order; and `stones`
 /// is the concatenation of each row's native node-order `int8` stones.
 #[pyfunction]
 fn encode_semantic_features(
@@ -2019,14 +1932,12 @@ mod tests {
 
     #[test]
     fn selected_terminal_rows_reset_independently_and_transactionally() {
-        let board = Arc::new(Board::new(3).unwrap());
-        let mut terminal_pass = GameState::new(Arc::clone(&board));
-        terminal_pass.apply(Action::Pass).unwrap();
-        terminal_pass.apply(Action::Pass).unwrap();
+        let board = Arc::new(Board::new(4).unwrap());
+        let terminal = full_state(Arc::clone(&board));
         let mut active = GameState::new(Arc::clone(&board));
         active.apply(Action::Place(0)).unwrap();
         let full = full_state(Arc::clone(&board));
-        let states = vec![terminal_pass, active, full];
+        let states = vec![terminal, active, full];
         let active_key = states[1].key();
         let full_key = states[2].key();
 
@@ -2042,40 +1953,29 @@ mod tests {
 
         assert!(prepare_terminal_resets(&board, &states, &[1]).is_err());
         assert!(prepare_terminal_resets(&board, &states, &[0, 0]).is_err());
-        assert_eq!(states[0].pass_streak(), 2);
         assert_eq!(states[1].key(), active_key);
     }
 
     #[test]
     fn semantic_import_round_trips_terminal_residual_states() {
-        for rings in [3, 5] {
+        for rings in [4, 6] {
             let board = Arc::new(Board::new(rings).unwrap());
             let full = full_state(Arc::clone(&board));
             let imported = semantic_round_trip(&full);
             assert_eq!(imported.key(), full.key());
             assert_eq!(imported.hash64(), full.hash64());
-            assert_eq!(imported.moves_left(), if rings == 3 { 1 } else { 0 });
+            assert_eq!(imported.moves_left(), if rings == 4 { 1 } else { 0 });
             assert!(imported.is_terminal());
             assert_eq!(
                 ScoringScratch::default().score_state(&imported).players,
                 ScoringScratch::default().score_state(&full).players
             );
         }
-
-        let board = Arc::new(Board::new(4).unwrap());
-        let mut passed = GameState::new(board);
-        passed.apply(Action::Pass).unwrap();
-        passed.apply(Action::Pass).unwrap();
-        let imported = semantic_round_trip(&passed);
-        assert_eq!(imported.key(), passed.key());
-        assert_eq!(imported.pass_streak(), 2);
-        assert_eq!(imported.moves_left(), 2);
-        assert!(imported.is_terminal());
     }
 
     #[test]
     fn imported_and_reset_rows_are_immediately_searchable() {
-        let board = Arc::new(Board::new(3).unwrap());
+        let board = Arc::new(Board::new(4).unwrap());
         let mut imported_source = GameState::new(Arc::clone(&board));
         imported_source.apply(Action::Place(7)).unwrap();
         imported_source.apply(Action::Place(8)).unwrap();
@@ -2087,13 +1987,10 @@ mod tests {
             packed.to_move,
             packed.moves_left,
             packed.opening,
-            packed.pass_streak,
         )
         .unwrap();
 
-        let mut terminal = GameState::new(Arc::clone(&board));
-        terminal.apply(Action::Pass).unwrap();
-        terminal.apply(Action::Pass).unwrap();
+        let terminal = full_state(Arc::clone(&board));
         let states = vec![terminal, GameState::new(Arc::clone(&board))];
         let mut replaced = states.clone();
         commit_rows(
@@ -2111,13 +2008,13 @@ mod tests {
         let reset_request = SearchTree::new(reset[0].clone()).root_request().unwrap();
         assert_eq!(
             reset_request.legal_actions.len(),
-            usize::from(board.node_count()) + 1
+            usize::from(board.node_count())
         );
     }
 
     #[test]
     fn semantic_import_rejects_malformed_rows() {
-        let board = Arc::new(Board::new(3).unwrap());
+        let board = Arc::new(Board::new(4).unwrap());
         let empty_words = vec![0_u64; BITBOARD_WORDS];
         assert!(
             decode_semantic_states(
@@ -2127,19 +2024,17 @@ mod tests {
                 vec![2],
                 vec![1],
                 vec![true],
-                vec![0],
             )
             .is_err()
         );
         assert!(
             decode_semantic_states(
                 Arc::clone(&board),
-                vec![1, 0, 0, 0, 0, 0, 0],
-                vec![1, 0, 0, 0, 0, 0, 0],
+                vec![1, 0, 0, 0, 0],
+                vec![1, 0, 0, 0, 0],
                 vec![0],
                 vec![2],
                 vec![false],
-                vec![0],
             )
             .is_err()
         );
@@ -2149,32 +2044,92 @@ mod tests {
                 empty_words.clone(),
                 empty_words,
                 vec![1],
-                vec![1],
+                vec![0],
                 vec![false],
-                vec![1],
             )
             .is_err()
         );
     }
 
     #[test]
+    fn feature_v3_uses_four_field_semantics_and_nodes_only_masks() {
+        let rings = [4_u8, 10];
+        let metadata = [0_u8, 1, 1, 0, 0, 1, 1, 0];
+        let stones = vec![u8::MAX; 50 + 275];
+        let states = decode_semantic_feature_states(&rings, &metadata, &stones).unwrap();
+        let features = pack_semantic_feature_states(&states);
+
+        assert_eq!(features.batch_size, 2);
+        assert_eq!(features.max_nodes, 275);
+        assert_eq!(NODE_FEATURE_DIM, 15);
+        assert_eq!(GLOBAL_FEATURE_DIM, 17);
+        assert_eq!(FEATURE_SCHEMA_VERSION, 3);
+        assert_eq!(FEATURE_SCHEMA_HASH, 0x6b5b_00f6_38e9_c16b);
+        assert_eq!(features.buffers.legal_action_mask.len(), 2 * 275);
+        assert!(
+            features.buffers.legal_action_mask[..50]
+                .iter()
+                .all(|bit| *bit == 1)
+        );
+        assert!(
+            features.buffers.legal_action_mask[50..275]
+                .iter()
+                .all(|bit| *bit == 0)
+        );
+        assert!(
+            features.buffers.legal_action_mask[275..]
+                .iter()
+                .all(|bit| *bit == 1)
+        );
+
+        let globals: Vec<_> = features
+            .buffers
+            .global_features
+            .chunks_exact(std::mem::size_of::<f32>())
+            .map(|bytes| f32::from_ne_bytes(bytes.try_into().unwrap()))
+            .collect();
+        assert_eq!(globals.len(), 2 * GLOBAL_FEATURE_DIM);
+        assert!((globals[0] - 0.4).abs() <= f32::EPSILON);
+        assert_eq!(globals[4], 0.5);
+        assert_eq!(globals[5], 1.0);
+        assert_eq!(globals[6], 0.0);
+        assert_eq!(globals[GLOBAL_FEATURE_DIM], 1.0);
+    }
+
+    #[test]
+    fn static_ties_remain_optional_but_action_minus_one_is_rejected() {
+        let board = Arc::new(Board::new(4).unwrap());
+        let state = GameState::new(board);
+        let score = ScoringScratch::default().score_state(&state);
+        assert_eq!(score.leader, None);
+        assert_eq!(score.outcome_for(Player::Zero), None);
+        let score_data = score_states(std::slice::from_ref(&state), state.board().node_count());
+        assert_eq!(score_data.winner, [-1]);
+        assert_eq!(score_data.terminal_value, [0.0]);
+        assert_eq!(score_data.outcome_class, [u8::MAX]);
+        assert!(prepare_applied_rows(&[state], vec![0], vec![-1]).is_err());
+    }
+
+    #[test]
     fn trajectory_metadata_exposes_terminal_value_and_residuals() {
-        let board = Arc::new(Board::new(3).unwrap());
+        let board = Arc::new(Board::new(4).unwrap());
         let full = full_state(board);
         let state_data = pack_states(std::slice::from_ref(&full));
-        assert_eq!(state_data.stones_placed, [30]);
+        assert_eq!(state_data.stones_placed, [50]);
         assert_eq!(state_data.moves_left, [1]);
         assert_eq!(state_data.mid_turn, [true]);
         let trajectory_data = pack_trajectory_data(std::slice::from_ref(&full));
         assert_eq!(trajectory_data.current_turn_offsets, [0, 1]);
         assert_eq!(trajectory_data.current_turn_moves.len(), 1);
-        assert_eq!(trajectory_data.turn_count, [15]);
+        assert_eq!(trajectory_data.turn_count, [25]);
 
-        let score_data = score_states(&[full], 30);
-        assert_eq!(score_data.terminal_reason, [1]);
-        assert_ne!(score_data.wdl_class, [u8::MAX]);
-        assert_eq!(score_data.terminal_value.len(), 1);
-        assert_eq!(score_data.score_margin.len(), 1);
+        let score_data = score_states(&[full], 50);
+        let value = score_data.terminal_value[0];
+        assert!(value == -1.0 || value == 1.0);
+        assert_eq!(score_data.outcome_class, [if value == 1.0 { 1 } else { 0 }]);
+        assert!(matches!(score_data.winner.as_slice(), [0 | 1]));
+        assert_ne!(score_data.score_margin[0], 0);
+        assert_ne!(score_data.score_margin[0] % 2, 0);
     }
 
     #[test]
@@ -2194,7 +2149,6 @@ mod tests {
             packed.to_move,
             packed.moves_left,
             packed.opening,
-            packed.pass_streak,
         )
         .unwrap()
         .pop()
@@ -2216,7 +2170,7 @@ mod tests {
             .unwrap();
         pool.install(|| {
             Python::attach(|py| {
-                let board = Arc::new(Board::new(3).unwrap());
+                let board = Arc::new(Board::new(4).unwrap());
                 let mut batch = PyStateBatch {
                     board: Arc::clone(&board),
                     states: (0..32)
@@ -2237,9 +2191,6 @@ mod tests {
                     .collect();
                 batch.apply_many(py, row_indices, second_actions).unwrap();
 
-                let pass_rows: Vec<_> = (0..8).flat_map(|index| [index, index]).collect();
-                batch.apply_many(py, pass_rows, vec![-1; 16]).unwrap();
-                batch.reset_many(py, vec![0, 2, 4, 6]).unwrap();
                 let transformed = batch.transformed(py, 7).unwrap();
                 let state_data = transformed.data(py);
                 let score_data = transformed.score_data(py);

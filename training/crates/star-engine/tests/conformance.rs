@@ -4,8 +4,8 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use star_engine::{
-    Action, BITBOARD_WORDS, BitBoard, Board, D5Maps, GameState, MAX_RINGS, MIN_RINGS, Player,
-    PlayerScore, RULES_HASH_VALUE, ScoringScratch, Symmetry, rules_hash,
+    Action, BITBOARD_WORDS, BitBoard, Board, D5Maps, GameState, Player, PlayerScore,
+    RULES_HASH_VALUE, SUPPORTED_RINGS, ScoringScratch, Symmetry, rules_hash,
 };
 
 fn edge_count(rings: u8) -> usize {
@@ -26,6 +26,7 @@ fn position(board: &Board, zero: &[&str], one: &[&str]) -> [BitBoard; 2] {
 
 #[test]
 fn typescript_known_board_counts_and_topology_match() {
+    assert_eq!(Board::new(4).unwrap().node_count(), 50);
     assert_eq!(Board::new(6).unwrap().node_count(), 105);
     assert_eq!(Board::new(8).unwrap().node_count(), 180);
     assert_eq!(Board::new(10).unwrap().node_count(), 275);
@@ -33,7 +34,7 @@ fn typescript_known_board_counts_and_topology_match() {
     assert_eq!(Board::new(8).unwrap().peri_count(), 40);
     assert_eq!(Board::new(10).unwrap().peri_count(), 50);
 
-    for rings in MIN_RINGS..=MAX_RINGS {
+    for rings in SUPPORTED_RINGS {
         let board = Board::new(rings).unwrap();
         assert_eq!(
             board.node_count(),
@@ -53,6 +54,9 @@ fn typescript_known_board_counts_and_topology_match() {
                 assert!(board.neighbors(neighbor).contains(&node));
             }
         }
+    }
+    for rings in [0, 1, 2, 3, 5, 7, 9, 11, 12, u8::MAX] {
+        assert!(Board::new(rings).is_err());
     }
 }
 
@@ -94,8 +98,8 @@ fn typescript_known_labels_and_adjacencies_match() {
 }
 
 #[test]
-fn double_star_atomic_protocol_passes_and_undo_match_oracle() {
-    let board = Arc::new(Board::new(3).unwrap());
+fn double_star_atomic_placements_and_undo_match_oracle() {
+    let board = Arc::new(Board::new(4).unwrap());
     let mut state = GameState::new(Arc::clone(&board));
     assert_eq!(state.to_move(), Player::Zero);
     assert_eq!(state.moves_left(), 1);
@@ -107,19 +111,19 @@ fn double_star_atomic_protocol_passes_and_undo_match_oracle() {
     assert_eq!(state.to_move(), Player::One);
     assert_eq!(state.moves_left(), 1);
 
-    let key_before_pass = state.key();
-    let (_, undo) = state.apply_reversible(Action::Pass).unwrap();
+    let key_before_second_placement = state.key();
+    let (_, undo) = state.apply_reversible(Action::Place(2)).unwrap();
     assert_eq!(state.to_move(), Player::Zero);
     assert_eq!(state.moves_left(), 2);
-    assert_eq!(state.pass_streak(), 1);
     state.undo(undo);
-    assert_eq!(state.key(), key_before_pass);
-
-    state.apply(Action::Pass).unwrap();
-    state.apply(Action::Pass).unwrap();
-    assert!(state.is_terminal());
-    assert!(state.legal_actions().is_empty());
-    assert!(state.apply(Action::Place(2)).is_err());
+    assert_eq!(state.key(), key_before_second_placement);
+    assert!(!state.is_terminal());
+    assert_eq!(
+        state.legal_actions().to_vec(),
+        (2..board.node_count())
+            .map(Action::Place)
+            .collect::<Vec<_>>()
+    );
 
     let mut full = GameState::new(board);
     for node in 0..full.board().node_count() {
@@ -151,7 +155,7 @@ fn pair_order_has_the_same_semantic_key_and_hash() {
 
 #[test]
 fn d5_maps_are_deterministic_bijections_and_graph_automorphisms() {
-    for rings in MIN_RINGS..=MAX_RINGS {
+    for rings in SUPPORTED_RINGS {
         let board = Board::new(rings).unwrap();
         let first = D5Maps::new(&board);
         let second = D5Maps::new(&board);
@@ -287,7 +291,7 @@ fn scoring_is_d5_invariant_and_full_board_identity_holds() {
     }
 
     let mut seed = 0x0057_17a5_u64;
-    for rings in [3, 4, 5, 6, 8, 10, 12] {
+    for rings in SUPPORTED_RINGS {
         let board = Board::new(rings).unwrap();
         for _ in 0..40 {
             let mut stones = [BitBoard::empty(); 2];
@@ -309,5 +313,5 @@ fn scoring_is_d5_invariant_and_full_board_identity_holds() {
     }
 
     assert_eq!(rules_hash(), RULES_HASH_VALUE);
-    assert_eq!(rules_hash(), 0xcdb3_4fb0_2be8_2843);
+    assert_eq!(rules_hash(), 0x2da3_7835_1938_1453);
 }

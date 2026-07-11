@@ -21,7 +21,7 @@ ONNX_INPUT_NAMES = (
 )
 ONNX_OUTPUT_NAMES = (
     "policy_logits",
-    "wdl_logits",
+    "outcome_logits",
     "score_margin_logits",
     "ownership_logits",
     "alive_logits",
@@ -75,7 +75,6 @@ def export_onnx(
     batch = torch.export.Dim("batch")
     nodes = torch.export.Dim("nodes")
     degree = torch.export.Dim("degree")
-    actions = nodes + 1
     dynamic_shapes = (
         {0: batch, 1: nodes},
         {0: batch},
@@ -83,7 +82,7 @@ def export_onnx(
         {0: batch, 1: nodes, 2: degree},
         {0: batch, 1: nodes, 2: degree},
         {0: batch, 1: nodes},
-        {0: batch, 1: actions},
+        {0: batch, 1: nodes},
     )
     try:
         torch.onnx.export(

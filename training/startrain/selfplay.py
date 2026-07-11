@@ -12,6 +12,7 @@ from typing import Any, Protocol, Sequence
 
 import numpy as np
 
+from .contracts import OUTCOME_LOSS, OUTCOME_WIN
 from .inference import InferenceResponse, NativeEvalBatchProtocol
 from .native import (
     positions_from_native,
@@ -20,6 +21,7 @@ from .native import (
 )
 from .replay import ReplaySample
 from .runtime import validate_identifier
+from .topology import SUPPORTED_RINGS
 
 
 class EvaluatorProtocol(Protocol):
@@ -49,7 +51,7 @@ class ReplaySinkProtocol(Protocol):
 
 @dataclass(frozen=True, slots=True)
 class SelfPlayConfig:
-    rings: int = 3
+    rings: int = 4
     batch_size: int = 1
     games: int = 1
     fast_probability: float = 0.75
@@ -65,14 +67,13 @@ class SelfPlayConfig:
     fast_policy_weight: float = 0.25
     c_visit: float = 50.0
     c_scale: float = 1.0
-    initial_pass_logit_penalty: float = 1.5
     score_utility_weight: float = 0.0
     shard_size: int = 512
     seed: int = 17
 
     def __post_init__(self) -> None:
-        if not 3 <= self.rings <= 12:
-            raise ValueError("self-play rings must be in 3..12")
+        if type(self.rings) is not int or self.rings not in SUPPORTED_RINGS:
+            raise ValueError("self-play rings must be one of (4, 6, 8, 10)")
         if self.batch_size <= 0 or self.games <= 0:
             raise ValueError("batch_size and games must be positive")
         if min(self.fast_probability, self.full_probability) < 0 or not np.isclose(
@@ -83,7 +84,11 @@ class SelfPlayConfig:
             )
         if min(self.fast_simulations, self.full_simulations) <= 0:
             raise ValueError("playout caps must be positive")
-        if self.simulation_reference_rings <= 0 or self.simulation_ring_exponent < 0:
+        if (
+            type(self.simulation_reference_rings) is not int
+            or self.simulation_reference_rings not in SUPPORTED_RINGS
+            or self.simulation_ring_exponent < 0
+        ):
             raise ValueError("ring-count simulation scaling is invalid")
         if (
             self.max_considered <= 0
@@ -96,15 +101,13 @@ class SelfPlayConfig:
             raise ValueError("record_fast_policy_targets must be boolean")
         if not 0 <= self.fast_policy_weight <= 1:
             raise ValueError("fast_policy_weight must be in [0, 1]")
-        if self.initial_pass_logit_penalty < 0:
-            raise ValueError("initial pass logit penalty must be non-negative")
         if not 0 <= self.score_utility_weight <= 1:
             raise ValueError("score utility weight must be in [0, 1]")
 
     @classmethod
     def cpu_smoke(cls, *, seed: int = 17) -> "SelfPlayConfig":
         return cls(
-            rings=3,
+            rings=4,
             batch_size=1,
             games=1,
             fast_probability=0.0,
@@ -142,7 +145,6 @@ class GameSummary:
     winner: int
     terminal_value: float
     score_margin: int
-    terminal_reason: int
     turn_count: int
     last_move: int
     model_version: str
@@ -155,15 +157,13 @@ class GameSummary:
 class SelfPlayMetrics:
     """Monotonic counters for one self-play actor lifetime.
 
-    Decision-mode, pass, and entropy counters are recorded when a decision is
-    made. ``completed_decisions`` and ``dropped_decisions`` partition those
-    attempts at the end of a run.
+    Decision-mode and entropy counters are recorded when a decision is made.
+    ``completed_decisions`` and ``dropped_decisions`` partition attempts.
     """
 
     completed_decisions: int = 0
     full_decisions: int = 0
     fast_decisions: int = 0
-    pass_decisions: int = 0
     policy_entropy_count: int = 0
     policy_entropy_sum: float = 0.0
     policy_weight_sum: float = 0.0
@@ -241,7 +241,6 @@ class SelfPlayActor:
         self.completed_decisions = 0
         self.full_decisions = 0
         self.fast_decisions = 0
-        self.pass_decisions = 0
         self.policy_entropy_count = 0
         self.policy_entropy_sum = 0.0
         self.policy_weight_sum = 0.0
@@ -257,7 +256,6 @@ class SelfPlayActor:
             completed_decisions=self.completed_decisions,
             full_decisions=self.full_decisions,
             fast_decisions=self.fast_decisions,
-            pass_decisions=self.pass_decisions,
             policy_entropy_count=self.policy_entropy_count,
             policy_entropy_sum=self.policy_entropy_sum,
             policy_weight_sum=self.policy_weight_sum,
@@ -405,8 +403,11 @@ class SelfPlayActor:
             active_rows = [
                 row for row, terminal in enumerate(results.terminal) if not terminal
             ]
-            if any(selected[row] == -2 for row in active_rows):
-                raise RuntimeError("active search row returned terminal sentinel")
+            if any(
+                selected[row] < 0 or selected[row] >= positions[row].stones.numel()
+                for row in active_rows
+            ):
+                raise RuntimeError("active search row returned an invalid placement")
             states.apply_many(active_rows, [selected[row] for row in active_rows])
             iteration += 1
             if progress is not None and iteration % 32 == 0:
@@ -455,14 +456,13 @@ class SelfPlayActor:
                 start, end = offsets[row], offsets[row + 1]
                 if end <= start or end > probabilities.size:
                     raise RuntimeError("full-search policy target is missing")
-                policy = np.zeros(position.stones.numel() + 1, dtype=np.float32)
+                policy = np.zeros(position.stones.numel(), dtype=np.float32)
                 for action, probability in zip(
                     actions[start:end], probabilities[start:end], strict=True
                 ):
-                    index = position.stones.numel() if action == -1 else action
-                    if index < 0 or index > position.stones.numel():
+                    if action < 0 or action >= position.stones.numel():
                         raise RuntimeError("search policy action is invalid")
-                    policy[index] = probability
+                    policy[action] = probability
                 mass = float(policy.sum())
                 if mass <= 0:
                     raise RuntimeError("completed-Q policy has no mass")
@@ -497,8 +497,6 @@ class SelfPlayActor:
                 self.full_decisions += 1
             else:
                 self.fast_decisions += 1
-            if selected_actions[row] == -1:
-                self.pass_decisions += 1
             if policy_entropy is not None:
                 self.policy_entropy_count += 1
                 self.policy_entropy_sum += policy_entropy
@@ -518,13 +516,36 @@ class SelfPlayActor:
         scores_data = states.score_data()
         trajectory_data = states.trajectory_data()
         scores = score_results_from_native(scores_data)
+        final_positions = positions_from_native(state_data)
         trajectory_rows = trajectory_rows_from_native(trajectory_data)
         terminal_value = list(scores_data.terminal_value)
+        outcome_class = list(scores_data.outcome_class)
         score_margin = list(scores_data.score_margin)
-        terminal_reason = list(scores_data.terminal_reason)
         winner = list(scores_data.winner)
         summaries: list[GameSummary] = []
         for row in rows:
+            final_position = final_positions[row]
+            final_score = scores[row]
+            if not final_position.terminal or final_score.leader not in (0, 1):
+                raise RuntimeError("self-play final state must be full and decisive")
+            if int(winner[row]) != final_score.leader:
+                raise RuntimeError("native final winner disagrees with final score")
+            expected_outcome = (
+                OUTCOME_WIN
+                if final_score.leader == final_position.to_move
+                else OUTCOME_LOSS
+            )
+            expected_value = 1.0 if expected_outcome == OUTCOME_WIN else -1.0
+            expected_margin = (
+                final_score.players[final_position.to_move].total
+                - final_score.players[1 - final_position.to_move].total
+            )
+            if (
+                int(outcome_class[row]) != expected_outcome
+                or float(terminal_value[row]) != expected_value
+                or int(score_margin[row]) != expected_margin
+            ):
+                raise RuntimeError("native binary terminal targets are inconsistent")
             decisions = trajectories[row]
             if not decisions:
                 raise RuntimeError("terminal game has no recorded decisions")
@@ -578,7 +599,6 @@ class SelfPlayActor:
                     winner=int(winner[row]),
                     terminal_value=float(terminal_value[row]),
                     score_margin=int(score_margin[row]),
-                    terminal_reason=int(terminal_reason[row]),
                     turn_count=metadata.turn_count,
                     last_move=metadata.last_move,
                     model_version=version,

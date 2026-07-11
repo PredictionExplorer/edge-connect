@@ -420,11 +420,11 @@ python scripts/hardware_preflight.py \
 python scripts/hardware_preflight.py \
   --config "$PROFILE" \
   --device cuda:0 \
-  --rings 12 \
+  --rings 10 \
   --batch-size 64
 ```
 
-The benchmark includes native-state decoding, schema-v2 features, host/device
+The benchmark includes native-state decoding, schema-v3 features, host/device
 transfer, compiled BF16 model execution, and legal-policy return. Both commands
 must exit zero and meet the configured threshold of at least 5,000 realistic
 leaf evaluations per second per H100.
@@ -448,9 +448,9 @@ python scripts/hardware_preflight.py \
 python scripts/hardware_preflight.py \
   --config "$PROFILE" \
   --device cuda:0 \
-  --rings 12 \
+  --rings 10 \
   --batch-size 64 \
-  | tee "$RUN_ROOT/hardware-preflight-r12.json"
+  | tee "$RUN_ROOT/hardware-preflight-r10.json"
 ```
 
 For a repeated ring/batch matrix with immutable JSON/JSONL evidence, run:
@@ -459,7 +459,7 @@ For a repeated ring/batch matrix with immutable JSON/JSONL evidence, run:
 python scripts/h100_system_benchmark.py \
   --config "$PROFILE" \
   --output-dir "$RUN_ROOT/system-benchmark" \
-  --rings 6 12 \
+  --rings 6 10 \
   --batch-sizes 64 128 256 \
   --repeats 3 \
   --metrics-root "$RUN_ROOT"
@@ -587,8 +587,8 @@ Normal startup order:
    anytime-valid promotion gate.
 
 The learner can legitimately remain in `replay_wait` while actors generate
-data. The curriculum initially permits rings 3–4, then rings 3–6 until total
-samples reach one million, and only then opens all rings. Since the learner
+data. The curriculum initially permits ring 4, then rings 4 and 6 until total
+samples reach one million, and only then opens rings 4/6/8/10. Since the learner
 requires a minimum unique count on every ring, initial training can wait beyond
 the nominal aggregate replay minimum. Actor progress during that period is the
 important health signal.
@@ -722,8 +722,8 @@ Useful metric expectations:
 Do not extrapolate the full run before measuring real data:
 
 1. Before launch: at least 5,000 realistic leaf evaluations/s/H100 at rings 6
-   and 12.
-2. After 10,000 games: record game length, pass rate, search mix, CPU
+   and 10.
+2. After 10,000 games: record game length, search mix, CPU
    saturation, ring distribution, replay growth, and GPU utilization.
 3. By 100,000 games: beat random/greedy nearly perfectly and beat a fixed
    shallow search convincingly on every active ring.
@@ -969,7 +969,7 @@ Before running `startrain-orchestrate`, confirm all boxes:
 - [ ] `star_native` release extension built and rules hash verified;
 - [ ] CPU/native tests pass without skips;
 - [ ] CUDA smoke passes;
-- [ ] ring-6 and ring-12 hardware preflight exceeds the throughput floor;
+- [ ] ring-6 and ring-10 hardware preflight exceeds the throughput floor;
 - [ ] NCCL smoke passes or custom DDP is explicitly out of scope;
 - [ ] copied profile has a unique run ID and absolute run root;
 - [ ] profile, source commit, environment, and preflight evidence archived;

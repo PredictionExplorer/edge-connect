@@ -20,7 +20,7 @@ const scriptDirectory = dirname(fileURLToPath(import.meta.url));
 const repositoryRoot = resolve(scriptDirectory, '..');
 const outputPath = process.argv[2]
   ? resolve(process.cwd(), process.argv[2])
-  : resolve(repositoryRoot, 'testdata/star/conformance-v1.json');
+  : resolve(repositoryRoot, 'testdata/star/conformance-v2.json');
 
 const actualHash =
   `${STAR_RULES_HASH_ALGORITHM}:${fnv1a64(STAR_RULES_CANONICAL)}`;

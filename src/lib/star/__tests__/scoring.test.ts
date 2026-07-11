@@ -1,13 +1,11 @@
 import { describe, expect, it } from 'vitest';
 import {
   getBoard,
-  MAX_RINGS,
-  MIN_RINGS,
   parseLabel,
+  SUPPORTED_RINGS,
   type Board,
 } from '../board';
-import { replay, type GameAction } from '../game';
-import { EMPTY, scorePosition } from '../scoring';
+import { EMPTY, scorePosition, validateTerminalWinner } from '../scoring';
 import { referenceScore } from './reference';
 
 function position(board: Board, blue: string[], red: string[]): Int8Array {
@@ -182,49 +180,12 @@ describe('scorePosition: hand-built fixtures', () => {
     expect(Array.from(got.nodeOwner)).toEqual(want.nodeOwner);
   });
 
-  it('scores a sparse position ended by consecutive passes', () => {
-    const b = getBoard(6);
-    const blue = [b.idx(0, 6, 0), b.idx(0, 6, 1)];
-    const red = [b.idx(2, 6, 0), b.idx(2, 6, 1)];
-    const dead = b.idx(4, 6, 3);
-    const log: GameAction[] = [
-      { type: 'place', node: blue[0] },
-      { type: 'place', node: red[0] },
-      { type: 'place', node: red[1] },
-      { type: 'place', node: blue[1] },
-      { type: 'place', node: dead },
-      { type: 'pass' },
-      { type: 'pass' },
-    ];
-    const terminal = replay(
-      {
-        rings: 6,
-        mode: 'double',
-        pieRule: false,
-        playerNames: ['Blue', 'Red'],
-      },
-      log,
-    );
-    expect(terminal.over).toBe(true);
-    expect(terminal.stonesPlaced).toBe(5);
-
-    const got = scorePosition(b, terminal.stones);
-    const want = referenceScore(b, terminal.stones);
-    expect(got.players[0].stars).toBe(1);
-    expect(got.players[1].stars).toBe(1);
-    for (const node of [...blue, ...red]) expect(got.aliveStone[node]).toBe(1);
-    expect(got.aliveStone[dead]).toBe(0);
-    expect(got.players).toEqual(want.players);
-    expect(got.contestedPeries).toBe(want.contestedPeries);
-    expect(Array.from(got.aliveStone)).toEqual(want.aliveStone);
-    expect(Array.from(got.nodeOwner)).toEqual(want.nodeOwner);
-  });
 });
 
 describe('scorePosition: cross-validation and invariants', () => {
-  it('matches the naive reference scorer on random positions for rings 3..12', () => {
+  it('matches the naive reference scorer on every supported board', () => {
     const rng = mulberry32(0xdecafbad);
-    for (let rings = MIN_RINGS; rings <= MAX_RINGS; rings++) {
+    for (const rings of SUPPORTED_RINGS) {
       const b = getBoard(rings);
       for (const density of [0.02, 0.1, 0.25, 0.55, 0.8, 1]) {
         for (let trial = 0; trial < 30; trial++) {
@@ -243,10 +204,9 @@ describe('scorePosition: cross-validation and invariants', () => {
     }
   });
 
-  it('sums to periCount + 1 on decided full boards (the *Star invariant)', () => {
+  it('makes every sampled full supported board decided and decisive', () => {
     const rng = mulberry32(0x5717a5);
-    let decided = 0;
-    for (const rings of [3, 4, 5, 6, 8, 10]) {
+    for (const rings of SUPPORTED_RINGS) {
       const b = getBoard(rings);
       for (let trial = 0; trial < 120; trial++) {
         const stones = new Int8Array(b.n);
@@ -255,25 +215,23 @@ describe('scorePosition: cross-validation and invariants', () => {
         for (let u = 0; u < b.n; u++) stones[u] = rng() < bias ? 0 : 1;
         const r = scorePosition(b, stones);
         const sum = r.players[0].total + r.players[1].total;
-        // General identity: awards cancel, so the sum is owned peries plus
-        // awarded quark-peri points.
-        expect(sum).toBe(
-          5 * rings - r.contestedPeries + r.players[0].quarkPeri + r.players[1].quarkPeri,
-        );
-        expect(r.players[0].quarkPeri + r.players[1].quarkPeri).toBeLessThanOrEqual(1);
-        if (r.contestedPeries === 0) {
-          decided++;
-          expect(sum).toBe(5 * rings + 1);
-          expect(r.leader).not.toBe(-1); // odd total: no ties possible
-        }
+        const margin = r.players[0].total - r.players[1].total;
+        expect(r.contestedPeries).toBe(0);
+        expect(r.players[0].peries + r.players[1].peries).toBe(b.periCount);
+        expect(r.players[0].quarks + r.players[1].quarks).toBe(5);
+        expect(r.players[0].quarkPeri + r.players[1].quarkPeri).toBe(1);
+        expect(r.players[0].award + r.players[1].award).toBe(0);
+        expect(sum).toBe(5 * rings + 1);
+        expect(margin).not.toBe(0);
+        expect(Math.abs(margin) % 2).toBe(1);
+        expect(r.leader).toBe(margin > 0 ? 0 : 1);
       }
     }
-    expect(decided).toBeGreaterThan(200); // the invariant checks must not be vacuous
   });
 
   it('agrees with the simplified and Schmittberger scoring margins', () => {
     const rng = mulberry32(0xace0fba5);
-    const b = getBoard(5);
+    const b = getBoard(6);
     for (let trial = 0; trial < 200; trial++) {
       const stones = new Int8Array(b.n).fill(EMPTY);
       for (let u = 0; u < b.n; u++) {
@@ -309,5 +267,48 @@ describe('scorePosition: cross-validation and invariants', () => {
       sink += scorePosition(b, fills[i % fills.length]).players[0].total;
     }
     expect(Number.isFinite(sink)).toBe(true);
+  });
+
+  it('validates a binary terminal winner and all final invariants', () => {
+    for (const rings of SUPPORTED_RINGS) {
+      const board = getBoard(rings);
+      const stones = Int8Array.from(
+        { length: board.n },
+        (_, node) => (node % 3 === 0 ? 0 : 1),
+      );
+      const terminal = validateTerminalWinner(board, stones);
+      expect(terminal.winner).toBe(terminal.margin > 0 ? 0 : 1);
+      expect(terminal.score.leader).toBe(terminal.winner);
+      expect(terminal.score.contestedPeries).toBe(0);
+      expect(
+        terminal.score.players[0].total + terminal.score.players[1].total,
+      ).toBe(5 * rings + 1);
+      expect(Math.abs(terminal.margin) % 2).toBe(1);
+    }
+  });
+
+  it('rejects nonfull, unsupported, and synthetic contested terminals', () => {
+    const board = getBoard(4);
+    expect(() =>
+      validateTerminalWinner(board, new Int8Array(board.n).fill(EMPTY)),
+    ).toThrow(/full/);
+
+    const unsupported = { ...board, rings: 5 } as Board;
+    expect(() =>
+      validateTerminalWinner(unsupported, new Int8Array(board.n)),
+    ).toThrow(/unsupported/);
+
+    const disconnected = {
+      ...board,
+      adjOff: new Int32Array(board.n + 1),
+      adj: new Int32Array(),
+    };
+    const mixed = Int8Array.from(
+      { length: board.n },
+      (_, node) => (node % 2) as 0 | 1,
+    );
+    expect(() => validateTerminalWinner(disconnected, mixed)).toThrow(
+      /zero contested peries/,
+    );
   });
 });

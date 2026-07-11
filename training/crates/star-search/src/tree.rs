@@ -628,7 +628,7 @@ mod tests {
 
     #[test]
     fn transposition_reuses_completed_pair_state() {
-        let board = Arc::new(Board::new(3).unwrap());
+        let board = Arc::new(Board::new(4).unwrap());
         let mut state = GameState::new(board);
         state.apply(Action::Place(0)).unwrap();
         let mut tree = SearchTree::new(state);
@@ -669,7 +669,7 @@ mod tests {
 
     #[test]
     fn appendix_d_completion_uses_prior_weighted_visited_q() {
-        let board = Arc::new(Board::new(3).unwrap());
+        let board = Arc::new(Board::new(4).unwrap());
         let mut state = GameState::new(board);
         state.apply(Action::Place(0)).unwrap();
         let mut tree = SearchTree::new(state);
@@ -693,7 +693,7 @@ mod tests {
 
     #[test]
     fn interior_selection_matches_improved_policy_visit_deficit() {
-        let board = Arc::new(Board::new(3).unwrap());
+        let board = Arc::new(Board::new(4).unwrap());
         let mut state = GameState::new(board);
         state.apply(Action::Place(0)).unwrap();
         let mut tree = SearchTree::new(state);
@@ -707,7 +707,7 @@ mod tests {
 
     #[test]
     fn backup_preserves_sign_for_same_player_then_flips_at_turn_boundary() {
-        let board = Arc::new(Board::new(3).unwrap());
+        let board = Arc::new(Board::new(4).unwrap());
         let mut state = GameState::new(board);
         state.apply(Action::Place(0)).unwrap();
         let mut tree = SearchTree::new(state);
@@ -746,7 +746,7 @@ mod tests {
 
     #[test]
     fn response_token_is_mandatory() {
-        let board = Arc::new(Board::new(3).unwrap());
+        let board = Arc::new(Board::new(4).unwrap());
         let mut state = GameState::new(board);
         state.apply(Action::Place(0)).unwrap();
         let mut tree = SearchTree::new(state);
@@ -761,43 +761,8 @@ mod tests {
     }
 
     #[test]
-    fn pass_is_a_real_edge_with_turn_aware_backup() {
-        let board = Arc::new(Board::new(3).unwrap());
-        let mut state = GameState::new(board);
-        state.apply(Action::Place(0)).unwrap();
-        state.apply(Action::Place(1)).unwrap();
-        let mut tree = SearchTree::new(state);
-        initialize_uniform(&mut tree, 0.0);
-        let pass = tree.root_edge(Action::Pass).unwrap();
-        let request = match tree
-            .start_simulation(Some(pass), GumbelParameters::PAPER)
-            .unwrap()
-        {
-            SimulationStart::NeedsEvaluation(request) => request,
-            SimulationStart::Terminal { .. } => panic!("only the first pass"),
-        };
-        assert_eq!(request.state.to_move(), Player::Zero);
-        tree.finish_simulation(evaluation(&request, 0.4)).unwrap();
-        assert!((tree.root_stats()[pass].q + 0.4).abs() < 1.0e-6);
-    }
-
-    #[test]
-    fn terminal_pass_and_board_fill_need_no_evaluator_and_are_cached() {
-        let board = Arc::new(Board::new(3).unwrap());
-        let mut after_one_pass = GameState::new(Arc::clone(&board));
-        after_one_pass.apply(Action::Pass).unwrap();
-        let mut pass_tree = SearchTree::new(after_one_pass);
-        initialize_uniform(&mut pass_tree, 0.0);
-        let pass = pass_tree.root_edge(Action::Pass).unwrap();
-        assert!(matches!(
-            pass_tree
-                .start_simulation(Some(pass), GumbelParameters::PAPER)
-                .unwrap(),
-            SimulationStart::Terminal { root_edge } if root_edge == pass
-        ));
-        let terminal_child = pass_tree.nodes[0].edges[pass].child.unwrap();
-        assert!(pass_tree.nodes[terminal_child].terminal_value.is_some());
-
+    fn board_fill_needs_no_evaluator_and_is_cached() {
+        let board = Arc::new(Board::new(4).unwrap());
         let mut nearly_full = GameState::new(board);
         let last = nearly_full.board().node_count() - 1;
         for node in 0..last {

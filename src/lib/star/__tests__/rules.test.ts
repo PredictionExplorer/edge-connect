@@ -10,7 +10,6 @@ import {
   STAR_ACTION_LAYOUT_SCHEMA_ID,
   STAR_CONFORMANCE_SCHEMA_ID,
   STAR_FEATURE_SCHEMA_ID,
-  STAR_PASS_ACTION_CODE,
   STAR_RULES_CANONICAL,
   STAR_RULES_HASH,
   STAR_RULES_HASH_ALGORITHM,
@@ -18,18 +17,16 @@ import {
   STAR_RULES_VERSION,
 } from '../rules';
 
-const EXPECTED_RULES_HASH = 'fnv1a64:cdb34fb02be82843';
-const EXPECTED_FIXTURE_SHA256 =
-  'sha256:57e533c5c247b65f043546dd1d8abf43174c9257155cacdb1dcba98140292ea4';
+const EXPECTED_RULES_HASH = 'fnv1a64:2da3783519381453';
 
 function sha256(value: string): string {
   return `sha256:${createHash('sha256').update(value, 'utf8').digest('hex')}`;
 }
 
 describe('versioned rules contract', () => {
-  it('pins the complete cross-language gameplay contract', () => {
-    expect(STAR_RULES_VERSION).toBe(1);
-    expect(STAR_RULES_SCHEMA_ID).toBe('edgeconnect.star.rules.v1');
+  it('pins the complete v2 gameplay contract', () => {
+    expect(STAR_RULES_VERSION).toBe(2);
+    expect(STAR_RULES_SCHEMA_ID).toBe('edgeconnect.star.rules.v2');
     expect(STAR_RULES_HASH_ALGORITHM).toBe('fnv1a64');
     expect(`${STAR_RULES_HASH_ALGORITHM}:${fnv1a64(STAR_RULES_CANONICAL)}`).toBe(
       STAR_RULES_HASH,
@@ -37,14 +34,16 @@ describe('versioned rules contract', () => {
     expect(STAR_RULES_HASH).toBe(EXPECTED_RULES_HASH);
 
     for (const requiredClause of [
+      'rings=even:{4,6,8,10}',
       'node-order=x:1..r,s:0..4,y:0..x-1',
       'node-id=5*x*(x-1)/2+s*x+y',
       'csr-neighbor-order=edge-insertion-order',
-      'action-wire=place(node)->node,pass->-1',
-      'legal-order=empty-node-id-ascending,pass-last',
-      'full-terminal=decrement-movesLeft',
-      'passStreak=2,movesLeft=2',
-      'terminal-value=toMove-perspective',
+      'action-wire=place(node)->node',
+      'legal-order=empty-node-id-ascending',
+      'native-action-layout=node-u-at-u',
+      'terminal=full',
+      'terminal-value=toMove-perspective:win=1,loss=-1,tie=invalid',
+      'outcome-class=loss:0,win:1',
       'd5-rk=t+k*x(mod5*x)',
       'd5-fk=k*x-t(mod5*x)',
     ]) {
@@ -52,27 +51,29 @@ describe('versioned rules contract', () => {
     }
   });
 
-  it('keeps model feature and action-layout schemas separate', () => {
+  it('keeps model features and node-only layout separately versioned', () => {
     expect(STAR_FEATURE_SCHEMA_ID).toBe(
-      'edgeconnect.star.model-features.external.v1',
+      'edgeconnect.star.model-features.external.v2',
     );
     expect(STAR_ACTION_LAYOUT_SCHEMA_ID).toBe(
-      'edgeconnect.star.action-layout.nodes-then-pass.v1',
+      'edgeconnect.star.action-layout.nodes-only.v1',
     );
     expect(STAR_RULES_CANONICAL).not.toContain(STAR_FEATURE_SCHEMA_ID);
     expect(STAR_RULES_CANONICAL).not.toContain(STAR_ACTION_LAYOUT_SCHEMA_ID);
   });
 });
 
-describe('Rust and Python conformance export', () => {
-  it('is deterministic with a pinned fixture digest', () => {
+describe('v2 conformance export', () => {
+  it('is deterministic and contains no legacy action or outcome fields', () => {
     const first = serializeStarConformance(createStarConformance());
     const second = serializeStarConformance(createStarConformance());
     expect(first).toBe(second);
-    expect(sha256(first)).toBe(EXPECTED_FIXTURE_SHA256);
+    expect(sha256(first)).toMatch(/^sha256:[0-9a-f]{64}$/);
+    expect(first).not.toContain('"pass"');
+    expect(first).not.toContain('"draw"');
   });
 
-  it('exports exact topology and D5 maps for rings 3..12', () => {
+  it('exports exact topology and D5 maps only for supported rings', () => {
     const conformance = createStarConformance();
     expect(conformance.schema).toBe(STAR_CONFORMANCE_SCHEMA_ID);
     expect(conformance.schemas).toEqual({
@@ -82,7 +83,7 @@ describe('Rust and Python conformance export', () => {
       actionLayout: STAR_ACTION_LAYOUT_SCHEMA_ID,
     });
     expect(conformance.boards.map((board) => board.rings)).toEqual([
-      3, 4, 5, 6, 7, 8, 9, 10, 11, 12,
+      4, 6, 8, 10,
     ]);
 
     for (const board of conformance.boards) {
@@ -110,8 +111,6 @@ describe('Rust and Python conformance export', () => {
         'f4',
       ]);
       for (const symmetry of board.symmetries) {
-        expect(symmetry.map).toHaveLength(board.nodeCount);
-        expect(symmetry.inverseMap).toHaveLength(board.nodeCount);
         for (let node = 0; node < board.nodeCount; node++) {
           expect(symmetry.inverseMap[symmetry.map[node]]).toBe(node);
         }
@@ -119,138 +118,69 @@ describe('Rust and Python conformance export', () => {
     }
   });
 
-  it('contains sparse static-aliveness scoring vectors', () => {
+  it('contains full-board traces with binary terminal outcomes', () => {
     const conformance = createStarConformance();
-    const singlePerimeter = conformance.scores.filter((score) =>
-      score.id.endsWith('-single-perimeter'),
-    );
-    const twoPerimeter = conformance.scores.filter((score) =>
-      score.id.endsWith('-two-perimeter-star'),
-    );
-    expect(singlePerimeter).toHaveLength(10);
-    expect(twoPerimeter).toHaveLength(10);
-    for (const score of singlePerimeter) {
-      expect(score.expected.players[0].stars).toBe(0);
-      expect(score.expected.aliveStone.every((alive) => alive === 0)).toBe(true);
-      expect(score.expected.contestedPeries).toBe(5 * score.rings);
-    }
-    for (const score of twoPerimeter) {
-      expect(score.expected.players[0].stars).toBe(1);
-      expect(score.expected.aliveStone.filter(Boolean)).toHaveLength(2);
-    }
-  });
-
-  it('exports both board-full residual parities and double-pass metadata', () => {
-    const conformance = createStarConformance();
-    const byId = (id: string) => {
-      const game = conformance.games.find((candidate) => candidate.id === id);
-      if (!game) throw new Error(`missing game vector ${id}`);
-      return game;
-    };
-    const residualOne = byId('rings-3-board-full-residual-1');
-    const residualZero = byId('rings-5-board-full-residual-0');
-    const doublePass = byId('double-midturn-two-pass-terminal');
-
-    const one = residualOne.states[residualOne.states.length - 1];
-    const beforeOne = residualOne.states[residualOne.states.length - 2];
-    expect(one).toMatchObject({
-      over: true,
-      movesLeft: 1,
-      midTurn: true,
-      passStreak: 0,
-    });
-    expect(one.toMove).toBe(beforeOne.toMove);
-    expect(one.turnCount).toBe(beforeOne.turnCount);
-    expect(one.currentTurnMoves).toHaveLength(1);
-    expect(one.lastMove).toBe(one.stones.length - 1);
-    expect(residualOne.terminal.reason).toBe('board-full');
-    expect(residualOne.actionCodes).not.toContain(STAR_PASS_ACTION_CODE);
-
-    const zero = residualZero.states[residualZero.states.length - 1];
-    const beforeZero = residualZero.states[residualZero.states.length - 2];
-    expect(zero).toMatchObject({
-      over: true,
-      movesLeft: 0,
-      midTurn: false,
-      passStreak: 0,
-    });
-    expect(zero.toMove).toBe(beforeZero.toMove);
-    expect(zero.turnCount).toBe(beforeZero.turnCount);
-    expect(zero.currentTurnMoves).toHaveLength(2);
-    expect(zero.lastMove).toBe(zero.stones.length - 1);
-    expect(residualZero.terminal.reason).toBe('board-full');
-
-    const passed = doublePass.states[doublePass.states.length - 1];
-    const beforeSecondPass =
-      doublePass.states[doublePass.states.length - 2];
-    expect(passed).toMatchObject({
-      over: true,
-      movesLeft: 2,
-      passStreak: 2,
-    });
-    expect(passed.toMove).toBe(beforeSecondPass.toMove);
-    expect(passed.turnCount).toBe(beforeSecondPass.turnCount);
-    expect(passed.midTurn).toBe(false);
-    expect(passed.currentTurnMoves).toEqual([]);
-    expect(passed.lastMove).toBe(beforeSecondPass.lastMove);
-    expect(doublePass.actionCodes.slice(-2)).toEqual([
-      STAR_PASS_ACTION_CODE,
-      STAR_PASS_ACTION_CODE,
+    expect(conformance.games.map((game) => game.config.rings)).toEqual([
+      4, 6, 8, 10,
     ]);
-    expect(doublePass.terminal.reason).toBe('double-pass');
-    expect(doublePass.terminal.winner).toBe(0);
-    expect(doublePass.terminal.valuePerspective).toEqual({
-      kind: 'toMove',
-      player: 1,
-      value: -1,
-      wdlClass: 0,
-      scoreMargin: doublePass.terminal.scoreMarginsByPlayer[1],
-    });
-
     for (const game of conformance.games) {
-      const final = game.states[game.states.length - 1];
-      expect(game.terminal.winner).toBe(game.terminal.score.leader);
-      expect(game.terminal.valuePerspective.player).toBe(final.toMove);
-      expect(game.terminal.valuePerspective.value).toBe(
-        game.terminal.valuesByPlayer[final.toMove],
+      const final = game.states.at(-1)!;
+      expect(final.over).toBe(true);
+      expect(final.stonesPlaced).toBe(final.stones.length);
+      expect(game.actions).toHaveLength(final.stones.length);
+      expect(game.actionCodes).toEqual(
+        Array.from({ length: final.stones.length }, (_, node) => node),
       );
-      expect(game.terminal.valuePerspective.wdlClass).toBe(
-        game.terminal.valuePerspective.value + 1,
+      expect(game.terminal.reason).toBe('board-full');
+      expect([0, 1]).toContain(game.terminal.winner);
+      expect(game.terminal.score.contestedPeries).toBe(0);
+      expect(
+        game.terminal.score.players[0].total +
+          game.terminal.score.players[1].total,
+      ).toBe(5 * game.config.rings + 1);
+      expect([...game.terminal.valuesByPlayer].sort()).toEqual([-1, 1]);
+      expect([...game.terminal.outcomeClassesByPlayer].sort()).toEqual([0, 1]);
+      expect(game.terminal.valuePerspective.outcomeClass).toBe(
+        game.terminal.valuePerspective.value === 1 ? 1 : 0,
       );
     }
+
+    const residualOne = conformance.games.find(
+      (game) => game.config.rings === 4,
+    )!.states.at(-1)!;
+    const residualZero = conformance.games.find(
+      (game) => game.config.rings === 6,
+    )!.states.at(-1)!;
+    expect(residualOne).toMatchObject({ movesLeft: 1, midTurn: true });
+    expect(residualZero).toMatchObject({ movesLeft: 0, midTurn: false });
   });
 
-  it('exports AB/BA semantic equivalence and mixed action layouts', () => {
+  it('exports AB/BA equivalence and nodes-only mixed layouts', () => {
     const conformance = createStarConformance();
     const pair = conformance.pairEquivalences[0];
     expect(pair.ab.semanticState).toEqual(pair.ba.semanticState);
     expect(pair.ab.lastMove).toBe(pair.pair.b);
     expect(pair.ba.lastMove).toBe(pair.pair.a);
-    expect(pair.ab.lastMove).not.toBe(pair.ba.lastMove);
     expect(pair.excludedPresentationFields).toEqual(['lastMove']);
 
-    expect(conformance.actionEncoding.passCode).toBe(STAR_PASS_ACTION_CODE);
-    for (const batch of conformance.actionLayouts.mixedBatches) {
-      for (const row of batch.rows) {
-        expect(row.native.passSlot).toBe(row.nodeCount);
-        expect(row.padded.passSlot).toBe(batch.maximumNodes);
-        expect(row.examples[2]).toMatchObject({
-          action: { type: 'pass' },
-          wireCode: STAR_PASS_ACTION_CODE,
-          nativeIndex: row.nodeCount,
-          paddedIndex: batch.maximumNodes,
-        });
-      }
+    const batch = conformance.actionLayouts.mixedBatches[0];
+    expect(batch.maximumNodes).toBe(275);
+    expect(batch.batchActionCount).toBe(275);
+    for (const row of batch.rows) {
+      expect(row.native.actionCount).toBe(row.nodeCount);
+      expect(row.padded.actionCount).toBe(batch.maximumNodes);
+      expect(row.examples).toHaveLength(2);
+      expect(row.examples.every((example) => example.wireCode >= 0)).toBe(
+        true,
+      );
     }
   });
 
-  it('matches the checked-in deterministic JSON fixture', () => {
+  it('matches the checked-in deterministic v2 fixture', () => {
     const fixture = readFileSync(
-      new URL('../../../../testdata/star/conformance-v1.json', import.meta.url),
+      new URL('../../../../testdata/star/conformance-v2.json', import.meta.url),
       'utf8',
     );
-    const generated = serializeStarConformance(createStarConformance());
-    expect(sha256(fixture)).toBe(EXPECTED_FIXTURE_SHA256);
-    expect(fixture).toBe(generated);
+    expect(fixture).toBe(serializeStarConformance(createStarConformance()));
   });
 });

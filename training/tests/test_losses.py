@@ -1,4 +1,5 @@
 import math
+from dataclasses import replace
 
 import pytest
 import torch
@@ -17,28 +18,28 @@ def test_loss_weights_reject_negative_nonfinite_and_all_zero() -> None:
         LossWeights(0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
 
 
-def outputs(batch: int = 2, nodes: int = 3, actions: int = 4) -> StarModelOutput:
+def outputs(batch: int = 2, nodes: int = 3, actions: int = 3) -> StarModelOutput:
     return StarModelOutput(
         policy_logits=torch.zeros(batch, actions, requires_grad=True),
-        wdl_logits=torch.zeros(batch, 3, requires_grad=True),
-        score_margin_logits=torch.zeros(batch, 363, requires_grad=True),
+        outcome_logits=torch.zeros(batch, 2, requires_grad=True),
+        score_margin_logits=torch.zeros(batch, 303, requires_grad=True),
         ownership_logits=torch.zeros(batch, nodes, 3, requires_grad=True),
         alive_logits=torch.zeros(batch, nodes, requires_grad=True),
         soft_policy_logits=torch.zeros(batch, actions, requires_grad=True),
     )
 
 
-def targets(batch: int = 2, nodes: int = 3, actions: int = 4) -> TrainingTargets:
+def targets(batch: int = 2, nodes: int = 3, actions: int = 3) -> TrainingTargets:
     false = torch.zeros(batch, dtype=torch.bool)
     return TrainingTargets(
         policy=torch.zeros(batch, actions),
-        wdl=torch.zeros(batch, dtype=torch.long),
+        outcome=torch.zeros(batch, dtype=torch.long),
         score_margin=torch.zeros(batch, dtype=torch.long),
         ownership=torch.full((batch, nodes), -100, dtype=torch.long),
         alive=torch.full((batch, nodes), -1.0),
         soft_policy=torch.zeros(batch, actions),
         policy_mask=false.clone(),
-        wdl_mask=false.clone(),
+        outcome_mask=false.clone(),
         score_margin_mask=false.clone(),
         ownership_mask=false.clone(),
         alive_mask=false.clone(),
@@ -56,7 +57,7 @@ def test_true_minus_100_margin_is_not_a_missing_sentinel() -> None:
     losses = compute_losses(
         output,
         target,
-        legal_action_mask=torch.zeros(1, 4, dtype=torch.bool),
+        legal_action_mask=torch.zeros(1, 3, dtype=torch.bool),
         node_mask=torch.ones(1, 3, dtype=torch.bool),
     )
     expected_class = -100 - SCORE_MARGIN_MIN
@@ -70,14 +71,14 @@ def test_true_minus_100_margin_is_not_a_missing_sentinel() -> None:
         compute_losses(
             output,
             target,
-            legal_action_mask=torch.zeros(1, 4, dtype=torch.bool),
+            legal_action_mask=torch.zeros(1, 3, dtype=torch.bool),
             node_mask=torch.ones(1, 3, dtype=torch.bool),
         )
     target.score_margin_mask[0] = False
     compute_losses(
         output,
         target,
-        legal_action_mask=torch.zeros(1, 4, dtype=torch.bool),
+        legal_action_mask=torch.zeros(1, 3, dtype=torch.bool),
         node_mask=torch.ones(1, 3, dtype=torch.bool),
     )
 
@@ -85,24 +86,33 @@ def test_true_minus_100_margin_is_not_a_missing_sentinel() -> None:
 def test_weights_below_one_are_normalized_not_clamped() -> None:
     output = outputs(batch=1)
     target = targets(batch=1)
-    target.wdl[0] = 2
-    target.wdl_mask[0] = True
+    target.outcome[0] = 1
+    target.outcome_mask[0] = True
     target.sample_weight[0] = 0.25
     losses = compute_losses(
         output,
         target,
-        legal_action_mask=torch.zeros(1, 4, dtype=torch.bool),
+        legal_action_mask=torch.zeros(1, 3, dtype=torch.bool),
         node_mask=torch.ones(1, 3, dtype=torch.bool),
         weights=LossWeights(
             policy=0,
-            wdl=1,
+            outcome=1,
             score_margin=0,
             ownership=0,
             alive=0,
             soft_policy=0,
         ),
     )
-    assert losses["wdl"].item() == pytest.approx(math.log(3), rel=1e-6)
+    assert losses["outcome"].item() == pytest.approx(math.log(2), rel=1e-6)
+
+    target.outcome[0] = 2
+    with pytest.raises(ValueError, match="loss=0 or win=1"):
+        compute_losses(
+            output,
+            target,
+            legal_action_mask=torch.zeros(1, 3, dtype=torch.bool),
+            node_mask=torch.ones(1, 3, dtype=torch.bool),
+        )
 
 
 def test_policy_confidence_weights_affect_only_policy_heads() -> None:
@@ -114,11 +124,11 @@ def test_policy_confidence_weights_affect_only_policy_heads() -> None:
     target = targets()
     target.policy[:, 0] = 1
     target.policy_mask[:] = True
-    target.wdl[:] = torch.tensor([0, 2])
-    target.wdl_mask[:] = True
+    target.outcome[:] = torch.tensor([0, 1])
+    target.outcome_mask[:] = True
     assert target.policy_weight is not None
     target.policy_weight[:] = torch.tensor([1.0, 0.0])
-    legal = torch.ones(2, 4, dtype=torch.bool)
+    legal = torch.ones(2, 3, dtype=torch.bool)
 
     losses = compute_losses(
         output,
@@ -132,7 +142,7 @@ def test_policy_confidence_weights_affect_only_policy_heads() -> None:
         policy_logits[:1], torch.tensor([0])
     )
     torch.testing.assert_close(losses["policy"], expected_policy)
-    assert losses["wdl"].item() == pytest.approx(math.log(3), rel=1e-6)
+    assert losses["outcome"].item() == pytest.approx(math.log(2), rel=1e-6)
 
     target.policy_weight[1] = -1
     with pytest.raises(ValueError, match="policy weights"):
@@ -181,7 +191,7 @@ def test_spatial_losses_average_each_sample_before_weighting(head: str) -> None:
     losses = compute_losses(
         output,
         target,
-        legal_action_mask=torch.zeros(2, 4, dtype=torch.bool),
+        legal_action_mask=torch.zeros(2, 3, dtype=torch.bool),
         node_mask=node_mask,
         weights=selected_weights,
     )
@@ -192,3 +202,53 @@ def test_spatial_losses_average_each_sample_before_weighting(head: str) -> None:
         if head == "ownership"
         else output.alive_logits.grad
     ).all()
+
+
+def test_loss_schema_rejects_malformed_masks_heads_targets_and_weights() -> None:
+    output = outputs()
+    target = targets()
+    legal = torch.ones(2, 3, dtype=torch.bool)
+    nodes = torch.ones(2, 3, dtype=torch.bool)
+
+    with pytest.raises(ValueError, match="rank-two"):
+        compute_losses(
+            output,
+            target,
+            legal_action_mask=legal[0],
+            node_mask=nodes,
+        )
+    with pytest.raises(ValueError, match="boolean"):
+        compute_losses(
+            output,
+            target,
+            legal_action_mask=legal.float(),
+            node_mask=nodes,
+        )
+    with pytest.raises(ValueError, match="batch dimensions"):
+        compute_losses(
+            output,
+            target,
+            legal_action_mask=legal,
+            node_mask=torch.ones(3, 3, dtype=torch.bool),
+        )
+    with pytest.raises(ValueError, match="policy logits"):
+        compute_losses(
+            output._replace(policy_logits=torch.zeros(2, 2)),
+            target,
+            legal_action_mask=legal,
+            node_mask=nodes,
+        )
+    with pytest.raises(ValueError, match="policy target"):
+        compute_losses(
+            output,
+            replace(target, policy=torch.zeros(2, 2)),
+            legal_action_mask=legal,
+            node_mask=nodes,
+        )
+    with pytest.raises(ValueError, match="sample weights"):
+        compute_losses(
+            output,
+            replace(target, sample_weight=torch.ones(3)),
+            legal_action_mask=legal,
+            node_mask=nodes,
+        )

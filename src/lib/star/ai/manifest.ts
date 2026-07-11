@@ -4,6 +4,7 @@ import {
   STAR_RULES_HASH,
   STAR_RULES_SCHEMA_ID,
 } from '../rules';
+import { SUPPORTED_RINGS } from '../board';
 import {
   STAR_ACTION_LAYOUT_VERSION,
   STAR_FEATURE_SCHEMA_HASH,
@@ -19,13 +20,15 @@ import { StarAiError } from './errors';
 
 export const STAR_BROWSER_MODEL_MANIFEST_SCHEMA_ID =
   'startrain.browser-model' as const;
-export const STAR_BROWSER_MODEL_MANIFEST_VERSION = 1 as const;
+export const STAR_BROWSER_MODEL_MANIFEST_VERSION = 2 as const;
 export const STAR_BROWSER_MODEL_PRECISION = 'float16' as const;
 
 /** Deployment convention; intentionally absent until a trained model is published. */
 export const STAR_BROWSER_MODEL_MANIFEST_PATH = '/models/star/manifest.json' as const;
-export const STAR_WASM_MODULE_PATH = '/models/star/wasm/star_wasm.js' as const;
-export const STAR_WASM_BINARY_PATH = '/models/star/wasm/star_wasm_bg.wasm' as const;
+export const STAR_WASM_MODULE_PATH =
+  '/models/star/wasm-2da3783519381453/star_wasm.js' as const;
+export const STAR_WASM_BINARY_PATH =
+  '/models/star/wasm-2da3783519381453/star_wasm_bg.wasm' as const;
 
 export interface StarBrowserModelManifest {
   format: typeof STAR_BROWSER_MODEL_MANIFEST_SCHEMA_ID;
@@ -39,6 +42,10 @@ export interface StarBrowserModelManifest {
   featureSchemaHash: string;
   actionLayout: typeof STAR_ACTION_LAYOUT_SCHEMA_ID;
   actionLayoutVersion: typeof STAR_ACTION_LAYOUT_VERSION;
+  outcome: {
+    classes: readonly ['loss', 'win'];
+    value: 'P(win)-P(loss)';
+  };
   wasm: {
     moduleUrl: typeof STAR_WASM_MODULE_PATH;
     binaryUrl: typeof STAR_WASM_BINARY_PATH;
@@ -58,7 +65,6 @@ export interface StarBrowserModelManifest {
     maxConsidered: number;
     cVisit: number;
     cScale: number;
-    initialPassLogitPenalty: number;
   };
 }
 
@@ -168,6 +174,7 @@ export function parseStarBrowserModelManifest(payload: unknown): StarBrowserMode
     'rules',
     'features',
     'actions',
+    'outcome',
     'architecture',
     'precision',
     'weights',
@@ -179,6 +186,7 @@ export function parseStarBrowserModelManifest(payload: unknown): StarBrowserMode
   const rules = payload.rules;
   const features = payload.features;
   const actions = payload.actions;
+  const outcome = payload.outcome;
   const architecture = payload.architecture;
   const artifacts = payload.artifacts;
   const tensors = payload.tensors;
@@ -199,10 +207,11 @@ export function parseStarBrowserModelManifest(payload: unknown): StarBrowserMode
     rules.hash !== STAR_RULES_HASH ||
     rules.mode !== 'double' ||
     rules.pie_rule !== false ||
-    !isRecord(rules.rings) ||
-    !hasExactKeys(rules.rings, ['minimum', 'maximum']) ||
-    rules.rings.minimum !== 3 ||
-    rules.rings.maximum !== 12 ||
+    !Array.isArray(rules.rings) ||
+    rules.rings.length !== SUPPORTED_RINGS.length ||
+    !rules.rings.every(
+      (rings, index) => rings === SUPPORTED_RINGS[index],
+    ) ||
     !isRecord(features) ||
     !hasExactKeys(features, [
       'schema_id',
@@ -218,7 +227,11 @@ export function parseStarBrowserModelManifest(payload: unknown): StarBrowserMode
     features.global_feature_count !== STAR_GLOBAL_FEATURE_DIM ||
     !isRecord(actions) ||
     !hasExactKeys(actions, ['schema_id']) ||
-    actions.schema_id !== STAR_ACTION_LAYOUT_SCHEMA_ID
+    actions.schema_id !== STAR_ACTION_LAYOUT_SCHEMA_ID ||
+    !isRecord(outcome) ||
+    !hasExactKeys(outcome, ['classes', 'value']) ||
+    !sameShape(outcome.classes, ['loss', 'win']) ||
+    outcome.value !== 'P(win)-P(loss)'
   ) {
     throw new StarAiError(
       'unavailable',
@@ -234,8 +247,15 @@ export function parseStarBrowserModelManifest(payload: unknown): StarBrowserMode
 
   if (
     !isRecord(architecture) ||
-    !hasExactKeys(architecture, ['name', 'all_size', 'parameter_count', 'config']) ||
+    !hasExactKeys(architecture, [
+      'name',
+      'schema_version',
+      'all_size',
+      'parameter_count',
+      'config',
+    ]) ||
     architecture.name !== 'GraphResTNet' ||
+    architecture.schema_version !== 2 ||
     architecture.all_size !== true ||
     !positiveInteger(architecture.parameter_count, Number.MAX_SAFE_INTEGER) ||
     !isRecord(architecture.config) ||
@@ -254,15 +274,15 @@ export function parseStarBrowserModelManifest(payload: unknown): StarBrowserMode
       ['neighbor_mask', 'bool', ['batch', 'nodes', 'degree']],
       ['neighbor_edge_type', 'int64', ['batch', 'nodes', 'degree']],
       ['node_mask', 'bool', ['batch', 'nodes']],
-      ['legal_action_mask', 'bool', ['batch', 'nodes + 1']],
+      ['legal_action_mask', 'bool', ['batch', 'nodes']],
     ]) ||
     !validateTensorMap(tensors.outputs, [
-      ['policy_logits', 'float16', ['batch', 'nodes + 1']],
-      ['wdl_logits', 'float16', ['batch', 3]],
-      ['score_margin_logits', 'float16', ['batch', 363]],
+      ['policy_logits', 'float16', ['batch', 'nodes']],
+      ['outcome_logits', 'float16', ['batch', 2]],
+      ['score_margin_logits', 'float16', ['batch', 303]],
       ['ownership_logits', 'float16', ['batch', 'nodes', 3]],
       ['alive_logits', 'float16', ['batch', 'nodes']],
-      ['soft_policy_logits', 'float16', ['batch', 'nodes + 1']],
+      ['soft_policy_logits', 'float16', ['batch', 'nodes']],
     ]) ||
     !isRecord(search) ||
     !hasExactKeys(search, ['simulations', 'max_considered', 'c_visit', 'c_scale']) ||
@@ -288,6 +308,10 @@ export function parseStarBrowserModelManifest(payload: unknown): StarBrowserMode
     featureSchemaHash: STAR_FEATURE_SCHEMA_HASH,
     actionLayout: STAR_ACTION_LAYOUT_SCHEMA_ID,
     actionLayoutVersion: STAR_ACTION_LAYOUT_VERSION,
+    outcome: {
+      classes: ['loss', 'win'],
+      value: 'P(win)-P(loss)',
+    },
     wasm: {
       moduleUrl: STAR_WASM_MODULE_PATH,
       binaryUrl: STAR_WASM_BINARY_PATH,
@@ -307,7 +331,6 @@ export function parseStarBrowserModelManifest(payload: unknown): StarBrowserMode
       maxConsidered: search.max_considered,
       cVisit: search.c_visit,
       cScale: search.c_scale,
-      initialPassLogitPenalty: 1.5,
     },
   };
 }

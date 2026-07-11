@@ -9,6 +9,7 @@ interface GameOverOverlayProps {
   open: boolean;
   game: GameState;
   score: ScoreResult;
+  winner: 0 | 1;
   onReview: () => void;
   onRematch: () => void;
   onSetup: () => void;
@@ -20,18 +21,12 @@ export function GameOverOverlay({
   open,
   game,
   score,
+  winner,
   onReview,
   onRematch,
   onSetup,
 }: GameOverOverlayProps) {
   if (!open) return null;
-
-  const winner = score.leader;
-  // Winner despite equal totals: the quark tie-break decided it.
-  const quarkTieBreak =
-    winner !== -1 && score.players[0].total === score.players[1].total
-      ? ([score.players[winner].quarks, score.players[winner === 0 ? 1 : 0].quarks] as const)
-      : null;
 
   return (
     <div
@@ -52,22 +47,11 @@ export function GameOverOverlay({
           the sky is settled
         </p>
         <h2 className="font-display fade-up mt-1 text-4xl text-ink" style={delay(1)}>
-          {winner === -1 ? (
-            'A perfect tie'
-          ) : (
-            <>
-              <span style={{ color: PLAYER_COLORS[winner].base }}>
-                {game.config.playerNames[winner]}
-              </span>{' '}
-              wins
-            </>
-          )}
+          <span style={{ color: PLAYER_COLORS[winner].base }}>
+            {game.config.playerNames[winner]}
+          </span>{' '}
+          wins
         </h2>
-        {quarkTieBreak && (
-          <p className="fade-in mt-1 text-sm text-muted" style={delay(2)}>
-            equal totals — decided on quarks, {quarkTieBreak[0]} to {quarkTieBreak[1]}
-          </p>
-        )}
 
         <div className="mt-6 grid grid-cols-2 gap-3">
           {([0, 1] as const).map((p) => {

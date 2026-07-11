@@ -13,8 +13,9 @@ from .losses import LossWeights
 from .model import ModelConfig
 from .optim import OptimizerConfig
 from .selfplay import SelfPlayConfig
+from .topology import SUPPORTED_RINGS
 
-CONFIG_SCHEMA_VERSION = 2
+CONFIG_SCHEMA_VERSION = 3
 _T = TypeVar("_T")
 
 
@@ -51,17 +52,18 @@ def parse_cpu_affinity(value: str) -> tuple[int, ...]:
 class GameConfig:
     mode: str = "double"
     pie_rule: bool = False
-    min_rings: int = 3
-    max_rings: int = 12
+    rings: tuple[int, ...] = SUPPORTED_RINGS
 
     def __post_init__(self) -> None:
         if (
             self.mode != "double"
             or self.pie_rule
-            or self.min_rings != 3
-            or self.max_rings != 12
+            or any(type(ring) is not int for ring in self.rings)
+            or self.rings != SUPPORTED_RINGS
         ):
-            raise ConfigError("only no-pie Double *Star rings 3..12 is supported")
+            raise ConfigError(
+                "only no-pie Double *Star rings (4, 6, 8, 10) are supported"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -105,7 +107,7 @@ class TrainConfig:
 
 @dataclass(frozen=True, slots=True)
 class DataConfig:
-    schema_version: int = 3
+    schema_version: int = 4
     ring_stratified: bool = True
     d5_augmentation: bool = True
     workers: int = 0
@@ -114,8 +116,8 @@ class DataConfig:
     shard_cache_size: int = 2
 
     def __post_init__(self) -> None:
-        if self.schema_version != 3:
-            raise ConfigError("data schema_version must be 3")
+        if self.schema_version != 4:
+            raise ConfigError("data schema_version must be 4")
         if self.workers < 0 or self.prefetch_factor <= 0 or self.shard_cache_size <= 0:
             raise ConfigError("invalid data-loader worker settings")
 
@@ -236,26 +238,31 @@ class CurriculumStage:
             or self.until_samples <= 0
         ):
             raise ConfigError("curriculum until_samples must be positive")
-        if not self.rings or any(ring < 3 or ring > 12 for ring in self.rings):
-            raise ConfigError("curriculum rings must be in 3..12")
+        if not self.rings or any(
+            type(ring) is not int or ring not in SUPPORTED_RINGS for ring in self.rings
+        ):
+            raise ConfigError("curriculum rings must be selected from (4, 6, 8, 10)")
         if len(set(self.rings)) != len(self.rings):
             raise ConfigError("curriculum rings must be unique")
 
 
 @dataclass(frozen=True, slots=True)
 class RingMixtureConfig:
-    rings: tuple[int, ...] = tuple(range(3, 13))
+    rings: tuple[int, ...] = SUPPORTED_RINGS
     curriculum: tuple[CurriculumStage, ...] = (
-        CurriculumStage(until_samples=100_000, rings=(3, 4)),
-        CurriculumStage(until_samples=500_000, rings=(3, 4, 5, 6)),
+        CurriculumStage(until_samples=100_000, rings=(4,)),
+        CurriculumStage(until_samples=500_000, rings=(4, 6)),
     )
     uniform_weight: float = 1.0
-    deficit_weights: tuple[float, ...] = (1.0,) * 10
+    deficit_weights: tuple[float, ...] = (1.0,) * len(SUPPORTED_RINGS)
 
     def __post_init__(self) -> None:
-        if self.rings != tuple(range(3, 13)):
+        if (
+            any(type(ring) is not int for ring in self.rings)
+            or self.rings != SUPPORTED_RINGS
+        ):
             raise ConfigError(
-                "orchestration must cover every ring in 3..12 exactly once"
+                "orchestration must cover rings (4, 6, 8, 10) exactly once"
             )
         if self.uniform_weight <= 0:
             raise ConfigError("ring uniform_weight must be positive")
@@ -590,7 +597,7 @@ class OrchestrationConfig:
 
 @dataclass(frozen=True, slots=True)
 class ArenaConfig:
-    rings: tuple[int, ...] = tuple(range(3, 13))
+    rings: tuple[int, ...] = SUPPORTED_RINGS
     pairs_per_ring: int = 20
     simulations: int = 1_024
     max_considered: int = 32
@@ -612,10 +619,15 @@ class ArenaConfig:
     def __post_init__(self) -> None:
         if (
             not self.rings
+            or any(
+                type(ring) is not int or ring not in SUPPORTED_RINGS
+                for ring in self.rings
+            )
             or tuple(sorted(set(self.rings))) != self.rings
-            or any(ring < 3 or ring > 12 for ring in self.rings)
         ):
-            raise ConfigError("arena rings must be a sorted unique subset of 3..12")
+            raise ConfigError(
+                "arena rings must be a sorted unique subset of (4, 6, 8, 10)"
+            )
         if self.pairs_per_ring < 2 or self.simulations <= 0:
             raise ConfigError(
                 "arena requires at least two pairs per ring and positive simulations"
@@ -640,7 +652,10 @@ class ArenaConfig:
             raise ConfigError(
                 "arena pair round/minimum/maximum settings are inconsistent"
             )
-        if any(ring not in self.rings for ring in self.per_ring_regression_floor_elo):
+        if any(
+            type(ring) is not int or ring not in self.rings
+            for ring in self.per_ring_regression_floor_elo
+        ):
             raise ConfigError("arena regression floor has an unknown ring")
 
 
@@ -748,7 +763,7 @@ def load_config(path: str | Path) -> ExperimentConfig:
             f"and unknown keys {sorted(unknown)}"
         )
     if raw["schema_version"] != CONFIG_SCHEMA_VERSION:
-        raise ConfigError("configuration schema_version must be 2")
+        raise ConfigError("configuration schema_version must be 3")
 
     optimizer_values = _mapping("optimizer", raw["optimizer"])
     if "betas" in optimizer_values:
@@ -757,23 +772,25 @@ def load_config(path: str | Path) -> ExperimentConfig:
     train_values["scheduler"] = _construct(
         SchedulerConfig, train_values.get("scheduler", {})
     )
+    game_values = _mapping("game", raw["game"])
+    game_values["rings"] = tuple(game_values.get("rings", SUPPORTED_RINGS))
     orchestration_values = _mapping("orchestration", raw.get("orchestration", {}))
     orchestration_values["gpus"] = tuple(
         _construct(GPUWorkerConfig, value)
         for value in orchestration_values.get("gpus", ())
     )
     ring_values = _mapping("ring_mixture", orchestration_values.get("ring_mixture", {}))
-    ring_values["rings"] = tuple(ring_values.get("rings", tuple(range(3, 13))))
+    ring_values["rings"] = tuple(ring_values.get("rings", SUPPORTED_RINGS))
     ring_values["deficit_weights"] = tuple(
-        ring_values.get("deficit_weights", (1.0,) * 10)
+        ring_values.get("deficit_weights", (1.0,) * len(SUPPORTED_RINGS))
     )
     ring_values["curriculum"] = tuple(
         _construct(CurriculumStage, _curriculum_values(value))
         for value in ring_values.get(
             "curriculum",
             (
-                {"until_samples": 100_000, "rings": (3, 4)},
-                {"until_samples": 500_000, "rings": (3, 4, 5, 6)},
+                {"until_samples": 100_000, "rings": (4,)},
+                {"until_samples": 500_000, "rings": (4, 6)},
             ),
         )
     )
@@ -790,7 +807,7 @@ def load_config(path: str | Path) -> ExperimentConfig:
     ):
         orchestration_values[key] = _construct(cls, orchestration_values.get(key, {}))
     arena_values = _mapping("arena", raw.get("arena", {}))
-    arena_values["rings"] = tuple(arena_values.get("rings", tuple(range(3, 13))))
+    arena_values["rings"] = tuple(arena_values.get("rings", SUPPORTED_RINGS))
     arena_values["per_ring_regression_floor_elo"] = {
         int(ring): float(value)
         for ring, value in _mapping(
@@ -800,7 +817,7 @@ def load_config(path: str | Path) -> ExperimentConfig:
     }
     return ExperimentConfig(
         schema_version=CONFIG_SCHEMA_VERSION,
-        game=_construct(GameConfig, raw["game"]),
+        game=_construct(GameConfig, game_values),
         model=_construct(ModelConfig, raw["model"]),
         loss=_construct(LossWeights, raw["loss"]),
         optimizer=_construct(OptimizerConfig, optimizer_values),

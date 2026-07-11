@@ -38,7 +38,7 @@ from .config import (
 )
 from .contracts import FEATURE_SCHEMA_HASH, RULES_HASH_WIRE
 from .losses import LossWeights
-from .model import GraphResTNet
+from .model import MODEL_SCHEMA_VERSION, GraphResTNet
 from .optim import build_optimizer
 from .replay import (
     DecodedReplayShard,
@@ -438,6 +438,7 @@ class ImmutableModelPublisher:
             "generation_family": self.run_identity.generation_family,
             "rules_hash": RULES_HASH_WIRE,
             "feature_schema_hash": f"{FEATURE_SCHEMA_HASH:016x}",
+            "model_schema_version": MODEL_SCHEMA_VERSION,
             "created_ns": time.time_ns(),
         }
         serialized = (

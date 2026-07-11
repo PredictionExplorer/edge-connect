@@ -1,4 +1,4 @@
-schema_version: 1
+schema_version: 2
 
 replay:
   sources:
@@ -11,7 +11,7 @@ teacher:
 
 student:
   node_feature_dim: 15
-  global_feature_dim: 18
+  global_feature_dim: 17
   width: 96
   rrt_groups: 3
   attention_heads: 6
@@ -20,8 +20,8 @@ student:
   ff_multiplier: 2.0
   dropout: 0.0
   rms_norm_eps: 0.000001
-  score_margin_min: -181
-  score_margin_max: 181
+  score_margin_min: -151
+  score_margin_max: 151
   soft_policy_temperature: 4.0
 
 train:
@@ -38,12 +38,12 @@ train:
 
 loss:
   policy: 1.0
-  wdl: 1.0
+  outcome: 1.0
   score_margin: 0.25
   ownership: 0.25
   alive: 0.1
   teacher_policy_kl: 0.5
-  teacher_wdl_kl: 0.25
+  teacher_outcome_kl: 0.25
   teacher_score_margin_kl: 0.1
   teacher_ownership_kl: 0.1
   teacher_alive_kl: 0.05
@@ -51,7 +51,7 @@ loss:
 
 export:
   output_directory: ../runs/browser
-  model_version: star-browser-v1
+  model_version: star-browser-v2
   onnx_opset: 18
   recommended_search:
     simulations: 64

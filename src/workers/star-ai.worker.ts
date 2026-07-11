@@ -1,4 +1,5 @@
 import type * as Ort from 'onnxruntime-web';
+import { getBoard } from '@/lib/star/board';
 import { STAR_RULES_HASH, STAR_RULES_SCHEMA_ID } from '@/lib/star/rules';
 import { StarAiError, asStarAiError } from '@/lib/star/ai/errors';
 import {
@@ -37,7 +38,6 @@ interface WorkerScope {
 export interface WasmState {
   readonly to_move: number;
   readonly moves_left: number;
-  readonly pass_streak: number;
   readonly terminal: boolean;
   apply(action: number): void;
   zero_bits(): BigUint64Array;
@@ -251,8 +251,8 @@ export function hasExpectedOnnxSchema(session: Ort.InferenceSession): boolean {
   ] as const;
   const outputSchema = [
     ['float16', 2],
-    ['float16', 2, 3],
-    ['float16', 2, 363],
+    ['float16', 2, 2],
+    ['float16', 2, 303],
     ['float16', 3, 3],
     ['float16', 2],
     ['float16', 2],
@@ -365,7 +365,7 @@ export function stonesFromWasm(state: WasmState, nodeCount: number): number[] {
 }
 
 export function semanticFromWasm(rings: number, state: WasmState): StarAiSemanticState {
-  const nodeCount = (5 * rings * (rings + 1)) / 2;
+  const nodeCount = getBoard(rings).n;
   const stones = stonesFromWasm(state, nodeCount);
   const occupied = stones.reduce((count, stone) => count + Number(stone !== -1), 0);
   return {
@@ -377,9 +377,7 @@ export function semanticFromWasm(rings: number, state: WasmState): StarAiSemanti
       occupied === 0 &&
       state.to_move === 0 &&
       state.moves_left === 1 &&
-      state.pass_streak === 0 &&
       !state.terminal,
-    passStreak: state.pass_streak,
     terminal: state.terminal,
   };
 }
@@ -393,7 +391,6 @@ export function replayAndVerify(request: StarAiRequest, wasm: StarWasmModule): W
       semantic.toMove !== request.state.toMove ||
       semantic.movesLeft !== request.state.movesLeft ||
       semantic.opening !== request.state.opening ||
-      semantic.passStreak !== request.state.passStreak ||
       semantic.terminal !== request.state.terminal ||
       !arraysEqual(semantic.stones, request.state.stones) ||
       !arraysEqual(state.legal_actions(), request.legalActions) ||
@@ -441,7 +438,7 @@ function tensorFeeds(runtime: LocalRuntime, semantic: StarAiSemanticState) {
     legal_action_mask: new Tensor(
       'bool',
       encoded.legalActionMask,
-      [1, encoded.nodeCount + 1],
+      [1, encoded.nodeCount],
     ),
   };
 }
@@ -478,17 +475,17 @@ export function finiteFloatData(
   return decoded;
 }
 
-export function wdlValue(logits: Float32Array): number {
-  if (logits.length !== 3) {
-    throw new StarAiError('protocol', 'ONNX WDL output must contain three logits.');
+export function outcomeValue(logits: Float32Array): number {
+  if (logits.length !== 2) {
+    throw new StarAiError('protocol', 'ONNX outcome output must contain two logits.');
   }
   const maximum = Math.max(...logits);
   const probabilities = Array.from(logits, (logit) => Math.exp(logit - maximum));
-  const total = probabilities[0] + probabilities[1] + probabilities[2];
+  const total = probabilities[0] + probabilities[1];
   if (!Number.isFinite(total) || total <= 0) {
-    throw new StarAiError('protocol', 'ONNX WDL output cannot be normalized.');
+    throw new StarAiError('protocol', 'ONNX outcome output cannot be normalized.');
   }
-  return (probabilities[2] - probabilities[0]) / total;
+  return (probabilities[1] - probabilities[0]) / total;
 }
 
 async function evaluate(
@@ -498,25 +495,22 @@ async function evaluate(
 ): Promise<Evaluation> {
   const outputs = await runtime.session.run(tensorFeeds(runtime, semantic));
   const densePolicy = finiteFloatData(outputs.policy_logits, 'policy_logits');
-  const wdl = finiteFloatData(outputs.wdl_logits, 'wdl_logits');
+  const outcome = finiteFloatData(outputs.outcome_logits, 'outcome_logits');
   const nodeCount = semantic.stones.length;
-  if (densePolicy.length !== nodeCount + 1) {
+  if (densePolicy.length !== nodeCount) {
     throw new StarAiError('protocol', 'ONNX policy output has the wrong action layout.');
   }
   const logits = new Float32Array(legalActions.length);
   for (let index = 0; index < legalActions.length; index++) {
     const action = legalActions[index];
     const modelIndex = actionCodeToModelIndex(action, nodeCount);
-    let logit = densePolicy[modelIndex];
-    if (semantic.opening && action === -1) {
-      logit -= runtime.manifest.search.initialPassLogitPenalty;
-    }
+    const logit = densePolicy[modelIndex];
     if (!Number.isFinite(logit)) {
       throw new StarAiError('protocol', 'ONNX policy contains a non-finite legal logit.');
     }
     logits[index] = logit;
   }
-  return { value: wdlValue(wdl), logits };
+  return { value: outcomeValue(outcome), logits };
 }
 
 async function yieldToCancellation(taskId: string): Promise<void> {
@@ -670,4 +664,4 @@ scope.addEventListener('message', (event) => {
   });
 });
 
-scope.postMessage({ type: 'ready', protocolVersion: 1 });
+scope.postMessage({ type: 'ready', protocolVersion: 2 });

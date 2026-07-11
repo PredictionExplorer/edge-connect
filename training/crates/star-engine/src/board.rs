@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fmt;
 
-use crate::{BitBoard, MAX_RINGS, MIN_RINGS, NodeId};
+use crate::{BitBoard, NodeId, SUPPORTED_RINGS};
 
 /// Sector symbols used by the official `Nxy` notation.
 pub const SECTOR_CHARS: [char; 5] = ['*', 'S', 'T', 'A', 'R'];
@@ -20,7 +20,7 @@ impl fmt::Display for BoardError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidRingCount(rings) => {
-                write!(f, "rings must be in {MIN_RINGS}..={MAX_RINGS}, got {rings}")
+                write!(f, "rings must be one of 4, 6, 8, or 10, got {rings}")
             }
             Self::UnknownLabel(label) => write!(f, "unknown node label: {label}"),
         }
@@ -49,9 +49,9 @@ pub struct Board {
 }
 
 impl Board {
-    /// Constructs one of the supported 3–12 ring boards.
+    /// Constructs one of the supported 4, 6, 8, or 10 ring boards.
     pub fn new(rings: u8) -> Result<Self, BoardError> {
-        if !(MIN_RINGS..=MAX_RINGS).contains(&rings) {
+        if !SUPPORTED_RINGS.contains(&rings) {
             return Err(BoardError::InvalidRingCount(rings));
         }
 

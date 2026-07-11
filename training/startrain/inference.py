@@ -42,8 +42,8 @@ class InferenceResponse:
 @dataclass(frozen=True, slots=True)
 class DetailedInferenceResponse:
     response: InferenceResponse
-    wdl_probabilities: list[list[float]]
-    wdl_values: list[float]
+    outcome_probabilities: list[list[float]]
+    outcome_values: list[float]
     score_expectations: list[float]
     score_probabilities: list[list[float]]
 
@@ -52,15 +52,12 @@ class DetailedInferenceResponse:
 class InferenceConfig:
     precision: str = "fp32"
     score_utility_weight: float = 0.0
-    initial_pass_logit_penalty: float = 1.5
 
     def __post_init__(self) -> None:
         if self.precision not in ("fp32", "bf16"):
             raise ValueError("inference precision must be fp32 or bf16")
         if not 0 <= self.score_utility_weight <= 1:
             raise ValueError("score_utility_weight must be in [0, 1]")
-        if self.initial_pass_logit_penalty < 0:
-            raise ValueError("initial_pass_logit_penalty must be non-negative")
 
 
 @dataclass(frozen=True, slots=True)
@@ -261,17 +258,14 @@ class GraphInferenceAdapter:
         self.feature_path_counts[feature_path] += 1
         if encoded.batch_size != rows:
             raise ValueError("state row count and tokens disagree")
-        node_count = encoded.max_nodes
         legal_counts = host_encoded.legal_action_mask.sum(dim=1, dtype=torch.int64)
         expected_offsets = [0, *legal_counts.cumsum(dim=0).tolist()]
         expected_indices = torch.nonzero(
             host_encoded.legal_action_mask, as_tuple=False
         )[:, 1]
-        expected_actions = expected_indices.masked_fill(
-            expected_indices == node_count, -1
-        ).tolist()
+        expected_actions = expected_indices.tolist()
         if legal_offsets != expected_offsets or legal_actions != expected_actions:
-            raise ValueError("native legal action order does not match nodes-then-pass")
+            raise ValueError("native legal action order is not ascending node-only")
         self._evaluator_calls += 1
         self._evaluator_rows += rows
         was_training = self.model.training
@@ -290,9 +284,20 @@ class GraphInferenceAdapter:
                 ),
             ):
                 output = self.model(*encoded.model_args())
-                wdl = torch.softmax(output.wdl_logits.float(), dim=-1)
-                wdl_values = wdl[:, 2] - wdl[:, 0]
-                values = wdl_values
+                expected_margin_bins = SCORE_MARGIN_MAX - SCORE_MARGIN_MIN + 1
+                if (
+                    output.policy_logits.shape != encoded.legal_action_mask.shape
+                    or output.outcome_logits.shape != (rows, 2)
+                    or output.score_margin_logits.shape != (rows, expected_margin_bins)
+                    or output.ownership_logits.shape != (rows, encoded.max_nodes, 3)
+                    or output.alive_logits.shape != (rows, encoded.max_nodes)
+                    or output.soft_policy_logits.shape
+                    != encoded.legal_action_mask.shape
+                ):
+                    raise ValueError("model output shapes violate schema v2")
+                outcome = torch.softmax(output.outcome_logits.float(), dim=-1)
+                outcome_values = outcome[:, 1] - outcome[:, 0]
+                values = outcome_values
                 score_probability = None
                 score_belief = None
                 if self.config.score_utility_weight or include_details:
@@ -330,19 +335,6 @@ class GraphInferenceAdapter:
             host = packed.cpu().tolist()
             host_values = host[:rows]
             flattened = host[rows:]
-        openings = list(requests.states.opening)
-        if len(openings) != rows:
-            raise ValueError("opening metadata row count is invalid")
-        if self.config.initial_pass_logit_penalty:
-            # Native legal actions are nodes-then-pass, so a legal pass is the
-            # final flattened logit for its row. Apply the opening prior after
-            # the single device-to-host copy instead of synchronizing per row.
-            penalty = self.config.initial_pass_logit_penalty
-            for row, opening in enumerate(openings):
-                if opening:
-                    end = legal_offsets[row + 1]
-                    if end > legal_offsets[row] and legal_actions[end - 1] == -1:
-                        flattened[end - 1] -= penalty
         response = InferenceResponse(
             tokens=tokens,
             values=host_values,
@@ -354,8 +346,8 @@ class GraphInferenceAdapter:
         assert score_probability is not None and score_belief is not None
         details = DetailedInferenceResponse(
             response=response,
-            wdl_probabilities=wdl.cpu().tolist(),
-            wdl_values=wdl_values.cpu().tolist(),
+            outcome_probabilities=outcome.cpu().tolist(),
+            outcome_values=outcome_values.cpu().tolist(),
             score_expectations=(
                 score_belief * max(abs(SCORE_MARGIN_MIN), SCORE_MARGIN_MAX)
             )

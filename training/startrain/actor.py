@@ -134,9 +134,6 @@ class ManifestModelProvider:
             config=InferenceConfig(
                 precision=self.config.train.precision,
                 score_utility_weight=self.config.selfplay.score_utility_weight,
-                initial_pass_logit_penalty=(
-                    self.config.selfplay.initial_pass_logit_penalty
-                ),
             ),
             model_version=manifest.model_version,
             model_step=manifest.model_step,
@@ -350,7 +347,8 @@ class ActorSupervisor:
                     )
                     wins = sum(summary.winner == 0 for summary in summaries)
                     losses = sum(summary.winner == 1 for summary in summaries)
-                    draws = sum(summary.winner == -1 for summary in summaries)
+                    if wins + losses != len(summaries):
+                        raise RuntimeError("self-play summaries cannot contain ties")
                     samples = sum(summary.samples for summary in summaries)
                     policy_samples = sum(
                         summary.policy_samples for summary in summaries
@@ -422,12 +420,6 @@ class ActorSupervisor:
                             "attempted_decisions": attempted_decisions,
                             "full_decisions": selfplay_metrics.full_decisions,
                             "fast_decisions": selfplay_metrics.fast_decisions,
-                            "pass_decisions": selfplay_metrics.pass_decisions,
-                            "pass_decision_rate": (
-                                selfplay_metrics.pass_decisions / attempted_decisions
-                                if attempted_decisions
-                                else 0.0
-                            ),
                             "game_lengths": game_lengths,
                             "game_length_distribution": game_length_distribution,
                             "mean_game_length": (
@@ -476,7 +468,6 @@ class ActorSupervisor:
                             ),
                             "wins_player_zero": wins,
                             "wins_player_one": losses,
-                            "draws": draws,
                             "elapsed_seconds": elapsed,
                             "model_role": model_role,
                             "selfplay_source": (

@@ -41,7 +41,7 @@ npm run test:e2e
 ```
 
 Native tests must not silently skip in CI. `--require-native` turns a missing
-PyO3 extension into a collection error.
+or rules-v1 PyO3 extension into a collection error.
 
 ## Tier 2: mutation and contract checks
 
@@ -56,11 +56,12 @@ uv run mutmut run
 cargo mutants --package star-engine --package star-search
 ```
 
-The deterministic conformance fixture must regenerate byte-for-byte:
+The Python mirror must match the canonical v2 bytes and fingerprint in
+`src/lib/star/rules.ts`:
 
 ```bash
-node scripts/export-star-conformance.mjs /tmp/conformance-v1.json
-cmp testdata/star/conformance-v1.json /tmp/conformance-v1.json
+uv run pytest tests/test_conformance_fixture.py
+# expected fingerprint: fnv1a64:2da3783519381453
 ```
 
 ## Tier 3: one-GPU CUDA validation
@@ -77,7 +78,7 @@ uv run python scripts/hardware_preflight.py \
   --rings 6
 uv run python scripts/hardware_preflight.py \
   --config configs/h100-8gpu.yaml \
-  --rings 12
+  --rings 10
 ```
 
 Both representative board sizes must sustain at least 5,000 realistic leaf
