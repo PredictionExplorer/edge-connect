@@ -13,7 +13,8 @@ from pathlib import Path
 import torch
 
 from .actor import ActorSupervisor
-from .arena import ArenaRunner
+from .arena import ArenaRunner, internal_elo_target_assessment
+from .baselines import FROZEN_BASELINE_CHOICES, create_frozen_baseline
 from .checkpoint import (
     load_ema_checkpoint,
     load_model_manifest,
@@ -291,32 +292,92 @@ def actor_main(argv: list[str] | None = None) -> None:
 
 def arena_main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
-        description="Run paired deterministic checkpoint arena evaluation"
+        description="Run paired deterministic arena evaluation"
     )
     parser.add_argument("--config", required=True)
     parser.add_argument("--candidate", required=True)
-    parser.add_argument("--baseline", required=True)
+    parser.add_argument(
+        "--baseline",
+        help="immutable checkpoint manifest (required for checkpoint baseline)",
+    )
+    parser.add_argument(
+        "--baseline-kind",
+        choices=("checkpoint", *FROZEN_BASELINE_CHOICES),
+        default="checkpoint",
+        help="checkpoint (default) or a versioned frozen non-human opponent",
+    )
     parser.add_argument("--output", required=True)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument(
+        "--target-elo-lcb",
+        type=float,
+        help="optional internal Elo target for the paired anytime-valid lower bound",
+    )
+    parser.add_argument(
+        "--target-rings",
+        type=int,
+        nargs="+",
+        help="rings assessed by --target-elo-lcb (defaults to configured arena rings)",
+    )
     arguments = parser.parse_args(argv)
+    if arguments.baseline_kind == "checkpoint" and not arguments.baseline:
+        parser.error("--baseline is required when --baseline-kind=checkpoint")
+    if arguments.baseline_kind != "checkpoint" and arguments.baseline:
+        parser.error("--baseline cannot be combined with a frozen --baseline-kind")
+    if arguments.target_rings and arguments.target_elo_lcb is None:
+        parser.error("--target-rings requires --target-elo-lcb")
 
     experiment = load_config(arguments.config)
     candidate_manifest = load_model_manifest(arguments.candidate)
-    baseline_manifest = load_model_manifest(arguments.baseline)
+    baseline_manifest = (
+        load_model_manifest(arguments.baseline)
+        if arguments.baseline_kind == "checkpoint"
+        else None
+    )
     candidate = load_manifest_evaluator(
         experiment, candidate_manifest, device=arguments.device
     )
-    baseline = load_manifest_evaluator(
-        experiment, baseline_manifest, device=arguments.device
+    checkpoint_baseline = (
+        load_manifest_evaluator(experiment, baseline_manifest, device=arguments.device)
+        if baseline_manifest is not None
+        else None
     )
     native = load_star_native(required=True)
     assert native is not None
-    result = ArenaRunner(
-        native_module=native,
-        candidate=candidate,
-        baseline=baseline,
-        config=experiment.arena,
-    ).run()
+    if arguments.baseline_kind == "checkpoint":
+        assert checkpoint_baseline is not None
+        result = ArenaRunner(
+            native_module=native,
+            candidate=candidate,
+            baseline=checkpoint_baseline,
+            config=experiment.arena,
+        ).run()
+    else:
+        baseline = create_frozen_baseline(
+            arguments.baseline_kind,
+            native_module=native,
+        )
+        result = ArenaRunner(
+            native_module=native,
+            candidate=candidate,
+            baseline=baseline,
+            config=experiment.arena,
+            baseline_search=baseline.search_budget,
+            baseline_metadata=baseline.result_metadata(),
+        ).run()
+    if arguments.target_elo_lcb is not None:
+        target_rings = tuple(arguments.target_rings or experiment.arena.rings)
+        unavailable = sorted(set(target_rings) - set(experiment.arena.rings))
+        if unavailable:
+            parser.error(
+                "--target-rings contains rings outside the arena config: "
+                + ", ".join(str(ring) for ring in unavailable)
+            )
+        result["internal_elo_target"] = internal_elo_target_assessment(
+            result,
+            rings=target_rings,
+            target_elo=arguments.target_elo_lcb,
+        )
     atomic_json(arguments.output, result)
     promotion = result.get("promotion")
     if not isinstance(promotion, dict) or not isinstance(
@@ -329,6 +390,8 @@ def arena_main(argv: list[str] | None = None) -> None:
                 "output": str(Path(arguments.output).resolve()),
                 "decision": promotion["decision"],
                 "aggregate": result["aggregate"],
+                "baseline": result["baseline_metadata"],
+                "internal_elo_target": result.get("internal_elo_target"),
             },
             sort_keys=True,
         )

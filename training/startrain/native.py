@@ -368,19 +368,38 @@ def encode_native_feature_data(
     )
     rings = rings_u8.to(dtype=torch.long)
 
-    max_degree = max(topology.max_degree for topology in topologies.values())
-    neighbor_index = torch.zeros((batch_size, max_nodes, max_degree), dtype=torch.long)
-    neighbor_mask = torch.zeros((batch_size, max_nodes, max_degree), dtype=torch.bool)
-    neighbor_edge_type = torch.zeros(
-        (batch_size, max_nodes, max_degree), dtype=torch.long
-    )
-    for ring_count, topology in topologies.items():
-        rows = rings == ring_count
-        nodes = topology.n
-        degree = topology.max_degree
-        neighbor_index[rows, :nodes, :degree] = topology.neighbor_index
-        neighbor_mask[rows, :nodes, :degree] = topology.neighbor_mask
-        neighbor_edge_type[rows, :nodes, :degree] = topology.neighbor_edge_type
+    if len(topologies) == 1:
+        # Search and arena cohorts are ring-homogeneous. Broadcast the immutable
+        # topology as a view instead of allocating and filling three full
+        # batch-sized tensors for every leaf-evaluation wave.
+        topology = next(iter(topologies.values()))
+        neighbor_index = topology.neighbor_index.unsqueeze(0).expand(
+            batch_size, -1, -1
+        )
+        neighbor_mask = topology.neighbor_mask.unsqueeze(0).expand(
+            batch_size, -1, -1
+        )
+        neighbor_edge_type = topology.neighbor_edge_type.unsqueeze(0).expand(
+            batch_size, -1, -1
+        )
+    else:
+        max_degree = max(topology.max_degree for topology in topologies.values())
+        neighbor_index = torch.zeros(
+            (batch_size, max_nodes, max_degree), dtype=torch.long
+        )
+        neighbor_mask = torch.zeros(
+            (batch_size, max_nodes, max_degree), dtype=torch.bool
+        )
+        neighbor_edge_type = torch.zeros(
+            (batch_size, max_nodes, max_degree), dtype=torch.long
+        )
+        for ring_count, topology in topologies.items():
+            rows = rings == ring_count
+            nodes = topology.n
+            degree = topology.max_degree
+            neighbor_index[rows, :nodes, :degree] = topology.neighbor_index
+            neighbor_mask[rows, :nodes, :degree] = topology.neighbor_mask
+            neighbor_edge_type[rows, :nodes, :degree] = topology.neighbor_edge_type
 
     encoded = EncodedBatch(
         node_features=node_features,

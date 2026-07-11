@@ -27,7 +27,11 @@ The following switches are deliberately first-class and recorded in metrics:
   reduced searches;
 - `selfplay.max_considered_ring_exponent`: scale the candidate set with board
   radius; and
-- `selfplay.max_considered_cap`: bound the scaled candidate set.
+- `selfplay.max_considered_cap`: bound the scaled candidate set;
+- `learner.use_ring_mixture_curriculum`: make stratified learner replay follow the
+  actor small-to-large unlock schedule; and
+- actor `actor_batch_size` plus `orchestration.actor_games_per_batch`, changed
+  together so the requested cohort can actually fill the larger GPU batch.
 
 Candidate/champion mixing keeps pointer roles and run identities strict. Models
 are refreshed only between complete game batches, so no game contains weights

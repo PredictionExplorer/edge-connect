@@ -218,6 +218,7 @@ class SelfPlayActor:
                     cohort_size,
                     cohort=cohort,
                     first_game=len(summaries),
+                    stop_requested=stop_requested,
                     progress=progress,
                 )
             )
@@ -246,6 +247,7 @@ class SelfPlayActor:
         *,
         cohort: int,
         first_game: int,
+        stop_requested: Callable[[], bool],
         progress: Callable[..., None] | None,
     ) -> list[GameSummary]:
         states = self.native.StateBatch(self.config.rings, cohort_size)
@@ -264,6 +266,16 @@ class SelfPlayActor:
             state_data = states.data()
             if all(bool(terminal) for terminal in state_data.terminal):
                 break
+            if stop_requested():
+                if progress is not None:
+                    progress(
+                        phase="selfplay_abort",
+                        cohort=cohort,
+                        ply_wave=iteration,
+                        dropped_games=cohort_size,
+                        dropped_decisions=sum(len(row) for row in trajectories),
+                    )
+                return []
             current_pin = (
                 self.evaluator.model_version,
                 self.evaluator.model_step,

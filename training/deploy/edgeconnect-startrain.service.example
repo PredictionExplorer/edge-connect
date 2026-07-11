@@ -17,6 +17,7 @@ ExecStart=@TRAINING_DIR@/.venv/bin/startrain-orchestrate --config @PROFILE@
 Restart=on-failure
 RestartSec=30
 KillSignal=SIGTERM
+KillMode=mixed
 TimeoutStopSec=1000
 LimitNOFILE=1048576
 NoNewPrivileges=true

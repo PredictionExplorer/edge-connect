@@ -10,6 +10,7 @@ import torch
 from torch import nn
 
 from .contracts import SCORE_MARGIN_MAX, SCORE_MARGIN_MIN
+from .features import EncodedBatch
 from .native import (
     NativeStateDataProtocol,
     encode_native_feature_data,
@@ -92,6 +93,63 @@ class GraphInferenceAdapter:
         self.model_identity = model_identity or model_version
         self.last_feature_path: str | None = None
         self.feature_path_counts = {"rust": 0, "python": 0}
+        self._topology_cache: dict[
+            tuple[int, int, int, int],
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+        ] = {}
+
+    def _to_device(self, encoded: EncodedBatch) -> EncodedBatch:
+        ring_values = encoded.rings.tolist()
+        if (
+            self.device.type == "cpu"
+            or not ring_values
+            or any(ring != ring_values[0] for ring in ring_values[1:])
+        ):
+            return encoded.to(self.device)
+
+        batch_size = encoded.batch_size
+        key = (
+            int(ring_values[0]),
+            batch_size,
+            encoded.max_nodes,
+            int(encoded.neighbor_index.shape[-1]),
+        )
+        topology = self._topology_cache.get(key)
+        if topology is None:
+            topology = (
+                encoded.neighbor_index[0]
+                .to(self.device)
+                .unsqueeze(0)
+                .expand(batch_size, -1, -1)
+                .contiguous(),
+                encoded.neighbor_mask[0]
+                .to(self.device)
+                .unsqueeze(0)
+                .expand(batch_size, -1, -1)
+                .contiguous(),
+                encoded.neighbor_edge_type[0]
+                .to(self.device)
+                .unsqueeze(0)
+                .expand(batch_size, -1, -1)
+                .contiguous(),
+                encoded.node_mask[0]
+                .to(self.device)
+                .unsqueeze(0)
+                .expand(batch_size, -1)
+                .contiguous(),
+            )
+            self._topology_cache[key] = topology
+        neighbor_index, neighbor_mask, neighbor_edge_type, node_mask = topology
+        return EncodedBatch(
+            node_features=encoded.node_features.to(self.device),
+            global_features=encoded.global_features.to(self.device),
+            neighbor_index=neighbor_index,
+            neighbor_mask=neighbor_mask,
+            neighbor_edge_type=neighbor_edge_type,
+            node_mask=node_mask,
+            legal_action_mask=encoded.legal_action_mask.to(self.device),
+            rings=encoded.rings.to(self.device),
+        )
 
     def evaluate(self, requests: NativeEvalBatchProtocol) -> InferenceResponse:
         response, _ = self._evaluate(requests, include_details=False)
@@ -110,9 +168,24 @@ class GraphInferenceAdapter:
         *,
         include_details: bool,
     ) -> tuple[InferenceResponse, DetailedInferenceResponse | None]:
-        tokens = _integer_list("tokens", requests.tokens)
-        legal_offsets = _integer_list("legal_offsets", requests.legal_offsets)
-        legal_actions = _integer_list("legal_actions", requests.legal_actions)
+        native_features = getattr(requests, "features", None)
+        if (
+            native_features is not None
+            and isinstance(requests.tokens, list)
+            and isinstance(requests.legal_offsets, list)
+            and isinstance(requests.legal_actions, list)
+        ):
+            # Validated PyO3 requests expose exact ``list[int]`` buffers. Their
+            # legality is checked against the independently encoded mask below,
+            # so avoid converting and type-checking tens of thousands of legal
+            # actions in Python for every search wave.
+            tokens = requests.tokens.copy()
+            legal_offsets = requests.legal_offsets.copy()
+            legal_actions = requests.legal_actions.copy()
+        else:
+            tokens = _integer_list("tokens", requests.tokens)
+            legal_offsets = _integer_list("legal_offsets", requests.legal_offsets)
+            legal_actions = _integer_list("legal_actions", requests.legal_actions)
         rows = len(tokens)
         if len(requests) != rows:
             raise ValueError("request length and token count disagree")
@@ -139,20 +212,33 @@ class GraphInferenceAdapter:
         ):
             raise ValueError("legal action CSR offsets are invalid")
 
-        native_features = getattr(requests, "features", None)
         if native_features is not None:
-            encoded = encode_native_feature_data(
+            host_encoded = encode_native_feature_data(
                 native_features, source="native_request"
-            ).to(self.device)
+            )
             feature_path = "rust"
         else:
             has_state_export = callable(getattr(requests.states, "feature_data", None))
-            encoded = encode_native_state_data(requests.states).to(self.device)
+            host_encoded = encode_native_state_data(requests.states)
             feature_path = "rust" if has_state_export else "python"
+        encoded = self._to_device(host_encoded)
         self.last_feature_path = feature_path
         self.feature_path_counts[feature_path] += 1
         if encoded.batch_size != rows:
             raise ValueError("state row count and tokens disagree")
+        node_count = encoded.max_nodes
+        legal_counts = host_encoded.legal_action_mask.sum(dim=1, dtype=torch.int64)
+        expected_offsets = [0, *legal_counts.cumsum(dim=0).tolist()]
+        expected_indices = torch.nonzero(
+            host_encoded.legal_action_mask, as_tuple=False
+        )[:, 1]
+        expected_actions = expected_indices.masked_fill(
+            expected_indices == node_count, -1
+        ).tolist()
+        if legal_offsets != expected_offsets or legal_actions != expected_actions:
+            raise ValueError(
+                "native legal action order does not match nodes-then-pass"
+            )
         was_training = self.model.training
         self.model.eval()
         autocast = self.config.precision == "bf16"
@@ -192,46 +278,29 @@ class GraphInferenceAdapter:
                     values = (
                         values + self.config.score_utility_weight * score_belief
                     ).clamp(-1, 1)
-                dense_logits = output.policy_logits.float().clone()
+                legal_logits = output.policy_logits.float().masked_select(
+                    encoded.legal_action_mask
+                )
         finally:
             self.model.train(was_training)
 
-        dense_logits = dense_logits.cpu().clone()
-        values = values.cpu()
+        flattened = legal_logits.cpu().tolist()
         openings = list(requests.states.opening)
-        node_count = encoded.max_nodes
         if len(openings) != rows:
             raise ValueError("opening metadata row count is invalid")
-        for row, opening in enumerate(openings):
-            if opening and self.config.initial_pass_logit_penalty:
-                # Pass remains legal and represented; only its initial prior is reduced.
-                dense_logits[row, node_count] -= self.config.initial_pass_logit_penalty
-
-        flattened: list[float] = []
-        for row in range(rows):
-            start, end = legal_offsets[row], legal_offsets[row + 1]
-            actions = legal_actions[start:end]
-            expected = (
-                torch.nonzero(
-                    encoded.legal_action_mask[row, :node_count], as_tuple=False
-                )
-                .flatten()
-                .tolist()
-            )
-            if bool(encoded.legal_action_mask[row, node_count]):
-                expected.append(-1)
-            if actions != expected:
-                raise ValueError(
-                    "native legal action order does not match nodes-then-pass"
-                )
-            for action in actions:
-                index = node_count if action == -1 else action
-                if index < 0 or index > node_count:
-                    raise ValueError("native legal action code is invalid")
-                flattened.append(float(dense_logits[row, index]))
+        if self.config.initial_pass_logit_penalty:
+            # Native legal actions are nodes-then-pass, so a legal pass is the
+            # final flattened logit for its row. Apply the opening prior after
+            # the single device-to-host copy instead of synchronizing per row.
+            penalty = self.config.initial_pass_logit_penalty
+            for row, opening in enumerate(openings):
+                if opening:
+                    end = legal_offsets[row + 1]
+                    if end > legal_offsets[row] and legal_actions[end - 1] == -1:
+                        flattened[end - 1] -= penalty
         response = InferenceResponse(
             tokens=tokens,
-            values=[float(value) for value in values],
+            values=values.cpu().tolist(),
             policy_offsets=legal_offsets,
             policy_logits=flattened,
         )
@@ -241,11 +310,12 @@ class GraphInferenceAdapter:
         details = DetailedInferenceResponse(
             response=response,
             wdl_probabilities=wdl.cpu().tolist(),
-            wdl_values=[float(value) for value in wdl_values.cpu()],
-            score_expectations=[
-                float(value * max(abs(SCORE_MARGIN_MIN), SCORE_MARGIN_MAX))
-                for value in score_belief.cpu()
-            ],
+            wdl_values=wdl_values.cpu().tolist(),
+            score_expectations=(
+                score_belief * max(abs(SCORE_MARGIN_MIN), SCORE_MARGIN_MAX)
+            )
+            .cpu()
+            .tolist(),
             score_probabilities=score_probability.cpu().tolist(),
         )
         return response, details

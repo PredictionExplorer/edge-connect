@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import signal
 import shutil
 from dataclasses import asdict, replace
 from pathlib import Path
@@ -9,6 +10,7 @@ from typing import Any
 import torch
 import pytest
 
+import startrain.orchestration as orchestration_module
 from startrain.actor import RingMixtureScheduler
 from startrain.checkpoint import (
     ExponentialMovingAverage,
@@ -17,11 +19,13 @@ from startrain.checkpoint import (
     load_model_manifest,
 )
 from startrain.config import (
+    CurriculumStage,
     GameConfig,
     ConfigError,
     DistributedConfig,
     GPUWorkerConfig,
     RestartPolicyConfig,
+    RingMixtureConfig,
     RunDirectoryConfig,
     SchedulerConfig,
     ShutdownConfig,
@@ -44,6 +48,35 @@ from startrain.training import build_scheduler
 
 
 CONFIGS = Path(__file__).parents[1] / "configs"
+
+
+def test_graceful_stop_signals_only_worker_leader_before_group_kill(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakePopen:
+        pid = 123
+
+    leader_signals: list[tuple[int, int]] = []
+    group_signals: list[tuple[int, int]] = []
+    monkeypatch.setattr(orchestration_module.subprocess, "Popen", FakePopen)
+    monkeypatch.setattr(
+        orchestration_module.os,
+        "kill",
+        lambda pid, sent: leader_signals.append((pid, sent)),
+    )
+    monkeypatch.setattr(orchestration_module.os, "getpgid", lambda pid: pid + 1)
+    monkeypatch.setattr(
+        orchestration_module.os,
+        "killpg",
+        lambda pgid, sent: group_signals.append((pgid, sent)),
+    )
+
+    process = FakePopen()
+    orchestration_module._signal_process(process, signal.SIGTERM)
+    orchestration_module._signal_process(process, signal.SIGKILL)
+
+    assert leader_signals == [(123, signal.SIGTERM)]
+    assert group_signals == [(124, signal.SIGKILL)]
 
 
 def test_h100_layouts_assign_one_learner_and_every_actor_gpu() -> None:
@@ -112,6 +145,20 @@ def test_ring_scheduler_curriculum_then_favors_deficits() -> None:
     draws = [scheduler.choose(mature) for _ in range(2_000)]
     assert set(draws) == set(range(3, 13))
     assert draws.count(12) > draws.count(3) * 2
+
+
+def test_ring_mixture_stage_selection_uses_aggregate_sample_boundaries() -> None:
+    mixture = RingMixtureConfig(
+        curriculum=(
+            CurriculumStage(until_samples=100, rings=(3, 4)),
+            CurriculumStage(until_samples=500, rings=(3, 4, 5, 6)),
+        )
+    )
+    assert mixture.active_rings(0) == (3, 4)
+    assert mixture.active_rings(99) == (3, 4)
+    assert mixture.active_rings(100) == (3, 4, 5, 6)
+    assert mixture.active_rings(499) == (3, 4, 5, 6)
+    assert mixture.active_rings(500) == tuple(range(3, 13))
 
 
 def test_explicit_ddp_builds_one_torchrun_job_and_partitions_batches(

@@ -12,6 +12,7 @@ from startrain.arena import (
     WDL,
     _pair_mean_exceeds,
     _pair_sequential_state,
+    internal_elo_target_assessment,
     promotion_assessment,
     summarize_pairs,
     summarize_wdl,
@@ -399,3 +400,36 @@ def test_configured_ring_floors_allow_representative_non_regression() -> None:
         floor["passed"] is True and floor["anytime_lower_elo"] >= floor["floor_elo"]
         for floor in assessment["ring_floors"].values()
     )
+
+
+def test_pair_summary_and_internal_target_use_anytime_valid_lower_bound() -> None:
+    pairs = [
+        ArenaPair(4, pair, pair, 0, True, (1, 1))
+        for pair in range(50)
+    ]
+    summary = summarize_pairs(
+        pairs,
+        confidence=0.95,
+        bootstrap_samples=200,
+        seed=17,
+    )
+    assert summary["anytime_confidence_sequence"][0] > 0.5
+    assert summary["anytime_elo_interval"][0] > 0
+
+    result = {
+        "per_ring": {
+            str(ring): {
+                "anytime_elo_interval": [lower, 800.0],
+                "pairs": 50,
+            }
+            for ring, lower in ((4, 450.0), (6, 425.0), (8, 399.0), (10, 500.0))
+        }
+    }
+    assessment = internal_elo_target_assessment(
+        result,
+        rings=(4, 6, 8, 10),
+        target_elo=400.0,
+    )
+    assert assessment["status"] == "not_reached"
+    assert assessment["passed"] is False
+    assert assessment["per_ring"]["8"]["passed"] is False

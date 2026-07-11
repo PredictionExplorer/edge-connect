@@ -31,11 +31,7 @@ class RingMixtureScheduler:
         if any(value < 0 for value in counts.values()):
             raise ValueError("ring sample counts must be non-negative")
         total = sum(counts.values())
-        eligible = self.config.rings
-        for stage in self.config.curriculum:
-            if total < stage.until_samples:
-                eligible = stage.rings
-                break
+        eligible = self.config.active_rings(total)
         target = max((counts[ring] for ring in eligible), default=0)
         weights = []
         for ring in eligible:
@@ -295,6 +291,8 @@ class ActorSupervisor:
                         stop_requested=stop_requested,
                         progress=self.heartbeat.advance,
                     )
+                    if not summaries and stop_requested():
+                        break
                     elapsed = time.monotonic() - started
                     wins = sum(summary.winner == 0 for summary in summaries)
                     losses = sum(summary.winner == 1 for summary in summaries)

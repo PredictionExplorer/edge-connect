@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import hashlib
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from types import SimpleNamespace
 
 import numpy as np
@@ -11,7 +11,14 @@ import pytest
 import torch
 from torch import nn
 
-from startrain.config import DataConfig, LearnerConfig, SchedulerConfig, TrainConfig
+from startrain.config import (
+    CurriculumStage,
+    DataConfig,
+    LearnerConfig,
+    RingMixtureConfig,
+    SchedulerConfig,
+    TrainConfig,
+)
 from startrain.contracts import (
     TARGET_ALIVE,
     TARGET_OWNERSHIP,
@@ -551,6 +558,40 @@ def test_selfplay_exact_cohort_never_resets_or_drops_uneven_games(
     assert len(drained) == 2
     assert len(drained_sink.samples) == sum(summary.samples for summary in drained)
 
+    abort_checks = {"count": 0}
+    abort_events: list[dict[str, object]] = []
+
+    def stop_mid_cohort() -> bool:
+        abort_checks["count"] += 1
+        return abort_checks["count"] >= 3
+
+    aborted_sink = CapturingSink()
+    aborted = SelfPlayActor(
+        SimpleNamespace(StateBatch=UnevenStates, SearchBatch=UnevenSearch),
+        UnevenEvaluator(),
+        aborted_sink,
+        SelfPlayConfig(
+            rings=3,
+            batch_size=2,
+            games=2,
+            fast_probability=0.0,
+            full_probability=1.0,
+            fast_simulations=1,
+            full_simulations=1,
+            max_considered=1,
+            shard_size=64,
+        ),
+        SelfPlayIdentity("run-test", "family-test", "actor-abort", 6),
+    ).run(
+        stop_requested=stop_mid_cohort,
+        progress=lambda **details: abort_events.append(details),
+    )
+    assert aborted == []
+    assert aborted_sink.samples == []
+    abort = next(event for event in abort_events if event["phase"] == "selfplay_abort")
+    assert abort["dropped_games"] == 2
+    assert abort["dropped_decisions"] == 2
+
 
 def make_replay_sample(
     rings: int = 3,
@@ -801,7 +842,97 @@ def tiny_model() -> GraphResTNet:
     )
 
 
-def test_learner_runs_homogeneous_batch_and_publishes_atomically(tmp_path) -> None:
+def curriculum_learner_stub(*, enabled: bool = True) -> LearnerLoop:
+    learner = object.__new__(LearnerLoop)
+    learner.learner_config = LearnerConfig(
+        minimum_replay_samples=4,
+        recent_samples_per_ring=16,
+        minimum_unique_samples_per_ring=2,
+        use_ring_mixture_curriculum=enabled,
+    )
+    learner.train_config = TrainConfig(per_rank_batch_size=2)
+    learner.data_config = DataConfig(ring_stratified=True)
+    learner.ring_mixture_config = RingMixtureConfig(
+        curriculum=(
+            CurriculumStage(until_samples=10, rings=(3, 4)),
+            CurriculumStage(until_samples=20, rings=(3, 4, 5, 6)),
+        )
+    )
+    learner.rank = 0
+    learner.world_size = 1
+    learner.step = 0
+    return learner
+
+
+def test_learner_curriculum_readiness_expands_without_waiting_on_locked_rings() -> None:
+    learner = curriculum_learner_stub()
+    early = {ring: 0 for ring in range(3, 13)}
+    early.update({3: 4, 4: 4})
+    assert learner._active_replay_rings(early) == (3, 4)
+    assert learner._replay_is_ready(early)
+    assert not curriculum_learner_stub(enabled=False)._replay_is_ready(early)
+
+    transition = dict(early)
+    transition.update({3: 5, 4: 5})
+    assert learner._active_replay_rings(transition) == (3, 4, 5, 6)
+    assert not learner._replay_is_ready(transition)
+
+    warmed = dict(transition)
+    warmed.update({5: 2, 6: 2})
+    assert learner._replay_is_ready(warmed)
+
+    fully_unlocked = dict(warmed)
+    fully_unlocked[3] = 11
+    assert learner._active_replay_rings(fully_unlocked) == tuple(range(3, 13))
+    assert not learner._replay_is_ready(fully_unlocked)
+
+
+def test_learner_curriculum_selects_only_currently_active_rings(tmp_path) -> None:
+    class CapturingStore:
+        def __init__(self, counts: dict[int, int]) -> None:
+            self.counts = counts
+            self.selections: list[tuple[int, ...]] = []
+
+        def eligible_sample_counts(
+            self, rings: tuple[int, ...], **_metadata: object
+        ) -> dict[int, int]:
+            assert rings == tuple(range(3, 13))
+            return dict(self.counts)
+
+        def select_recent_spans(
+            self, *, rings: tuple[int, ...], **_metadata: object
+        ) -> ReplaySelection:
+            self.selections.append(rings)
+            return ReplaySelection(
+                (),
+                {ring: self.counts.get(ring, 0) for ring in rings},
+                0,
+            )
+
+    learner = curriculum_learner_stub()
+    early = {ring: 0 for ring in range(3, 13)}
+    early.update({3: 4, 4: 4})
+    store = CapturingStore(early)
+    learner.store = store
+    learner.run_identity = run_identity(tmp_path)
+
+    assert tuple(learner._select_replay_spans().samples_by_ring) == (3, 4)
+
+    store.counts.update({3: 5, 4: 5, 5: 2, 6: 2})
+    assert tuple(learner._select_replay_spans().samples_by_ring) == (3, 4, 5, 6)
+
+    store.counts = {ring: 2 for ring in range(3, 13)}
+    assert tuple(learner._select_replay_spans().samples_by_ring) == tuple(range(3, 13))
+    assert store.selections == [
+        (3, 4),
+        (3, 4, 5, 6),
+        tuple(range(3, 13)),
+    ]
+
+
+def test_learner_runs_homogeneous_batch_publishes_and_resumes_curriculum_opt_in(
+    tmp_path,
+) -> None:
     identity = run_identity(tmp_path)
     with ReplayStore(tmp_path / "replay") as store:
         generation = store.lease_generation(identity, "actor-test")
@@ -853,7 +984,7 @@ def test_learner_runs_homogeneous_batch_and_publishes_atomically(tmp_path) -> No
             data_config=DataConfig(workers=0, ring_stratified=False),
             loss_weights=LossWeights(),
             seed=5,
-            serialized_config={"schema_version": 2},
+            serialized_config={"schema_version": 2, "learner": {}},
             run_identity=identity,
         )
         assert learner.run(steps=1) == 1
@@ -889,12 +1020,18 @@ def test_learner_runs_homogeneous_batch_and_publishes_atomically(tmp_path) -> No
             scheduler=restored_scheduler,
             ema=ExponentialMovingAverage(restored_model, decay=0.9),
             output_directory=tmp_path / "restored",
-            learner_config=learner.learner_config,
+            learner_config=replace(
+                learner.learner_config,
+                use_ring_mixture_curriculum=True,
+            ),
             train_config=learner.train_config,
             data_config=learner.data_config,
             loss_weights=LossWeights(),
             seed=5,
-            serialized_config={"schema_version": 2},
+            serialized_config={
+                "schema_version": 2,
+                "learner": {"use_ring_mixture_curriculum": True},
+            },
             run_identity=identity,
         )
         restored.resume(
@@ -903,6 +1040,7 @@ def test_learner_runs_homogeneous_batch_and_publishes_atomically(tmp_path) -> No
             expected_bytes=published.checkpoint_bytes,
         )
         assert restored.step == 1
+        assert restored.learner_config.use_ring_mixture_curriculum is True
 
 
 def test_learner_publishes_initial_ema_then_waits_for_minimum_replay(

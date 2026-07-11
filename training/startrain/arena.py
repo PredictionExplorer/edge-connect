@@ -25,6 +25,51 @@ class ArenaEvaluatorProtocol(Protocol):
     def evaluate(self, requests: NativeEvalBatchProtocol) -> InferenceResponse: ...
 
 
+@dataclass(frozen=True, slots=True)
+class ArenaSearchBudget:
+    """Immutable native search budget for one arena participant."""
+
+    simulations: int
+    max_considered: int
+    c_visit: float
+    c_scale: float
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.simulations, bool)
+            or not isinstance(self.simulations, int)
+            or self.simulations <= 0
+        ):
+            raise ValueError("arena search simulations must be a positive integer")
+        if (
+            isinstance(self.max_considered, bool)
+            or not isinstance(self.max_considered, int)
+            or self.max_considered <= 0
+        ):
+            raise ValueError("arena search max_considered must be a positive integer")
+        if not math.isfinite(self.c_visit) or self.c_visit <= 0:
+            raise ValueError("arena search c_visit must be finite and positive")
+        if not math.isfinite(self.c_scale) or self.c_scale <= 0:
+            raise ValueError("arena search c_scale must be finite and positive")
+
+    @classmethod
+    def from_config(cls, config: ArenaConfig) -> "ArenaSearchBudget":
+        return cls(
+            simulations=config.simulations,
+            max_considered=config.max_considered,
+            c_visit=config.c_visit,
+            c_scale=config.c_scale,
+        )
+
+    def metadata(self) -> dict[str, int | float]:
+        return {
+            "simulations": self.simulations,
+            "max_considered": self.max_considered,
+            "c_visit": self.c_visit,
+            "c_scale": self.c_scale,
+        }
+
+
 # A complete role-reversed pair has 0, 0.5, 1, 1.5, or 2 candidate points.
 # The sequential test works on the corresponding [0, 1] score rates. Each
 # betting fraction is mixed with equal initial capital, so no data-dependent
@@ -167,6 +212,11 @@ def summarize_pairs(
         samples=bootstrap_samples,
         seed=seed,
     )
+    error_probability = (1.0 - confidence) / 2.0
+    anytime_lower, anytime_upper = pair_confidence_sequence(
+        pairs,
+        error_probability=error_probability,
+    )
     counts = _pentanomial_counts(pairs)
     return {
         **asdict(wdl),
@@ -179,6 +229,12 @@ def summarize_pairs(
             elo_from_probability(lower),
             elo_from_probability(upper),
         ],
+        "anytime_confidence_sequence": [anytime_lower, anytime_upper],
+        "anytime_elo_interval": [
+            elo_from_probability(anytime_lower),
+            elo_from_probability(anytime_upper),
+        ],
+        "anytime_error_probability_per_side": error_probability,
         "pentanomial": {
             "0": counts[0],
             "0.5": counts[1],
@@ -186,6 +242,57 @@ def summarize_pairs(
             "1.5": counts[3],
             "2": counts[4],
         },
+    }
+
+
+def internal_elo_target_assessment(
+    arena_result: Mapping[str, object],
+    *,
+    rings: Sequence[int],
+    target_elo: float,
+) -> dict[str, object]:
+    """Assess a fixed internal target with paired anytime-valid lower bounds."""
+
+    if not rings or len(set(rings)) != len(rings):
+        raise ValueError("internal Elo target rings must be non-empty and unique")
+    if not math.isfinite(target_elo):
+        raise ValueError("internal Elo target must be finite")
+    per_ring = arena_result.get("per_ring")
+    if not isinstance(per_ring, Mapping):
+        raise ValueError("arena result omitted per-ring summaries")
+
+    assessments: dict[str, object] = {}
+    passed = True
+    for ring in rings:
+        summary = per_ring.get(str(ring))
+        if not isinstance(summary, Mapping):
+            raise ValueError(f"arena result omitted ring {ring}")
+        interval = summary.get("anytime_elo_interval")
+        if (
+            not isinstance(interval, Sequence)
+            or isinstance(interval, str | bytes)
+            or len(interval) != 2
+            or isinstance(interval[0], bool)
+            or not isinstance(interval[0], int | float)
+        ):
+            raise ValueError(f"arena result has an invalid ring {ring} Elo interval")
+        lower = float(interval[0])
+        ring_passed = lower >= target_elo
+        passed = passed and ring_passed
+        assessments[str(ring)] = {
+            "lower_elo": lower,
+            "target_elo": target_elo,
+            "passed": ring_passed,
+            "pairs": summary.get("pairs"),
+        }
+    return {
+        "schema_version": 1,
+        "status": "passed" if passed else "not_reached",
+        "passed": passed,
+        "target_elo": target_elo,
+        "rings": list(rings),
+        "confidence_method": "pair-level-mixture-betting-confidence-sequence-v1",
+        "per_ring": assessments,
     }
 
 
@@ -545,11 +652,16 @@ class ArenaRunner:
         candidate: ArenaEvaluatorProtocol,
         baseline: ArenaEvaluatorProtocol,
         config: ArenaConfig,
+        baseline_search: ArenaSearchBudget | None = None,
+        baseline_metadata: Mapping[str, object] | None = None,
     ) -> None:
         self.native = native_module
         self.candidate = candidate
         self.baseline = baseline
         self.config = config
+        self.candidate_search = ArenaSearchBudget.from_config(config)
+        self.baseline_search = baseline_search or self.candidate_search
+        self.baseline_metadata = dict(baseline_metadata or {})
 
     def run(
         self,
@@ -609,18 +721,22 @@ class ArenaRunner:
                         completed_pairs=len(pairs),
                     )
         statistical = summarize_arena_pairs(pairs, self.config)
+        baseline_metadata = dict(self.baseline_metadata)
+        baseline_metadata.setdefault("kind", "checkpoint")
+        baseline_metadata["identity"] = self.baseline.model_version
+        baseline_metadata["search_budget"] = self.baseline_search.metadata()
+        baseline_metadata["deterministic"] = True
+        baseline_metadata["seed_schedule"] = "arena-runner-v1"
         return {
             "schema_version": ARENA_RESULT_SCHEMA_VERSION,
             "candidate": self.candidate.model_version,
             "baseline": self.baseline.model_version,
+            "baseline_metadata": baseline_metadata,
             "started_ns": started_ns,
             "completed_ns": time.time_ns(),
             "search": {
                 "deterministic": True,
-                "simulations": self.config.simulations,
-                "max_considered": self.config.max_considered,
-                "c_visit": self.config.c_visit,
-                "c_scale": self.config.c_scale,
+                **self.candidate_search.metadata(),
                 "pie_rule": False,
             },
             **statistical,
@@ -676,12 +792,17 @@ class ArenaRunner:
                     continue
                 subset = self._semantic_subset(data, rows)
                 evaluator = self.candidate if evaluator_index == 0 else self.baseline
+                budget = (
+                    self.candidate_search
+                    if evaluator_index == 0
+                    else self.baseline_search
+                )
                 search = self.native.SearchBatch(
                     subset,
-                    simulations=self.config.simulations,
-                    max_considered=self.config.max_considered,
-                    c_visit=self.config.c_visit,
-                    c_scale=self.config.c_scale,
+                    simulations=budget.simulations,
+                    max_considered=budget.max_considered,
+                    c_visit=budget.c_visit,
+                    c_scale=budget.c_scale,
                     deterministic_seed=_batch_search_seed(
                         ring,
                         wave,
@@ -695,7 +816,7 @@ class ArenaRunner:
                 guard = 0
                 while not search.is_done():
                     guard += 1
-                    if guard > self.config.simulations * len(rows) * 4 + 16:
+                    if guard > budget.simulations * len(rows) * 4 + 16:
                         raise RuntimeError(
                             "batched arena search failed to make progress"
                         )
@@ -785,12 +906,17 @@ class ArenaRunner:
                 break
             player = int(state_data.to_move[0])
             evaluator = self.candidate if player == candidate_player else self.baseline
+            budget = (
+                self.candidate_search
+                if player == candidate_player
+                else self.baseline_search
+            )
             search = self.native.SearchBatch(
                 states,
-                simulations=self.config.simulations,
-                max_considered=self.config.max_considered,
-                c_visit=self.config.c_visit,
-                c_scale=self.config.c_scale,
+                simulations=budget.simulations,
+                max_considered=budget.max_considered,
+                c_visit=budget.c_visit,
+                c_scale=budget.c_scale,
                 deterministic_seed=_search_seed(opening_seed, moves),
             )
             roots = search.root_requests()
@@ -799,7 +925,7 @@ class ArenaRunner:
             guard = 0
             while not search.is_done():
                 guard += 1
-                if guard > self.config.simulations * 4 + 16:
+                if guard > budget.simulations * 4 + 16:
                     raise RuntimeError("arena native search failed to make progress")
                 requests = search.next_requests()
                 if len(requests) == 0:

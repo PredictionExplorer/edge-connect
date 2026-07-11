@@ -13,6 +13,9 @@ For an actual multi-H100 launch, follow the
 host preparation through graceful shutdown and recovery. Do not launch a long run from
 the abbreviated examples alone.
 
+The measured 8-H100 host evidence, accepted treatments and current forecast are in the
+[target-host benchmark results](docs/h100-target-host-benchmark-results.md).
+
 ## Architecture
 
 - `crates/star-engine`: authoritative Rust board, rules, scoring and D5 symmetry.
@@ -200,6 +203,17 @@ or:
 startrain-orchestrate --config configs/h100-8gpu.yaml
 ```
 
+The evidence-backed 8-H100 treatment is available separately, leaving the historical
+control unchanged:
+
+```bash
+startrain-orchestrate --config configs/h100-8gpu-optimized.yaml
+```
+
+It uses 128-game actor cohorts, seven actor GPUs, learner/arena pause-sharing on GPU 0,
+and learner-aware progressive rings. Copy and freeze it per run exactly like the
+control profile.
+
 The orchestrator has no `--run-id` or `--run-identity` option. It atomically creates
 `<run-root>/run.json`, then passes that required identity path to every learner, actor
 and promotion child process. An existing `run.json` is reused; a configured `run_id`
@@ -208,6 +222,14 @@ that disagrees with it is rejected.
 For custom DDP, configure at least two learner GPU entries with equal CPU budgets and
 set `orchestration.distributed.enabled: true` with backend `nccl`. The coordinator then
 constructs the `torch.distributed.run` command and required run-identity arguments.
+
+The actor ring mixture already progresses from small to large boards. The shipped
+profiles intentionally keep `learner.use_ring_mixture_curriculum: false` as the
+historical control, so their stratified learner waits for the replay minimum on every
+ring. Set that field to `true` in a new frozen profile to make the learner use the same
+unlocked rings as the actors: it starts with rings 3–4, expands to 3–6, then trains on
+3–12. A stage transition waits only for the configured minimum on the newly active
+rings; checkpoints and the shared all-ring model remain compatible.
 
 ## Run files and model lifecycle
 
@@ -243,6 +265,24 @@ The shipped `model_refresh.selfplay_source: champion` means rejected candidates 
 feed self-play. Research ablations may select `candidate` or
 `candidate_champion_mix`; the selected role and policy-supervision rate are written to
 actor metrics and model swaps still occur only at complete batch boundaries.
+
+For a reproducible non-human strength anchor, `startrain-arena` also accepts
+`--baseline-kind uniform`, `greedy`, or `shallow-search`. The frozen baseline identity,
+algorithm and its separate search budget are embedded in the result. An internal target
+can be assessed with paired anytime-valid bounds:
+
+```bash
+startrain-arena \
+  --config "$PROFILE" \
+  --candidate "$RUN/learner/candidate.json" \
+  --baseline-kind shallow-search \
+  --target-elo-lcb 400 \
+  --target-rings 4 6 8 10 \
+  --output "$RUN/arena/internal-target.json" \
+  --device cuda
+```
+
+This is an internal engineering milestone, not evidence of superhuman strength.
 
 If candidate/champion lag reaches the configured plateau, the learner pauses for a
 terminal arena result. After three terminal rejections, the shipped profile resets
@@ -300,6 +340,20 @@ RAYON_NUM_THREADS=32 \
 
 It measures native scoring and uniform-evaluator search only. It is not an H100
 end-to-end benchmark.
+
+Use the bounded system harness for repeatable ring/batch sweeps and optional
+orchestration-metric summaries. It refuses to overwrite an existing output directory
+and records the code, config and environment with every result:
+
+```bash
+python scripts/h100_system_benchmark.py \
+  --config "$PROFILE" \
+  --output-dir "$RUN_ROOT/system-benchmark" \
+  --rings 6 12 \
+  --batch-sizes 64 128 256 \
+  --repeats 3 \
+  --metrics-root "$RUN_ROOT"
+```
 
 Before committing to a long run, use these planning gates:
 

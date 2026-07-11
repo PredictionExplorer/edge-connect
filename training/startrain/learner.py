@@ -29,7 +29,13 @@ from .checkpoint import (
     verify_file,
     write_model_pointer,
 )
-from .config import DataConfig, ExperimentConfig, LearnerConfig, TrainConfig
+from .config import (
+    DataConfig,
+    ExperimentConfig,
+    LearnerConfig,
+    RingMixtureConfig,
+    TrainConfig,
+)
 from .contracts import FEATURE_SCHEMA_HASH, RULES_HASH_WIRE
 from .losses import LossWeights
 from .model import GraphResTNet
@@ -452,6 +458,7 @@ class LearnerLoop:
         seed: int,
         serialized_config: dict[str, object],
         run_identity: RunIdentity,
+        ring_mixture_config: RingMixtureConfig = RingMixtureConfig(),
         promotion_status_path: str | Path | None = None,
         gpu_pause_path: str | Path | None = None,
         rank: int = 0,
@@ -471,6 +478,7 @@ class LearnerLoop:
         self.seed = seed
         self.serialized_config = serialized_config
         self.run_identity = run_identity
+        self.ring_mixture_config = ring_mixture_config
         self.promotion_status_path = (
             Path(promotion_status_path) if promotion_status_path is not None else None
         )
@@ -495,7 +503,14 @@ class LearnerLoop:
             )
         self.step = 0
         self.epoch = 0
-        compiled_model = maybe_compile_model(self.model, enabled=train_config.compile)
+        # Replay batches are fixed-size and ring-homogeneous. Static compilation
+        # avoids Inductor's dynamic backward reductions (which fail on variable
+        # graph lengths) while allowing one cached graph per encountered ring.
+        compiled_model = maybe_compile_model(
+            self.model,
+            enabled=train_config.compile,
+            dynamic=False,
+        )
         if world_size > 1:
             parameter = next(self.model.parameters())
             device_ids = (
@@ -546,6 +561,7 @@ class LearnerLoop:
             seed=config.train.seed,
             serialized_config=config.as_dict(),
             run_identity=run_identity,
+            ring_mixture_config=config.orchestration.ring_mixture,
             promotion_status_path=promotion_status_path,
             gpu_pause_path=gpu_pause_path,
             rank=rank,
@@ -768,27 +784,10 @@ class LearnerLoop:
     ) -> bool:
         started = time.monotonic()
         while True:
-            counts = self.store.eligible_sample_counts(
-                tuple(range(3, 13)),
-                run_id=self.run_identity.run_id,
-                generation_family=self.run_identity.generation_family,
-                current_model_step=self.step,
-                max_model_lag_steps=self.learner_config.max_replay_lag_steps,
-            )
-            available = sum(counts.values())
-            per_ring_ready = (
-                all(
-                    count >= self.learner_config.minimum_unique_samples_per_ring
-                    for count in counts.values()
-                )
-                if self.data_config.ring_stratified
-                else True
-            )
-            ready = (
-                available >= self.learner_config.minimum_replay_samples
-                and per_ring_ready
-                and self._available_batch_capacity(counts) >= self.world_size
-            )
+            counts = self._eligible_replay_counts()
+            active_counts = self._active_replay_counts(counts)
+            available = sum(active_counts.values())
+            ready = self._replay_is_ready(counts)
             stop, globally_ready = self._collective_flags(stop_requested(), ready)
             if stop:
                 return False
@@ -815,9 +814,12 @@ class LearnerLoop:
         return capacity // self.world_size
 
     def _select_replay_spans(self) -> ReplaySelection:
+        rings = self.ring_mixture_config.rings
+        if self.learner_config.use_ring_mixture_curriculum and self.rank == 0:
+            rings = self._active_replay_rings(self._eligible_replay_counts())
         selection = (
             self.store.select_recent_spans(
-                rings=tuple(range(3, 13)),
+                rings=rings,
                 per_ring_quota=self.learner_config.recent_samples_per_ring,
                 run_id=self.run_identity.run_id,
                 generation_family=self.run_identity.generation_family,
@@ -831,6 +833,42 @@ class LearnerLoop:
         if not isinstance(selection, ReplaySelection):
             raise RuntimeError("rank 0 broadcast invalid replay selection metadata")
         return selection
+
+    def _eligible_replay_counts(self) -> dict[int, int]:
+        return self.store.eligible_sample_counts(
+            self.ring_mixture_config.rings,
+            run_id=self.run_identity.run_id,
+            generation_family=self.run_identity.generation_family,
+            current_model_step=self.step,
+            max_model_lag_steps=self.learner_config.max_replay_lag_steps,
+        )
+
+    def _active_replay_rings(self, counts: Mapping[int, int]) -> tuple[int, ...]:
+        if not self.learner_config.use_ring_mixture_curriculum:
+            return self.ring_mixture_config.rings
+        total = sum(int(counts.get(ring, 0)) for ring in self.ring_mixture_config.rings)
+        return self.ring_mixture_config.active_rings(total)
+
+    def _active_replay_counts(self, counts: Mapping[int, int]) -> dict[int, int]:
+        return {
+            ring: int(counts.get(ring, 0)) for ring in self._active_replay_rings(counts)
+        }
+
+    def _replay_is_ready(self, counts: Mapping[int, int]) -> bool:
+        active_counts = self._active_replay_counts(counts)
+        per_ring_ready = (
+            all(
+                count >= self.learner_config.minimum_unique_samples_per_ring
+                for count in active_counts.values()
+            )
+            if self.data_config.ring_stratified
+            else True
+        )
+        return (
+            sum(active_counts.values()) >= self.learner_config.minimum_replay_samples
+            and per_ring_ready
+            and self._available_batch_capacity(active_counts) >= self.world_size
+        )
 
     def _available_batch_capacity(self, counts: Mapping[int, int]) -> int:
         batch = self.train_config.per_rank_batch_size

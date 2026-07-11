@@ -436,6 +436,18 @@ python scripts/hardware_preflight.py \
   | tee "$RUN_ROOT/hardware-preflight-r12.json"
 ```
 
+For a repeated ring/batch matrix with immutable JSON/JSONL evidence, run:
+
+```bash
+python scripts/h100_system_benchmark.py \
+  --config "$PROFILE" \
+  --output-dir "$RUN_ROOT/system-benchmark" \
+  --rings 6 12 \
+  --batch-sizes 64 128 256 \
+  --repeats 3 \
+  --metrics-root "$RUN_ROOT"
+```
+
 Do not start the long run if either gate fails. Capture the JSON and profiler
 evidence before changing batch size, model size, compile settings, or search
 parameters.
@@ -519,6 +531,11 @@ sudo install -m 0644 \
 sudo systemctl daemon-reload
 sudo systemctl enable --now "edgeconnect-startrain-$RUN_ID.service"
 ```
+
+Keep the template's `KillMode=mixed`: systemd sends the graceful signal only to
+the coordinator, allowing it to unwind learner DataLoader children and actor
+search waves, while still hard-killing the complete cgroup after
+`TimeoutStopSec` if graceful shutdown fails.
 
 Inspect it:
 

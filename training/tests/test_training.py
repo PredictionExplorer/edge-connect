@@ -83,10 +83,36 @@ def test_yaml_configs_load_strictly() -> None:
     continuous = load_config(CONFIGS / "h100-8gpu.yaml")
     assert continuous.profile == "continuous"
     assert continuous.data.ring_stratified is True
+    assert continuous.learner.use_ring_mixture_curriculum is False
     assert continuous.orchestration.model_refresh.selfplay_source == "champion"
     assert continuous.orchestration.model_refresh.candidate_probability == 0.8
     assert continuous.selfplay.record_fast_policy_targets is False
     assert continuous.selfplay.max_considered_cap == 64
+    optimized = load_config(CONFIGS / "h100-8gpu-optimized.yaml")
+    assert optimized.learner.use_ring_mixture_curriculum is True
+    assert len(optimized.orchestration.actor_gpus) == 7
+    assert {
+        gpu.actor_batch_size for gpu in optimized.orchestration.actor_gpus
+    } == {128}
+    assert optimized.orchestration.actor_games_per_batch == 128
+    assert optimized.orchestration.promotion.gpu_id == 0
+    assert optimized.orchestration.promotion.pause_sharing_mode is True
+
+
+def test_yaml_parses_opt_in_learner_ring_mixture_curriculum(tmp_path) -> None:
+    source = (CONFIGS / "small.yaml").read_text(encoding="utf-8")
+    configured = tmp_path / "curriculum.yaml"
+    configured.write_text(
+        source.replace(
+            "learner:\n",
+            "learner:\n  use_ring_mixture_curriculum: true\n",
+            1,
+        ),
+        encoding="utf-8",
+    )
+
+    experiment = load_config(configured)
+    assert experiment.learner.use_ring_mixture_curriculum is True
 
 
 def test_optimizer_decay_groups_and_muon_selection() -> None:

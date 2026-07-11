@@ -100,6 +100,7 @@ class LearnerConfig:
     minimum_replay_samples: int = 1
     recent_samples_per_ring: int = 10_000
     minimum_unique_samples_per_ring: int = 1
+    use_ring_mixture_curriculum: bool = False
     max_replay_lag_steps: int = 50_000
     steps_per_window: int = 100
     candidate_interval: int = 1_000
@@ -110,6 +111,8 @@ class LearnerConfig:
     device: str = "cpu"
 
     def __post_init__(self) -> None:
+        if type(self.use_ring_mixture_curriculum) is not bool:
+            raise ConfigError("use_ring_mixture_curriculum must be boolean")
         if type(self.resume_latest) is not bool:
             raise ConfigError("resume_latest must be boolean")
         values = (
@@ -216,6 +219,22 @@ class RingMixtureConfig:
             if any(ring not in self.rings for ring in stage.rings):
                 raise ConfigError("curriculum stage contains an unavailable ring")
             previous = stage.until_samples
+
+    def active_rings(self, total_samples: int) -> tuple[int, ...]:
+        """Return the curriculum rings active at an aggregate sample count."""
+
+        if (
+            isinstance(total_samples, bool)
+            or not isinstance(total_samples, int)
+            or total_samples < 0
+        ):
+            raise ValueError(
+                "total ring-mixture samples must be a non-negative integer"
+            )
+        for stage in self.curriculum:
+            if total_samples < stage.until_samples:
+                return stage.rings
+        return self.rings
 
 
 @dataclass(frozen=True, slots=True)

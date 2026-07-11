@@ -761,7 +761,14 @@ class Coordinator:
 def _signal_process(process: ProcessProtocol, signal_number: int) -> None:
     if isinstance(process, subprocess.Popen):
         try:
-            os.killpg(os.getpgid(process.pid), signal_number)
+            if signal_number == signal.SIGTERM:
+                # Let the worker's SignalLatch unwind first. Signaling the whole
+                # group here kills learner DataLoader children underneath the
+                # iterator and turns an otherwise clean stop into a restartable
+                # RuntimeError. The hard-stop path below still kills the group.
+                os.kill(process.pid, signal_number)
+            else:
+                os.killpg(os.getpgid(process.pid), signal_number)
         except ProcessLookupError:
             return
     elif signal_number == signal.SIGTERM:

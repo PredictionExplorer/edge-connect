@@ -34,6 +34,7 @@ operator trains a champion or publishes a distilled browser model. This is imple
 training infrastructure, not a claim of superhuman playing strength. See the
 [training operator guide](training/README.md) and
 [production H100 training runbook](training/docs/production-h100-training-runbook.md), then the
+[target-host benchmark results](training/docs/h100-target-host-benchmark-results.md) and
 [serving/distillation details](training/docs/serving-and-distillation.md).
 
 ## Development
