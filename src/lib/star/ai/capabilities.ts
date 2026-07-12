@@ -5,6 +5,7 @@ import {
   STAR_RULES_SCHEMA_ID,
 } from '../rules';
 import type { ControllerType } from './controllers';
+import type { StarAiSearchBudget } from './decision';
 import {
   STAR_FEATURE_SCHEMA_HASH,
   STAR_FEATURE_SCHEMA_VERSION,
@@ -13,7 +14,13 @@ import { configuredServerHealthUrl } from './server-client';
 
 export type AiCapability =
   | { status: 'checking'; label: string }
-  | { status: 'available'; label: string }
+  | {
+      status: 'available';
+      label: string;
+      search?: AiSearchCapability;
+      device?: string;
+      champion?: AiChampionCapability;
+    }
   | {
       status: 'unavailable';
       label: string;
@@ -21,6 +28,19 @@ export type AiCapability =
       reason: string;
       retryable: boolean;
     };
+
+export interface AiSearchCapability {
+  default: StarAiSearchBudget;
+  maximum: StarAiSearchBudget;
+  presets: Readonly<Record<string, StarAiSearchBudget>>;
+}
+
+export interface AiChampionCapability {
+  role: 'champion';
+  modelVersion: string;
+  modelStep: number;
+  modelIdentity: string;
+}
 
 export interface AiCapabilities {
   server: AiCapability;
@@ -38,6 +58,92 @@ const CAPABILITY_BODY_BYTES = 256 * 1024;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function hasExactKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
+  const actual = Object.keys(value).sort();
+  const expected = [...keys].sort();
+  return (
+    actual.length === expected.length &&
+    actual.every((key, index) => key === expected[index])
+  );
+}
+
+function parseHealthBudget(value: unknown): StarAiSearchBudget {
+  if (
+    !isRecord(value) ||
+    !hasExactKeys(value, ['simulations', 'max_considered']) ||
+    typeof value.simulations !== 'number' ||
+    !Number.isSafeInteger(value.simulations) ||
+    value.simulations <= 0 ||
+    typeof value.max_considered !== 'number' ||
+    !Number.isSafeInteger(value.max_considered) ||
+    value.max_considered <= 0
+  ) {
+    throw new Error('invalid search budget');
+  }
+  return {
+    simulations: value.simulations,
+    maxConsidered: value.max_considered,
+  };
+}
+
+function parseHealthSearch(value: unknown): AiSearchCapability {
+  if (
+    !isRecord(value) ||
+    !hasExactKeys(value, ['defaults', 'maximums', 'presets']) ||
+    !isRecord(value.presets) ||
+    Object.keys(value.presets).length === 0
+  ) {
+    throw new Error('invalid search metadata');
+  }
+  const defaultBudget = parseHealthBudget(value.defaults);
+  const maximum = parseHealthBudget(value.maximums);
+  if (
+    defaultBudget.simulations > maximum.simulations ||
+    defaultBudget.maxConsidered > maximum.maxConsidered
+  ) {
+    throw new Error('invalid search defaults');
+  }
+  const presets: Record<string, StarAiSearchBudget> = {};
+  for (const [name, rawBudget] of Object.entries(value.presets)) {
+    if (!/^[a-z][a-z0-9_-]{0,31}$/.test(name)) {
+      throw new Error('invalid search preset name');
+    }
+    const budget = parseHealthBudget(rawBudget);
+    if (
+      budget.simulations > maximum.simulations ||
+      budget.maxConsidered > maximum.maxConsidered
+    ) {
+      throw new Error('invalid search preset');
+    }
+    presets[name] = budget;
+  }
+  return { default: defaultBudget, maximum, presets };
+}
+
+function parseChampionCapability(model: Record<string, unknown>): AiChampionCapability | undefined {
+  if (!('role' in model) && !('model_identity' in model)) return undefined;
+  if (
+    model.role !== 'champion' ||
+    typeof model.model_version !== 'string' ||
+    model.model_version.length === 0 ||
+    model.model_version.length > 256 ||
+    typeof model.model_step !== 'number' ||
+    !Number.isSafeInteger(model.model_step) ||
+    model.model_step < 0 ||
+    typeof model.model_identity !== 'string' ||
+    model.model_identity.length === 0 ||
+    model.model_identity.length > 256
+  ) {
+    throw new Error('invalid champion metadata');
+  }
+  return {
+    role: 'champion',
+    modelVersion: model.model_version,
+    modelStep: model.model_step,
+    modelIdentity: model.model_identity,
+  };
 }
 
 function unavailable(
@@ -162,7 +268,8 @@ export async function checkServerAiCapability(
       payload.features.hash !== STAR_FEATURE_SCHEMA_HASH ||
       !isRecord(payload.actions) ||
       payload.actions.schema_id !== STAR_ACTION_LAYOUT_SCHEMA_ID ||
-      (isRecord(payload.model) && payload.model.ready === false)
+      !isRecord(payload.model) ||
+      payload.model.ready !== true
     ) {
       return unavailable(
         'Server AI',
@@ -171,7 +278,36 @@ export async function checkServerAiCapability(
         false,
       );
     }
-    return { status: 'available', label: 'Server AI' };
+    try {
+      let device: string | undefined;
+      if (payload.device !== undefined) {
+        if (
+          typeof payload.device !== 'string' ||
+          payload.device.length === 0 ||
+          payload.device.length > 128
+        ) {
+          throw new Error('invalid device metadata');
+        }
+        device = payload.device;
+      }
+      const search =
+        payload.search === undefined ? undefined : parseHealthSearch(payload.search);
+      const champion = parseChampionCapability(payload.model);
+      return {
+        status: 'available',
+        label: 'Server AI',
+        ...(device === undefined ? {} : { device }),
+        ...(search === undefined ? {} : { search }),
+        ...(champion === undefined ? {} : { champion }),
+      };
+    } catch {
+      return unavailable(
+        'Server AI',
+        'server_incompatible',
+        'Server AI capability metadata is invalid.',
+        false,
+      );
+    }
   } catch {
     return unavailable(
       'Server AI',
@@ -229,7 +365,30 @@ export async function checkLocalAiCapability(
         false,
       );
     }
-    return { status: 'available', label: 'Local AI' };
+    const defaultBudget = {
+      simulations: manifest.search.simulations,
+      maxConsidered: manifest.search.maxConsidered,
+    };
+    const maximum = {
+      simulations: manifest.search.maximumSimulations,
+      maxConsidered: manifest.search.maximumMaxConsidered,
+    };
+    return {
+      status: 'available',
+      label: 'Local AI',
+      search: {
+        default: defaultBudget,
+        maximum,
+        presets: {
+          quick: {
+            simulations: Math.min(128, defaultBudget.simulations),
+            maxConsidered: Math.min(8, defaultBudget.maxConsidered),
+          },
+          strong: defaultBudget,
+          maximum,
+        },
+      },
+    };
   } catch {
     return unavailable(
       'Local AI',

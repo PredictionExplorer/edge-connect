@@ -99,8 +99,17 @@ describe('local worker runtime contract', () => {
     expect(Array.from(decoded)).toEqual([-1, 0, 2]);
     expect(runtime.outcomeValue(new Float32Array([0, 0]))).toBe(0);
     expect(runtime.outcomeValue(new Float32Array([-10, 10]))).toBeGreaterThan(0.99);
+    const belief = runtime.outcomeBelief(new Float32Array([0, Math.log(3)]));
+    expect(belief.loss).toBeCloseTo(0.25, 6);
+    expect(belief.win).toBeCloseTo(0.75, 6);
+    const scoreLogits = new Float32Array(303).fill(-100);
+    scoreLogits[153] = 0;
+    expect(runtime.expectedScoreMargin(scoreLogits)).toBeCloseTo(2, 8);
     expect(() => runtime.outcomeValue(new Float32Array([0, 0, 0]))).toThrow(
       /two logits/i,
+    );
+    expect(() => runtime.expectedScoreMargin(new Float32Array([0]))).toThrow(
+      /303 logits/i,
     );
 
     const nonFinite = float32ToFloat16Array(new Float32Array([Number.NaN]));

@@ -10,6 +10,8 @@ import pytest
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
+import starserve.cli as cli_module
+import starserve.runtime as runtime_module
 from starserve.app import create_app
 from starserve.config import (
     LimitConfig,
@@ -25,6 +27,7 @@ from starserve.runtime import (
     ModelLease,
     NativeAnalysisService,
     SearchCancelled,
+    validate_device_availability,
 )
 from starserve.schemas import AnalyzeRequest, AnalyzeResponse, AtomicAction, ScoreBelief
 from startrain.checkpoint import ModelManifest
@@ -126,6 +129,8 @@ class FakeService:
             "ready": self.started,
             "model_version": "fake-v2",
             "model_step": 5,
+            "model_identity": "sha256-" + "f" * 64,
+            "role": "champion",
         }
 
     def analyze(
@@ -156,6 +161,18 @@ def test_v2_api_health_auth_and_binary_response(tmp_path, monkeypatch) -> None:
             "types": ["place"],
         }
         assert health.json()["outcomes"]["classes"] == ["loss", "win"]
+        assert health.json()["device"] == "cpu"
+        assert health.json()["model"]["role"] == "champion"
+        assert health.json()["model"]["model_identity"] == "sha256-" + "f" * 64
+        assert health.json()["search"] == {
+            "defaults": {"simulations": 4, "max_considered": 2},
+            "maximums": {"simulations": 16, "max_considered": 64},
+            "presets": {
+                "quick": {"simulations": 4, "max_considered": 2},
+                "strong": {"simulations": 4, "max_considered": 2},
+                "maximum": {"simulations": 16, "max_considered": 64},
+            },
+        }
 
         assert client.post("/v2/analyze", json=request_payload()).status_code == 401
         headers = {"Authorization": "Bearer correct-secret"}
@@ -273,6 +290,39 @@ def test_server_config_and_request_size_fail_closed(tmp_path) -> None:
         )
     assert response.status_code == 413
     assert response.json()["error"]["code"] == "request_too_large"
+
+
+def test_mps_availability_validation_is_explicit(monkeypatch) -> None:
+    monkeypatch.setattr(
+        runtime_module.torch.backends.mps,
+        "is_available",
+        lambda: False,
+    )
+    with pytest.raises(RuntimeError, match="configured MPS device.*unavailable.*cpu"):
+        validate_device_availability("mps")
+
+    monkeypatch.setattr(
+        runtime_module.torch.backends.mps,
+        "is_available",
+        lambda: True,
+    )
+    assert validate_device_availability("mps").type == "mps"
+
+
+def test_cli_device_override_supports_cpu_fallback(
+    tmp_path,
+    monkeypatch,
+    capsys,
+) -> None:
+    monkeypatch.setattr(
+        cli_module,
+        "load_server_config",
+        lambda _path: server_config(tmp_path, device="mps"),
+    )
+    cli_module.main(
+        ["--config", "snapshot/starserve-mac.yaml", "--device", "cpu", "--check-config"]
+    )
+    assert json.loads(capsys.readouterr().out)["device"] == "cpu"
 
 
 def test_v2_api_cors_validation_budgets_and_request_ids(tmp_path, monkeypatch) -> None:
@@ -455,6 +505,7 @@ def test_atomic_model_manager_reloads_only_between_leases(tmp_path) -> None:
     health = manager.health()
     assert health["last_reload_error"] == "ValueError: bad publication"
     assert health["active_requests"] == 0
+    assert health["role"] == "champion"
 
 
 def test_atomic_model_manager_rejects_candidate_and_bad_dimensions(tmp_path) -> None:

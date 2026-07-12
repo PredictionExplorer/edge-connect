@@ -27,6 +27,103 @@ champion pointer is checked at request boundaries. A valid replacement is
 installed only when no request is active; an invalid replacement leaves the
 previous champion live and marks health as degraded.
 
+## Mac-local champion service
+
+The full champion can run on Apple silicon through the existing Python service.
+The browser and Next.js development server must run on the same Mac because a
+remote website cannot connect to that Mac's `127.0.0.1`.
+
+Install the service and native search extension from a repository checkout on
+the Mac:
+
+```bash
+cd /path/to/EdgeConnect/training
+python3.11 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install "maturin==1.14.1" -e ".[serve]"
+rustup toolchain install 1.93.0
+RUSTUP_TOOLCHAIN=1.93.0 maturin develop --release --locked \
+  --manifest-path crates/star-py/Cargo.toml
+python -c 'import star_native, torch; print(star_native.__file__); print("mps_available=", torch.backends.mps.is_available())'
+```
+
+Create each snapshot on the training host, where the atomic pointer and its
+immutable artifacts are on one filesystem. The output directory must not
+exist. The exporter reads one complete `champion.json`, rejects candidate
+pointers and paths that escape the publication root, verifies hashes and byte
+lengths, copies only that pointer's manifest/checkpoint, and validates the
+copied EMA checkpoint against a derived FP32/non-compiled experiment profile.
+
+Run the export remotely and transfer the new, versioned directory with SSH and
+`rsync`:
+
+```bash
+export TRAIN_HOST=trainer.example
+export TRAINING_ROOT=/srv/EdgeConnect/training
+export REMOTE_CHAMPION=runs/h100-8gpu-optimized/learner/champion.json
+export REMOTE_PROFILE=configs/h100-8gpu-optimized.yaml
+export SNAPSHOT_ID="$(date -u +%Y%m%dT%H%M%SZ)"
+export REMOTE_SNAPSHOT="/tmp/edgeconnect-champion-$SNAPSHOT_ID"
+
+ssh "$TRAIN_HOST" \
+  "cd '$TRAINING_ROOT' && .venv/bin/python scripts/export_champion_snapshot.py \
+  --champion '$REMOTE_CHAMPION' \
+  --profile '$REMOTE_PROFILE' \
+  --output '$REMOTE_SNAPSHOT'"
+
+export LOCAL_SNAPSHOT="$HOME/.local/share/edgeconnect/$SNAPSHOT_ID"
+mkdir -p "$LOCAL_SNAPSHOT"
+rsync -a "$TRAIN_HOST:$REMOTE_SNAPSHOT/" "$LOCAL_SNAPSHOT/"
+```
+
+The bundle is relocatable. `champion.json` retains its manifest path, the
+manifest retains its checkpoint path, and `starserve-mac.yaml` uses only
+bundle-relative paths. The generated server config binds `127.0.0.1`, selects
+`mps`, has no CORS origins or bearer token, and limits analysis to one
+concurrent request. Its derived experiment profile uses FP32 and disables
+`torch.compile`.
+
+Start and verify the Mac service:
+
+```bash
+cd /path/to/EdgeConnect/training
+source .venv/bin/activate
+starserve --config "$LOCAL_SNAPSHOT/starserve-mac.yaml" --check-config
+starserve --config "$LOCAL_SNAPSHOT/starserve-mac.yaml"
+```
+
+In another terminal, verify readiness and launch Next.js with the private
+loopback endpoint:
+
+```bash
+curl --fail --silent http://127.0.0.1:8080/v2/health | python -m json.tool
+
+cd /path/to/EdgeConnect
+export STAR_AI_SERVER_URL=http://127.0.0.1:8080
+export NEXT_PUBLIC_STAR_AI_DEVTOOLS=1
+npm run dev
+```
+
+The equivalent `.env.local` entries are:
+
+```dotenv
+STAR_AI_SERVER_URL=http://127.0.0.1:8080
+NEXT_PUBLIC_STAR_AI_DEVTOOLS=1
+```
+
+If startup reports that MPS is unavailable, or batch-one measurements show
+CPU is faster, use the same verified bundle with the explicit CPU override:
+
+```bash
+starserve --config "$LOCAL_SNAPSHOT/starserve-mac.yaml" --device cpu
+```
+
+Refresh by exporting and syncing a new `SNAPSHOT_ID`, stopping the old process,
+and launching from the new directory. Do not rsync over an active snapshot;
+both exporter and versioned-directory workflow intentionally refuse unsafe
+in-place replacement.
+
 ## Training publication lifecycle
 
 Launch the single-host pipeline with an explicit topology:
@@ -127,9 +224,10 @@ profile and cannot wait for absent rings. Use `h100-4gpu.yaml` or
 
 ## API
 
-`GET /healthz` and `GET /v2/health` report service, model, rules, feature,
-action, and binary-outcome schemas. `POST /v2/analyze` is the documented endpoint;
-`POST /v2/move` exposes the same v2 schema. Health is intentionally
+`GET /healthz` and `GET /v2/health` report service, configured device, champion
+role/identity, search defaults/maximums/named presets, model, rules, feature,
+action, and binary-outcome schemas. `POST /v2/analyze` is the documented
+endpoint; `POST /v2/move` exposes the same v2 schema. Health is intentionally
 unauthenticated for container orchestration.
 
 The v2 request is strict: unknown fields, coercions, terminal states, incompatible

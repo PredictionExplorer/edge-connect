@@ -57,6 +57,23 @@ class LoadedModel:
     evaluator: GraphInferenceAdapter
 
 
+def validate_device_availability(device: str) -> torch.device:
+    """Resolve a configured device and fail with an actionable accelerator error."""
+
+    target = torch.device(device)
+    if target.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError(f"configured CUDA device {device!r} is unavailable")
+    if target.type == "mps":
+        mps = getattr(torch.backends, "mps", None)
+        is_available = getattr(mps, "is_available", None)
+        if not callable(is_available) or not is_available():
+            raise RuntimeError(
+                f"configured MPS device {device!r} is unavailable; "
+                "use device 'cpu' on hosts without Apple Metal support"
+            )
+    return target
+
+
 @dataclass(frozen=True, slots=True)
 class ModelLease:
     model: LoadedModel
@@ -181,6 +198,7 @@ class AtomicModelManager:
                 "model_identity": (
                     current.manifest.model_identity if current is not None else None
                 ),
+                "role": current.manifest.role if current is not None else None,
                 "active_requests": self._active,
                 "reload_in_progress": self._loading,
                 "last_reload_ns": self._last_reload_ns,
@@ -209,9 +227,7 @@ class AtomicModelManager:
         experiment: ExperimentConfig,
         device: str,
     ) -> LoadedModel:
-        target = torch.device(device)
-        if target.type == "cuda" and not torch.cuda.is_available():
-            raise RuntimeError(f"configured CUDA device {device!r} is unavailable")
+        target = validate_device_availability(device)
         model = GraphResTNet(experiment.model).to(target)
         metadata = load_ema_checkpoint(
             manifest.checkpoint,

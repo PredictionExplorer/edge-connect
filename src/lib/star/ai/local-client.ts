@@ -1,6 +1,13 @@
 import { StarAiError } from './errors';
-import { parseAiResponse, type StarAiRequest, type StarAiResponse } from './protocol';
 import {
+  parseStarAiDecision,
+  responseFromStarAiDecision,
+  type StarAiDecision,
+  type StarAiSearchBudget,
+} from './decision';
+import type { StarAiRequest, StarAiResponse } from './protocol';
+import {
+  parseBrowserSearchBudget,
   parseWorkerEvent,
   type StarAiWorkerCommand,
   type StarAiWorkerEvent,
@@ -8,7 +15,7 @@ import {
 
 interface PendingRequest {
   request: StarAiRequest;
-  resolve: (response: StarAiResponse) => void;
+  resolve: (decision: StarAiDecision) => void;
   reject: (error: StarAiError) => void;
   signal?: AbortSignal;
   abortListener?: () => void;
@@ -16,6 +23,12 @@ interface PendingRequest {
 }
 
 type WorkerFactory = () => Worker;
+
+export interface LocalAiRequestOptions {
+  signal?: AbortSignal;
+  timeoutMs?: number;
+  search?: StarAiSearchBudget;
+}
 
 export const DEFAULT_LOCAL_AI_TIMEOUT_MS = 90_000;
 export const LOCAL_AI_HANDSHAKE_TIMEOUT_MS = 5_000;
@@ -41,8 +54,8 @@ export class LocalStarAiClient {
 
   request(
     request: StarAiRequest,
-    options: { signal?: AbortSignal; timeoutMs?: number } = {},
-  ): Promise<StarAiResponse> {
+    options: LocalAiRequestOptions = {},
+  ): Promise<StarAiDecision> {
     const { signal } = options;
     if (signal?.aborted) {
       return Promise.reject(new StarAiError('cancelled', 'AI request cancelled.'));
@@ -55,8 +68,20 @@ export class LocalStarAiClient {
     if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
       return Promise.reject(new StarAiError('protocol', 'Local AI timeout is invalid.'));
     }
+    let search: StarAiSearchBudget | null = null;
+    try {
+      if (options.search !== undefined) {
+        search = parseBrowserSearchBudget(options.search);
+      }
+    } catch (error) {
+      return Promise.reject(
+        error instanceof StarAiError
+          ? error
+          : new StarAiError('protocol', 'Local AI search budget is invalid.', false, error),
+      );
+    }
 
-    return new Promise<StarAiResponse>((resolve, reject) => {
+    return new Promise<StarAiDecision>((resolve, reject) => {
       const pending: PendingRequest = {
         request,
         resolve,
@@ -99,6 +124,7 @@ export class LocalStarAiClient {
             type: 'choose',
             taskId: request.requestId,
             request,
+            search,
           };
           worker.postMessage(command);
         })
@@ -182,7 +208,7 @@ export class LocalStarAiClient {
       return;
     }
     try {
-      pending.resolve(parseAiResponse(pending.request, message.response));
+      pending.resolve(parseStarAiDecision(pending.request, message.decision));
     } catch (error) {
       pending.reject(
         error instanceof StarAiError
@@ -252,8 +278,15 @@ const localClient = new LocalStarAiClient();
 
 export function requestLocalAiAction(
   request: StarAiRequest,
-  options: { signal?: AbortSignal; timeoutMs?: number } = {},
+  options: LocalAiRequestOptions = {},
 ): Promise<StarAiResponse> {
+  return requestLocalAiDecision(request, options).then(responseFromStarAiDecision);
+}
+
+export function requestLocalAiDecision(
+  request: StarAiRequest,
+  options: LocalAiRequestOptions = {},
+): Promise<StarAiDecision> {
   return localClient.request(request, options);
 }
 

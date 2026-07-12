@@ -14,6 +14,7 @@ import {
   type AiCapabilities,
 } from '@/lib/star/ai/capabilities';
 import {
+  DEFAULT_AI_SEARCH_SETTINGS,
   DEFAULT_CONFIG,
   useAppStore,
   type AppState,
@@ -32,12 +33,45 @@ const availableCapabilities: AiCapabilities = {
   local: { status: 'available', label: 'Local AI' },
 };
 
+const developerCapabilities: AiCapabilities = {
+  server: {
+    status: 'available',
+    label: 'Server AI',
+    search: {
+      default: { simulations: 512, maxConsidered: 16 },
+      maximum: { simulations: 4_096, maxConsidered: 64 },
+      presets: {
+        quick: { simulations: 128, maxConsidered: 8 },
+        strong: { simulations: 512, maxConsidered: 16 },
+        maximum: { simulations: 4_096, maxConsidered: 64 },
+      },
+    },
+  },
+  local: {
+    status: 'available',
+    label: 'Local AI',
+    search: {
+      default: { simulations: 64, maxConsidered: 16 },
+      maximum: { simulations: 1_024, maxConsidered: 128 },
+      presets: {
+        quick: { simulations: 64, maxConsidered: 8 },
+        strong: { simulations: 64, maxConsidered: 16 },
+        maximum: { simulations: 1_024, maxConsidered: 128 },
+      },
+    },
+  },
+};
+
 function resetStore(overrides: Partial<AppState> = {}) {
   const config = overrides.config ?? DEFAULT_CONFIG;
   useAppStore.setState({
     phase: 'setup',
     config: { ...config, playerNames: [...config.playerNames] },
     controllers: ['human', 'human'],
+    aiSearchSettings: {
+      server: { ...DEFAULT_AI_SEARCH_SETTINGS.server },
+      local: { ...DEFAULT_AI_SEARCH_SETTINGS.local },
+    },
     aiPaused: false,
     log: [],
     redoStack: [],
@@ -48,6 +82,7 @@ function resetStore(overrides: Partial<AppState> = {}) {
 
 beforeEach(() => {
   localStorage.clear();
+  vi.stubEnv('NEXT_PUBLIC_STAR_AI_DEVTOOLS', '0');
   resetStore();
   vi.mocked(checkAiCapabilities).mockReset();
   vi.mocked(checkAiCapabilities).mockResolvedValue(availableCapabilities);
@@ -56,6 +91,7 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   localStorage.clear();
+  vi.unstubAllEnvs();
 });
 
 describe('SetupScreen', () => {
@@ -117,6 +153,9 @@ describe('SetupScreen', () => {
     );
     await user.selectOptions(playerOneController, 'server');
     expect(playerOneController).toHaveValue('server');
+    expect(
+      screen.queryByText('Engine developer settings'),
+    ).not.toBeInTheDocument();
 
     const pieRule = screen.getByRole('checkbox', { name: /pie rule/i });
     await user.click(pieRule);
@@ -164,6 +203,118 @@ describe('SetupScreen', () => {
     );
     await waitFor(() => expect(begin).toBeEnabled());
     expect(checkAiCapabilities).toHaveBeenCalledTimes(2);
+  });
+
+  it('offers exact validated developer budgets from capability presets', async () => {
+    vi.stubEnv('NEXT_PUBLIC_STAR_AI_DEVTOOLS', '1');
+    vi.mocked(checkAiCapabilities).mockResolvedValue(developerCapabilities);
+    const user = userEvent.setup();
+    render(<SetupScreen />);
+
+    await user.click(
+      screen.getByRole('button', { name: /Double \*Star, 2 stones per turn/i }),
+    );
+    expect(
+      screen.queryByText('Engine developer settings'),
+    ).not.toBeInTheDocument();
+
+    const playerOneController = screen.getByRole('combobox', {
+      name: 'Player 1 controller',
+    });
+    await waitFor(() =>
+      expect(
+        within(playerOneController).getByRole('option', {
+          name: 'Mac engine — current champion',
+        }),
+      ).toBeEnabled(),
+    );
+    expect(
+      within(playerOneController).getByRole('option', {
+        name: 'Browser AI — lightweight',
+      }),
+    ).toBeEnabled();
+    await user.selectOptions(playerOneController, 'server');
+
+    const settingsSummary = screen.getByText('Engine developer settings');
+    const settingsDetails = settingsSummary.closest('details');
+    expect(settingsDetails).not.toHaveAttribute('open');
+    await user.click(settingsSummary);
+
+    const quick = screen.getByRole('button', {
+      name: /Quick, 128 simulations.*8 candidates/i,
+    });
+    const strong = screen.getByRole('button', {
+      name: /Strong, 512 simulations.*16 candidates/i,
+    });
+    const maximum = screen.getByRole('button', {
+      name: /Maximum, 4,096 simulations.*64 candidates/i,
+    });
+    expect(strong).toHaveAttribute('aria-pressed', 'true');
+    expect(quick).toHaveAttribute('aria-pressed', 'false');
+    expect(maximum).toHaveAttribute('aria-pressed', 'false');
+
+    await user.click(quick);
+    expect(useAppStore.getState().aiSearchSettings.server).toEqual({
+      simulations: 128,
+      maxConsidered: 8,
+    });
+    expect(screen.getByText(/Runs exactly 128 simulations/i)).toBeInTheDocument();
+
+    await user.click(screen.getByText('Advanced search budget'));
+    const simulations = screen.getByRole('spinbutton', {
+      name: 'Simulations',
+    });
+    fireEvent.change(simulations, { target: { value: '4097' } });
+    expect(simulations).toHaveAttribute('aria-invalid', 'true');
+    expect(screen.getByRole('alert')).toHaveTextContent(
+      'Simulations must be a whole number from 1 to 4,096.',
+    );
+    expect(useAppStore.getState().aiSearchSettings.server.simulations).toBe(128);
+    await waitFor(() =>
+      expect(
+        screen.getByRole('button', { name: /begin the game/i }),
+      ).toBeDisabled(),
+    );
+
+    fireEvent.change(simulations, { target: { value: '777' } });
+    await waitFor(() =>
+      expect(useAppStore.getState().aiSearchSettings.server).toEqual({
+        simulations: 777,
+        maxConsidered: 8,
+      }),
+    );
+    expect(simulations).toHaveAttribute('aria-invalid', 'false');
+    await waitFor(() =>
+      expect(
+        screen.getByRole('button', { name: /begin the game/i }),
+      ).toBeEnabled(),
+    );
+  });
+
+  it('keeps developer engine controls accessible when expanded', async () => {
+    vi.stubEnv('NEXT_PUBLIC_STAR_AI_DEVTOOLS', '1');
+    vi.mocked(checkAiCapabilities).mockResolvedValue(developerCapabilities);
+    const user = userEvent.setup();
+    const { container } = render(<SetupScreen />);
+
+    await user.click(
+      screen.getByRole('button', { name: /Double \*Star, 2 stones per turn/i }),
+    );
+    const controller = screen.getByRole('combobox', {
+      name: 'Player 1 controller',
+    });
+    await waitFor(() =>
+      expect(
+        within(controller).getByRole('option', {
+          name: 'Mac engine — current champion',
+        }),
+      ).toBeEnabled(),
+    );
+    await user.selectOptions(controller, 'server');
+    await user.click(screen.getByText('Engine developer settings'));
+    await user.click(screen.getByText('Advanced search budget'));
+
+    expect((await axe(container)).violations).toEqual([]);
   });
 
   it('has no detectable accessibility violations', async () => {

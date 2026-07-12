@@ -11,14 +11,26 @@ import {
   type ControllerType,
   type PlayerControllers,
 } from './star/ai/controllers';
+import type { StarAiSearchBudget } from './star/ai/decision';
+import {
+  MAX_BROWSER_AI_MAX_CONSIDERED,
+  MAX_BROWSER_AI_SIMULATIONS,
+} from './star/ai/manifest';
+import {
+  MAX_SERVER_AI_MAX_CONSIDERED,
+  MAX_SERVER_AI_SIMULATIONS,
+} from './star/ai/server-client';
 import { replay, type GameAction, type GameConfig } from './star/game';
 
 export type Phase = 'setup' | 'playing';
+export type AiRuntime = Exclude<ControllerType, 'human'>;
+export type AiSearchSettings = Record<AiRuntime, StarAiSearchBudget>;
 
 export interface AppState {
   phase: Phase;
   config: GameConfig;
   controllers: PlayerControllers;
+  aiSearchSettings: AiSearchSettings;
   aiPaused: boolean;
   log: GameAction[];
   redoStack: GameAction[];
@@ -33,6 +45,7 @@ export interface AppState {
   toSetup: () => void;
   resumeAi: () => void;
   setPlayerController: (player: 0 | 1, controller: ControllerType) => void;
+  setAiSearchBudget: (runtime: AiRuntime, budget: StarAiSearchBudget) => void;
   setReviewing: (reviewing: boolean) => void;
 }
 
@@ -40,6 +53,7 @@ export interface PersistedAppState {
   phase: Phase;
   config: GameConfig;
   controllers: PlayerControllers;
+  aiSearchSettings: AiSearchSettings;
   aiPaused: boolean;
   log: GameAction[];
   redoStack: GameAction[];
@@ -53,7 +67,22 @@ export const DEFAULT_CONFIG: GameConfig = {
 };
 
 export const DEFAULT_CONTROLLERS: PlayerControllers = [...HUMAN_CONTROLLERS];
-export const APP_STORE_VERSION = 4;
+export const DEFAULT_AI_SEARCH_SETTINGS: AiSearchSettings = {
+  server: { simulations: 512, maxConsidered: 16 },
+  local: { simulations: 64, maxConsidered: 16 },
+};
+export const APP_STORE_VERSION = 5;
+
+const AI_SEARCH_LIMITS: Record<AiRuntime, StarAiSearchBudget> = {
+  server: {
+    simulations: MAX_SERVER_AI_SIMULATIONS,
+    maxConsidered: MAX_SERVER_AI_MAX_CONSIDERED,
+  },
+  local: {
+    simulations: MAX_BROWSER_AI_SIMULATIONS,
+    maxConsidered: MAX_BROWSER_AI_MAX_CONSIDERED,
+  },
+};
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -108,6 +137,45 @@ export function normalizeGameConfig(value: unknown): GameConfig {
   };
 }
 
+export function parseAiSearchBudget(
+  runtime: AiRuntime,
+  value: unknown,
+): StarAiSearchBudget | null {
+  if (runtime !== 'server' && runtime !== 'local') return null;
+  if (!isRecord(value) || !hasExactKeys(value, ['simulations', 'maxConsidered'])) {
+    return null;
+  }
+  const limit = AI_SEARCH_LIMITS[runtime];
+  if (
+    typeof value.simulations !== 'number' ||
+    !Number.isSafeInteger(value.simulations) ||
+    value.simulations <= 0 ||
+    value.simulations > limit.simulations ||
+    typeof value.maxConsidered !== 'number' ||
+    !Number.isSafeInteger(value.maxConsidered) ||
+    value.maxConsidered <= 0 ||
+    value.maxConsidered > limit.maxConsidered
+  ) {
+    return null;
+  }
+  return {
+    simulations: value.simulations,
+    maxConsidered: value.maxConsidered,
+  };
+}
+
+export function normalizeAiSearchSettings(value: unknown): AiSearchSettings {
+  const record = isRecord(value) ? value : {};
+  return {
+    server:
+      parseAiSearchBudget('server', record.server) ??
+      { ...DEFAULT_AI_SEARCH_SETTINGS.server },
+    local:
+      parseAiSearchBudget('local', record.local) ??
+      { ...DEFAULT_AI_SEARCH_SETTINGS.local },
+  };
+}
+
 export function parseGameAction(value: unknown): GameAction | null {
   if (!isRecord(value) || typeof value.type !== 'string') return null;
   if (value.type === 'swap') {
@@ -132,11 +200,13 @@ function allGameActions(values: Array<GameAction | null>): values is GameAction[
 function setupSnapshot(
   config: GameConfig = DEFAULT_CONFIG,
   controllers: PlayerControllers = DEFAULT_CONTROLLERS,
+  aiSearchSettings: AiSearchSettings = normalizeAiSearchSettings(undefined),
 ): PersistedAppState {
   return {
     phase: 'setup',
     config: { ...config, playerNames: [...config.playerNames] },
     controllers: normalizeControllers(config, controllers),
+    aiSearchSettings: normalizeAiSearchSettings(aiSearchSettings),
     aiPaused: false,
     log: [],
     redoStack: [],
@@ -148,25 +218,29 @@ export function sanitizePersistedState(value: unknown): PersistedAppState {
   const config = parseGameConfig(value.config);
   if (!config) return setupSnapshot();
   const controllers = normalizeControllers(config, value.controllers);
-  if (value.phase !== 'playing') return setupSnapshot(config, controllers);
+  const aiSearchSettings = normalizeAiSearchSettings(value.aiSearchSettings);
+  if (value.phase !== 'playing') {
+    return setupSnapshot(config, controllers, aiSearchSettings);
+  }
   if (!Array.isArray(value.log) || !Array.isArray(value.redoStack)) {
-    return setupSnapshot(config, controllers);
+    return setupSnapshot(config, controllers, aiSearchSettings);
   }
   const log = value.log.map(parseGameAction);
   const redoStack = value.redoStack.map(parseGameAction);
   if (!allGameActions(log) || !allGameActions(redoStack)) {
-    return setupSnapshot(config, controllers);
+    return setupSnapshot(config, controllers, aiSearchSettings);
   }
   try {
     replay(config, log);
     replay(config, [...log, ...[...redoStack].reverse()]);
   } catch {
-    return setupSnapshot(config, controllers);
+    return setupSnapshot(config, controllers, aiSearchSettings);
   }
   return {
     phase: 'playing',
     config,
     controllers,
+    aiSearchSettings,
     aiPaused: value.aiPaused === true,
     log,
     redoStack,
@@ -183,7 +257,8 @@ export function migratePersistedState(
   const record = isRecord(value) ? value : {};
   const config = normalizeGameConfig(record.config);
   const controllers = normalizeControllers(config, record.controllers);
-  return setupSnapshot(config, controllers);
+  const aiSearchSettings = normalizeAiSearchSettings(record.aiSearchSettings);
+  return setupSnapshot(config, controllers, aiSearchSettings);
 }
 
 export const useAppStore = create<AppState>()(
@@ -192,6 +267,7 @@ export const useAppStore = create<AppState>()(
       phase: 'setup',
       config: DEFAULT_CONFIG,
       controllers: DEFAULT_CONTROLLERS,
+      aiSearchSettings: normalizeAiSearchSettings(undefined),
       aiPaused: false,
       log: [],
       redoStack: [],
@@ -261,6 +337,17 @@ export const useAppStore = create<AppState>()(
             aiPaused: false,
           };
         }),
+      setAiSearchBudget: (runtime, budget) =>
+        set((state) => {
+          const valid = parseAiSearchBudget(runtime, budget);
+          if (!valid) return state;
+          return {
+            aiSearchSettings: {
+              ...state.aiSearchSettings,
+              [runtime]: valid,
+            },
+          };
+        }),
       setReviewing: (reviewing) => set({ reviewing }),
     }),
     {
@@ -279,6 +366,7 @@ export const useAppStore = create<AppState>()(
         phase: s.phase,
         config: s.config,
         controllers: s.controllers,
+        aiSearchSettings: s.aiSearchSettings,
         aiPaused: s.aiPaused,
         log: s.log,
         redoStack: s.redoStack,

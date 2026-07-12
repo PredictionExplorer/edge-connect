@@ -1,9 +1,12 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import {
   APP_STORE_VERSION,
+  DEFAULT_AI_SEARCH_SETTINGS,
   DEFAULT_CONFIG,
   migratePersistedState,
+  normalizeAiSearchSettings,
   normalizeGameConfig,
+  parseAiSearchBudget,
   parseGameAction,
   sanitizePersistedState,
   useAppStore,
@@ -22,6 +25,10 @@ afterEach(() => {
     phase: 'setup',
     config: DEFAULT_CONFIG,
     controllers: ['human', 'human'],
+    aiSearchSettings: {
+      server: { ...DEFAULT_AI_SEARCH_SETTINGS.server },
+      local: { ...DEFAULT_AI_SEARCH_SETTINGS.local },
+    },
     aiPaused: false,
     log: [],
     redoStack: [],
@@ -36,6 +43,10 @@ describe('persisted app-state validation', () => {
         phase: 'playing',
         config: double,
         controllers: ['server', 'local'],
+        aiSearchSettings: {
+          server: { simulations: 128, maxConsidered: 8 },
+          local: { simulations: 32, maxConsidered: 4 },
+        },
         aiPaused: true,
         log: [{ type: 'place', node: 0 }],
         redoStack: [{ type: 'place', node: 1 }],
@@ -43,6 +54,10 @@ describe('persisted app-state validation', () => {
     ).toMatchObject({
       phase: 'playing',
       controllers: ['server', 'local'],
+      aiSearchSettings: {
+        server: { simulations: 128, maxConsidered: 8 },
+        local: { simulations: 32, maxConsidered: 4 },
+      },
       aiPaused: true,
       log: [{ type: 'place', node: 0 }],
       redoStack: [{ type: 'place', node: 1 }],
@@ -126,6 +141,7 @@ describe('persisted app-state validation', () => {
         playerNames: ['Ada', 'Grace'],
       },
       controllers: ['server', 'local'],
+      aiSearchSettings: DEFAULT_AI_SEARCH_SETTINGS,
       aiPaused: false,
       log: [],
       redoStack: [],
@@ -145,6 +161,51 @@ describe('persisted app-state validation', () => {
       mode: 'double',
       pieRule: true,
       playerNames: ['Ada', 'Player 2'],
+    });
+  });
+
+  it('validates each runtime search budget without clamping', () => {
+    expect(parseAiSearchBudget('server', {
+      simulations: 4_096,
+      maxConsidered: 64,
+    })).toEqual({ simulations: 4_096, maxConsidered: 64 });
+    expect(parseAiSearchBudget('server', {
+      simulations: 16_385,
+      maxConsidered: 64,
+    })).toBeNull();
+    expect(parseAiSearchBudget('local', {
+      simulations: 1_025,
+      maxConsidered: 8,
+    })).toBeNull();
+
+    expect(
+      normalizeAiSearchSettings({
+        server: { simulations: 256, maxConsidered: 12 },
+        local: { simulations: 0, maxConsidered: 8 },
+      }),
+    ).toEqual({
+      server: { simulations: 256, maxConsidered: 12 },
+      local: DEFAULT_AI_SEARCH_SETTINGS.local,
+    });
+  });
+
+  it('updates valid runtime settings and ignores invalid setter values', () => {
+    useAppStore.getState().setAiSearchBudget('local', {
+      simulations: 128,
+      maxConsidered: 8,
+    });
+    expect(useAppStore.getState().aiSearchSettings.local).toEqual({
+      simulations: 128,
+      maxConsidered: 8,
+    });
+
+    useAppStore.getState().setAiSearchBudget('local', {
+      simulations: 2_048,
+      maxConsidered: 8,
+    });
+    expect(useAppStore.getState().aiSearchSettings.local).toEqual({
+      simulations: 128,
+      maxConsidered: 8,
     });
   });
 });

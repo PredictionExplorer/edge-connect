@@ -31,6 +31,7 @@ test('a compatible server AI capability drives one validated atomic move', async
     moveCalls += 1;
     const body = route.request().postDataJSON() as {
       stones: number[];
+      search: { simulations: number };
     };
     const action = body.stones.findIndex((stone) => stone === -1);
     const score = new Array<number>(303).fill(0);
@@ -51,7 +52,7 @@ test('a compatible server AI capability drives one validated atomic move', async
         ],
         root_policy: [0.9, 0.1],
         root_q: [0.1, -0.1],
-        root_visits: [9, 1],
+        root_visits: [body.search.simulations - 1, 1],
         outcome: { loss: 0.25, win: 0.75 },
         value: 0.5,
         search_value: 0.25,

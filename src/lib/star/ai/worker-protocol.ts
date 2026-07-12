@@ -5,7 +5,16 @@ import {
   STAR_RULES_SCHEMA_ID,
 } from '../rules';
 import { getBoard, isSupportedRings } from '../board';
+import {
+  parseUnboundStarAiDecision,
+  type StarAiDecision,
+  type StarAiSearchBudget,
+} from './decision';
 import { StarAiError, asStarAiError, type StarAiErrorCode } from './errors';
+import {
+  MAX_BROWSER_AI_MAX_CONSIDERED,
+  MAX_BROWSER_AI_SIMULATIONS,
+} from './manifest';
 import {
   STAR_ACTION_LAYOUT_VERSION,
   STAR_AI_PROTOCOL_SCHEMA_ID,
@@ -14,17 +23,21 @@ import {
   STAR_FEATURE_SCHEMA_VERSION,
   semanticStateHash,
   type StarAiRequest,
-  type StarAiResponse,
   type StarAiSemanticState,
 } from './protocol';
 
 export type StarAiWorkerCommand =
-  | { type: 'choose'; taskId: string; request: StarAiRequest }
+  | {
+      type: 'choose';
+      taskId: string;
+      request: StarAiRequest;
+      search: StarAiSearchBudget | null;
+    }
   | { type: 'cancel'; taskId: string };
 
 export type StarAiWorkerEvent =
   | { type: 'ready'; protocolVersion: 2 }
-  | { type: 'result'; taskId: string; response: StarAiResponse }
+  | { type: 'result'; taskId: string; decision: StarAiDecision }
   | {
       type: 'error';
       taskId: string;
@@ -55,6 +68,31 @@ function isIntegerArray(value: unknown, minimum: number): value is number[] {
       (item) => typeof item === 'number' && Number.isInteger(item) && item >= minimum,
     )
   );
+}
+
+export function parseBrowserSearchBudget(value: unknown): StarAiSearchBudget {
+  if (
+    !isRecord(value) ||
+    !hasExactKeys(value, ['simulations', 'maxConsidered']) ||
+    typeof value.simulations !== 'number' ||
+    !Number.isSafeInteger(value.simulations) ||
+    value.simulations <= 0 ||
+    value.simulations > MAX_BROWSER_AI_SIMULATIONS ||
+    typeof value.maxConsidered !== 'number' ||
+    !Number.isSafeInteger(value.maxConsidered) ||
+    value.maxConsidered <= 0 ||
+    value.maxConsidered > MAX_BROWSER_AI_MAX_CONSIDERED
+  ) {
+    throw new StarAiError(
+      'protocol',
+      `Browser AI search budget must use simulations in 1..${MAX_BROWSER_AI_SIMULATIONS} ` +
+        `and max-considered in 1..${MAX_BROWSER_AI_MAX_CONSIDERED}.`,
+    );
+  }
+  return {
+    simulations: value.simulations,
+    maxConsidered: value.maxConsidered,
+  };
 }
 
 function parseSemanticState(value: unknown): StarAiSemanticState {
@@ -131,6 +169,22 @@ function parseRequest(value: unknown): StarAiRequest {
   if (semanticStateHash(state) !== value.stateHash) {
     throw new StarAiError('protocol', 'Worker request state hash does not match its state.');
   }
+  const nodeCount = state.stones.length;
+  const actionLog = [...value.actionLog];
+  const legalActions = [...value.legalActions];
+  if (
+    state.terminal ||
+    legalActions.length === 0 ||
+    actionLog.some((action) => action >= nodeCount) ||
+    legalActions.some(
+      (action, index) =>
+        action >= nodeCount ||
+        state.stones[action] !== -1 ||
+        (index > 0 && legalActions[index - 1] >= action),
+    )
+  ) {
+    throw new StarAiError('protocol', 'Worker received inconsistent AI actions.');
+  }
   return {
     schema: STAR_AI_PROTOCOL_SCHEMA_ID,
     version: STAR_AI_PROTOCOL_VERSION,
@@ -144,8 +198,8 @@ function parseRequest(value: unknown): StarAiRequest {
     actionLayoutVersion: STAR_ACTION_LAYOUT_VERSION,
     stateHash: value.stateHash,
     state,
-    actionLog: [...value.actionLog],
-    legalActions: [...value.legalActions],
+    actionLog,
+    legalActions,
   };
 }
 
@@ -153,9 +207,26 @@ export function parseWorkerCommand(value: unknown): StarAiWorkerCommand {
   if (!isRecord(value) || !isTaskId(value.taskId)) {
     throw new StarAiError('protocol', 'Worker command is invalid.');
   }
-  if (value.type === 'cancel') return { type: 'cancel', taskId: value.taskId };
+  if (value.type === 'cancel') {
+    if (!hasExactKeys(value, ['type', 'taskId'])) {
+      throw new StarAiError('protocol', 'Worker cancel command is invalid.');
+    }
+    return { type: 'cancel', taskId: value.taskId };
+  }
   if (value.type === 'choose') {
-    return { type: 'choose', taskId: value.taskId, request: parseRequest(value.request) };
+    if (!hasExactKeys(value, ['type', 'taskId', 'request', 'search'])) {
+      throw new StarAiError('protocol', 'Worker choose command is invalid.');
+    }
+    const request = parseRequest(value.request);
+    if (request.requestId !== value.taskId) {
+      throw new StarAiError('stale', 'Worker task identity does not match its AI request.');
+    }
+    return {
+      type: 'choose',
+      taskId: value.taskId,
+      request,
+      search: value.search === null ? null : parseBrowserSearchBudget(value.search),
+    };
   }
   throw new StarAiError('protocol', 'Worker command type is invalid.');
 }
@@ -164,20 +235,36 @@ export function parseWorkerEvent(value: unknown): StarAiWorkerEvent {
   if (!isRecord(value)) {
     throw new StarAiError('protocol', 'Local AI worker returned an invalid message.');
   }
-  if (value.type === 'ready' && value.protocolVersion === 2) {
+  if (
+    value.type === 'ready' &&
+    value.protocolVersion === 2 &&
+    hasExactKeys(value, ['type', 'protocolVersion'])
+  ) {
     return { type: 'ready', protocolVersion: 2 };
   }
   if (!isTaskId(value.taskId)) {
     throw new StarAiError('protocol', 'Local AI worker returned an invalid message.');
   }
   if (value.type === 'result') {
+    if (!hasExactKeys(value, ['type', 'taskId', 'decision'])) {
+      throw new StarAiError('protocol', 'Local AI worker returned an invalid result.');
+    }
+    const decision = parseUnboundStarAiDecision(value.decision);
+    if (decision.response.requestId !== value.taskId) {
+      throw new StarAiError('stale', 'Local AI worker result identity is incompatible.');
+    }
     return {
       type: 'result',
       taskId: value.taskId,
-      response: value.response as StarAiResponse,
+      decision,
     };
   }
-  if (value.type === 'error' && isRecord(value.error)) {
+  if (
+    value.type === 'error' &&
+    hasExactKeys(value, ['type', 'taskId', 'error']) &&
+    isRecord(value.error) &&
+    hasExactKeys(value.error, ['code', 'message', 'retryable'])
+  ) {
     const code = value.error.code;
     if (
       typeof code === 'string' &&

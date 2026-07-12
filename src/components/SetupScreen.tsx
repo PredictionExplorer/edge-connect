@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { Sparkles, Star, Users } from 'lucide-react';
 import {
   getBoard,
@@ -25,14 +25,24 @@ import {
 } from '@/lib/star/ai/controllers';
 import { EMPTY } from '@/lib/star/scoring';
 import type { GameConfig, Mode } from '@/lib/star/game';
-import { useAppStore } from '@/lib/store';
+import { useAppStore, type AiRuntime } from '@/lib/store';
+import {
+  EngineDeveloperSettings,
+  budgetFitsCapability,
+} from './EngineDeveloperSettings';
 import { StarBoard } from './StarBoard';
+import {
+  engineControllerLabel,
+  starAiDevtoolsEnabled,
+} from './starAiDevtools';
 import { BOARD_PRESETS, PLAYER_COLORS } from './theme';
 
 export function SetupScreen() {
   const startGame = useAppStore((s) => s.startGame);
   const lastConfig = useAppStore((s) => s.config);
   const lastControllers = useAppStore((s) => s.controllers);
+  const aiSearchSettings = useAppStore((s) => s.aiSearchSettings);
+  const devtools = starAiDevtoolsEnabled();
 
   const [mode, setMode] = useState<Mode>(lastConfig.mode);
   const [rings, setRings] = useState(lastConfig.rings);
@@ -45,6 +55,9 @@ export function SetupScreen() {
     INITIAL_AI_CAPABILITIES,
   );
   const [capabilityCheck, setCapabilityCheck] = useState(0);
+  const [engineDraftValidity, setEngineDraftValidity] = useState<
+    Partial<Record<AiRuntime, boolean>>
+  >({});
 
   const board = useMemo(() => getBoard(rings), [rings]);
   const emptyStones = useMemo(() => new Int8Array(board.n).fill(EMPTY), [board]);
@@ -52,9 +65,26 @@ export function SetupScreen() {
   const selectedCapabilities = controllers.map((controller) =>
     capabilityForController(capabilities, controller),
   );
+  const selectedAiRuntimes = Array.from(
+    new Set(
+      controllers.filter(
+        (controller): controller is AiRuntime => controller !== 'human',
+      ),
+    ),
+  );
   const controllersReady = selectedCapabilities.every(
     (capability) => capability.status === 'available',
   );
+  const engineSettingsReady =
+    !devtools ||
+    selectedAiRuntimes.every((runtime) => {
+      const capability = capabilities[runtime];
+      return (
+        engineDraftValidity[runtime] !== false &&
+        (capability.status !== 'available' ||
+          budgetFitsCapability(aiSearchSettings[runtime], capability.search))
+      );
+    });
 
   useEffect(() => {
     const controller = new AbortController();
@@ -66,7 +96,10 @@ export function SetupScreen() {
 
   const chooseMode = (nextMode: Mode) => {
     setMode(nextMode);
-    if (nextMode !== 'double') setControllers([...HUMAN_CONTROLLERS]);
+    if (nextMode !== 'double') {
+      setControllers([...HUMAN_CONTROLLERS]);
+      setEngineDraftValidity({});
+    }
   };
 
   const chooseController = (player: number, controller: ControllerType) => {
@@ -75,7 +108,19 @@ export function SetupScreen() {
       next[player] = controller;
       return next;
     });
+    setEngineDraftValidity({});
   };
+
+  const handleEngineValidityChange = useCallback(
+    (runtime: AiRuntime, valid: boolean) => {
+      setEngineDraftValidity((previous) =>
+        previous[runtime] === valid
+          ? previous
+          : { ...previous, [runtime]: valid },
+      );
+    },
+    [],
+  );
 
   const start = () => {
     const config: GameConfig = {
@@ -86,6 +131,7 @@ export function SetupScreen() {
     };
     const validControllers = normalizeControllers(config, controllers);
     if (
+      !engineSettingsReady ||
       validControllers.some(
         (controller) =>
           capabilityForController(capabilities, controller).status !== 'available',
@@ -268,7 +314,9 @@ export function SetupScreen() {
                               disabled={capability.status !== 'available'}
                               className="bg-[#17130f]"
                             >
-                              {controllerLabel(controller)}
+                              {devtools
+                                ? engineControllerLabel(controller)
+                                : controllerLabel(controller)}
                               {suffix}
                             </option>
                           );
@@ -295,7 +343,10 @@ export function SetupScreen() {
                 aria-label="Pie rule"
                 onChange={(e) => {
                   setPieRule(e.target.checked);
-                  if (e.target.checked) setControllers([...HUMAN_CONTROLLERS]);
+                  if (e.target.checked) {
+                    setControllers([...HUMAN_CONTROLLERS]);
+                    setEngineDraftValidity({});
+                  }
                 }}
                 className="h-4 w-4 accent-[#e8c48b]"
               />
@@ -315,7 +366,10 @@ export function SetupScreen() {
                       role="alert"
                       className="mt-2 px-1 text-[11px] text-danger"
                     >
-                      {controllerLabel(controllers[player])}: {capability.reason}
+                      {devtools
+                        ? engineControllerLabel(controllers[player])
+                        : controllerLabel(controllers[player])}
+                      : {capability.reason}
                     </p>
                   ),
               )}
@@ -326,6 +380,7 @@ export function SetupScreen() {
                   type="button"
                   onClick={() => {
                     setCapabilities(INITIAL_AI_CAPABILITIES);
+                    setEngineDraftValidity({});
                     setCapabilityCheck((value) => value + 1);
                   }}
                   className="mt-2 px-1 text-left text-[11px] text-gold-strong underline decoration-gold/40 underline-offset-2"
@@ -335,10 +390,18 @@ export function SetupScreen() {
               )}
           </section>
 
+          {devtools && aiAllowed && selectedAiRuntimes.length > 0 && (
+            <EngineDeveloperSettings
+              runtimes={selectedAiRuntimes}
+              capabilities={capabilities}
+              onValidityChange={handleEngineValidityChange}
+            />
+          )}
+
           <button
             type="button"
             onClick={start}
-            disabled={!controllersReady}
+            disabled={!controllersReady || !engineSettingsReady}
             className="font-display group mt-1 flex items-center justify-center gap-2.5 rounded-2xl border border-gold/60 bg-gradient-to-b from-[#e8c48b] to-[#c99d5f] px-6 py-4 text-xl font-medium text-[#241703] shadow-[0_8px_40px_rgba(232,196,139,0.25)] transition-[transform,box-shadow] duration-200 hover:scale-[1.015] hover:shadow-[0_8px_54px_rgba(232,196,139,0.4)] active:scale-[0.985] disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:scale-100"
           >
             <Star className="h-5 w-5 transition-transform group-hover:rotate-[72deg]" aria-hidden />

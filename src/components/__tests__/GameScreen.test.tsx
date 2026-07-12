@@ -1,17 +1,31 @@
 import { StrictMode } from 'react';
-import { act, cleanup, render, screen, waitFor } from '@testing-library/react';
+import {
+  act,
+  cleanup,
+  render,
+  screen,
+  waitFor,
+  within,
+} from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { axe } from 'vitest-axe';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import type {
+  StarAiAnalysis,
+  StarAiDecision,
+} from '@/lib/star/ai/decision';
 import { StarAiError } from '@/lib/star/ai/errors';
 import {
   acceptAiResponse,
   makeAiResponse,
-  type StarAiResponse,
+  type AtomicGameAction,
+  type StarAiRequest,
 } from '@/lib/star/ai/protocol';
-import { requestServerAiAction } from '@/lib/star/ai/server-client';
+import { requestLocalAiDecision } from '@/lib/star/ai/local-client';
+import { requestServerAiDecision } from '@/lib/star/ai/server-client';
 import { getBoard, parseLabel } from '@/lib/star/board';
 import {
+  DEFAULT_AI_SEARCH_SETTINGS,
   useAppStore,
   type AppState,
 } from '@/lib/store';
@@ -28,7 +42,14 @@ vi.mock('@/lib/star/ai/server-client', async () => {
   const actual = await vi.importActual<typeof import('@/lib/star/ai/server-client')>(
     '@/lib/star/ai/server-client',
   );
-  return { ...actual, requestServerAiAction: vi.fn() };
+  return { ...actual, requestServerAiDecision: vi.fn() };
+});
+
+vi.mock('@/lib/star/ai/local-client', async () => {
+  const actual = await vi.importActual<typeof import('@/lib/star/ai/local-client')>(
+    '@/lib/star/ai/local-client',
+  );
+  return { ...actual, requestLocalAiDecision: vi.fn() };
 });
 
 const config = {
@@ -54,11 +75,58 @@ function deferred<T>(): Deferred<T> {
   return { promise, resolve, reject };
 }
 
+function makeDecision(
+  request: StarAiRequest,
+  action: AtomicGameAction = { type: 'place', node: 0 },
+  overrides: Partial<StarAiAnalysis> = {},
+): StarAiDecision {
+  const rootActions = overrides.rootActions ?? [
+    action,
+    { type: 'place', node: action.node + 1 },
+    { type: 'place', node: action.node + 2 },
+  ];
+  const rootVisits = overrides.rootVisits ?? [6, 3, 1];
+  const simulations =
+    overrides.simulations ??
+    rootVisits.reduce((total, visits) => total + visits, 0);
+  return {
+    response: makeAiResponse(request, action),
+    analysis: {
+      perspective: request.state.toMove,
+      stateHash: request.stateHash,
+      outcome: { loss: 0.25, win: 0.75 },
+      modelValue: 0.5,
+      searchValue: 0.4,
+      expectedMargin: 2.5,
+      rootActions,
+      rootPolicy: rootActions.map((_, index) => (index === 0 ? 0.6 : 0.2)),
+      rootQ: rootActions.map((_, index) => 0.3 - index * 0.2),
+      rootVisits,
+      modelVersion: 'test-champion',
+      modelStep: 700,
+      modelIdentity: 'sha256-test',
+      simulations,
+      maxConsidered: 16,
+      timingMs: {
+        queue: 1,
+        modelLoad: 2,
+        inferenceSearch: 9,
+        total: 12,
+      },
+      ...overrides,
+    },
+  };
+}
+
 function resetPlayingStore(overrides: Partial<AppState> = {}) {
   useAppStore.setState({
     phase: 'playing',
     config: { ...config, playerNames: [...config.playerNames] },
     controllers: ['server', 'human'],
+    aiSearchSettings: {
+      server: { ...DEFAULT_AI_SEARCH_SETTINGS.server },
+      local: { ...DEFAULT_AI_SEARCH_SETTINGS.local },
+    },
     aiPaused: false,
     log: [],
     redoStack: [],
@@ -74,19 +142,22 @@ function PhaseHarness() {
 
 beforeEach(() => {
   localStorage.clear();
+  vi.stubEnv('NEXT_PUBLIC_STAR_AI_DEVTOOLS', '0');
   resetPlayingStore();
-  vi.mocked(requestServerAiAction).mockReset();
+  vi.mocked(requestServerAiDecision).mockReset();
+  vi.mocked(requestLocalAiDecision).mockReset();
 });
 
 afterEach(() => {
   cleanup();
   localStorage.clear();
+  vi.unstubAllEnvs();
 });
 
 describe('GameScreen AI lifecycle', () => {
   it('reuses one logical request when Strict Mode replays effects', async () => {
-    const flight = deferred<StarAiResponse>();
-    vi.mocked(requestServerAiAction).mockReturnValue(flight.promise);
+    const flight = deferred<StarAiDecision>();
+    vi.mocked(requestServerAiDecision).mockReturnValue(flight.promise);
 
     render(
       <StrictMode>
@@ -95,58 +166,71 @@ describe('GameScreen AI lifecycle', () => {
     );
 
     expect(await screen.findByText('Server AI is thinking…')).toBeInTheDocument();
-    expect(requestServerAiAction).toHaveBeenCalledOnce();
-    const [request, options] = vi.mocked(requestServerAiAction).mock.calls[0];
+    expect(requestServerAiDecision).toHaveBeenCalledOnce();
+    const [request, options] = vi.mocked(requestServerAiDecision).mock.calls[0];
     expect(options?.signal?.aborted).toBe(false);
+    expect(options?.search).toBeUndefined();
 
-    flight.resolve(makeAiResponse(request, { type: 'place', node: 0 }));
+    flight.resolve(makeDecision(request));
     await waitFor(() =>
       expect(useAppStore.getState().log).toEqual([{ type: 'place', node: 0 }]),
     );
-    expect(requestServerAiAction).toHaveBeenCalledOnce();
+    expect(requestServerAiDecision).toHaveBeenCalledOnce();
+    expect(
+      screen.queryByRole('status', { name: 'Engine estimate' }),
+    ).not.toBeInTheDocument();
   });
 
   it('aborts on exit and ignores a response that arrives after cancellation', async () => {
-    const flight = deferred<StarAiResponse>();
-    vi.mocked(requestServerAiAction).mockReturnValue(flight.promise);
+    vi.stubEnv('NEXT_PUBLIC_STAR_AI_DEVTOOLS', '1');
+    const flight = deferred<StarAiDecision>();
+    vi.mocked(requestServerAiDecision).mockReturnValue(flight.promise);
     const user = userEvent.setup();
     render(<PhaseHarness />);
 
-    await screen.findByText('Server AI is thinking…');
-    const [request, options] = vi.mocked(requestServerAiAction).mock.calls[0];
+    await screen.findByText('Mac engine — current champion is thinking…');
+    const [request, options] = vi.mocked(requestServerAiDecision).mock.calls[0];
 
     await user.click(screen.getByRole('button', { name: 'New game' }));
     expect(options?.signal?.aborted).toBe(true);
     expect(screen.getByText('Setup is ready')).toBeInTheDocument();
 
     await act(async () => {
-      flight.resolve(makeAiResponse(request, { type: 'place', node: 0 }));
+      flight.resolve(makeDecision(request));
       await flight.promise;
     });
     expect(acceptAiResponse).not.toHaveBeenCalled();
     expect(useAppStore.getState().log).toEqual([]);
+    expect(
+      screen.queryByRole('status', { name: 'Engine estimate' }),
+    ).not.toBeInTheDocument();
   });
 
   it('rejects a stale response without mutating the action log', async () => {
-    const flight = deferred<StarAiResponse>();
-    vi.mocked(requestServerAiAction).mockReturnValue(flight.promise);
+    vi.stubEnv('NEXT_PUBLIC_STAR_AI_DEVTOOLS', '1');
+    const flight = deferred<StarAiDecision>();
+    vi.mocked(requestServerAiDecision).mockReturnValue(flight.promise);
     render(<GameScreen />);
 
-    await screen.findByText('Server AI is thinking…');
-    const [request] = vi.mocked(requestServerAiAction).mock.calls[0];
+    await screen.findByText('Mac engine — current champion is thinking…');
+    const [request] = vi.mocked(requestServerAiDecision).mock.calls[0];
+    const stale = makeDecision(request);
     flight.resolve({
-      ...makeAiResponse(request, { type: 'place', node: 0 }),
-      requestId: 'obsolete-request',
+      ...stale,
+      response: { ...stale.response, requestId: 'obsolete-request' },
     });
 
     await waitFor(() => expect(acceptAiResponse).toHaveBeenCalledOnce());
     expect(useAppStore.getState().log).toEqual([]);
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole('status', { name: 'Engine estimate' }),
+    ).not.toBeInTheDocument();
   });
 
   it('retries a recoverable error and applies the successful response', async () => {
-    const retryFlight = deferred<StarAiResponse>();
-    vi.mocked(requestServerAiAction)
+    const retryFlight = deferred<StarAiDecision>();
+    vi.mocked(requestServerAiDecision)
       .mockRejectedValueOnce(new StarAiError('network', 'Server AI is offline.', true))
       .mockReturnValueOnce(retryFlight.promise);
     const user = userEvent.setup();
@@ -154,17 +238,17 @@ describe('GameScreen AI lifecycle', () => {
 
     expect(await screen.findByRole('alert')).toHaveTextContent('Server AI is offline.');
     await user.click(screen.getByRole('button', { name: 'Retry' }));
-    await waitFor(() => expect(requestServerAiAction).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(requestServerAiDecision).toHaveBeenCalledTimes(2));
 
-    const [retryRequest] = vi.mocked(requestServerAiAction).mock.calls[1];
-    retryFlight.resolve(makeAiResponse(retryRequest, { type: 'place', node: 0 }));
+    const [retryRequest] = vi.mocked(requestServerAiDecision).mock.calls[1];
+    retryFlight.resolve(makeDecision(retryRequest));
     await waitFor(() =>
       expect(useAppStore.getState().log).toEqual([{ type: 'place', node: 0 }]),
     );
   });
 
   it('lets the current player take over after an AI error', async () => {
-    vi.mocked(requestServerAiAction).mockRejectedValue(
+    vi.mocked(requestServerAiDecision).mockRejectedValue(
       new StarAiError('network', 'Server AI is offline.', true),
     );
     const user = userEvent.setup();
@@ -181,13 +265,201 @@ describe('GameScreen AI lifecycle', () => {
     expect(useAppStore.getState().log).toEqual([{ type: 'place', node: 0 }]);
   });
 
+  it('passes the selected server and local budgets only in developer mode', async () => {
+    vi.stubEnv('NEXT_PUBLIC_STAR_AI_DEVTOOLS', '1');
+    resetPlayingStore({
+      aiSearchSettings: {
+        server: { simulations: 777, maxConsidered: 21 },
+        local: { simulations: 123, maxConsidered: 9 },
+      },
+    });
+    const serverFlight = deferred<StarAiDecision>();
+    vi.mocked(requestServerAiDecision).mockReturnValue(serverFlight.promise);
+    const first = render(<GameScreen />);
+
+    await screen.findByText('Mac engine — current champion is thinking…');
+    expect(requestServerAiDecision).toHaveBeenCalledOnce();
+    expect(vi.mocked(requestServerAiDecision).mock.calls[0][1]?.search).toEqual({
+      simulations: 777,
+      maxConsidered: 21,
+    });
+    first.unmount();
+
+    resetPlayingStore({
+      controllers: ['local', 'human'],
+      aiSearchSettings: {
+        server: { simulations: 777, maxConsidered: 21 },
+        local: { simulations: 123, maxConsidered: 9 },
+      },
+    });
+    const localFlight = deferred<StarAiDecision>();
+    vi.mocked(requestLocalAiDecision).mockReturnValue(localFlight.promise);
+    render(<GameScreen />);
+
+    await screen.findByText('Browser AI — lightweight is thinking…');
+    expect(requestLocalAiDecision).toHaveBeenCalledOnce();
+    expect(vi.mocked(requestLocalAiDecision).mock.calls[0][1]?.search).toEqual({
+      simulations: 123,
+      maxConsidered: 9,
+    });
+  });
+
+  it('renders named estimates and top board labels from the accepted perspective', async () => {
+    vi.stubEnv('NEXT_PUBLIC_STAR_AI_DEVTOOLS', '1');
+    const flight = deferred<StarAiDecision>();
+    vi.mocked(requestServerAiDecision).mockReturnValue(flight.promise);
+    const { container } = render(<GameScreen />);
+
+    await screen.findByText('Mac engine — current champion is thinking…');
+    const [request] = vi.mocked(requestServerAiDecision).mock.calls[0];
+    flight.resolve(
+      makeDecision(request, { type: 'place', node: 0 }, {
+        outcome: { loss: 0.2, win: 0.8 },
+        modelValue: 0.6,
+        searchValue: -0.25,
+        expectedMargin: 3.5,
+        rootActions: [
+          { type: 'place', node: 0 },
+          { type: 'place', node: 1 },
+          { type: 'place', node: 2 },
+        ],
+        rootPolicy: [0.2, 0.5, 0.3],
+        rootQ: [-0.1, 0.7, 0.3],
+        rootVisits: [2, 7, 5],
+        simulations: 14,
+        modelStep: 12_345,
+        timingMs: {
+          queue: 1,
+          modelLoad: 2,
+          inferenceSearch: 15,
+          total: 18,
+        },
+      }),
+    );
+
+    const panel = await screen.findByRole('status', { name: 'Engine estimate' });
+    expect(within(panel).getByText('Ada 80.0%')).toBeInTheDocument();
+    expect(within(panel).getByText('Grace 20.0%')).toBeInTheDocument();
+    expect(within(panel).getByText('Ada +3.5 points')).toBeInTheDocument();
+    expect(within(panel).getByText('-0.250')).toBeInTheDocument();
+    expect(within(panel).queryByText('37.5%')).not.toBeInTheDocument();
+    expect(within(panel).getByText('14')).toBeInTheDocument();
+    expect(within(panel).getByText('18 ms')).toBeInTheDocument();
+    expect(within(panel).getByText('12,345')).toBeInTheDocument();
+    const candidates = within(panel).getAllByRole('listitem');
+    expect(candidates[0]).toHaveTextContent('S10');
+    expect(candidates[1]).toHaveTextContent('T10');
+    expect(candidates[2]).toHaveTextContent('*10');
+    expect((await axe(container)).violations).toEqual([]);
+  });
+
+  it('maps a second-player analysis to the correct named win estimates', async () => {
+    vi.stubEnv('NEXT_PUBLIC_STAR_AI_DEVTOOLS', '1');
+    resetPlayingStore({
+      controllers: ['human', 'server'],
+      log: [
+        { type: 'place', node: 0 },
+        { type: 'place', node: 1 },
+      ],
+    });
+    const flight = deferred<StarAiDecision>();
+    vi.mocked(requestServerAiDecision).mockReturnValue(flight.promise);
+    render(<GameScreen />);
+
+    await screen.findByText('Mac engine — current champion is thinking…');
+    const [request] = vi.mocked(requestServerAiDecision).mock.calls[0];
+    expect(request.state.toMove).toBe(1);
+    flight.resolve(
+      makeDecision(request, { type: 'place', node: 2 }, {
+        outcome: { loss: 0.3, win: 0.7 },
+        modelValue: 0.4,
+        expectedMargin: -4,
+      }),
+    );
+
+    const panel = await screen.findByRole('status', { name: 'Engine estimate' });
+    expect(within(panel).getByText('Ada 30.0%')).toBeInTheDocument();
+    expect(within(panel).getByText('Grace 70.0%')).toBeInTheDocument();
+    expect(within(panel).getByText('Ada +4.0 points')).toBeInTheDocument();
+    expect(within(panel).getByText(/from Grace's turn/i)).toBeInTheDocument();
+  });
+
+  it('clears a published estimate on history navigation', async () => {
+    vi.stubEnv('NEXT_PUBLIC_STAR_AI_DEVTOOLS', '1');
+    const flight = deferred<StarAiDecision>();
+    vi.mocked(requestServerAiDecision).mockReturnValue(flight.promise);
+    const user = userEvent.setup();
+    render(<GameScreen />);
+
+    await screen.findByText('Mac engine — current champion is thinking…');
+    const [request] = vi.mocked(requestServerAiDecision).mock.calls[0];
+    flight.resolve(makeDecision(request));
+    await screen.findByRole('status', { name: 'Engine estimate' });
+
+    await user.click(screen.getByRole('button', { name: 'Undo' }));
+    expect(
+      screen.queryByRole('status', { name: 'Engine estimate' }),
+    ).not.toBeInTheDocument();
+  });
+
+  it('clears the previous estimate when the next engine request errors', async () => {
+    vi.stubEnv('NEXT_PUBLIC_STAR_AI_DEVTOOLS', '1');
+    resetPlayingStore({ controllers: ['server', 'server'] });
+    const first = deferred<StarAiDecision>();
+    const second = deferred<StarAiDecision>();
+    vi.mocked(requestServerAiDecision)
+      .mockReturnValueOnce(first.promise)
+      .mockReturnValueOnce(second.promise);
+    render(<GameScreen />);
+
+    await screen.findByText('Mac engine — current champion is thinking…');
+    const [firstRequest] = vi.mocked(requestServerAiDecision).mock.calls[0];
+    first.resolve(makeDecision(firstRequest));
+    await screen.findByRole('status', { name: 'Engine estimate' });
+    await waitFor(() =>
+      expect(requestServerAiDecision).toHaveBeenCalledTimes(2),
+    );
+
+    second.reject(new StarAiError('timeout', 'Engine timed out.', true));
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'Engine timed out.',
+    );
+    expect(
+      screen.queryByRole('status', { name: 'Engine estimate' }),
+    ).not.toBeInTheDocument();
+  });
+
+  it('retries a timeout with an explicitly reduced search budget', async () => {
+    vi.stubEnv('NEXT_PUBLIC_STAR_AI_DEVTOOLS', '1');
+    const retryFlight = deferred<StarAiDecision>();
+    vi.mocked(requestServerAiDecision)
+      .mockRejectedValueOnce(new StarAiError('timeout', 'Engine timed out.', true))
+      .mockReturnValueOnce(retryFlight.promise);
+    const user = userEvent.setup();
+    render(<GameScreen />);
+
+    await screen.findByRole('alert');
+    await user.click(screen.getByRole('button', { name: 'Use less effort' }));
+    await waitFor(() =>
+      expect(requestServerAiDecision).toHaveBeenCalledTimes(2),
+    );
+    expect(useAppStore.getState().aiSearchSettings.server).toEqual({
+      simulations: 256,
+      maxConsidered: 8,
+    });
+    expect(vi.mocked(requestServerAiDecision).mock.calls[1][1]?.search).toEqual({
+      simulations: 256,
+      maxConsidered: 8,
+    });
+  });
+
   it('has no detectable accessibility violations for a human turn', async () => {
     resetPlayingStore({ controllers: ['human', 'human'] });
     const { container } = render(<GameScreen />);
 
     expect(screen.queryByRole('button', { name: 'Pass' })).not.toBeInTheDocument();
     expect((await axe(container)).violations).toEqual([]);
-    expect(requestServerAiAction).not.toHaveBeenCalled();
+    expect(requestServerAiDecision).not.toHaveBeenCalled();
   });
 });
 

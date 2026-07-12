@@ -9,6 +9,7 @@ import {
   deterministicServerSeed,
   parseAnalyzeResponse,
   requestServerAiAction,
+  requestServerAiDecision,
   resolveServerSearchBudget,
   resolveStarAiHealthUrl,
   resolveStarAiMoveUrl,
@@ -88,13 +89,35 @@ describe('starserve v2 adapter', () => {
   });
 
   it('validates binary outcomes and maps a placement response', () => {
-    expect(
-      parseAnalyzeResponse(
-        request,
-        representativeAnalyzeResponse(),
-        request.requestId,
-      ),
-    ).toEqual(makeAiResponse(request, { type: 'place', node: 0 }));
+    const decision = parseAnalyzeResponse(
+      request,
+      representativeAnalyzeResponse(),
+      request.requestId,
+      { simulations: 4, maxConsidered: 2 },
+    );
+    expect(decision.response).toEqual(
+      makeAiResponse(request, { type: 'place', node: 0 }),
+    );
+    expect(decision.analysis).toMatchObject({
+      perspective: 0,
+      stateHash: request.stateHash,
+      outcome: { loss: 0.2, win: 0.8 },
+      modelValue: 0.6,
+      searchValue: 0.3,
+      expectedMargin: 0,
+      rootActions: [
+        { type: 'place', node: 0 },
+        { type: 'place', node: 1 },
+      ],
+      rootPolicy: [0.75, 0.25],
+      rootQ: [0.2, -0.1],
+      rootVisits: [3, 1],
+      modelVersion: 'fake-v2',
+      modelStep: 5,
+      simulations: 4,
+      maxConsidered: 2,
+      timingMs: { queue: 0, modelLoad: 0, inferenceSearch: 1, total: 1 },
+    });
   });
 
   it('rejects removed action and outcome shapes', () => {
@@ -118,6 +141,29 @@ describe('starserve v2 adapter', () => {
         value: 0,
       }),
     ).toThrow(/value belief/i);
+    expect(() =>
+      parseAnalyzeResponse(request, {
+        ...response,
+        root_q: [Number.NaN, -0.1],
+      }),
+    ).toThrow(/root Q/i);
+    expect(() =>
+      parseAnalyzeResponse(request, {
+        ...response,
+        score_belief: {
+          ...response.score_belief,
+          expected_margin: 1,
+        },
+      }),
+    ).toThrow(/expected score margin/i);
+    expect(() =>
+      parseAnalyzeResponse(
+        request,
+        response,
+        request.requestId,
+        { simulations: 5, maxConsidered: 2 },
+      ),
+    ).toThrow(/visits/i);
   });
 
   it('rejects inconsistent, illegal, or stale actions', () => {
@@ -228,11 +274,20 @@ describe('starserve v2 adapter', () => {
     vi.stubGlobal('fetch', fetchMock);
 
     await expect(
+      requestServerAiDecision(request, {
+        url: 'https://ai.example',
+        search: { simulations: 4, maxConsidered: 2 },
+      }),
+    ).resolves.toMatchObject({
+      response: makeAiResponse(request, { type: 'place', node: 0 }),
+      analysis: { simulations: 4, maxConsidered: 2, modelVersion: 'fake-v2' },
+    });
+    await expect(
       requestServerAiAction(request, {
         url: 'https://ai.example',
         search: { simulations: 4, maxConsidered: 2 },
       }),
     ).resolves.toEqual(makeAiResponse(request, { type: 'place', node: 0 }));
-    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 });

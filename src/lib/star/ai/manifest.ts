@@ -22,6 +22,8 @@ export const STAR_BROWSER_MODEL_MANIFEST_SCHEMA_ID =
   'startrain.browser-model' as const;
 export const STAR_BROWSER_MODEL_MANIFEST_VERSION = 2 as const;
 export const STAR_BROWSER_MODEL_PRECISION = 'float16' as const;
+export const MAX_BROWSER_AI_SIMULATIONS = 1_024;
+export const MAX_BROWSER_AI_MAX_CONSIDERED = 128;
 
 /** Deployment convention; intentionally absent until a trained model is published. */
 export const STAR_BROWSER_MODEL_MANIFEST_PATH = '/models/star/manifest.json' as const;
@@ -63,6 +65,8 @@ export interface StarBrowserModelManifest {
   search: {
     simulations: number;
     maxConsidered: number;
+    maximumSimulations: typeof MAX_BROWSER_AI_SIMULATIONS;
+    maximumMaxConsidered: typeof MAX_BROWSER_AI_MAX_CONSIDERED;
     cVisit: number;
     cScale: number;
   };
@@ -286,8 +290,8 @@ export function parseStarBrowserModelManifest(payload: unknown): StarBrowserMode
     ]) ||
     !isRecord(search) ||
     !hasExactKeys(search, ['simulations', 'max_considered', 'c_visit', 'c_scale']) ||
-    !positiveInteger(search.simulations, 1024) ||
-    !positiveInteger(search.max_considered, 128) ||
+    !positiveInteger(search.simulations, MAX_BROWSER_AI_SIMULATIONS) ||
+    !positiveInteger(search.max_considered, MAX_BROWSER_AI_MAX_CONSIDERED) ||
     !positiveFinite(search.c_visit) ||
     !positiveFinite(search.c_scale) ||
     !isRecord(payload.training)
@@ -329,6 +333,8 @@ export function parseStarBrowserModelManifest(payload: unknown): StarBrowserMode
     search: {
       simulations: search.simulations,
       maxConsidered: search.max_considered,
+      maximumSimulations: MAX_BROWSER_AI_SIMULATIONS,
+      maximumMaxConsidered: MAX_BROWSER_AI_MAX_CONSIDERED,
       cVisit: search.c_visit,
       cScale: search.c_scale,
     },

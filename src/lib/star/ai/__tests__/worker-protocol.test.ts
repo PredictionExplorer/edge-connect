@@ -9,7 +9,11 @@ import {
   STAR_WASM_MODULE_PATH,
   parseStarBrowserModelManifest,
 } from '../manifest';
-import { STAR_FEATURE_SCHEMA_HASH, buildAiRequest } from '../protocol';
+import {
+  STAR_FEATURE_SCHEMA_HASH,
+  buildAiRequest,
+  makeAiResponse,
+} from '../protocol';
 import { parseWorkerCommand, parseWorkerEvent } from '../worker-protocol';
 
 const request = buildAiRequest(
@@ -22,6 +26,38 @@ const request = buildAiRequest(
   [],
   'worker-task',
 );
+
+function workerDecision() {
+  return {
+    response: makeAiResponse(request, { type: 'place' as const, node: 0 }),
+    analysis: {
+      perspective: request.state.toMove,
+      stateHash: request.stateHash,
+      outcome: { loss: 0.4, win: 0.6 },
+      modelValue: 0.2,
+      searchValue: 0.2,
+      expectedMargin: 1.5,
+      rootActions: [
+        { type: 'place' as const, node: 0 },
+        { type: 'place' as const, node: 1 },
+      ],
+      rootPolicy: [0.75, 0.25],
+      rootQ: [0.2, -0.1],
+      rootVisits: [3, 1],
+      modelVersion: 'browser-smoke-v2',
+      modelStep: null,
+      modelIdentity: 'browser-smoke-v2',
+      simulations: 4,
+      maxConsidered: 2,
+      timingMs: {
+        queue: 0,
+        modelLoad: 1,
+        inferenceSearch: 2,
+        total: 3,
+      },
+    },
+  };
+}
 
 const manifest = {
   format: STAR_BROWSER_MODEL_MANIFEST_SCHEMA_ID,
@@ -119,8 +155,17 @@ const manifest = {
 describe('local worker protocol', () => {
   it('round-trips a typed choose command and cancellation', () => {
     expect(
-      parseWorkerCommand({ type: 'choose', taskId: request.requestId, request }),
-    ).toMatchObject({ type: 'choose', taskId: 'worker-task' });
+      parseWorkerCommand({
+        type: 'choose',
+        taskId: request.requestId,
+        request,
+        search: { simulations: 32, maxConsidered: 8 },
+      }),
+    ).toMatchObject({
+      type: 'choose',
+      taskId: 'worker-task',
+      search: { simulations: 32, maxConsidered: 8 },
+    });
     expect(parseWorkerCommand({ type: 'cancel', taskId: 'worker-task' })).toEqual({
       type: 'cancel',
       taskId: 'worker-task',
@@ -133,6 +178,7 @@ describe('local worker protocol', () => {
         type: 'choose',
         taskId: 'worker-task',
         request: { ...request, stateHash: 'zobrist64:0000000000000000' },
+        search: null,
       }),
     ).toThrow(/state hash/i);
   });
@@ -146,6 +192,7 @@ describe('local worker protocol', () => {
           ...request,
           state: { ...request.state, passStreak: 0 },
         },
+        search: null,
       }),
     ).toThrow(/invalid semantic state/i);
     expect(() =>
@@ -153,8 +200,27 @@ describe('local worker protocol', () => {
         type: 'choose',
         taskId: 'worker-task',
         request: { ...request, legalActions: [...request.legalActions, -1] },
+        search: null,
       }),
     ).toThrow(/incompatible AI request/i);
+  });
+
+  it('rejects malformed or out-of-range per-request browser budgets', () => {
+    for (const search of [
+      { simulations: 0, maxConsidered: 8 },
+      { simulations: 1_025, maxConsidered: 8 },
+      { simulations: 32, maxConsidered: 129 },
+      { simulations: 32, maxConsidered: 8, extra: true },
+    ]) {
+      expect(() =>
+        parseWorkerCommand({
+          type: 'choose',
+          taskId: request.requestId,
+          request,
+          search,
+        }),
+      ).toThrow(/search budget/i);
+    }
   });
 
   it('parses structured worker errors without trusting arbitrary codes', () => {
@@ -169,6 +235,39 @@ describe('local worker protocol', () => {
         error: { code: 'unavailable', message: 'missing', retryable: false },
       }),
     ).toMatchObject({ type: 'error', error: { code: 'unavailable' } });
+    expect(
+      parseWorkerEvent({
+        type: 'result',
+        taskId: request.requestId,
+        decision: workerDecision(),
+      }),
+    ).toMatchObject({
+      type: 'result',
+      decision: {
+        analysis: {
+          outcome: { loss: 0.4, win: 0.6 },
+          rootVisits: [3, 1],
+          modelIdentity: 'browser-smoke-v2',
+        },
+      },
+    });
+    expect(() =>
+      parseWorkerEvent({
+        type: 'result',
+        taskId: request.requestId,
+        decision: {
+          ...workerDecision(),
+          analysis: { ...workerDecision().analysis, rootQ: [Number.NaN, 0] },
+        },
+      }),
+    ).toThrow(/root Q/i);
+    expect(() =>
+      parseWorkerEvent({
+        type: 'result',
+        taskId: 'stale-task',
+        decision: workerDecision(),
+      }),
+    ).toThrow(/identity/i);
     expect(() =>
       parseWorkerEvent({
         type: 'error',
@@ -193,6 +292,12 @@ describe('local worker protocol', () => {
         sha256: `sha256:${'a'.repeat(64)}`,
         inputs: STAR_MODEL_INPUT_NAMES,
         outputs: STAR_MODEL_OUTPUT_NAMES,
+      },
+      search: {
+        simulations: 64,
+        maxConsidered: 16,
+        maximumSimulations: 1_024,
+        maximumMaxConsidered: 128,
       },
     });
     expect(() =>

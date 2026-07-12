@@ -1,5 +1,11 @@
 import { StarAiError } from './errors';
 import {
+  parseStarAiDecision,
+  responseFromStarAiDecision,
+  type StarAiDecision,
+  type StarAiSearchBudget,
+} from './decision';
+import {
   codeToAction,
   makeAiResponse,
   semanticStateHash,
@@ -15,10 +21,7 @@ export const MAX_SERVER_AI_SIMULATIONS = 16_384;
 export const DEFAULT_SERVER_AI_MAX_CONSIDERED = 32;
 export const MAX_SERVER_AI_MAX_CONSIDERED = 128;
 
-export interface ServerSearchBudget {
-  simulations: number;
-  maxConsidered: number;
-}
+export type ServerSearchBudget = StarAiSearchBudget;
 
 export interface AnalyzeRequestV2 {
   schema_version: 2;
@@ -284,7 +287,8 @@ export function parseAnalyzeResponse(
   request: StarAiRequest,
   payload: unknown,
   headerRequestId?: string | null,
-): StarAiResponse {
+  search?: ServerSearchBudget,
+): StarAiDecision {
   const responseKeys = [
     'schema_version',
     'request_id',
@@ -338,7 +342,7 @@ export function parseAnalyzeResponse(
     rootActions.length,
     (item) => item >= 0,
   );
-  parseFiniteArray(
+  const rootQ = parseFiniteArray(
     payload.root_q,
     'Starserve root Q values',
     rootActions.length,
@@ -354,6 +358,7 @@ export function parseAnalyzeResponse(
   ) {
     throw new StarAiError('protocol', 'Starserve root statistics are invalid.');
   }
+  const rootVisits = [...payload.root_visits] as number[];
 
   if (
     !isRecord(payload.outcome) ||
@@ -404,6 +409,16 @@ export function parseAnalyzeResponse(
   if (!approximatelyOne(scoreProbabilities, 1e-5)) {
     throw new StarAiError('protocol', 'Starserve score probabilities are not normalized.');
   }
+  const expectedMargin = scoreProbabilities.reduce(
+    (total, probability, index) => total + probability * (index - 151),
+    0,
+  );
+  if (
+    Math.abs(expectedMargin - (payload.score_belief.expected_margin as number)) >
+    1e-3
+  ) {
+    throw new StarAiError('protocol', 'Starserve expected score margin is inconsistent.');
+  }
 
   if (
     typeof payload.model_version !== 'string' ||
@@ -420,13 +435,56 @@ export function parseAnalyzeResponse(
     throw new StarAiError('protocol', 'Starserve model or timing metadata is invalid.');
   }
 
-  return makeAiResponse(request, codeToAction(action.code));
+  const effectiveSearch = search ?? {
+    simulations: rootVisits.reduce((total, visits) => total + visits, 0),
+    maxConsidered: rootActions.length,
+  };
+  strictBudgetInteger(
+    'Server AI simulations',
+    effectiveSearch.simulations,
+    MAX_SERVER_AI_SIMULATIONS,
+  );
+  strictBudgetInteger(
+    'Server AI max-considered',
+    effectiveSearch.maxConsidered,
+    MAX_SERVER_AI_MAX_CONSIDERED,
+  );
+  const response = makeAiResponse(request, codeToAction(action.code));
+  return parseStarAiDecision(request, {
+    response,
+    analysis: {
+      perspective: request.state.toMove,
+      stateHash: request.stateHash,
+      outcome: {
+        loss: payload.outcome.loss,
+        win: payload.outcome.win,
+      },
+      modelValue: payload.value,
+      searchValue: payload.search_value,
+      expectedMargin: payload.score_belief.expected_margin,
+      rootActions: rootActions.map((rootAction) => codeToAction(rootAction.code)),
+      rootPolicy,
+      rootQ,
+      rootVisits,
+      modelVersion: payload.model_version,
+      modelStep: payload.model_step,
+      modelIdentity: null,
+      simulations: effectiveSearch.simulations,
+      maxConsidered: effectiveSearch.maxConsidered,
+      timingMs: {
+        queue: payload.timing_ms.queue,
+        modelLoad: payload.timing_ms.model_reload,
+        inferenceSearch: payload.timing_ms.inference_search,
+        total: payload.timing_ms.total,
+      },
+    },
+  });
 }
 
-export async function requestServerAiAction(
+export async function requestServerAiDecision(
   request: StarAiRequest,
   options: ServerAiRequestOptions = {},
-): Promise<StarAiResponse> {
+): Promise<StarAiDecision> {
   const url = options.url?.trim()
     ? resolveStarAiMoveUrl(options.url)
     : configuredServerAiUrl();
@@ -441,10 +499,8 @@ export async function requestServerAiAction(
   if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(request.requestId)) {
     throw new StarAiError('protocol', 'AI request id is not accepted by starserve.');
   }
-  const analyzeRequest = toAnalyzeRequest(
-    request,
-    resolveServerSearchBudget(options.search),
-  );
+  const search = resolveServerSearchBudget(options.search);
+  const analyzeRequest = toAnalyzeRequest(request, search);
 
   const controller = new AbortController();
   let timedOut = false;
@@ -500,7 +556,12 @@ export async function requestServerAiAction(
         response.status >= 500 || response.status === 429,
       );
     }
-    return parseAnalyzeResponse(request, payload, response.headers.get('X-Request-ID'));
+    return parseAnalyzeResponse(
+      request,
+      payload,
+      response.headers.get('X-Request-ID'),
+      search,
+    );
   } catch (error) {
     if (error instanceof StarAiError) throw error;
     if (options.signal?.aborted) {
@@ -514,4 +575,11 @@ export async function requestServerAiAction(
     clearTimeout(timeout);
     options.signal?.removeEventListener('abort', abortFromCaller);
   }
+}
+
+export async function requestServerAiAction(
+  request: StarAiRequest,
+  options: ServerAiRequestOptions = {},
+): Promise<StarAiResponse> {
+  return responseFromStarAiDecision(await requestServerAiDecision(request, options));
 }

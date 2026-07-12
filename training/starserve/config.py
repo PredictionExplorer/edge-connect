@@ -51,6 +51,22 @@ class SearchConfig:
         if self.c_visit <= 0 or self.c_scale <= 0:
             raise ServerConfigError("Gumbel search constants must be positive")
 
+    def named_presets(self) -> dict[str, dict[str, int]]:
+        return {
+            "quick": {
+                "simulations": min(128, self.default_simulations),
+                "max_considered": min(8, self.default_max_considered),
+            },
+            "strong": {
+                "simulations": self.default_simulations,
+                "max_considered": self.default_max_considered,
+            },
+            "maximum": {
+                "simulations": self.maximum_simulations,
+                "max_considered": self.maximum_max_considered,
+            },
+        }
+
 
 @dataclass(frozen=True, slots=True)
 class LimitConfig:

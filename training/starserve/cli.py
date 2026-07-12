@@ -1,9 +1,10 @@
-"""Command-line entry point for the single-process CUDA service."""
+"""Command-line entry point for the single-process model service."""
 
 from __future__ import annotations
 
 import argparse
 import json
+from dataclasses import replace
 
 import uvicorn
 
@@ -18,10 +19,16 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--config", required=True)
     parser.add_argument("--host")
     parser.add_argument("--port", type=int)
+    parser.add_argument(
+        "--device",
+        help="override the configured PyTorch device, for example mps or cpu",
+    )
     parser.add_argument("--check-config", action="store_true")
     parser.add_argument("--log-level", default="info")
     arguments = parser.parse_args(argv)
     config = load_server_config(arguments.config)
+    if arguments.device is not None:
+        config = replace(config, device=arguments.device)
     if arguments.check_config:
         print(
             json.dumps(

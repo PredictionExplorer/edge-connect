@@ -17,6 +17,10 @@ import {
   asStarAiError,
   type StarAiErrorCode,
 } from '@/lib/star/ai/errors';
+import type {
+  StarAiAnalysis,
+  StarAiSearchBudget,
+} from '@/lib/star/ai/decision';
 import {
   acceptAiResponse,
   buildAiRequest,
@@ -24,15 +28,20 @@ import {
   semanticStateHash,
   type StarAiRequest,
 } from '@/lib/star/ai/protocol';
-import { requestServerAiAction } from '@/lib/star/ai/server-client';
+import { requestServerAiDecision } from '@/lib/star/ai/server-client';
 import { scoreCompletionBounds } from '@/lib/star/completion-bounds';
 import { replay } from '@/lib/star/game';
 import { scorePosition, validateTerminalWinner } from '@/lib/star/scoring';
 import { useAppStore } from '@/lib/store';
+import { EngineEstimatePanel } from './EngineEstimatePanel';
 import { GameOverOverlay } from './GameOverOverlay';
 import { RulesDialog } from './RulesDialog';
 import { ScorePanel } from './ScorePanel';
 import { StarBoard } from './StarBoard';
+import {
+  engineControllerLabel,
+  starAiDevtoolsEnabled,
+} from './starAiDevtools';
 import { PLAYER_COLORS } from './theme';
 
 type AiStatus =
@@ -53,10 +62,34 @@ interface AiFlight {
   abortController: AbortController;
   cancelScheduled: boolean;
   cancelled: boolean;
+  settled: boolean;
+}
+
+interface PublishedAiAnalysis {
+  key: string;
+  analysis: StarAiAnalysis;
+}
+
+function reducedSearchBudget(
+  budget: StarAiSearchBudget,
+): StarAiSearchBudget | null {
+  if (budget.simulations === 1 && budget.maxConsidered === 1) return null;
+  return {
+    simulations: Math.max(1, Math.floor(budget.simulations / 2)),
+    maxConsidered: Math.max(1, Math.floor(budget.maxConsidered / 2)),
+  };
 }
 
 export function GameScreen() {
-  const { config, controllers, aiPaused, log, redoStack, reviewing } = useAppStore();
+  const {
+    config,
+    controllers,
+    aiSearchSettings,
+    aiPaused,
+    log,
+    redoStack,
+    reviewing,
+  } = useAppStore();
   const {
     act,
     undo,
@@ -65,13 +98,17 @@ export function GameScreen() {
     toSetup,
     resumeAi,
     setPlayerController,
+    setAiSearchBudget,
     setReviewing,
   } = useAppStore();
+  const devtools = starAiDevtoolsEnabled();
 
   const [rulesOpen, setRulesOpen] = useState(false);
   const [showInfluence, setShowInfluence] = useState(false);
   const [hoverNode, setHoverNode] = useState(-1);
   const [aiStatus, setAiStatus] = useState<AiStatus>({ kind: 'idle' });
+  const [publishedAnalysis, setPublishedAnalysis] =
+    useState<PublishedAiAnalysis | null>(null);
   const [retryNonce, setRetryNonce] = useState(0);
   const flightRef = useRef<AiFlight | null>(null);
 
@@ -96,6 +133,7 @@ export function GameScreen() {
   }, [controllers, game]);
 
   const cancelActiveAi = useCallback(() => {
+    setPublishedAnalysis(null);
     const flight = flightRef.current;
     if (!flight) return;
     flight.cancelScheduled = false;
@@ -109,14 +147,21 @@ export function GameScreen() {
     const controller = controllers[game.toMove];
     if (controller === 'human' || !aiPositionKey) return;
 
-    const key = `${aiPositionKey}:${retryNonce}`;
+    const selectedSearch = aiSearchSettings[controller];
+    const key = `${aiPositionKey}:${retryNonce}${
+      devtools
+        ? `:${selectedSearch.simulations}:${selectedSearch.maxConsidered}`
+        : ''
+    }`;
     const scheduleCancellation = (flight: AiFlight) => {
+      if (flight.settled) return;
       flight.cancelScheduled = true;
       queueMicrotask(() => {
         if (flightRef.current !== flight || !flight.cancelScheduled) return;
         flight.cancelled = true;
         flightRef.current = null;
         flight.abortController.abort();
+        setPublishedAnalysis(null);
       });
     };
 
@@ -131,6 +176,7 @@ export function GameScreen() {
       existing.cancelled = true;
       existing.abortController.abort();
       flightRef.current = null;
+      if (!existing.settled) setPublishedAnalysis(null);
     }
 
     let request: StarAiRequest;
@@ -139,6 +185,7 @@ export function GameScreen() {
     } catch (error) {
       const aiError = asStarAiError(error);
       queueMicrotask(() => {
+        setPublishedAnalysis(null);
         setAiStatus({
           kind: 'error',
           controller,
@@ -157,6 +204,7 @@ export function GameScreen() {
       abortController: new AbortController(),
       cancelScheduled: false,
       cancelled: false,
+      settled: false,
     };
     flightRef.current = flight;
     queueMicrotask(() => {
@@ -165,21 +213,39 @@ export function GameScreen() {
       }
     });
 
+    const options = {
+      signal: flight.abortController.signal,
+      ...(devtools ? { search: selectedSearch } : {}),
+    };
     const response =
       controller === 'server'
-        ? requestServerAiAction(request, { signal: flight.abortController.signal })
-        : import('@/lib/star/ai/local-client').then(({ requestLocalAiAction }) =>
-            requestLocalAiAction(request, { signal: flight.abortController.signal }),
+        ? requestServerAiDecision(request, options)
+        : import('@/lib/star/ai/local-client').then(({ requestLocalAiDecision }) =>
+            requestLocalAiDecision(request, options),
           );
 
     void response
-      .then((payload) => {
+      .then((decision) => {
         if (flight.cancelled || flightRef.current !== flight) return;
         const current = useAppStore.getState();
-        if (current.phase !== 'playing') return;
-        const accepted = acceptAiResponse(request, payload, current.config, current.log);
+        if (current.phase !== 'playing') {
+          flight.settled = true;
+          setPublishedAnalysis(null);
+          return;
+        }
+        const accepted = acceptAiResponse(
+          request,
+          decision.response,
+          current.config,
+          current.log,
+        );
         if (!accepted.ok) {
-          if (accepted.code === 'stale') return;
+          if (accepted.code === 'stale') {
+            flight.settled = true;
+            setPublishedAnalysis(null);
+            setAiStatus({ kind: 'idle' });
+            return;
+          }
           throw new StarAiError(accepted.code, accepted.message, false);
         }
         const currentGame = replay(current.config, current.log);
@@ -187,14 +253,29 @@ export function GameScreen() {
           currentGame.over ||
           current.controllers[currentGame.toMove] !== flight.controller
         ) {
+          flight.settled = true;
+          setPublishedAnalysis(null);
           return;
         }
+        flight.settled = true;
+        setAiStatus({ kind: 'idle' });
         current.act(accepted.action);
+        if (devtools) {
+          setPublishedAnalysis({
+            key: `${decision.analysis.stateHash}:${decision.analysis.perspective}`,
+            analysis: decision.analysis,
+          });
+        }
       })
       .catch((error) => {
         if (flight.cancelled || flightRef.current !== flight) return;
+        flight.settled = true;
+        setPublishedAnalysis(null);
         const aiError = asStarAiError(error);
-        if (aiError.code === 'cancelled') return;
+        if (aiError.code === 'cancelled' || aiError.code === 'stale') {
+          setAiStatus({ kind: 'idle' });
+          return;
+        }
         setAiStatus({
           kind: 'error',
           controller: flight.controller,
@@ -208,7 +289,17 @@ export function GameScreen() {
       });
 
     return () => scheduleCancellation(flight);
-  }, [aiPaused, aiPositionKey, config, controllers, game, log, retryNonce]);
+  }, [
+    aiPaused,
+    aiPositionKey,
+    aiSearchSettings,
+    config,
+    controllers,
+    devtools,
+    game,
+    log,
+    retryNonce,
+  ]);
 
   const disposeLocalAi = useCallback(() => {
     void import('@/lib/star/ai/local-client').then(({ disposeLocalAiClient }) => {
@@ -252,6 +343,19 @@ export function GameScreen() {
     resumeAi();
   }, [resumeAi]);
 
+  const retryWithLessEffort = useCallback(
+    (controller: Exclude<ControllerType, 'human'>) => {
+      const reduced = reducedSearchBudget(
+        useAppStore.getState().aiSearchSettings[controller],
+      );
+      if (!reduced) return;
+      setPublishedAnalysis(null);
+      setAiStatus({ kind: 'idle' });
+      setAiSearchBudget(controller, reduced);
+    },
+    [setAiSearchBudget],
+  );
+
   const score = useMemo(
     () => (game ? scorePosition(game.board, game.stones) : null),
     [game],
@@ -280,6 +384,15 @@ export function GameScreen() {
     aiStatus.controller === currentController
       ? aiStatus
       : null;
+  const lowerBudget =
+    currentController === 'human'
+      ? null
+      : reducedSearchBudget(aiSearchSettings[currentController]);
+  const canUseLessEffort =
+    devtools &&
+    activeAiError?.retryable === true &&
+    activeAiError.code === 'timeout' &&
+    lowerBudget !== null;
   const humanCanAct = currentController === 'human' && !thinking;
 
   return (
@@ -340,7 +453,10 @@ export function GameScreen() {
             interactive={!game.over && humanCanAct}
             playerNames={config.playerNames}
             onPlace={(node) => {
-              if (humanCanAct) act({ type: 'place', node });
+              if (humanCanAct) {
+                setPublishedAnalysis(null);
+                act({ type: 'place', node });
+              }
             }}
             onHover={setHoverNode}
             className="max-h-[82dvh] w-full max-w-[860px]"
@@ -462,10 +578,23 @@ export function GameScreen() {
                     {activeAiError.retryable && (
                       <button
                         type="button"
-                        onClick={() => setRetryNonce((value) => value + 1)}
+                        onClick={() => {
+                          setPublishedAnalysis(null);
+                          setAiStatus({ kind: 'idle' });
+                          setRetryNonce((value) => value + 1);
+                        }}
                         className="rounded-lg border border-gold/50 px-2.5 py-1 text-gold-strong transition-colors hover:bg-gold/15"
                       >
                         Retry
+                      </button>
+                    )}
+                    {canUseLessEffort && (
+                      <button
+                        type="button"
+                        onClick={() => retryWithLessEffort(currentController)}
+                        className="rounded-lg border border-gold/50 px-2.5 py-1 text-gold-strong transition-colors hover:bg-gold/15"
+                      >
+                        Use less effort
                       </button>
                     )}
                     <button
@@ -478,9 +607,23 @@ export function GameScreen() {
                   </div>
                 </div>
               ) : (
-                <span>{controllerLabel(currentController)} is thinking…</span>
+                <span>
+                  {devtools
+                    ? engineControllerLabel(currentController)
+                    : controllerLabel(currentController)}{' '}
+                  is thinking…
+                </span>
               )}
             </div>
+          )}
+
+          {devtools && publishedAnalysis && (
+            <EngineEstimatePanel
+              key={publishedAnalysis.key}
+              analysis={publishedAnalysis.analysis}
+              board={board}
+              playerNames={config.playerNames}
+            />
           )}
 
           {/* Pie rule offer */}
@@ -493,7 +636,10 @@ export function GameScreen() {
                 type="button"
                 disabled={!humanCanAct}
                 onClick={() => {
-                  if (humanCanAct) act({ type: 'swap' });
+                  if (humanCanAct) {
+                    setPublishedAnalysis(null);
+                    act({ type: 'swap' });
+                  }
                 }}
                 className="mt-2 flex items-center gap-2 rounded-lg border border-gold/60 px-3 py-1.5 text-xs font-medium text-gold-strong transition-colors hover:bg-gold/20"
               >

@@ -3,6 +3,13 @@ import { getBoard } from '@/lib/star/board';
 import { STAR_RULES_HASH, STAR_RULES_SCHEMA_ID } from '@/lib/star/rules';
 import { StarAiError, asStarAiError } from '@/lib/star/ai/errors';
 import {
+  STAR_SCORE_MARGIN_MIN,
+  parseStarAiDecision,
+  type StarAiOutcomeBelief,
+  type StarAiSearchBudget,
+  type StarAiTiming,
+} from '@/lib/star/ai/decision';
+import {
   STAR_GLOBAL_FEATURE_DIM,
   STAR_MODEL_INPUT_NAMES,
   STAR_MODEL_OUTPUT_NAMES,
@@ -65,6 +72,7 @@ interface WasmSearchTree {
   actions(): Int32Array;
   visits(): Uint32Array;
   completed_q(): Float32Array;
+  policy_target(): Float32Array;
   free?(): void;
 }
 
@@ -107,7 +115,25 @@ interface LocalRuntime {
 
 interface Evaluation {
   value: number;
+  outcome: StarAiOutcomeBelief;
+  expectedMargin: number;
   logits: Float32Array;
+}
+
+interface LocalSearchResult {
+  actionCode: number;
+  outcome: StarAiOutcomeBelief;
+  modelValue: number;
+  searchValue: number;
+  expectedMargin: number;
+  rootActions: number[];
+  rootPolicy: number[];
+  rootQ: number[];
+  rootVisits: number[];
+  modelVersion: string;
+  modelIdentity: string;
+  search: StarAiSearchBudget;
+  timingMs: Pick<StarAiTiming, 'modelLoad' | 'inferenceSearch'>;
 }
 
 const scope = globalThis as unknown as WorkerScope;
@@ -475,17 +501,46 @@ export function finiteFloatData(
   return decoded;
 }
 
-export function outcomeValue(logits: Float32Array): number {
-  if (logits.length !== 2) {
-    throw new StarAiError('protocol', 'ONNX outcome output must contain two logits.');
+function normalizedProbabilities(
+  logits: Float32Array,
+  expectedLength: number,
+  label: string,
+): number[] {
+  if (logits.length !== expectedLength) {
+    throw new StarAiError(
+      'protocol',
+      `ONNX ${label} output must contain ${expectedLength} logits.`,
+    );
   }
   const maximum = Math.max(...logits);
   const probabilities = Array.from(logits, (logit) => Math.exp(logit - maximum));
-  const total = probabilities[0] + probabilities[1];
+  const total = probabilities.reduce((sum, probability) => sum + probability, 0);
   if (!Number.isFinite(total) || total <= 0) {
-    throw new StarAiError('protocol', 'ONNX outcome output cannot be normalized.');
+    throw new StarAiError('protocol', `ONNX ${label} output cannot be normalized.`);
   }
-  return (probabilities[1] - probabilities[0]) / total;
+  return probabilities.map((probability) => probability / total);
+}
+
+export function outcomeBelief(logits: Float32Array): StarAiOutcomeBelief {
+  if (logits.length !== 2) {
+    throw new StarAiError('protocol', 'ONNX outcome output must contain two logits.');
+  }
+  const [loss, win] = normalizedProbabilities(logits, 2, 'outcome');
+  return { loss, win };
+}
+
+export function outcomeValue(logits: Float32Array): number {
+  const outcome = outcomeBelief(logits);
+  return outcome.win - outcome.loss;
+}
+
+export function expectedScoreMargin(logits: Float32Array): number {
+  const probabilities = normalizedProbabilities(logits, 303, 'score margin');
+  return probabilities.reduce(
+    (total, probability, index) =>
+      total + probability * (STAR_SCORE_MARGIN_MIN + index),
+    0,
+  );
 }
 
 async function evaluate(
@@ -495,7 +550,11 @@ async function evaluate(
 ): Promise<Evaluation> {
   const outputs = await runtime.session.run(tensorFeeds(runtime, semantic));
   const densePolicy = finiteFloatData(outputs.policy_logits, 'policy_logits');
-  const outcome = finiteFloatData(outputs.outcome_logits, 'outcome_logits');
+  const outcomeLogits = finiteFloatData(outputs.outcome_logits, 'outcome_logits');
+  const scoreMarginLogits = finiteFloatData(
+    outputs.score_margin_logits,
+    'score_margin_logits',
+  );
   const nodeCount = semantic.stones.length;
   if (densePolicy.length !== nodeCount) {
     throw new StarAiError('protocol', 'ONNX policy output has the wrong action layout.');
@@ -510,7 +569,13 @@ async function evaluate(
     }
     logits[index] = logit;
   }
-  return { value: outcomeValue(outcome), logits };
+  const outcome = outcomeBelief(outcomeLogits);
+  return {
+    value: outcome.win - outcome.loss,
+    outcome,
+    expectedMargin: expectedScoreMargin(scoreMarginLogits),
+    logits,
+  };
 }
 
 async function yieldToCancellation(taskId: string): Promise<void> {
@@ -518,14 +583,35 @@ async function yieldToCancellation(taskId: string): Promise<void> {
   ensureNotCancelled(taskId);
 }
 
+function nowMs(): number {
+  return typeof performance !== 'undefined' ? performance.now() : Date.now();
+}
+
 async function chooseAction(
   taskId: string,
   request: StarAiRequest,
+  requestedSearch: StarAiSearchBudget | null,
   signal: AbortSignal,
-): Promise<number> {
+): Promise<LocalSearchResult> {
   ensureNotCancelled(taskId);
+  const runtimeStarted = nowMs();
   const runtime = await getRuntime(signal);
+  const modelLoad = nowMs() - runtimeStarted;
   ensureNotCancelled(taskId);
+  const search = requestedSearch ?? {
+    simulations: runtime.manifest.search.simulations,
+    maxConsidered: runtime.manifest.search.maxConsidered,
+  };
+  if (
+    search.simulations > runtime.manifest.search.maximumSimulations ||
+    search.maxConsidered > runtime.manifest.search.maximumMaxConsidered
+  ) {
+    throw new StarAiError(
+      'protocol',
+      'Browser AI search budget exceeds the loaded runtime limits.',
+    );
+  }
+  const searchStarted = nowMs();
   const root = replayAndVerify(request, runtime.wasm);
   let tree: WasmSearchTree | null = null;
   let scheduler: WasmGumbel | null = null;
@@ -549,8 +635,8 @@ async function chooseAction(
 
     scheduler = new runtime.wasm.WasmGumbel(
       rootEvaluation.logits,
-      runtime.manifest.search.simulations,
-      runtime.manifest.search.maxConsidered,
+      search.simulations,
+      search.maxConsidered,
       runtime.manifest.search.cVisit,
       runtime.manifest.search.cScale,
       root.hash64(),
@@ -584,12 +670,34 @@ async function chooseAction(
       simulations += 1;
       if (simulations % 8 === 0) await yieldToCancellation(taskId);
     }
-    const selected = scheduler.selected(tree.completed_q(), tree.visits());
+    if (simulations !== search.simulations) {
+      throw new StarAiError('protocol', 'WASM search did not consume its exact budget.');
+    }
+    const rootQ = Array.from(tree.completed_q());
+    const rootVisits = Array.from(tree.visits());
+    const selected = scheduler.selected(Float32Array.from(rootQ), Uint32Array.from(rootVisits));
     const actions = tree.actions();
     if (selected < 0 || selected >= actions.length) {
       throw new StarAiError('protocol', 'WASM search selected an invalid edge.');
     }
-    return actions[selected];
+    return {
+      actionCode: actions[selected],
+      outcome: rootEvaluation.outcome,
+      modelValue: rootEvaluation.value,
+      searchValue: rootEvaluation.value,
+      expectedMargin: rootEvaluation.expectedMargin,
+      rootActions: Array.from(actions),
+      rootPolicy: Array.from(tree.policy_target()),
+      rootQ,
+      rootVisits,
+      modelVersion: runtime.manifest.modelVersion,
+      modelIdentity: runtime.manifest.modelVersion,
+      search,
+      timingMs: {
+        modelLoad,
+        inferenceSearch: nowMs() - searchStarted,
+      },
+    };
   } finally {
     scheduler?.free?.();
     tree?.free?.();
@@ -597,20 +705,55 @@ async function chooseAction(
   }
 }
 
-async function runChoose(command: Extract<StarAiWorkerCommand, { type: 'choose' }>) {
+async function runChoose(
+  command: Extract<StarAiWorkerCommand, { type: 'choose' }>,
+  queuedAt: number,
+) {
   const taskController = taskControllers.get(command.taskId);
   try {
     if (!taskController) throw new StarAiError('cancelled', 'Local AI request cancelled.');
-    const actionCode = await chooseAction(
+    const startedAt = nowMs();
+    const result = await chooseAction(
       command.taskId,
       command.request,
+      command.search,
       taskController.signal,
     );
     ensureNotCancelled(command.taskId);
+    const response = makeAiResponse(
+      command.request,
+      codeToAction(result.actionCode),
+    );
+    const decision = parseStarAiDecision(command.request, {
+      response,
+      analysis: {
+        perspective: command.request.state.toMove,
+        stateHash: command.request.stateHash,
+        outcome: result.outcome,
+        modelValue: result.modelValue,
+        searchValue: result.searchValue,
+        expectedMargin: result.expectedMargin,
+        rootActions: result.rootActions.map(codeToAction),
+        rootPolicy: result.rootPolicy,
+        rootQ: result.rootQ,
+        rootVisits: result.rootVisits,
+        modelVersion: result.modelVersion,
+        modelStep: null,
+        modelIdentity: result.modelIdentity,
+        simulations: result.search.simulations,
+        maxConsidered: result.search.maxConsidered,
+        timingMs: {
+          queue: startedAt - queuedAt,
+          modelLoad: result.timingMs.modelLoad,
+          inferenceSearch: result.timingMs.inferenceSearch,
+          total: nowMs() - queuedAt,
+        },
+      },
+    });
     scope.postMessage({
       type: 'result',
       taskId: command.taskId,
-      response: makeAiResponse(command.request, codeToAction(actionCode)),
+      decision,
     });
   } catch (error) {
     const aiError = asStarAiError(error);
@@ -659,7 +802,8 @@ scope.addEventListener('message', (event) => {
 
   knownTasks.add(command.taskId);
   taskControllers.set(command.taskId, new AbortController());
-  queue = queue.then(() => runChoose(command)).catch(() => {
+  const queuedAt = nowMs();
+  queue = queue.then(() => runChoose(command, queuedAt)).catch(() => {
     // runChoose contains its own typed error boundary; keep the queue usable.
   });
 });

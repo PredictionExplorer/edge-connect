@@ -316,7 +316,19 @@ def create_app(
             "api_schema_version": 2,
             "server_config_schema_version": SERVER_CONFIG_SCHEMA_VERSION,
             "model_schema_version": MODEL_SCHEMA_VERSION,
+            "device": settings.device,
             "model": model_health,
+            "search": {
+                "defaults": {
+                    "simulations": settings.search.default_simulations,
+                    "max_considered": settings.search.default_max_considered,
+                },
+                "maximums": {
+                    "simulations": settings.search.maximum_simulations,
+                    "max_considered": settings.search.maximum_max_considered,
+                },
+                "presets": settings.search.named_presets(),
+            },
             "rules": {
                 "schema_id": RULES_SCHEMA_ID,
                 "version": RULES_VERSION,
