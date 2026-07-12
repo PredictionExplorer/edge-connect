@@ -89,8 +89,10 @@ export interface StarBoardProps {
   stones: ArrayLike<number>;
   /** Node controller from the scorer, for the territory overlay. */
   nodeOwner?: ArrayLike<number> | null;
-  /** 1 = stone belongs to an alive star. Dead stones render dimmed. */
+  /** 1 = stone currently belongs to a living star. */
   aliveStone?: ArrayLike<number> | null;
+  /** 1 = existing stone cannot form a living star in any completion. */
+  provablyDeadStone?: ArrayLike<number> | null;
   showTerritory?: boolean;
   lastMove?: number;
   currentTurnMoves?: number[];
@@ -153,6 +155,7 @@ export const StarBoard = memo(function StarBoard({
   stones,
   nodeOwner,
   aliveStone,
+  provablyDeadStone,
   showTerritory = false,
   lastMove = -1,
   currentTurnMoves = [],
@@ -399,16 +402,12 @@ export const StarBoard = memo(function StarBoard({
         const y = board.ys[u] * S;
         const stone = stones[u];
         const isEmpty = stone === EMPTY;
-        const scoredOwner = nodeOwner?.[u] ?? -1;
         const owner = territory ? territory[u] : -1;
         const quark = board.isQuark[u] === 1;
         const peri = board.isPeri[u] === 1;
         const notInStar = !isEmpty && aliveStone ? aliveStone[u] === 0 : false;
-        const captured =
-          !isEmpty &&
-          (scoredOwner === 0 || scoredOwner === 1) &&
-          scoredOwner !== stone;
-        const dimmed = captured || (showTerritory && notInStar);
+        const provablyDead = !isEmpty && provablyDeadStone?.[u] === 1;
+        const dimmed = provablyDead || (showTerritory && notInStar);
         const inHighlightedGroup =
           !isEmpty && highlightedGroup >= 0 && groups.groupOf[u] === highlightedGroup;
         const nodeKind = quark ? 'quark peri' : peri ? 'peri' : 'interior node';
@@ -419,11 +418,8 @@ export const StarBoard = memo(function StarBoard({
             }${
               currentTurnMoves.includes(u) && u !== lastMove ? ', placed this turn' : ''
             }${
-              captured
-                ? `, currently surrounded and captured by ${
-                    playerNames?.[scoredOwner as 0 | 1] ||
-                    PLAYER_COLORS[scoredOwner as 0 | 1].name
-                  }`
+              provablyDead
+                ? ', provably dead; cannot form a living star in any completion'
                 : notInStar
                   ? `, connected group of ${groups.groupSize[groups.groupOf[u]]} stone${
                       groups.groupSize[groups.groupOf[u]] === 1 ? '' : 's'
@@ -477,8 +473,9 @@ export const StarBoard = memo(function StarBoard({
             {!isEmpty && (
               <g
                 className="stone-pop"
-                opacity={captured ? 0.22 : dimmed ? 0.35 : 1}
+                opacity={provablyDead ? 0.22 : dimmed ? 0.35 : 1}
                 data-group-root={groups.groupOf[u]}
+                data-stone-node={u}
               >
                 <circle
                   cx={x}
@@ -515,12 +512,12 @@ export const StarBoard = memo(function StarBoard({
               />
             )}
 
-            {captured && (
+            {provablyDead && (
               <g
                 aria-hidden
-                data-captured-stone={u}
+                data-provably-dead-stone={u}
                 pointerEvents="none"
-                stroke={PLAYER_COLORS[scoredOwner as 0 | 1].bright}
+                stroke="rgba(255,125,104,0.95)"
                 strokeWidth={Math.max(stoneR * 0.14, 0.8)}
                 strokeLinecap="round"
               >

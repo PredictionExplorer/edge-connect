@@ -20,6 +20,11 @@ export interface CompletionBounds {
   emptyNodes: number;
   /** Winner forced across every full completion, or null while still unsettled. */
   guaranteedWinner: 0 | 1 | null;
+  /**
+   * Existing stones that cannot belong to a living star in any completion.
+   * Empty nodes are always 0.
+   */
+  provablyDeadStone: Uint8Array;
 }
 
 function fillEmptyNodes(
@@ -57,6 +62,13 @@ function fillEmptyNodes(
  * Therefore repeated recolorings make the all-zero fill player zero's upper
  * bound and the all-one fill player one's upper bound. This terminal theorem
  * is intentionally distinct from live scoring, which is not monotone.
+ *
+ * The same extremal positions characterize permanent stone death. Every
+ * same-color path available in any continuation is present when that player
+ * receives every empty node. An existing stone that is not alive in that
+ * maximal rescue therefore cannot become alive in any continuation. If it is
+ * alive there, the maximal rescue itself proves that permanent death has not
+ * yet been established.
  */
 export function scoreCompletionBounds(
   board: Board,
@@ -87,5 +99,16 @@ export function scoreCompletionBounds(
         ? 0
         : null;
 
-  return { scenarios, emptyNodes, guaranteedWinner };
+  const provablyDeadStone = new Uint8Array(board.n);
+  for (let node = 0; node < board.n; node++) {
+    const stone = stones[node];
+    if (
+      (stone === 0 || stone === 1) &&
+      scenarios[stone].score.aliveStone[node] === 0
+    ) {
+      provablyDeadStone[node] = 1;
+    }
+  }
+
+  return { scenarios, emptyNodes, guaranteedWinner, provablyDeadStone };
 }

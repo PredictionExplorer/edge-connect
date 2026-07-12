@@ -2,7 +2,12 @@ import fc from 'fast-check';
 import { describe, expect, it } from 'vitest';
 import { getBoard, parseLabel, SUPPORTED_RINGS } from '../board';
 import { scoreCompletionBounds } from '../completion-bounds';
-import { replay, type GameAction } from '../game';
+import {
+  applyAction,
+  initialState,
+  replay,
+  type GameAction,
+} from '../game';
 import { EMPTY, scorePosition, validateTerminalWinner } from '../scoring';
 
 const configFor = (rings: number) => ({
@@ -43,6 +48,58 @@ describe('completion score bounds', () => {
 
     expect(scoreCompletionBounds(board, zeroDominant).guaranteedWinner).toBe(0);
     expect(scoreCompletionBounds(board, oneDominant).guaranteedWinner).toBe(1);
+  });
+
+  it('does not confuse projected opponent territory with permanent death', () => {
+    const board = getBoard(4);
+    const stones = new Int8Array(board.n).fill(EMPTY);
+    const amber = [parseLabel(board, 'S10'), parseLabel(board, 'R10')];
+    for (const node of amber) stones[node] = 0;
+    stones[parseLabel(board, '*40')] = 1;
+    stones[parseLabel(board, '*41')] = 1;
+
+    const live = scorePosition(board, stones);
+    const bounds = scoreCompletionBounds(board, stones);
+    expect(live.players[1].stars).toBe(1);
+    for (const node of amber) {
+      expect(live.aliveStone[node]).toBe(0);
+      expect(live.nodeOwner[node]).toBe(1);
+      expect(bounds.scenarios[0].score.aliveStone[node]).toBe(1);
+      expect(bounds.provablyDeadStone[node]).toBe(0);
+    }
+  });
+
+  it('marks a walled group only when maximal rescue cannot reach a second peri', () => {
+    const board = getBoard(4);
+    const stones = new Int8Array(board.n).fill(EMPTY);
+    for (const label of ['*43', 'T42', 'T43']) {
+      stones[parseLabel(board, label)] = 0;
+    }
+    for (const label of ['*42', '*32', 'S30', 'S40']) {
+      stones[parseLabel(board, label)] = 1;
+    }
+
+    const bounds = scoreCompletionBounds(board, stones);
+    expect(bounds.provablyDeadStone[parseLabel(board, '*43')]).toBe(1);
+    expect(bounds.provablyDeadStone[parseLabel(board, 'T42')]).toBe(0);
+    expect(bounds.provablyDeadStone[parseLabel(board, 'T43')]).toBe(0);
+  });
+
+  it('allows lone peries and bridge-separated arms to be rescued', () => {
+    const board = getBoard(4);
+    const stones = new Int8Array(board.n).fill(EMPTY);
+    for (const label of ['*40', '*30', '*20', 'A40', 'A30', 'A20']) {
+      stones[parseLabel(board, label)] = 0;
+    }
+
+    const live = scorePosition(board, stones);
+    const bounds = scoreCompletionBounds(board, stones);
+    expect(live.players[0].stars).toBe(0);
+    for (const label of ['*40', 'A40']) {
+      const node = parseLabel(board, label);
+      expect(bounds.scenarios[0].score.aliveStone[node]).toBe(1);
+      expect(bounds.provablyDeadStone[node]).toBe(0);
+    }
   });
 
   it('rejects malformed positions', () => {
@@ -134,6 +191,11 @@ describe('completion-bound properties', () => {
           if (bounds.guaranteedWinner !== null) {
             expect(actual.winner).toBe(bounds.guaranteedWinner);
           }
+          for (let node = 0; node < board.n; node++) {
+            if (bounds.provablyDeadStone[node]) {
+              expect(actual.score.aliveStone[node]).toBe(0);
+            }
+          }
 
           const swapped = Int8Array.from(partial, (stone) =>
             stone === EMPTY ? EMPTY : 1 - stone,
@@ -152,6 +214,35 @@ describe('completion-bound properties', () => {
               ? null
               : 1 - bounds.guaranteedWinner,
           );
+          expect(Array.from(mirrored.provablyDeadStone)).toEqual(
+            Array.from(bounds.provablyDeadStone),
+          );
+        },
+      ),
+      { numRuns: 80 },
+    );
+  });
+
+  it('never revives a provably dead stone along a legal trace', () => {
+    fc.assert(
+      fc.property(
+        fc.uniqueArray(fc.integer({ min: 0, max: 49 }), {
+          maxLength: 50,
+        }),
+        (order) => {
+          let state = initialState(configFor(4));
+          const established = new Uint8Array(state.board.n);
+
+          for (const node of order) {
+            state = applyAction(state, { type: 'place', node });
+            const bounds = scoreCompletionBounds(state.board, state.stones);
+            for (let placed = 0; placed < state.board.n; placed++) {
+              if (established[placed]) {
+                expect(bounds.provablyDeadStone[placed]).toBe(1);
+              }
+              if (bounds.provablyDeadStone[placed]) established[placed] = 1;
+            }
+          }
         },
       ),
       { numRuns: 80 },

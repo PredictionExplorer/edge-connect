@@ -122,6 +122,11 @@ export function ScorePanel({ game, score, completionBounds }: ScorePanelProps) {
 
   return (
     <div className="flex flex-col gap-3">
+      <div className="flex items-center justify-between px-1 text-[10px] font-semibold uppercase tracking-[0.16em] text-muted">
+        <span>{game.over ? 'Final score' : 'Current scoring projection'}</span>
+        {!game.over && <span className="normal-case tracking-normal">can change</span>}
+      </div>
+
       {([0, 1] as const).map((p) => {
         const s = score.players[p];
         const active = !game.over && game.toMove === p;
@@ -182,11 +187,13 @@ export function ScorePanel({ game, score, completionBounds }: ScorePanelProps) {
             {score.contestedPeries === 1 ? 'i is' : 'ies are'} still contested · totals reach{' '}
             <span className="text-gold">{game.board.periCount + 1}</span> when decided
           </>
-        ) : (
+        ) : game.over ? (
           <>
             every peri is claimed — totals sum to{' '}
             <span className="text-gold">{game.board.periCount + 1}</span>
           </>
+        ) : (
+          <>the current projection assigns every peri — play can still change it</>
         )}
       </p>
 

@@ -3,6 +3,7 @@ import userEvent from '@testing-library/user-event';
 import { axe } from 'vitest-axe';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { getBoard, parseLabel } from '@/lib/star/board';
+import { scoreCompletionBounds } from '@/lib/star/completion-bounds';
 import { EMPTY, scorePosition } from '@/lib/star/scoring';
 import { StarBoard } from '../StarBoard';
 
@@ -148,7 +149,60 @@ describe('StarBoard', () => {
     expect(container.querySelectorAll('[data-group-highlight]')).toHaveLength(2);
   });
 
-  it('marks an opponent-owned stone as captured without influence enabled', () => {
+  it('does not cross out rescuable stones in projected opponent territory', () => {
+    const stones = emptyBoard();
+    const amber = [parseLabel(board, 'S10'), parseLabel(board, 'R10')];
+    for (const node of amber) stones[node] = 0;
+    stones[parseLabel(board, '*40')] = 1;
+    stones[parseLabel(board, '*41')] = 1;
+    const score = scorePosition(board, stones);
+    const bounds = scoreCompletionBounds(board, stones);
+    const { container, rerender } = render(
+      <StarBoard
+        board={board}
+        stones={stones}
+        nodeOwner={score.nodeOwner}
+        aliveStone={score.aliveStone}
+        provablyDeadStone={bounds.provablyDeadStone}
+        interactive
+        playerNames={['Ada', 'Grace']}
+      />,
+    );
+
+    for (const node of amber) {
+      expect(score.nodeOwner[node]).toBe(1);
+      expect(bounds.provablyDeadStone[node]).toBe(0);
+      expect(
+        container.querySelector(`[data-stone-node="${node}"]`),
+      ).toHaveAttribute('opacity', '1');
+    }
+    expect(
+      container.querySelectorAll('[data-provably-dead-stone]'),
+    ).toHaveLength(0);
+
+    rerender(
+      <StarBoard
+        board={board}
+        stones={stones}
+        nodeOwner={score.nodeOwner}
+        aliveStone={score.aliveStone}
+        provablyDeadStone={bounds.provablyDeadStone}
+        showTerritory
+        interactive
+        playerNames={['Ada', 'Grace']}
+      />,
+    );
+    for (const node of amber) {
+      expect(
+        container.querySelector(`[data-stone-node="${node}"]`),
+      ).toHaveAttribute('opacity', '0.35');
+    }
+    expect(
+      container.querySelectorAll('[data-provably-dead-stone]'),
+    ).toHaveLength(0);
+  });
+
+  it('marks a provably dead stone without influence enabled', () => {
     const stones = emptyBoard();
     for (const label of ['*43', 'T42', 'T43']) {
       stones[parseLabel(board, label)] = 0;
@@ -157,6 +211,7 @@ describe('StarBoard', () => {
       stones[parseLabel(board, label)] = 1;
     }
     const score = scorePosition(board, stones);
+    const bounds = scoreCompletionBounds(board, stones);
     const captured = parseLabel(board, '*43');
     const { container } = render(
       <StarBoard
@@ -164,20 +219,46 @@ describe('StarBoard', () => {
         stones={stones}
         nodeOwner={score.nodeOwner}
         aliveStone={score.aliveStone}
+        provablyDeadStone={bounds.provablyDeadStone}
         interactive
         playerNames={['Ada', 'Grace']}
       />,
     );
 
     expect(score.nodeOwner[captured]).toBe(1);
+    expect(bounds.provablyDeadStone[captured]).toBe(1);
     expect(
-      container.querySelector(`[data-captured-stone="${captured}"]`),
+      container.querySelector(`[data-provably-dead-stone="${captured}"]`),
     ).toBeInTheDocument();
     expect(
       screen.getByRole('button', {
-        name: /node \*43, ada stone on peri, currently surrounded and captured by grace/i,
+        name: /node \*43, ada stone on peri, provably dead; cannot form a living star in any completion/i,
       }),
     ).toBeInTheDocument();
+  });
+
+  it('crosses every stone in a supplied provably dead group', () => {
+    const stones = emptyBoard();
+    const first = parseLabel(board, 'S20');
+    const second = parseLabel(board, 'S30');
+    stones[first] = 0;
+    stones[second] = 0;
+    const dead = new Uint8Array(board.n);
+    dead[first] = 1;
+    dead[second] = 1;
+    const { container } = render(
+      <StarBoard
+        board={board}
+        stones={stones}
+        provablyDeadStone={dead}
+        interactive
+        playerNames={['Ada', 'Grace']}
+      />,
+    );
+
+    expect(
+      container.querySelectorAll('[data-provably-dead-stone]'),
+    ).toHaveLength(2);
   });
 
   it('has no detectable accessibility violations', async () => {

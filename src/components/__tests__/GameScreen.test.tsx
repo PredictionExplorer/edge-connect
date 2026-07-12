@@ -10,6 +10,7 @@ import {
   type StarAiResponse,
 } from '@/lib/star/ai/protocol';
 import { requestServerAiAction } from '@/lib/star/ai/server-client';
+import { getBoard, parseLabel } from '@/lib/star/board';
 import {
   useAppStore,
   type AppState,
@@ -243,5 +244,57 @@ describe('GameScreen score guidance', () => {
     expect(
       screen.queryByRole('heading', { name: 'Completion bounds' }),
     ).not.toBeInTheDocument();
+  });
+
+  it('does not cross rescuable stones in projected opponent territory', () => {
+    const board = getBoard(4);
+    resetPlayingStore({
+      controllers: ['human', 'human'],
+      log: ['S10', '*40', '*41'].map((label) => ({
+        type: 'place' as const,
+        node: parseLabel(board, label),
+      })),
+    });
+    const { container } = render(<GameScreen />);
+
+    expect(
+      screen.getByText('Current scoring projection'),
+    ).toBeInTheDocument();
+    expect(
+      container.querySelectorAll('[data-provably-dead-stone]'),
+    ).toHaveLength(0);
+    expect(
+      screen.getByRole('button', {
+        name: /node s10, ada stone.*not currently part of a living star/i,
+      }),
+    ).toBeInTheDocument();
+  });
+
+  it('removes and restores a provably dead marker through undo and redo', async () => {
+    const user = userEvent.setup();
+    const board = getBoard(4);
+    const dead = parseLabel(board, '*43');
+    resetPlayingStore({
+      controllers: ['human', 'human'],
+      log: ['*43', '*42', '*32', 'T42', 'T43', 'S30', 'S40'].map(
+        (label) => ({
+          type: 'place' as const,
+          node: parseLabel(board, label),
+        }),
+      ),
+    });
+    const { container } = render(<GameScreen />);
+
+    expect(
+      container.querySelector(`[data-provably-dead-stone="${dead}"]`),
+    ).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: 'Undo' }));
+    expect(
+      container.querySelector(`[data-provably-dead-stone="${dead}"]`),
+    ).not.toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: 'Redo' }));
+    expect(
+      container.querySelector(`[data-provably-dead-stone="${dead}"]`),
+    ).toBeInTheDocument();
   });
 });

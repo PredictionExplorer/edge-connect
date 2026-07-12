@@ -258,7 +258,7 @@ export function GameScreen() {
   );
   const completionBounds = useMemo(
     () =>
-      game && !game.over && !game.canSwap
+      game && !game.canSwap
         ? scoreCompletionBounds(game.board, game.stones)
         : null,
     [game],
@@ -332,6 +332,7 @@ export function GameScreen() {
             stones={game.stones}
             nodeOwner={score.nodeOwner}
             aliveStone={score.aliveStone}
+            provablyDeadStone={completionBounds?.provablyDeadStone}
             showTerritory={showTerritory}
             lastMove={game.lastMove}
             currentTurnMoves={game.currentTurnMoves}
@@ -541,9 +542,9 @@ export function GameScreen() {
           </label>
 
           <p className="px-1 text-[11px] leading-relaxed text-muted">
-            Influence shows who currently claims each peri — occupied or walled off — and dims
-            stones that do not yet belong to a star. Surrounded stones are always crossed out.
-            Influence is always on once the game ends.
+            Influence shows the current scoring projection and dims groups that are not yet
+            stars. Crosses mark only groups that cannot become a star even if they received every
+            open node. Influence is always on once the game ends.
           </p>
         </div>
       </div>
