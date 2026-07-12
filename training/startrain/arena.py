@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 import random
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Executor, ThreadPoolExecutor
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from statistics import NormalDist
@@ -705,7 +705,10 @@ class ArenaRunner:
         config: ArenaConfig,
         baseline_search: ArenaSearchBudget | None = None,
         baseline_metadata: Mapping[str, object] | None = None,
+        search_workers: int = 2,
     ) -> None:
+        if search_workers not in (1, 2):
+            raise ValueError("arena search_workers must be one or two")
         self.native = native_module
         self.candidate = candidate
         self.baseline = baseline
@@ -713,6 +716,10 @@ class ArenaRunner:
         self.candidate_search = ArenaSearchBudget.from_config(config)
         self.baseline_search = baseline_search or self.candidate_search
         self.baseline_metadata = dict(baseline_metadata or {})
+        self.search_workers = search_workers
+        self._inference_calls = 0
+        self._inference_seconds = 0.0
+        self._inference_queue_wait_seconds = 0.0
 
     def run(
         self,
@@ -729,53 +736,72 @@ class ArenaRunner:
         baseline_rows_before = int(getattr(self.baseline, "evaluator_rows", 0))
         games: list[ArenaGame] = []
         pairs: list[ArenaPair] = []
-        for ring in self.config.rings:
-            node_count = get_topology(ring).n
-            first_pair = int((pair_starts or {}).get(ring, 0))
-            pair_count = int((pair_counts or {}).get(ring, self.config.pairs_per_ring))
-            specifications: list[tuple[int, int, int, int | None]] = []
-            for pair in range(first_pair, first_pair + pair_count):
-                opening_seed = _opening_seed(self.config.seed, ring, pair)
-                forced_opening = _forced_opening(
-                    opening_seed, self.config.unforced_opening_fraction
+        self._inference_calls = 0
+        self._inference_seconds = 0.0
+        self._inference_queue_wait_seconds = 0.0
+        # Dynamo/Inductor compiled models are not thread-safe. Keep the two
+        # GIL-releasing native search groups parallel, but route both models
+        # through one stable inference thread for the entire arena run.
+        with ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="arena-inference",
+        ) as inference_executor:
+            for ring in self.config.rings:
+                node_count = get_topology(ring).n
+                first_pair = int((pair_starts or {}).get(ring, 0))
+                pair_count = int(
+                    (pair_counts or {}).get(ring, self.config.pairs_per_ring)
                 )
-                opening_action = opening_seed % node_count if forced_opening else None
-                for candidate_player in (0, 1):
-                    specifications.append(
-                        (
-                            pair,
-                            candidate_player,
-                            opening_seed,
-                            opening_action,
-                        )
+                specifications: list[tuple[int, int, int, int | None]] = []
+                for pair in range(first_pair, first_pair + pair_count):
+                    opening_seed = _opening_seed(self.config.seed, ring, pair)
+                    forced_opening = _forced_opening(
+                        opening_seed, self.config.unforced_opening_fraction
                     )
-            ring_games = self._play_ring_batch(ring, specifications, progress=progress)
-            games.extend(ring_games)
-            for offset in range(0, len(ring_games), 2):
-                pair_games = ring_games[offset : offset + 2]
-                pair = pair_games[0].pair
-                opening_seed = pair_games[0].opening_seed
-                opening_action = pair_games[0].opening_action
-                forced_opening = pair_games[0].forced_opening
-                completed_pair = ArenaPair(
-                    ring=ring,
-                    pair=pair,
-                    opening_seed=opening_seed,
-                    opening_action=opening_action,
-                    forced_opening=forced_opening,
-                    outcomes=(
-                        pair_games[0].outcome,
-                        pair_games[1].outcome,
-                    ),
+                    opening_action = (
+                        opening_seed % node_count if forced_opening else None
+                    )
+                    for candidate_player in (0, 1):
+                        specifications.append(
+                            (
+                                pair,
+                                candidate_player,
+                                opening_seed,
+                                opening_action,
+                            )
+                        )
+                ring_games = self._play_ring_batch(
+                    ring,
+                    specifications,
+                    progress=progress,
+                    inference_executor=inference_executor,
                 )
-                pairs.append(completed_pair)
-                if progress is not None:
-                    progress(
-                        phase="arena",
+                games.extend(ring_games)
+                for offset in range(0, len(ring_games), 2):
+                    pair_games = ring_games[offset : offset + 2]
+                    pair = pair_games[0].pair
+                    opening_seed = pair_games[0].opening_seed
+                    opening_action = pair_games[0].opening_action
+                    forced_opening = pair_games[0].forced_opening
+                    completed_pair = ArenaPair(
                         ring=ring,
                         pair=pair,
-                        completed_pairs=len(pairs),
+                        opening_seed=opening_seed,
+                        opening_action=opening_action,
+                        forced_opening=forced_opening,
+                        outcomes=(
+                            pair_games[0].outcome,
+                            pair_games[1].outcome,
+                        ),
                     )
+                    pairs.append(completed_pair)
+                    if progress is not None:
+                        progress(
+                            phase="arena",
+                            ring=ring,
+                            pair=pair,
+                            completed_pairs=len(pairs),
+                        )
         statistical = summarize_arena_pairs(pairs, self.config)
         candidate_calls = (
             int(getattr(self.candidate, "evaluator_calls", 0)) - candidate_calls_before
@@ -815,11 +841,16 @@ class ArenaRunner:
                 "total_evaluator_calls": candidate_calls + baseline_calls,
                 "total_evaluator_rows": total_rows,
                 "evaluator_rows_per_second": (total_rows / elapsed if elapsed else 0.0),
+                "serialized_inference_calls": self._inference_calls,
+                "serialized_inference_seconds": self._inference_seconds,
+                "inference_queue_wait_seconds": (self._inference_queue_wait_seconds),
             },
             "search": {
                 "deterministic": True,
                 **self.candidate_search.metadata(),
                 "pie_rule": False,
+                "search_workers": self.search_workers,
+                "inference_workers": 1,
             },
             **statistical,
             "games": [asdict(game) for game in games],
@@ -832,6 +863,7 @@ class ArenaRunner:
         specifications: Sequence[tuple[int, int, int, int | None]],
         *,
         progress: Callable[..., None] | None,
+        inference_executor: Executor,
     ) -> list[ArenaGame]:
         importer = getattr(self.native.StateBatch, "from_semantic", None)
         if not callable(importer):
@@ -842,6 +874,7 @@ class ArenaRunner:
                     candidate_player=candidate_player,
                     opening_seed=opening_seed,
                     opening_action=opening_action,
+                    inference_executor=inference_executor,
                 )
                 for pair, candidate_player, opening_seed, opening_action in specifications
             ]
@@ -860,7 +893,7 @@ class ArenaRunner:
         wave = 0
         maximum_moves = get_topology(ring).n
         with ThreadPoolExecutor(
-            max_workers=2,
+            max_workers=self.search_workers,
             thread_name_prefix="arena-search",
         ) as executor:
             while True:
@@ -905,6 +938,7 @@ class ArenaRunner:
                             seed,
                             len(rows),
                             rows,
+                            inference_executor,
                         )
                     )
                 for future in futures:
@@ -955,6 +989,7 @@ class ArenaRunner:
         seed: int,
         row_count: int,
         rows: Sequence[int],
+        inference_executor: Executor,
     ) -> tuple[list[int], list[int]]:
         search = self.native.SearchBatch(
             states,
@@ -965,7 +1000,11 @@ class ArenaRunner:
             deterministic_seed=seed,
         )
         roots = search.root_requests()
-        response = evaluator.evaluate(roots)
+        response = self._evaluate_serialized(
+            inference_executor,
+            evaluator,
+            roots,
+        )
         search.initialize_roots(*response.submit_args())
         guard = 0
         while not search.is_done():
@@ -975,7 +1014,11 @@ class ArenaRunner:
             requests = search.next_requests()
             if len(requests) == 0:
                 continue
-            response = evaluator.evaluate(requests)
+            response = self._evaluate_serialized(
+                inference_executor,
+                evaluator,
+                requests,
+            )
             search.submit(*response.submit_args())
         results = search.results()
         actions = [int(value) for value in results.selected_actions]
@@ -984,6 +1027,25 @@ class ArenaRunner:
         if any(action < 0 for action in actions):
             raise RuntimeError("active batched arena row returned invalid placement")
         return list(rows), actions
+
+    def _evaluate_serialized(
+        self,
+        inference_executor: Executor,
+        evaluator: ArenaEvaluatorProtocol,
+        requests: NativeEvalBatchProtocol,
+    ) -> InferenceResponse:
+        submitted = time.perf_counter()
+
+        def evaluate() -> InferenceResponse:
+            started = time.perf_counter()
+            self._inference_queue_wait_seconds += started - submitted
+            try:
+                return evaluator.evaluate(requests)
+            finally:
+                self._inference_calls += 1
+                self._inference_seconds += time.perf_counter() - started
+
+        return inference_executor.submit(evaluate).result()
 
     def _semantic_subset(self, data: Any, rows: Sequence[int]) -> Any:
         def words(name: str) -> list[int]:
@@ -1011,6 +1073,7 @@ class ArenaRunner:
         candidate_player: int,
         opening_seed: int,
         opening_action: int | None,
+        inference_executor: Executor,
     ) -> ArenaGame:
         states = self.native.StateBatch(ring, 1)
         # Both games in a pair receive the same legal one-stone opening. The
@@ -1039,7 +1102,11 @@ class ArenaRunner:
                 deterministic_seed=_search_seed(opening_seed, moves),
             )
             roots = search.root_requests()
-            root_response = evaluator.evaluate(roots)
+            root_response = self._evaluate_serialized(
+                inference_executor,
+                evaluator,
+                roots,
+            )
             search.initialize_roots(*root_response.submit_args())
             guard = 0
             while not search.is_done():
@@ -1049,7 +1116,11 @@ class ArenaRunner:
                 requests = search.next_requests()
                 if len(requests) == 0:
                     continue
-                response = evaluator.evaluate(requests)
+                response = self._evaluate_serialized(
+                    inference_executor,
+                    evaluator,
+                    requests,
+                )
                 search.submit(*response.submit_args())
             results = search.results()
             if bool(results.terminal[0]) or int(results.selected_actions[0]) < 0:

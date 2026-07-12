@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import threading
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -247,8 +248,13 @@ def test_pair_promotion_and_per_ring_regression_are_binary() -> None:
     assert assessment["ring_floors"]["10"]["passed"] is False
 
 
-def test_batched_arena_advances_candidate_and_baseline_groups_concurrently() -> None:
-    barrier = threading.Barrier(2, timeout=2)
+def test_batched_arena_parallelizes_search_but_serializes_inference() -> None:
+    search_barrier: threading.Barrier | None = threading.Barrier(2, timeout=2)
+    inference_guard = threading.Lock()
+    active_inference = 0
+    maximum_active_inference = 0
+    inference_threads: set[int] = set()
+    search_threads: set[int] = set()
 
     class BatchRequests:
         def __init__(self, size: int) -> None:
@@ -260,7 +266,7 @@ def test_batched_arena_advances_candidate_and_baseline_groups_concurrently() -> 
         def __len__(self) -> int:
             return len(self.tokens)
 
-    class ConcurrentEvaluator:
+    class SerializedEvaluator:
         evaluator_calls = 0
         evaluator_rows = 0
 
@@ -268,15 +274,26 @@ def test_batched_arena_advances_candidate_and_baseline_groups_concurrently() -> 
             self.model_version = name
 
         def evaluate(self, requests: BatchRequests) -> InferenceResponse:
-            barrier.wait()
-            self.evaluator_calls += 1
-            self.evaluator_rows += len(requests)
-            return InferenceResponse(
-                tokens=list(requests.tokens),
-                values=[0.0] * len(requests),
-                policy_offsets=list(requests.legal_offsets),
-                policy_logits=[1.0] * len(requests),
-            )
+            nonlocal active_inference, maximum_active_inference
+            with inference_guard:
+                active_inference += 1
+                maximum_active_inference = max(
+                    maximum_active_inference, active_inference
+                )
+                inference_threads.add(threading.get_ident())
+            try:
+                time.sleep(0.01)
+                self.evaluator_calls += 1
+                self.evaluator_rows += len(requests)
+                return InferenceResponse(
+                    tokens=list(requests.tokens),
+                    values=[0.0] * len(requests),
+                    policy_offsets=list(requests.legal_offsets),
+                    policy_logits=[1.0] * len(requests),
+                )
+            finally:
+                with inference_guard:
+                    active_inference -= 1
 
     class BatchStates:
         def __init__(self, rings: int, batch_size: int) -> None:
@@ -340,6 +357,9 @@ def test_batched_arena_advances_candidate_and_baseline_groups_concurrently() -> 
             self.initialized = False
 
         def root_requests(self) -> BatchRequests:
+            search_threads.add(threading.get_ident())
+            if search_barrier is not None:
+                search_barrier.wait()
             return BatchRequests(self.size)
 
         def initialize_roots(self, *_buffers: object) -> None:
@@ -361,8 +381,8 @@ def test_batched_arena_advances_candidate_and_baseline_groups_concurrently() -> 
             )
 
     native = SimpleNamespace(StateBatch=BatchStates, SearchBatch=BatchSearch)
-    candidate = ConcurrentEvaluator("candidate")
-    baseline = ConcurrentEvaluator("baseline")
+    candidate = SerializedEvaluator("candidate")
+    baseline = SerializedEvaluator("baseline")
     result = ArenaRunner(
         native_module=native,
         candidate=candidate,
@@ -384,6 +404,36 @@ def test_batched_arena_advances_candidate_and_baseline_groups_concurrently() -> 
     assert "draws" not in result["aggregate"]
     assert candidate.evaluator_calls == baseline.evaluator_calls == 2
     assert candidate.evaluator_rows == baseline.evaluator_rows == 3
+    assert len(search_threads) == 2
+    assert maximum_active_inference == 1
+    assert len(inference_threads) == 1
+    assert result["evaluation_metrics"]["serialized_inference_calls"] == 4
+    assert result["search"]["search_workers"] == 2
+    assert result["search"]["inference_workers"] == 1
+
+    search_barrier = None
+    sequential = ArenaRunner(
+        native_module=native,
+        candidate=SerializedEvaluator("candidate"),
+        baseline=SerializedEvaluator("baseline"),
+        config=ArenaConfig(
+            rings=(4,),
+            pairs_per_ring=2,
+            simulations=1,
+            max_considered=1,
+            minimum_pairs_per_ring=2,
+            max_pairs_per_ring=4,
+            bootstrap_samples=200,
+            regression_floor_elo=-2_500,
+            unforced_opening_fraction=0.5,
+        ),
+        search_workers=1,
+    ).run()
+
+    assert result["games"] == sequential["games"]
+    assert result["pairs"] == sequential["pairs"]
+    assert result["aggregate"] == sequential["aggregate"]
+    assert result["promotion"] == sequential["promotion"]
 
 
 def test_pair_confidence_summary_and_internal_target_use_anytime_bounds() -> None:

@@ -3,8 +3,12 @@ from __future__ import annotations
 import torch
 
 import pytest
+from startrain.arena import ArenaRunner
+from startrain.config import ArenaConfig
 from startrain.features import DoubleStarPosition, encode_batch
+from startrain.inference import GraphInferenceAdapter, InferenceConfig
 from startrain.model import GraphResTNet, ModelConfig
+from startrain.native import load_star_native
 from startrain.topology import get_topology
 from startrain.training import maybe_compile_model, unwrap_model
 
@@ -66,6 +70,56 @@ def test_cuda_bf16_compiled_forward_backward_is_finite() -> None:
             parameter.grad is None or bool(torch.isfinite(parameter.grad).all())
             for parameter in model.parameters()
         )
+
+
+@pytest.mark.cuda
+@pytest.mark.native
+@pytest.mark.timeout(600)
+def test_cuda_dual_compiled_arena_first_wave_completes() -> None:
+    native = load_star_native(required=True)
+    assert native is not None
+    evaluators = []
+    for version in ("candidate", "baseline"):
+        model = _model().eval()
+        compiled = maybe_compile_model(
+            model,
+            enabled=True,
+            dynamic=True,
+            fullgraph=True,
+            backend="inductor",
+        )
+        evaluators.append(
+            GraphInferenceAdapter(
+                compiled,
+                device="cuda",
+                config=InferenceConfig(precision="bf16"),
+                model_version=version,
+            )
+        )
+    progress: list[dict[str, object]] = []
+
+    result = ArenaRunner(
+        native_module=native,
+        candidate=evaluators[0],
+        baseline=evaluators[1],
+        config=ArenaConfig(
+            rings=(4,),
+            pairs_per_ring=2,
+            simulations=2,
+            max_considered=2,
+            minimum_pairs_per_ring=2,
+            max_pairs_per_ring=2,
+            bootstrap_samples=200,
+            regression_floor_elo=-2_500,
+        ),
+    ).run(progress=lambda **details: progress.append(details))
+
+    assert len(result["pairs"]) == 2
+    assert result["evaluation_metrics"]["serialized_inference_calls"] > 0
+    assert result["evaluation_metrics"]["total_evaluator_rows"] > 0
+    assert result["search"]["search_workers"] == 2
+    assert result["search"]["inference_workers"] == 1
+    assert any(item.get("completed_pairs") == 2 for item in progress)
 
 
 @pytest.mark.cuda

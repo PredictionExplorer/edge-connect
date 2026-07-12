@@ -556,14 +556,31 @@ class PromotionSupervisor:
                 candidate_step=candidate.model_step,
                 champion_step=champion.model_step,
             )
+            progress(
+                phase="arena_loading_candidate",
+                candidate_step=candidate.model_step,
+                champion_step=champion.model_step,
+            )
         candidate_evaluator = load_manifest_evaluator(
             self.experiment, candidate, device=self.device
         )
         try:
+            if progress is not None:
+                progress(
+                    phase="arena_loading_champion",
+                    candidate_step=candidate.model_step,
+                    champion_step=champion.model_step,
+                )
             champion_evaluator = load_manifest_evaluator(
                 self.experiment, champion, device=self.device
             )
             try:
+                if progress is not None:
+                    progress(
+                        phase="arena_search_start",
+                        candidate_step=candidate.model_step,
+                        champion_step=champion.model_step,
+                    )
                 result = ArenaRunner(
                     native_module=self.native,
                     candidate=candidate_evaluator,

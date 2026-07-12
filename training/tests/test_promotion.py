@@ -194,7 +194,21 @@ def test_promotion_supervisor_bootstraps_and_only_promotes_arena_pass(
     newest_seed = supervisor._arena_config(newest, first).seed
     assert first_seed != newest_seed
     assert first_seed == supervisor._arena_config(second, first).seed
-    assert supervisor.run(stop_requested=lambda: False, once=True) == 1
+    progress: list[dict[str, object]] = []
+    assert (
+        supervisor.run(
+            stop_requested=lambda: False,
+            progress=lambda **details: progress.append(details),
+            once=True,
+        )
+        == 1
+    )
+    phases = [item.get("phase") for item in progress]
+    assert phases.index("arena") < phases.index("arena_loading_candidate")
+    assert phases.index("arena_loading_candidate") < phases.index(
+        "arena_loading_champion"
+    )
+    assert phases.index("arena_loading_champion") < phases.index("arena_search_start")
     champion = load_model_manifest(tmp_path / "learner" / "champion.json")
     assert champion.model_identity == newest.model_identity
     assert champion.model_identity != first.model_identity
