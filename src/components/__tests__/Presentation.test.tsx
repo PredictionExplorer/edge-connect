@@ -40,13 +40,24 @@ describe('RulesDialog', () => {
     const user = userEvent.setup();
     const onClose = vi.fn();
     const { container, rerender } = render(
-      <RulesDialog open={false} onClose={onClose} />,
+      <>
+        <button type="button">Open rules</button>
+        <RulesDialog open={false} onClose={onClose} />
+      </>,
     );
     expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
 
-    rerender(<RulesDialog open onClose={onClose} />);
+    const opener = screen.getByRole('button', { name: 'Open rules' });
+    opener.focus();
+    rerender(
+      <>
+        <button type="button">Open rules</button>
+        <RulesDialog open onClose={onClose} />
+      </>,
+    );
     const close = screen.getByRole('button', { name: 'Close rules' });
     expect(close).toHaveFocus();
+    expect(document.body.style.overflow).toBe('hidden');
     await user.click(screen.getByRole('heading', { name: 'How to play' }));
     expect(onClose).not.toHaveBeenCalled();
     await user.keyboard('{Escape}');
@@ -54,6 +65,15 @@ describe('RulesDialog', () => {
     await user.click(screen.getByRole('dialog'));
     expect(onClose).toHaveBeenCalledTimes(2);
     expect((await axe(container)).violations).toEqual([]);
+
+    rerender(
+      <>
+        <button type="button">Open rules</button>
+        <RulesDialog open={false} onClose={onClose} />
+      </>,
+    );
+    expect(document.body.style.overflow).toBe('');
+    expect(screen.getByRole('button', { name: 'Open rules' })).toHaveFocus();
   });
 });
 
@@ -84,6 +104,7 @@ describe('GameOverOverlay', () => {
     expect(
       screen.getByRole('heading', { name: /Aurora wins/ }),
     ).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Rematch' })).toHaveFocus();
     await user.click(screen.getByRole('button', { name: 'Review board' }));
     await user.click(screen.getByRole('button', { name: 'Rematch' }));
     await user.click(screen.getByRole('button', { name: 'New setup' }));

@@ -65,19 +65,19 @@ export function EngineEstimatePanel({
       aria-labelledby={titleId}
       className="rounded-2xl border border-gold/30 bg-gold-faint"
     >
-      <details open className="group px-4 py-3">
-        <summary className="cursor-pointer list-none text-sm text-gold-strong marker:text-gold">
+      <details className="group px-4 py-2">
+        <summary className="flex min-h-11 cursor-pointer list-none items-center text-sm text-gold-strong marker:text-gold">
           <span id={titleId} className="font-medium">
             Engine estimate
           </span>
-          <span className="ml-2 text-[11px] text-muted">
+          <span className="ml-2 truncate text-xs text-muted">
             from {playerNames[analysis.perspective]}&apos;s turn
           </span>
         </summary>
 
-        <div className="mt-3 grid gap-2 text-xs sm:grid-cols-2">
+        <div className="mb-2 mt-1 grid gap-2 text-xs sm:grid-cols-2">
           <div className="rounded-lg border border-white/10 bg-black/10 px-3 py-2">
-            <p className="text-[10px] uppercase tracking-wider text-muted">
+            <p className="text-xs uppercase tracking-[0.12em] text-muted">
               Win estimates
             </p>
             <p className="mt-1 text-ink">
@@ -88,7 +88,7 @@ export function EngineEstimatePanel({
             </p>
           </div>
           <div className="rounded-lg border border-white/10 bg-black/10 px-3 py-2">
-            <p className="text-[10px] uppercase tracking-wider text-muted">
+            <p className="text-xs uppercase tracking-[0.12em] text-muted">
               Expected margin
             </p>
             <p className="mt-1 text-ink">
@@ -96,7 +96,7 @@ export function EngineEstimatePanel({
             </p>
           </div>
           <div className="rounded-lg border border-white/10 bg-black/10 px-3 py-2">
-            <p className="text-[10px] uppercase tracking-wider text-muted">
+            <p className="text-xs uppercase tracking-[0.12em] text-muted">
               Search value
             </p>
             <p className="mt-1 font-mono text-ink">
@@ -104,7 +104,7 @@ export function EngineEstimatePanel({
             </p>
           </div>
           <div className="rounded-lg border border-white/10 bg-black/10 px-3 py-2">
-            <p className="text-[10px] uppercase tracking-wider text-muted">
+            <p className="text-xs uppercase tracking-[0.12em] text-muted">
               Simulations
             </p>
             <p className="mt-1 text-ink">
@@ -112,7 +112,7 @@ export function EngineEstimatePanel({
             </p>
           </div>
           <div className="rounded-lg border border-white/10 bg-black/10 px-3 py-2">
-            <p className="text-[10px] uppercase tracking-wider text-muted">
+            <p className="text-xs uppercase tracking-[0.12em] text-muted">
               Latency
             </p>
             <p className="mt-1 text-ink">
@@ -120,7 +120,7 @@ export function EngineEstimatePanel({
             </p>
           </div>
           <div className="rounded-lg border border-white/10 bg-black/10 px-3 py-2">
-            <p className="text-[10px] uppercase tracking-wider text-muted">
+            <p className="text-xs uppercase tracking-[0.12em] text-muted">
               Model step
             </p>
             <p className="mt-1 text-ink">
@@ -132,14 +132,14 @@ export function EngineEstimatePanel({
         </div>
 
         <div className="mt-3">
-          <p className="text-[10px] uppercase tracking-wider text-muted">
+          <p className="text-xs uppercase tracking-[0.12em] text-muted">
             Top candidate moves by visits
           </p>
           <ol className="mt-1.5 space-y-1">
             {candidates.map((candidate) => (
               <li
                 key={candidate.action.node}
-                className="grid grid-cols-[auto_1fr] items-baseline gap-2 rounded-lg bg-black/10 px-2.5 py-1.5 text-[11px] sm:grid-cols-[auto_1fr_auto]"
+                className="grid grid-cols-[auto_1fr] items-baseline gap-2 rounded-lg bg-black/10 px-2.5 py-1.5 text-xs sm:grid-cols-[auto_1fr_auto]"
               >
                 <span className="font-mono text-gold-strong">
                   {board.labels[candidate.action.node]}

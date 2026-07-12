@@ -1,4 +1,4 @@
-import type { Metadata } from "next";
+import type { Metadata, Viewport } from "next";
 import { Geist, Geist_Mono, Fraunces } from "next/font/google";
 import "./globals.css";
 
@@ -22,6 +22,11 @@ export const metadata: Metadata = {
   title: "✳Star — a connection game",
   description:
     "Play *Star, Ea Ea's connection game of peries, quarks and stars, for two players on one screen. Classic and Double *Star variants on boards of any size.",
+};
+
+export const viewport: Viewport = {
+  themeColor: "#0a0d1d",
+  colorScheme: "dark",
 };
 
 export default function RootLayout({

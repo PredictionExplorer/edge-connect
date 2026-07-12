@@ -27,9 +27,10 @@ describe('Home phase routing', () => {
 
   it('always renders decoration and gates setup until hydration', () => {
     state.mounted = false;
-    render(<Home />);
+    const { container } = render(<Home />);
     expect(screen.getByText('starfield')).toBeInTheDocument();
     expect(screen.queryByText('setup-screen')).not.toBeInTheDocument();
+    expect(container.querySelector('.app-skeleton')).toBeInTheDocument();
   });
 
   it('selects setup and game screens from the persisted phase', () => {
@@ -38,6 +39,22 @@ describe('Home phase routing', () => {
     state.phase = 'playing';
     rerender(<Home />);
     expect(screen.getByText('game-screen')).toBeInTheDocument();
+  });
+
+  it('resets document scroll whenever the persisted phase changes', () => {
+    const scrollTo = vi.spyOn(window, 'scrollTo');
+    const { rerender } = render(<Home />);
+    scrollTo.mockClear();
+
+    state.phase = 'playing';
+    rerender(<Home />);
+
+    expect(scrollTo).toHaveBeenCalledWith({
+      top: 0,
+      left: 0,
+      behavior: 'auto',
+    });
+    scrollTo.mockRestore();
   });
 });
 

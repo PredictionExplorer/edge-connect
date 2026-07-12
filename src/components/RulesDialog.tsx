@@ -1,7 +1,8 @@
 'use client';
 
-import { useEffect, useRef } from 'react';
+import { useId, useRef } from 'react';
 import { X } from 'lucide-react';
+import { ModalDialog } from './ModalDialog';
 
 interface RulesDialogProps {
   open: boolean;
@@ -10,27 +11,18 @@ interface RulesDialogProps {
 
 export function RulesDialog({ open, onClose }: RulesDialogProps) {
   const closeButton = useRef<HTMLButtonElement>(null);
-  useEffect(() => {
-    if (!open) return;
-    closeButton.current?.focus();
-    const closeOnEscape = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') onClose();
-    };
-    document.addEventListener('keydown', closeOnEscape);
-    return () => document.removeEventListener('keydown', closeOnEscape);
-  }, [onClose, open]);
-  if (!open) return null;
+  const titleId = useId();
+
   return (
-    <div
-      className="fade-in fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4 backdrop-blur-sm"
-      onClick={onClose}
-      role="dialog"
-      aria-modal
-      aria-label="How to play *Star"
+    <ModalDialog
+      open={open}
+      onClose={onClose}
+      ariaLabel="How to play *Star"
+      initialFocusRef={closeButton}
+      className="max-w-2xl"
     >
       <article
-        onClick={(e) => e.stopPropagation()}
-        className="fade-up thin-scroll relative max-h-[85dvh] w-full max-w-2xl overflow-y-auto rounded-3xl border border-gold/30 bg-night-raise p-8 shadow-2xl"
+        className="thin-scroll panel-surface relative max-h-[calc(100dvh-2rem)] w-full overflow-y-auto rounded-3xl p-5 shadow-2xl sm:p-8"
       >
         <button
           ref={closeButton}
@@ -42,7 +34,9 @@ export function RulesDialog({ open, onClose }: RulesDialogProps) {
           <X className="h-4 w-4" />
         </button>
 
-        <h2 className="font-display text-3xl text-gold-strong">How to play</h2>
+        <h2 id={titleId} className="font-display pr-12 text-3xl text-gold-strong">
+          How to play
+        </h2>
 
         <div className="mt-4 space-y-4 text-sm leading-relaxed text-ink/90">
           <p>
@@ -112,6 +106,6 @@ export function RulesDialog({ open, onClose }: RulesDialogProps) {
           </p>
         </div>
       </article>
-    </div>
+    </ModalDialog>
   );
 }

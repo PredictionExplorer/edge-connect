@@ -4,11 +4,16 @@
   --night-deep: #04050c;
   --night: #0a0d1d;
   --night-raise: #12162b;
+  --night-surface: rgba(16, 21, 42, 0.88);
+  --night-surface-strong: rgba(20, 26, 50, 0.96);
   --ink: #f4eede;
-  --muted: #9d97ad;
+  --muted: #aaa4b8;
   --gold: #e8c48b;
   --gold-strong: #f7dca6;
   --gold-faint: rgba(232, 196, 139, 0.16);
+  --hairline: rgba(255, 255, 255, 0.11);
+  --hairline-strong: rgba(255, 255, 255, 0.18);
+  --focus-ring: #f7dca6;
   --p1: #ffb958;
   --p1-soft: rgba(255, 185, 88, 0.18);
   --p2: #62c6ff;
@@ -20,6 +25,8 @@
   --color-night-deep: var(--night-deep);
   --color-night: var(--night);
   --color-night-raise: var(--night-raise);
+  --color-night-surface: var(--night-surface);
+  --color-night-surface-strong: var(--night-surface-strong);
   --color-ink: var(--ink);
   --color-muted: var(--muted);
   --color-gold: var(--gold);
@@ -36,6 +43,8 @@
 
 html {
   color-scheme: dark;
+  background: var(--night-deep);
+  scrollbar-gutter: stable;
 }
 
 body {
@@ -45,7 +54,28 @@ body {
     linear-gradient(180deg, var(--night) 0%, var(--night-deep) 100%);
   color: var(--ink);
   font-family: var(--font-geist-sans), ui-sans-serif, system-ui, sans-serif;
-  min-height: 100dvh;
+  min-height: 100svh;
+  text-rendering: optimizeLegibility;
+}
+
+@supports (min-height: 100dvh) {
+  body {
+    min-height: 100dvh;
+  }
+}
+
+:where(button, a, input, select, textarea, summary, [role="button"]):focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 3px;
+}
+
+:where(button, input, select, textarea) {
+  touch-action: manipulation;
+}
+
+button,
+summary {
+  -webkit-tap-highlight-color: transparent;
 }
 
 ::selection {
@@ -68,12 +98,15 @@ body {
   -webkit-background-clip: text;
   background-clip: text;
   color: transparent;
-  animation: shimmer 6s linear infinite;
+  animation: shimmer 1.8s ease-out 0.2s 1 both;
 }
 
 @keyframes shimmer {
+  from {
+    background-position: 100% 0;
+  }
   to {
-    background-position: -200% 0;
+    background-position: -100% 0;
   }
 }
 
@@ -144,21 +177,21 @@ body {
 @keyframes twinkle {
   0%,
   100% {
-    opacity: 0.9;
+    opacity: 0.72;
   }
   50% {
-    opacity: 0.25;
+    opacity: 0.46;
   }
 }
 
 .star-layer-a,
 .star-layer-b {
-  animation: twinkle 7s ease-in-out infinite;
+  animation: twinkle 12s ease-in-out infinite;
 }
 
 .star-layer-b {
-  animation-duration: 11s;
-  animation-delay: -3.5s;
+  animation-duration: 17s;
+  animation-delay: -5s;
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -175,7 +208,7 @@ body {
   .fade-up,
   .fade-in,
   .pop-in {
-    animation-duration: 0.01s;
+    animation: none;
   }
 }
 
@@ -183,4 +216,43 @@ body {
 .thin-scroll {
   scrollbar-width: thin;
   scrollbar-color: rgba(232, 196, 139, 0.25) transparent;
+}
+
+.panel-surface {
+  border: 1px solid var(--hairline);
+  background:
+    linear-gradient(145deg, rgba(255, 255, 255, 0.035), transparent 46%),
+    var(--night-surface);
+  box-shadow:
+    0 24px 80px rgba(0, 0, 0, 0.24),
+    inset 0 1px 0 rgba(255, 255, 255, 0.035);
+  backdrop-filter: blur(18px);
+}
+
+.control-surface {
+  min-height: 2.75rem;
+  border: 1px solid var(--hairline);
+  background: rgba(255, 255, 255, 0.035);
+}
+
+.control-surface:focus-within {
+  border-color: rgba(232, 196, 139, 0.55);
+  box-shadow: 0 0 0 3px rgba(232, 196, 139, 0.1);
+}
+
+.screen-safe {
+  padding-top: max(1rem, env(safe-area-inset-top));
+  padding-right: max(1rem, env(safe-area-inset-right));
+  padding-bottom: max(1rem, env(safe-area-inset-bottom));
+  padding-left: max(1rem, env(safe-area-inset-left));
+}
+
+.app-skeleton {
+  min-height: 100svh;
+}
+
+@supports (min-height: 100dvh) {
+  .app-skeleton {
+    min-height: 100dvh;
+  }
 }

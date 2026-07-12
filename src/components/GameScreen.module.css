@@ -1,0 +1,141 @@
+.screen {
+  min-height: 100svh;
+  padding-top: max(0.875rem, env(safe-area-inset-top));
+  padding-right: max(1rem, env(safe-area-inset-right));
+  padding-bottom: max(1rem, env(safe-area-inset-bottom));
+  padding-left: max(1rem, env(safe-area-inset-left));
+}
+
+.workspace {
+  display: grid;
+  min-width: 0;
+  gap: 1rem;
+}
+
+.boardArea {
+  min-width: 0;
+  min-height: 0;
+}
+
+.sidePanel {
+  display: grid;
+  min-width: 0;
+  min-height: 0;
+  gap: 1rem;
+  grid-template-rows: auto auto auto;
+}
+
+.rail {
+  min-width: 0;
+}
+
+.actions {
+  min-width: 0;
+}
+
+.boardStage {
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+  align-items: center;
+  justify-content: center;
+}
+
+.boardFrame {
+  position: relative;
+  aspect-ratio: 1;
+  width: min(100%, 46rem);
+  min-width: 0;
+}
+
+@media (min-width: 40rem) and (max-width: 63.999rem) {
+  .boardFrame {
+    width: min(100%, 56svh);
+  }
+}
+
+@media (min-width: 64rem) {
+  .workspace {
+    grid-template-columns: minmax(0, 1fr) 22.5rem;
+    grid-template-rows: auto;
+    align-items: start;
+    column-gap: 1.5rem;
+  }
+
+  .boardArea {
+    position: sticky;
+    top: 5rem;
+    align-self: start;
+  }
+
+  .sidePanel {
+    align-self: start;
+  }
+}
+
+@media (min-width: 64rem) and (min-height: 40rem) {
+  .screen {
+    height: 100svh;
+    min-height: 0;
+    overflow: hidden;
+  }
+
+  .workspace {
+    height: calc(100svh - 5.375rem);
+    min-height: 0;
+    flex: none;
+    grid-template-rows: minmax(0, 1fr);
+    align-items: stretch;
+  }
+
+  .boardArea {
+    position: static;
+    align-self: stretch;
+  }
+
+  .sidePanel {
+    align-self: stretch;
+    grid-template-rows: auto minmax(0, 1fr) auto;
+  }
+
+  .rail {
+    min-height: 0;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    overflow-anchor: none;
+    scrollbar-gutter: stable;
+    padding-right: 0.25rem;
+  }
+
+  .boardFrame {
+    width: min(100%, calc(100svh - 5.75rem));
+    height: auto;
+    max-width: 100%;
+  }
+}
+
+@supports (height: 100dvh) {
+  .screen {
+    min-height: 100dvh;
+  }
+
+  @media (min-width: 64rem) and (min-height: 40rem) {
+    .screen {
+      height: 100dvh;
+    }
+
+    .workspace {
+      height: calc(100dvh - 5.375rem);
+    }
+
+    .boardFrame {
+      width: min(100%, calc(100dvh - 5.75rem));
+    }
+  }
+}
+
+@media (min-width: 90rem) {
+  .workspace {
+    grid-template-columns: minmax(0, 1fr) 24rem;
+  }
+}

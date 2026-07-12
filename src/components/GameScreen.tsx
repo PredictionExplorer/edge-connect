@@ -3,11 +3,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   BookOpenText,
+  CircleAlert,
   Eye,
   Redo2,
   Replace,
   Settings2,
-  ShieldCheck,
   Trophy,
   Undo2,
 } from 'lucide-react';
@@ -33,15 +33,17 @@ import { scoreCompletionBounds } from '@/lib/star/completion-bounds';
 import { replay } from '@/lib/star/game';
 import { scorePosition, validateTerminalWinner } from '@/lib/star/scoring';
 import { useAppStore } from '@/lib/store';
+import { BoardStage } from './BoardStage';
 import { EngineEstimatePanel } from './EngineEstimatePanel';
 import { GameOverOverlay } from './GameOverOverlay';
+import { GameStatus, type GameStatusState } from './GameStatus';
 import { RulesDialog } from './RulesDialog';
 import { ScorePanel } from './ScorePanel';
-import { StarBoard } from './StarBoard';
 import {
   engineControllerLabel,
   starAiDevtoolsEnabled,
 } from './starAiDevtools';
+import styles from './GameScreen.module.css';
 import { PLAYER_COLORS } from './theme';
 
 type AiStatus =
@@ -81,31 +83,26 @@ function reducedSearchBudget(
 }
 
 export function GameScreen() {
-  const {
-    config,
-    controllers,
-    aiSearchSettings,
-    aiPaused,
-    log,
-    redoStack,
-    reviewing,
-  } = useAppStore();
-  const {
-    act,
-    undo,
-    redo,
-    rematch,
-    toSetup,
-    resumeAi,
-    setPlayerController,
-    setAiSearchBudget,
-    setReviewing,
-  } = useAppStore();
+  const config = useAppStore((state) => state.config);
+  const controllers = useAppStore((state) => state.controllers);
+  const aiSearchSettings = useAppStore((state) => state.aiSearchSettings);
+  const aiPaused = useAppStore((state) => state.aiPaused);
+  const log = useAppStore((state) => state.log);
+  const redoStack = useAppStore((state) => state.redoStack);
+  const reviewing = useAppStore((state) => state.reviewing);
+  const act = useAppStore((state) => state.act);
+  const undo = useAppStore((state) => state.undo);
+  const redo = useAppStore((state) => state.redo);
+  const rematch = useAppStore((state) => state.rematch);
+  const toSetup = useAppStore((state) => state.toSetup);
+  const resumeAi = useAppStore((state) => state.resumeAi);
+  const setPlayerController = useAppStore((state) => state.setPlayerController);
+  const setAiSearchBudget = useAppStore((state) => state.setAiSearchBudget);
+  const setReviewing = useAppStore((state) => state.setReviewing);
   const devtools = starAiDevtoolsEnabled();
 
   const [rulesOpen, setRulesOpen] = useState(false);
   const [showInfluence, setShowInfluence] = useState(false);
-  const [hoverNode, setHoverNode] = useState(-1);
   const [aiStatus, setAiStatus] = useState<AiStatus>({ kind: 'idle' });
   const [publishedAnalysis, setPublishedAnalysis] =
     useState<PublishedAiAnalysis | null>(null);
@@ -367,14 +364,9 @@ export function GameScreen() {
         : null,
     [game],
   );
-
-  if (!game || !score) return null;
-
-  const { board } = game;
-  const showTerritory = game.over || showInfluence;
-  const activeColor = PLAYER_COLORS[game.toMove];
-  const currentController = controllers[game.toMove];
+  const currentController = game ? controllers[game.toMove] : 'human';
   const thinking =
+    Boolean(game) &&
     currentController !== 'human' &&
     aiStatus.kind === 'thinking' &&
     aiStatus.controller === currentController;
@@ -393,35 +385,74 @@ export function GameScreen() {
     activeAiError?.retryable === true &&
     activeAiError.code === 'timeout' &&
     lowerBudget !== null;
-  const humanCanAct = currentController === 'human' && !thinking;
+  const humanCanAct = Boolean(game) && currentController === 'human' && !thinking;
+  const placeStone = useCallback(
+    (node: number) => {
+      if (!humanCanAct) return;
+      setPublishedAnalysis(null);
+      act({ type: 'place', node });
+    },
+    [act, humanCanAct],
+  );
+
+  if (!game || !score) return null;
+
+  const { board } = game;
+  const showTerritory = game.over || showInfluence;
+  const activeColor = PLAYER_COLORS[game.toMove];
+  const gameStatusState: GameStatusState = game.over
+    ? 'over'
+    : currentController === 'human'
+      ? 'human'
+      : aiPaused
+        ? 'paused'
+        : activeAiError
+          ? 'error'
+          : 'thinking';
+  const currentControllerName =
+    currentController === 'human'
+      ? 'Human'
+      : devtools
+        ? engineControllerLabel(currentController)
+        : controllerLabel(currentController);
 
   return (
-    <main className="relative z-10 mx-auto flex w-full max-w-7xl flex-1 flex-col px-4 py-5 sm:px-6">
+    <main
+      className={`${styles.screen} relative z-10 mx-auto flex w-full max-w-[100rem] flex-col`}
+    >
       <h1 className="sr-only">*Star game</h1>
-      <header className="mb-4 flex items-center justify-between gap-3">
-        <button type="button" onClick={leaveGame} className="group flex items-baseline gap-3 text-left">
+      <header className="mb-3 flex shrink-0 items-center justify-between gap-3">
+        <button
+          type="button"
+          onClick={leaveGame}
+          aria-label="Return to setup"
+          className="group flex min-h-11 min-w-0 items-center gap-3 text-left"
+        >
           <span className="font-display text-shimmer text-3xl font-semibold leading-none">
             ✳Star
           </span>
-          <span className="hidden text-xs text-muted sm:block">
+          <span className="hidden truncate text-xs text-muted sm:block">
             {config.mode === 'double' ? 'Double *Star' : 'Classic'} · {config.rings} rings ·{' '}
             {board.periCount + 1} points in the sky
           </span>
         </button>
-        <nav className="flex items-center gap-2">
+        <nav className="flex shrink-0 items-center gap-1.5 sm:gap-2" aria-label="Game">
           {game.over && reviewing && (
             <button
               type="button"
               onClick={() => setReviewing(false)}
-              className="flex items-center gap-2 rounded-xl border border-gold/60 bg-gold-faint px-3.5 py-2 text-sm text-gold-strong transition-colors hover:bg-gold/25"
+              aria-label="Result"
+              className="flex min-h-11 items-center gap-2 rounded-xl border border-gold/60 bg-gold-faint px-3 text-sm text-gold-strong transition-colors hover:bg-gold/25"
             >
-              <Trophy className="h-4 w-4" aria-hidden /> Result
+              <Trophy className="h-4 w-4" aria-hidden />
+              <span className="hidden sm:inline">Result</span>
             </button>
           )}
           <button
             type="button"
             onClick={() => setRulesOpen(true)}
-            className="flex items-center gap-2 rounded-xl border border-white/15 px-3.5 py-2 text-sm text-ink transition-colors hover:border-gold/50"
+            aria-label="Rules"
+            className="flex min-h-11 items-center gap-2 rounded-xl border border-white/15 px-3 text-sm text-ink transition-colors hover:border-gold/50"
           >
             <BookOpenText className="h-4 w-4" aria-hidden />
             <span className="hidden sm:inline">Rules</span>
@@ -429,7 +460,8 @@ export function GameScreen() {
           <button
             type="button"
             onClick={leaveGame}
-            className="flex items-center gap-2 rounded-xl border border-white/15 px-3.5 py-2 text-sm text-ink transition-colors hover:border-gold/50"
+            aria-label="New game"
+            className="flex min-h-11 items-center gap-2 rounded-xl border border-white/15 px-3 text-sm text-ink transition-colors hover:border-gold/50"
           >
             <Settings2 className="h-4 w-4" aria-hidden />
             <span className="hidden sm:inline">New game</span>
@@ -437,145 +469,72 @@ export function GameScreen() {
         </nav>
       </header>
 
-      <div className="grid flex-1 gap-6 lg:grid-cols-[minmax(0,1fr)_360px]">
-        {/* Board */}
-        <div className="relative flex items-center justify-center">
-          <StarBoard
-            board={board}
-            stones={game.stones}
-            nodeOwner={score.nodeOwner}
-            aliveStone={score.aliveStone}
-            provablyDeadStone={completionBounds?.provablyDeadStone}
-            showTerritory={showTerritory}
-            lastMove={game.lastMove}
-            currentTurnMoves={game.currentTurnMoves}
-            toMove={game.toMove}
-            interactive={!game.over && humanCanAct}
-            playerNames={config.playerNames}
-            onPlace={(node) => {
-              if (humanCanAct) {
-                setPublishedAnalysis(null);
-                act({ type: 'place', node });
-              }
-            }}
-            onHover={setHoverNode}
-            className="max-h-[82dvh] w-full max-w-[860px]"
-          />
-          {/* Node readout */}
-          <div
-            aria-live="polite"
-            className="pointer-events-none absolute bottom-1 left-2 rounded-lg border border-white/10 bg-black/30 px-2.5 py-1 font-mono text-xs text-muted backdrop-blur-sm"
-          >
-            {hoverNode >= 0 ? (
-              <>
-                node <span className="text-gold">{board.labels[hoverNode]}</span>
-                {board.isQuark[hoverNode]
-                  ? ' · quark'
-                  : board.isPeri[hoverNode]
-                    ? ' · peri'
-                    : ''}
-              </>
-            ) : (
-              `${game.stonesPlaced} / ${board.n} nodes filled`
-            )}
-          </div>
-        </div>
+      <div className={`${styles.workspace} w-full`}>
+        <BoardStage
+          className={styles.boardArea}
+          board={board}
+          stones={game.stones}
+          nodeOwner={score.nodeOwner}
+          aliveStone={score.aliveStone}
+          provablyDeadStone={completionBounds?.provablyDeadStone}
+          showTerritory={showTerritory}
+          lastMove={game.lastMove}
+          currentTurnMoves={game.currentTurnMoves}
+          toMove={game.toMove}
+          interactive={!game.over && humanCanAct}
+          playerNames={config.playerNames}
+          onPlace={placeStone}
+          filledCount={game.stonesPlaced}
+        />
 
         {/* Side panel */}
-        <div className="flex min-w-0 flex-col gap-4">
-          {/* Turn banner */}
-          <div
-            key={game.over ? 'over' : `${game.toMove}-${game.movesLeft}`}
-            className="fade-in rounded-2xl border px-4 py-3 text-center text-sm"
-            style={{
-              borderColor: game.over ? 'rgba(232,196,139,0.5)' : activeColor.base + '66',
-              background: game.over ? 'rgba(232,196,139,0.10)' : activeColor.soft,
-            }}
-          >
-            {game.over ? (
-              <span className="text-gold-strong">Game over — the sky is settled</span>
-            ) : (
-              <span style={{ color: activeColor.bright }}>
-                {config.playerNames[game.toMove]} to play
-                {config.mode === 'double' &&
-                  ` — ${game.movesLeft} stone${game.movesLeft > 1 ? 's' : ''} left`}
-              </span>
-            )}
-          </div>
-
-          {!game.over &&
-            completionBounds &&
-            completionBounds.guaranteedWinner !== null && (
-              <div
-                role="status"
-                aria-live="polite"
-                className="fade-in flex items-start gap-3 rounded-2xl border px-4 py-3"
-                style={{
-                  borderColor:
-                    PLAYER_COLORS[completionBounds.guaranteedWinner].base + '88',
-                  background: PLAYER_COLORS[completionBounds.guaranteedWinner].soft,
-                }}
-              >
-                <ShieldCheck
-                  className="mt-0.5 h-5 w-5 shrink-0"
-                  style={{
-                    color: PLAYER_COLORS[completionBounds.guaranteedWinner].bright,
-                  }}
-                  aria-hidden
-                />
-                <div>
-                  <p
-                    className="text-sm font-medium"
-                    style={{
-                      color: PLAYER_COLORS[completionBounds.guaranteedWinner].bright,
-                    }}
-                  >
-                    {config.playerNames[completionBounds.guaranteedWinner]} has clinched the game
-                  </p>
-                  <p className="mt-0.5 text-[11px] leading-relaxed text-muted">
-                    Even if every open node went to{' '}
-                    {config.playerNames[1 - completionBounds.guaranteedWinner]}, the result would
-                    not change. Play may continue.
-                  </p>
-                </div>
-              </div>
-            )}
-
-          {!game.over && currentController !== 'human' && (
-            <div
-              aria-live="polite"
-              className="rounded-xl border border-white/10 bg-white/[0.03] px-3.5 py-2.5 text-xs text-muted"
-            >
-              {aiPaused ? (
-                <div>
-                  <p>AI is paused after history navigation.</p>
-                  <div className="mt-2 flex flex-wrap gap-2">
-                    <button
-                      type="button"
-                      onClick={resumeAiAction}
-                      className="rounded-lg border border-gold/50 px-2.5 py-1 text-gold-strong transition-colors hover:bg-gold/15"
-                    >
-                      Resume AI
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => takeOverAsHuman(game.toMove, currentController)}
-                      className="rounded-lg border border-white/20 px-2.5 py-1 text-ink transition-colors hover:border-gold/40"
-                    >
-                      Take over as human
-                    </button>
+        <div className={styles.sidePanel}>
+          <GameStatus
+            className={styles.status}
+            state={gameStatusState}
+            playerName={config.playerNames[game.toMove]}
+            controllerName={currentControllerName}
+            mode={config.mode}
+            movesLeft={game.movesLeft}
+            color={activeColor}
+          />
+          <div className={`${styles.rail} thin-scroll flex min-w-0 flex-col gap-3`}>
+            {!game.over &&
+              currentController !== 'human' &&
+              (aiPaused || activeAiError) && (
+                <section
+                  aria-live="polite"
+                  className="rounded-2xl border border-danger/35 bg-danger/[0.06] px-4 py-3 text-xs text-muted"
+                >
+                  <div className="flex items-start gap-3">
+                    <CircleAlert
+                      className="mt-0.5 h-4 w-4 shrink-0 text-danger"
+                      aria-hidden
+                    />
+                    <div className="min-w-0 flex-1">
+                      {aiPaused ? (
+                        <p>AI is paused after history navigation.</p>
+                      ) : activeAiError ? (
+                        <p role="alert">
+                          {activeAiError.message}{' '}
+                          <span className="font-mono text-xs opacity-70">
+                            ({activeAiError.code})
+                          </span>
+                        </p>
+                      ) : null}
+                    </div>
                   </div>
-                </div>
-              ) : activeAiError ? (
-                <div>
-                  <p role="alert">
-                    {activeAiError.message}{' '}
-                    <span className="font-mono text-[10px] opacity-70">
-                      ({activeAiError.code})
-                    </span>
-                  </p>
-                  <div className="mt-2 flex flex-wrap gap-2">
-                    {activeAiError.retryable && (
+                  <div className="mt-3 flex flex-wrap gap-2 pl-7">
+                    {aiPaused && (
+                      <button
+                        type="button"
+                        onClick={resumeAiAction}
+                        className="min-h-9 rounded-lg border border-gold/50 px-3 py-1 text-gold-strong transition-colors hover:bg-gold/15"
+                      >
+                        Resume AI
+                      </button>
+                    )}
+                    {activeAiError?.retryable && (
                       <button
                         type="button"
                         onClick={() => {
@@ -583,7 +542,7 @@ export function GameScreen() {
                           setAiStatus({ kind: 'idle' });
                           setRetryNonce((value) => value + 1);
                         }}
-                        className="rounded-lg border border-gold/50 px-2.5 py-1 text-gold-strong transition-colors hover:bg-gold/15"
+                        className="min-h-9 rounded-lg border border-gold/50 px-3 py-1 text-gold-strong transition-colors hover:bg-gold/15"
                       >
                         Retry
                       </button>
@@ -592,7 +551,7 @@ export function GameScreen() {
                       <button
                         type="button"
                         onClick={() => retryWithLessEffort(currentController)}
-                        className="rounded-lg border border-gold/50 px-2.5 py-1 text-gold-strong transition-colors hover:bg-gold/15"
+                        className="min-h-9 rounded-lg border border-gold/50 px-3 py-1 text-gold-strong transition-colors hover:bg-gold/15"
                       >
                         Use less effort
                       </button>
@@ -600,35 +559,17 @@ export function GameScreen() {
                     <button
                       type="button"
                       onClick={() => takeOverAsHuman(game.toMove, currentController)}
-                      className="rounded-lg border border-white/20 px-2.5 py-1 text-ink transition-colors hover:border-gold/40"
+                      className="min-h-9 rounded-lg border border-white/20 px-3 py-1 text-ink transition-colors hover:border-gold/40"
                     >
                       Take over as human
                     </button>
                   </div>
-                </div>
-              ) : (
-                <span>
-                  {devtools
-                    ? engineControllerLabel(currentController)
-                    : controllerLabel(currentController)}{' '}
-                  is thinking…
-                </span>
+                </section>
               )}
-            </div>
-          )}
-
-          {devtools && publishedAnalysis && (
-            <EngineEstimatePanel
-              key={publishedAnalysis.key}
-              analysis={publishedAnalysis.analysis}
-              board={board}
-              playerNames={config.playerNames}
-            />
-          )}
 
           {/* Pie rule offer */}
           {game.canSwap && (
-            <div className="fade-up rounded-2xl border border-dashed border-gold/50 bg-gold-faint px-4 py-3 text-sm">
+            <div className="rounded-2xl border border-dashed border-gold/50 bg-gold-faint px-4 py-3 text-sm">
               <p className="text-ink">
                 Pie rule — {config.playerNames[1]} may steal the opening stone.
               </p>
@@ -641,7 +582,7 @@ export function GameScreen() {
                     act({ type: 'swap' });
                   }
                 }}
-                className="mt-2 flex items-center gap-2 rounded-lg border border-gold/60 px-3 py-1.5 text-xs font-medium text-gold-strong transition-colors hover:bg-gold/20"
+                className="mt-2 flex min-h-10 items-center gap-2 rounded-lg border border-gold/60 px-3 py-1.5 text-xs font-medium text-gold-strong transition-colors hover:bg-gold/20"
               >
                 <Replace className="h-3.5 w-3.5" aria-hidden /> Steal it (swap sides)
               </button>
@@ -654,13 +595,36 @@ export function GameScreen() {
             completionBounds={completionBounds}
           />
 
-          {/* Actions */}
-          <div className="grid grid-cols-2 gap-2">
+            {devtools && publishedAnalysis && (
+              <EngineEstimatePanel
+                analysis={publishedAnalysis.analysis}
+                board={board}
+                playerNames={config.playerNames}
+              />
+            )}
+
+            <details className="rounded-xl border border-white/10 bg-white/[0.025] px-3">
+              <summary className="flex min-h-11 cursor-pointer items-center text-xs font-medium text-muted">
+                About the scoring display
+              </summary>
+              <p className="pb-3 text-xs leading-relaxed text-muted">
+                Influence shows the current scoring projection and dims groups that are not yet
+                stars. Crosses mark only groups that cannot become a star even if they received
+                every open node. Influence is always on once the game ends.
+              </p>
+            </details>
+          </div>
+
+          {/* Persistent actions */}
+          <div
+            className={`${styles.actions} panel-surface grid grid-cols-2 gap-2 rounded-2xl p-2`}
+            data-action-dock
+          >
             <button
               type="button"
               disabled={log.length === 0}
               onClick={undoAction}
-              className="flex items-center justify-center gap-2 rounded-xl border border-white/15 px-3 py-2.5 text-sm text-ink transition-colors enabled:hover:border-gold/50 disabled:opacity-35"
+              className="flex min-h-11 items-center justify-center gap-2 rounded-xl border border-white/15 px-3 py-2 text-sm text-ink transition-colors enabled:hover:border-gold/50 disabled:opacity-35"
             >
               <Undo2 className="h-4 w-4" aria-hidden /> Undo
             </button>
@@ -668,30 +632,24 @@ export function GameScreen() {
               type="button"
               disabled={redoStack.length === 0}
               onClick={redoAction}
-              className="flex items-center justify-center gap-2 rounded-xl border border-white/15 px-3 py-2.5 text-sm text-ink transition-colors enabled:hover:border-gold/50 disabled:opacity-35"
+              className="flex min-h-11 items-center justify-center gap-2 rounded-xl border border-white/15 px-3 py-2 text-sm text-ink transition-colors enabled:hover:border-gold/50 disabled:opacity-35"
             >
               <Redo2 className="h-4 w-4" aria-hidden /> Redo
             </button>
+
+            <label className="col-span-2 flex min-h-11 cursor-pointer items-center justify-between rounded-xl border border-white/10 bg-white/[0.03] px-3 py-2">
+              <span className="flex items-center gap-2 text-sm text-ink">
+                <Eye className="h-4 w-4 text-muted" aria-hidden /> Show influence
+              </span>
+              <input
+                type="checkbox"
+                checked={showTerritory}
+                disabled={game.over}
+                onChange={(e) => setShowInfluence(e.target.checked)}
+                className="h-4 w-4 accent-[#e8c48b]"
+              />
+            </label>
           </div>
-
-          <label className="flex cursor-pointer items-center justify-between rounded-xl border border-white/10 bg-white/[0.03] px-4 py-3">
-            <span className="flex items-center gap-2 text-sm text-ink">
-              <Eye className="h-4 w-4 text-muted" aria-hidden /> Show influence
-            </span>
-            <input
-              type="checkbox"
-              checked={showTerritory}
-              disabled={game.over}
-              onChange={(e) => setShowInfluence(e.target.checked)}
-              className="h-4 w-4 accent-[#e8c48b]"
-            />
-          </label>
-
-          <p className="px-1 text-[11px] leading-relaxed text-muted">
-            Influence shows the current scoring projection and dims groups that are not yet
-            stars. Crosses mark only groups that cannot become a star even if they received every
-            open node. Influence is always on once the game ends.
-          </p>
         </div>
       </div>
 

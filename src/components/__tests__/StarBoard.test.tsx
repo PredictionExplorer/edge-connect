@@ -80,7 +80,30 @@ describe('StarBoard', () => {
     expect(onPlace).toHaveBeenCalledOnce();
     expect(onPlace).toHaveBeenCalledWith(0);
 
-    fireEvent.mouseLeave(screen.getByRole('group', { name: /\*star board with 4 rings/i }));
+    const svg = screen.getByRole('group', { name: /\*star board with 4 rings/i });
+    vi.spyOn(svg, 'getBoundingClientRect').mockReturnValue({
+      x: 0,
+      y: 0,
+      top: 0,
+      left: 0,
+      right: 238,
+      bottom: 238,
+      width: 238,
+      height: 238,
+      toJSON: () => ({}),
+    });
+    fireEvent.pointerMove(svg, {
+      clientX: board.xs[1] * 100 + 119,
+      clientY: board.ys[1] * 100 + 119,
+    });
+    expect(onHover).toHaveBeenLastCalledWith(1);
+    fireEvent.click(svg, {
+      clientX: board.xs[1] * 100 + 119,
+      clientY: board.ys[1] * 100 + 119,
+    });
+    expect(onPlace).toHaveBeenNthCalledWith(2, 1);
+
+    fireEvent.mouseLeave(svg);
     expect(onHover).toHaveBeenLastCalledWith(-1);
   });
 

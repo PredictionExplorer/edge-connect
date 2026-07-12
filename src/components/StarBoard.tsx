@@ -1,6 +1,16 @@
 'use client';
 
-import { memo, useId, useMemo, useRef, useState, type KeyboardEvent } from 'react';
+import {
+  memo,
+  useCallback,
+  useId,
+  useMemo,
+  useRef,
+  useState,
+  type KeyboardEvent,
+  type MouseEvent,
+  type PointerEvent,
+} from 'react';
 import type { Board } from '@/lib/star/board';
 import { EMPTY } from '@/lib/star/scoring';
 import { PLAYER_COLORS } from './theme';
@@ -169,6 +179,7 @@ export const StarBoard = memo(function StarBoard({
   const [hovered, setHovered] = useState(-1);
   const [activeNode, setActiveNode] = useState(0);
   const [focusedNode, setFocusedNode] = useState(-1);
+  const svgRef = useRef<SVGSVGElement>(null);
   const nodeRefs = useRef(new Map<number, SVGCircleElement>());
   const instructionsId = useId();
 
@@ -231,10 +242,58 @@ export const StarBoard = memo(function StarBoard({
     };
   }, [board]);
 
-  const hover = (u: number) => {
+  const hover = useCallback((u: number) => {
     setHovered(u);
     onHover?.(u);
-  };
+  }, [onHover]);
+
+  const nodeAtPointer = useCallback(
+    (clientX: number, clientY: number): number => {
+      const svg = svgRef.current;
+      if (!svg) return -1;
+      const rect = svg.getBoundingClientRect();
+      if (rect.width <= 0 || rect.height <= 0) return -1;
+
+      const scale = Math.min(rect.width / 238, rect.height / 238);
+      const renderedWidth = 238 * scale;
+      const renderedHeight = 238 * scale;
+      const originX = rect.left + (rect.width - renderedWidth) / 2;
+      const originY = rect.top + (rect.height - renderedHeight) / 2;
+      const x = (clientX - originX) / scale - 119;
+      const y = (clientY - originY) / scale - 119;
+      const maxDistance = Math.max(board.minEdge * S * 0.56, stoneR * 1.25);
+      let nearest = -1;
+      let nearestDistance = maxDistance;
+
+      for (let node = 0; node < board.n; node++) {
+        const distance = Math.hypot(board.xs[node] * S - x, board.ys[node] * S - y);
+        if (distance <= nearestDistance) {
+          nearest = node;
+          nearestDistance = distance;
+        }
+      }
+      return nearest;
+    },
+    [board, stoneR],
+  );
+
+  const handlePointerMove = useCallback(
+    (event: PointerEvent<SVGSVGElement>) => {
+      if (!interactive) return;
+      const node = nodeAtPointer(event.clientX, event.clientY);
+      if (node !== hovered) hover(node);
+    },
+    [hover, hovered, interactive, nodeAtPointer],
+  );
+
+  const handleBoardClick = useCallback(
+    (event: MouseEvent<SVGSVGElement>) => {
+      if (!interactive) return;
+      const node = nodeAtPointer(event.clientX, event.clientY);
+      if (node >= 0 && stones[node] === EMPTY) onPlace?.(node);
+    },
+    [interactive, nodeAtPointer, onPlace, stones],
+  );
 
   const territory = showTerritory && nodeOwner ? nodeOwner : null;
   const occupiedCount = Array.from({ length: board.n }, (_, node) => stones[node]).filter(
@@ -284,12 +343,15 @@ export const StarBoard = memo(function StarBoard({
 
   return (
     <svg
+      ref={svgRef}
       viewBox="-119 -119 238 238"
       className={className}
       role={interactive ? 'group' : 'img'}
       aria-label={`*Star board with ${board.rings} rings, ${occupiedCount} of ${board.n} nodes occupied`}
       aria-describedby={instructionsId}
+      onPointerMove={handlePointerMove}
       onMouseLeave={() => hover(-1)}
+      onClick={handleBoardClick}
     >
       <desc id={instructionsId}>
         {interactive
@@ -545,33 +607,39 @@ export const StarBoard = memo(function StarBoard({
               <circle cx={x} cy={y} r={stoneR * 0.22} fill="rgba(255,255,255,0.85)" />
             )}
             {u === lastMove && (
-              <circle
-                className="last-move-pulse"
-                cx={x}
-                cy={y}
-                fill="none"
-                stroke="rgba(255,255,255,0.9)"
-              >
-                {/* SMIL keeps the pulse alive without JS-driven animation. */}
-                <animate
-                  attributeName="r"
-                  values={`${stoneR};${stoneR * 1.5}`}
-                  dur="1.6s"
-                  repeatCount="indefinite"
+              <g aria-hidden pointerEvents="none">
+                <circle
+                  data-last-move={u}
+                  cx={x}
+                  cy={y}
+                  r={stoneR * 1.18}
+                  fill="none"
+                  stroke="rgba(255,255,255,0.9)"
+                  strokeWidth="0.8"
                 />
-                <animate
-                  attributeName="stroke-opacity"
-                  values="0.9;0"
-                  dur="1.6s"
-                  repeatCount="indefinite"
-                />
-                <animate
-                  attributeName="stroke-width"
-                  values="0.9;0.5"
-                  dur="1.6s"
-                  repeatCount="indefinite"
-                />
-              </circle>
+                <circle
+                  className="last-move-pulse"
+                  cx={x}
+                  cy={y}
+                  fill="none"
+                  stroke="rgba(255,255,255,0.75)"
+                >
+                  <animate
+                    attributeName="r"
+                    values={`${stoneR * 1.18};${stoneR * 1.65}`}
+                    dur="0.8s"
+                    repeatCount="1"
+                    fill="freeze"
+                  />
+                  <animate
+                    attributeName="stroke-opacity"
+                    values="0.75;0"
+                    dur="0.8s"
+                    repeatCount="1"
+                    fill="freeze"
+                  />
+                </circle>
+              </g>
             )}
 
             {interactive && focusedNode === u && (
@@ -614,7 +682,8 @@ export const StarBoard = memo(function StarBoard({
                   hover(-1);
                 }}
                 onKeyDown={(event) => handleNodeKeyDown(event, u, isEmpty)}
-                onClick={() => {
+                onClick={(event) => {
+                  event.stopPropagation();
                   if (isEmpty) onPlace?.(u);
                 }}
               />
