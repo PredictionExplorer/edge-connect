@@ -63,6 +63,8 @@ export function RulesDialog({ open, onClose }: RulesDialogProps) {
             <strong className="text-gold">star</strong>. A star owns the peries it occupies, plus
             any peries it walls off from the rest of the board. Groups that fail to make a star
             are removed at scoring time — the peries around them go to whoever surrounds them.
+            Stones are never physically removed; a stone currently surrounded and owned by the
+            other player is crossed out on the board.
           </p>
           <div className="rounded-2xl border border-white/10 bg-white/[0.03] p-4">
             <h3 className="mb-2 text-xs font-semibold uppercase tracking-[0.2em] text-muted">
@@ -85,6 +87,24 @@ export function RulesDialog({ open, onClose }: RulesDialogProps) {
             everything; waste nothing. Live totals may be tied, but on a full board the two
             totals sum to the number of peries plus one. That sum is odd on every supported
             board, so the final margin is nonzero and someone always wins.
+          </p>
+          <div className="rounded-2xl border border-white/10 bg-white/[0.03] p-4">
+            <h3 className="mb-2 text-xs font-semibold uppercase tracking-[0.2em] text-muted">
+              Completion bounds
+            </h3>
+            <p>
+              The score panel also fills every open node with one color, then the other, to show
+              the two extreme final scores. These are mathematical bounds, not possible turn
+              sequences. On a full board, changing an opponent stone to your color can only merge
+              your groups or split theirs, so it cannot make your final score worse. If your
+              opponent still wins after every open node is assigned to you, they have clinched
+              the game — although you may keep playing.
+            </p>
+          </div>
+          <p>
+            The live score itself is only a snapshot and is not monotone. Creating a new separate
+            star can lower its player&apos;s current star award even though the completion bounds
+            remain valid.
           </p>
           <p>
             The game ends only when the board is full.

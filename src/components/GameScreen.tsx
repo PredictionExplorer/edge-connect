@@ -7,6 +7,7 @@ import {
   Redo2,
   Replace,
   Settings2,
+  ShieldCheck,
   Trophy,
   Undo2,
 } from 'lucide-react';
@@ -24,6 +25,7 @@ import {
   type StarAiRequest,
 } from '@/lib/star/ai/protocol';
 import { requestServerAiAction } from '@/lib/star/ai/server-client';
+import { scoreCompletionBounds } from '@/lib/star/completion-bounds';
 import { replay } from '@/lib/star/game';
 import { scorePosition, validateTerminalWinner } from '@/lib/star/scoring';
 import { useAppStore } from '@/lib/store';
@@ -254,6 +256,13 @@ export function GameScreen() {
     () => (game ? scorePosition(game.board, game.stones) : null),
     [game],
   );
+  const completionBounds = useMemo(
+    () =>
+      game && !game.over && !game.canSwap
+        ? scoreCompletionBounds(game.board, game.stones)
+        : null,
+    [game],
+  );
 
   if (!game || !score) return null;
 
@@ -377,6 +386,44 @@ export function GameScreen() {
             )}
           </div>
 
+          {!game.over &&
+            completionBounds &&
+            completionBounds.guaranteedWinner !== null && (
+              <div
+                role="status"
+                aria-live="polite"
+                className="fade-in flex items-start gap-3 rounded-2xl border px-4 py-3"
+                style={{
+                  borderColor:
+                    PLAYER_COLORS[completionBounds.guaranteedWinner].base + '88',
+                  background: PLAYER_COLORS[completionBounds.guaranteedWinner].soft,
+                }}
+              >
+                <ShieldCheck
+                  className="mt-0.5 h-5 w-5 shrink-0"
+                  style={{
+                    color: PLAYER_COLORS[completionBounds.guaranteedWinner].bright,
+                  }}
+                  aria-hidden
+                />
+                <div>
+                  <p
+                    className="text-sm font-medium"
+                    style={{
+                      color: PLAYER_COLORS[completionBounds.guaranteedWinner].bright,
+                    }}
+                  >
+                    {config.playerNames[completionBounds.guaranteedWinner]} has clinched the game
+                  </p>
+                  <p className="mt-0.5 text-[11px] leading-relaxed text-muted">
+                    Even if every open node went to{' '}
+                    {config.playerNames[1 - completionBounds.guaranteedWinner]}, the result would
+                    not change. Play may continue.
+                  </p>
+                </div>
+              </div>
+            )}
+
           {!game.over && currentController !== 'human' && (
             <div
               aria-live="polite"
@@ -454,7 +501,11 @@ export function GameScreen() {
             </div>
           )}
 
-          <ScorePanel game={game} score={score} />
+          <ScorePanel
+            game={game}
+            score={score}
+            completionBounds={completionBounds}
+          />
 
           {/* Actions */}
           <div className="grid grid-cols-2 gap-2">
@@ -491,7 +542,8 @@ export function GameScreen() {
 
           <p className="px-1 text-[11px] leading-relaxed text-muted">
             Influence shows who currently claims each peri — occupied or walled off — and dims
-            stones that do not yet belong to a star. It is always on once the game ends.
+            stones that do not yet belong to a star. Surrounded stones are always crossed out.
+            Influence is always on once the game ends.
           </p>
         </div>
       </div>

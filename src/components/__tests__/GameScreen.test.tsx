@@ -189,3 +189,59 @@ describe('GameScreen AI lifecycle', () => {
     expect(requestServerAiAction).not.toHaveBeenCalled();
   });
 });
+
+describe('GameScreen score guidance', () => {
+  it('shows both extreme completion scores throughout play', () => {
+    resetPlayingStore({ controllers: ['human', 'human'] });
+    render(<GameScreen />);
+
+    expect(
+      screen.getByRole('heading', { name: 'Completion bounds' }),
+    ).toBeInTheDocument();
+    expect(screen.getByText('All open → Ada')).toBeInTheDocument();
+    expect(screen.getByText('All open → Grace')).toBeInTheDocument();
+    expect(
+      screen.getByText('The final winner is not clinched yet.'),
+    ).toBeInTheDocument();
+  });
+
+  it('announces a clinched result without ending the game', () => {
+    resetPlayingStore({
+      controllers: ['human', 'human'],
+      log: Array.from({ length: 49 }, (_, node) => ({
+        type: 'place' as const,
+        node,
+      })),
+    });
+    render(<GameScreen />);
+
+    expect(
+      screen.getByText('Grace has clinched the game', { exact: true }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(/even if every open node went to ada/i),
+    ).toBeInTheDocument();
+    expect(screen.getByLabelText('Ada scores 10')).toBeInTheDocument();
+    expect(screen.getByLabelText('Grace scores 11')).toBeInTheDocument();
+    expect(screen.getByText(/Grace to play/)).toBeInTheDocument();
+    expect(screen.queryByRole('dialog', { name: 'Game over' })).not.toBeInTheDocument();
+  });
+
+  it('suppresses completion guidance while a pie swap can recolor the opening', () => {
+    resetPlayingStore({
+      controllers: ['human', 'human'],
+      config: {
+        ...config,
+        pieRule: true,
+        playerNames: [...config.playerNames],
+      },
+      log: [{ type: 'place', node: 0 }],
+    });
+    render(<GameScreen />);
+
+    expect(screen.getByText(/may steal the opening stone/i)).toBeInTheDocument();
+    expect(
+      screen.queryByRole('heading', { name: 'Completion bounds' }),
+    ).not.toBeInTheDocument();
+  });
+});

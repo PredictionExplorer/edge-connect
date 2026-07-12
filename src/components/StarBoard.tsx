@@ -7,6 +7,83 @@ import { PLAYER_COLORS } from './theme';
 
 const S = 100; // unit-coordinate scale
 
+interface GroupPresentation {
+  groupOf: Int32Array;
+  groupSize: Int32Array;
+  connectionPaths: [string, string];
+  starConnectionPaths: [string, string];
+  groupPaths: string[];
+}
+
+function buildGroupPresentation(
+  board: Board,
+  stones: ArrayLike<number>,
+  aliveStone?: ArrayLike<number> | null,
+): GroupPresentation {
+  const parent = new Int32Array(board.n).fill(-1);
+  for (let node = 0; node < board.n; node++) {
+    if (stones[node] !== EMPTY) parent[node] = node;
+  }
+
+  const find = (node: number): number => {
+    let root = node;
+    while (parent[root] !== root) {
+      parent[root] = parent[parent[root]];
+      root = parent[root];
+    }
+    return root;
+  };
+
+  for (let node = 0; node < board.n; node++) {
+    const color = stones[node];
+    if (color === EMPTY) continue;
+    for (let edge = board.adjOff[node]; edge < board.adjOff[node + 1]; edge++) {
+      const neighbor = board.adj[edge];
+      if (neighbor <= node || stones[neighbor] !== color) continue;
+      const nodeRoot = find(node);
+      const neighborRoot = find(neighbor);
+      if (nodeRoot !== neighborRoot) parent[neighborRoot] = nodeRoot;
+    }
+  }
+
+  const groupOf = new Int32Array(board.n).fill(-1);
+  const groupSize = new Int32Array(board.n);
+  for (let node = 0; node < board.n; node++) {
+    if (stones[node] === EMPTY) continue;
+    const root = find(node);
+    groupOf[node] = root;
+    groupSize[root]++;
+  }
+
+  const connections: [string[], string[]] = [[], []];
+  const starConnections: [string[], string[]] = [[], []];
+  const groupSegments = Array.from({ length: board.n }, () => [] as string[]);
+  for (let node = 0; node < board.n; node++) {
+    const color = stones[node];
+    if (color !== 0 && color !== 1) continue;
+    for (let edge = board.adjOff[node]; edge < board.adjOff[node + 1]; edge++) {
+      const neighbor = board.adj[edge];
+      if (neighbor <= node || stones[neighbor] !== color) continue;
+      const segment =
+        `M${(board.xs[node] * S).toFixed(2)} ${(board.ys[node] * S).toFixed(2)}` +
+        `L${(board.xs[neighbor] * S).toFixed(2)} ${(board.ys[neighbor] * S).toFixed(2)}`;
+      connections[color].push(segment);
+      if (aliveStone?.[node] === 1 && aliveStone[neighbor] === 1) {
+        starConnections[color].push(segment);
+      }
+      groupSegments[groupOf[node]].push(segment);
+    }
+  }
+
+  return {
+    groupOf,
+    groupSize,
+    connectionPaths: [connections[0].join(''), connections[1].join('')],
+    starConnectionPaths: [starConnections[0].join(''), starConnections[1].join('')],
+    groupPaths: groupSegments.map((segments) => segments.join('')),
+  };
+}
+
 export interface StarBoardProps {
   board: Board;
   stones: ArrayLike<number>;
@@ -93,6 +170,10 @@ export const StarBoard = memo(function StarBoard({
   const instructionsId = useId();
 
   const stoneR = Math.min(board.minEdge * 0.46 * S, 9.5);
+  const groups = useMemo(
+    () => buildGroupPresentation(board, stones, aliveStone),
+    [aliveStone, board, stones],
+  );
 
   const { meshPath, bridgeChordPath, bridgeStarPoints, periRingPath } = useMemo(() => {
     const { adjOff, adj, xs, ys, ringOf, sectorOf, bridge } = board;
@@ -157,6 +238,10 @@ export const StarBoard = memo(function StarBoard({
     (stone) => stone !== EMPTY,
   ).length;
   const currentPlayerName = playerNames?.[toMove] || PLAYER_COLORS[toMove].name;
+  const highlightedGroup =
+    hovered >= 0 && stones[hovered] !== EMPTY ? groups.groupOf[hovered] : -1;
+  const highlightedColor =
+    highlightedGroup >= 0 ? (stones[hovered] as 0 | 1) : null;
 
   const focusNode = (node: number) => {
     setActiveNode(node);
@@ -231,6 +316,13 @@ export const StarBoard = memo(function StarBoard({
         <filter id="stoneShadow" x="-60%" y="-60%" width="220%" height="220%">
           <feDropShadow dx="0" dy="1.1" stdDeviation="1.4" floodColor="#000" floodOpacity="0.55" />
         </filter>
+        <filter id="connectionGlow" x="-40%" y="-40%" width="180%" height="180%">
+          <feGaussianBlur stdDeviation="0.8" result="blur" />
+          <feMerge>
+            <feMergeNode in="blur" />
+            <feMergeNode in="SourceGraphic" />
+          </feMerge>
+        </filter>
       </defs>
 
       {/* Plate */}
@@ -258,23 +350,85 @@ export const StarBoard = memo(function StarBoard({
         filter="url(#softGlow)"
       />
 
+      {/* Same-color graph connections. The brighter pass marks living stars. */}
+      <g aria-hidden pointerEvents="none">
+        {PLAYER_COLORS.map((color, player) => (
+          <path
+            key={`connections-${player}`}
+            data-connection-layer="group"
+            data-player={player}
+            d={groups.connectionPaths[player as 0 | 1]}
+            stroke={color.deep}
+            strokeWidth={Math.max(stoneR * 0.48, 1.2)}
+            strokeOpacity="0.72"
+            fill="none"
+            strokeLinecap="round"
+          />
+        ))}
+        {PLAYER_COLORS.map((color, player) => (
+          <path
+            key={`star-connections-${player}`}
+            data-connection-layer="star"
+            data-player={player}
+            d={groups.starConnectionPaths[player as 0 | 1]}
+            stroke={color.base}
+            strokeWidth={Math.max(stoneR * 0.24, 0.7)}
+            strokeOpacity="0.82"
+            fill="none"
+            strokeLinecap="round"
+            filter="url(#connectionGlow)"
+          />
+        ))}
+        {highlightedGroup >= 0 && highlightedColor !== null && (
+          <path
+            data-connection-layer="highlight"
+            d={groups.groupPaths[highlightedGroup]}
+            stroke={PLAYER_COLORS[highlightedColor].bright}
+            strokeWidth={Math.max(stoneR * 0.68, 1.6)}
+            strokeOpacity="0.95"
+            fill="none"
+            strokeLinecap="round"
+            filter="url(#connectionGlow)"
+          />
+        )}
+      </g>
+
       {/* Node layers */}
       {Array.from({ length: board.n }, (_, u) => {
         const x = board.xs[u] * S;
         const y = board.ys[u] * S;
         const stone = stones[u];
         const isEmpty = stone === EMPTY;
+        const scoredOwner = nodeOwner?.[u] ?? -1;
         const owner = territory ? territory[u] : -1;
         const quark = board.isQuark[u] === 1;
         const peri = board.isPeri[u] === 1;
-        const dead = !isEmpty && aliveStone && showTerritory ? aliveStone[u] === 0 : false;
+        const notInStar = !isEmpty && aliveStone ? aliveStone[u] === 0 : false;
+        const captured =
+          !isEmpty &&
+          (scoredOwner === 0 || scoredOwner === 1) &&
+          scoredOwner !== stone;
+        const dimmed = captured || (showTerritory && notInStar);
+        const inHighlightedGroup =
+          !isEmpty && highlightedGroup >= 0 && groups.groupOf[u] === highlightedGroup;
         const nodeKind = quark ? 'quark peri' : peri ? 'peri' : 'interior node';
         const nodeState = isEmpty
           ? `empty ${nodeKind}; ${currentPlayerName} may place here`
           : `${playerNames?.[stone as 0 | 1] || PLAYER_COLORS[stone as 0 | 1].name} stone on ${nodeKind}${
-              dead ? ', not currently part of a living star' : ''
-            }${u === lastMove ? ', last move' : ''}${
+              u === lastMove ? ', last move' : ''
+            }${
               currentTurnMoves.includes(u) && u !== lastMove ? ', placed this turn' : ''
+            }${
+              captured
+                ? `, currently surrounded and captured by ${
+                    playerNames?.[scoredOwner as 0 | 1] ||
+                    PLAYER_COLORS[scoredOwner as 0 | 1].name
+                  }`
+                : notInStar
+                  ? `, connected group of ${groups.groupSize[groups.groupOf[u]]} stone${
+                      groups.groupSize[groups.groupOf[u]] === 1 ? '' : 's'
+                    }, not currently part of a living star`
+                  : `, part of a living star with ${groups.groupSize[groups.groupOf[u]]} stones`
             }`;
 
         return (
@@ -293,7 +447,7 @@ export const StarBoard = memo(function StarBoard({
             )}
 
             {/* territory tint */}
-            {territory && owner !== -1 && (isEmpty || dead) && (
+            {territory && owner !== -1 && (isEmpty || notInStar) && (
               <circle
                 cx={x}
                 cy={y}
@@ -321,7 +475,11 @@ export const StarBoard = memo(function StarBoard({
 
             {/* stone */}
             {!isEmpty && (
-              <g className="stone-pop" opacity={dead ? 0.35 : 1}>
+              <g
+                className="stone-pop"
+                opacity={captured ? 0.22 : dimmed ? 0.35 : 1}
+                data-group-root={groups.groupOf[u]}
+              >
                 <circle
                   cx={x}
                   cy={y}
@@ -329,7 +487,7 @@ export const StarBoard = memo(function StarBoard({
                   fill={`url(#stone${stone})`}
                   stroke={PLAYER_COLORS[stone as 0 | 1].deep}
                   strokeWidth="0.5"
-                  filter={dead ? undefined : 'url(#stoneShadow)'}
+                  filter={dimmed ? undefined : 'url(#stoneShadow)'}
                 />
                 <ellipse
                   cx={x - stoneR * 0.3}
@@ -338,6 +496,49 @@ export const StarBoard = memo(function StarBoard({
                   ry={stoneR * 0.22}
                   fill="rgba(255,255,255,0.55)"
                   transform={`rotate(-24 ${x - stoneR * 0.3} ${y - stoneR * 0.38})`}
+                />
+              </g>
+            )}
+
+            {inHighlightedGroup && (
+              <circle
+                aria-hidden
+                data-group-highlight={u}
+                cx={x}
+                cy={y}
+                r={stoneR * 1.18}
+                fill="none"
+                stroke={PLAYER_COLORS[stone as 0 | 1].bright}
+                strokeWidth="0.8"
+                strokeOpacity="0.9"
+                pointerEvents="none"
+              />
+            )}
+
+            {captured && (
+              <g
+                aria-hidden
+                data-captured-stone={u}
+                pointerEvents="none"
+                stroke={PLAYER_COLORS[scoredOwner as 0 | 1].bright}
+                strokeWidth={Math.max(stoneR * 0.14, 0.8)}
+                strokeLinecap="round"
+              >
+                <circle
+                  cx={x}
+                  cy={y}
+                  r={stoneR * 0.92}
+                  fill="none"
+                  strokeDasharray="1.6 1.6"
+                  strokeWidth={Math.max(stoneR * 0.1, 0.65)}
+                />
+                <path
+                  d={`M${x - stoneR * 0.42} ${y - stoneR * 0.42}L${x + stoneR * 0.42} ${
+                    y + stoneR * 0.42
+                  }M${x + stoneR * 0.42} ${y - stoneR * 0.42}L${
+                    x - stoneR * 0.42
+                  } ${y + stoneR * 0.42}`}
+                  fill="none"
                 />
               </g>
             )}

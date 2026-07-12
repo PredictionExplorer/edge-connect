@@ -2,8 +2,8 @@ import { cleanup, fireEvent, render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { axe } from 'vitest-axe';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { getBoard } from '@/lib/star/board';
-import { EMPTY } from '@/lib/star/scoring';
+import { getBoard, parseLabel } from '@/lib/star/board';
+import { EMPTY, scorePosition } from '@/lib/star/scoring';
 import { StarBoard } from '../StarBoard';
 
 const board = getBoard(4);
@@ -108,6 +108,76 @@ describe('StarBoard', () => {
     await user.keyboard('{Enter}');
     await user.click(occupiedNode);
     expect(onPlace).not.toHaveBeenCalled();
+  });
+
+  it('draws same-color connections and highlights a whole group', () => {
+    const stones = emptyBoard();
+    const first = parseLabel(board, '*40');
+    const second = parseLabel(board, '*41');
+    stones[first] = 0;
+    stones[second] = 0;
+    const score = scorePosition(board, stones);
+    const { container } = render(
+      <StarBoard
+        board={board}
+        stones={stones}
+        aliveStone={score.aliveStone}
+        interactive
+        playerNames={['Ada', 'Grace']}
+      />,
+    );
+
+    const groupPath = container.querySelector(
+      'path[data-connection-layer="group"][data-player="0"]',
+    );
+    const starPath = container.querySelector(
+      'path[data-connection-layer="star"][data-player="0"]',
+    );
+    const groupPathData = groupPath?.getAttribute('d');
+    expect(groupPathData).toContain('M');
+    expect(starPath?.getAttribute('d')).toContain('M');
+
+    fireEvent.mouseEnter(
+      screen.getByRole('button', { name: /node \*40, ada stone/i }),
+    );
+    expect(
+      container
+        .querySelector('path[data-connection-layer="highlight"]')
+        ?.getAttribute('d'),
+    ).toBe(groupPathData);
+    expect(container.querySelectorAll('[data-group-highlight]')).toHaveLength(2);
+  });
+
+  it('marks an opponent-owned stone as captured without influence enabled', () => {
+    const stones = emptyBoard();
+    for (const label of ['*43', 'T42', 'T43']) {
+      stones[parseLabel(board, label)] = 0;
+    }
+    for (const label of ['*42', '*32', 'S30', 'S40']) {
+      stones[parseLabel(board, label)] = 1;
+    }
+    const score = scorePosition(board, stones);
+    const captured = parseLabel(board, '*43');
+    const { container } = render(
+      <StarBoard
+        board={board}
+        stones={stones}
+        nodeOwner={score.nodeOwner}
+        aliveStone={score.aliveStone}
+        interactive
+        playerNames={['Ada', 'Grace']}
+      />,
+    );
+
+    expect(score.nodeOwner[captured]).toBe(1);
+    expect(
+      container.querySelector(`[data-captured-stone="${captured}"]`),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole('button', {
+        name: /node \*43, ada stone on peri, currently surrounded and captured by grace/i,
+      }),
+    ).toBeInTheDocument();
   });
 
   it('has no detectable accessibility violations', async () => {
