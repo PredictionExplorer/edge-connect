@@ -48,6 +48,19 @@ def tiny_model() -> GraphResTNet:
     )
 
 
+def test_scheduler_holds_minimum_rate_after_configured_horizon() -> None:
+    parameter = torch.nn.Parameter(torch.ones(()))
+    optimizer = torch.optim.SGD([parameter], lr=1.0)
+    scheduler = build_scheduler(
+        optimizer,
+        SchedulerConfig(warmup_steps=0, total_steps=10, min_lr_ratio=0.05),
+    )
+    for _ in range(25):
+        optimizer.step()
+        scheduler.step()
+    assert optimizer.param_groups[0]["lr"] == pytest.approx(0.05)
+
+
 def sample(rings: int = 4) -> ReplaySample:
     topology = get_topology(rings)
     stones = torch.full((topology.n,), -1, dtype=torch.int8)

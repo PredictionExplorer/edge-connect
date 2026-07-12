@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 from pathlib import Path
@@ -190,6 +191,56 @@ def test_collect_snapshot_reports_healthy_run(tmp_path, monkeypatch) -> None:
     assert "learner=10/100" in monitor.format_text(snapshot)
 
 
+def test_collect_snapshot_reports_unlimited_recovery_state(
+    tmp_path, monkeypatch
+) -> None:
+    now_ns = 10_000_000_000
+    root = _fixture(tmp_path, now_ns=now_ns)
+    profile = yaml.safe_load((root / "profile.yaml").read_text(encoding="utf-8"))
+    profile["learner"].update({"unlimited": True, "recovery_interval_steps": 5})
+    (root / "profile.yaml").write_text(yaml.safe_dump(profile), encoding="utf-8")
+    recovery_checkpoint = root / "learner" / "recovery" / ("sha256-" + "a" * 64 + ".pt")
+    recovery_checkpoint.parent.mkdir(parents=True)
+    recovery_checkpoint.write_bytes(b"checkpoint")
+    recovery_sha = hashlib.sha256(b"checkpoint").hexdigest()
+    _write_json(
+        root / "learner" / "recovery.json",
+        {
+            "format": "startrain.recovery-pointer",
+            "schema_version": 1,
+            "checkpoint": f"recovery/{recovery_checkpoint.name}",
+            "checkpoint_sha256": recovery_sha,
+            "checkpoint_bytes": len(b"checkpoint"),
+            "step": 10,
+            "epoch": 1,
+        },
+    )
+    backup = root / "recovery" / "replay-manifest" / "manifest-1.sqlite3"
+    backup.parent.mkdir(parents=True)
+    backup.write_bytes(b"backup")
+    _write_json(
+        backup.parent / "latest.json",
+        {
+            "schema_version": 1,
+            "path": backup.name,
+            "bytes": len(b"backup"),
+            "sha256": hashlib.sha256(b"backup").hexdigest(),
+            "created_ns": now_ns,
+        },
+    )
+    with (root / "learner" / "metrics.jsonl").open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps({"event": "recovery_checkpoint", "step": 10}) + "\n")
+    _healthy_dependencies(monkeypatch)
+
+    snapshot: Any = monitor.collect_snapshot(root, now_ns=now_ns)
+    assert snapshot["status"] == "OK"
+    assert snapshot["learner"]["target_steps"] == "unlimited"
+    assert snapshot["recovery"]["step"] == 10
+    assert snapshot["recovery"]["replay_backup_valid"] is True
+    assert snapshot["learner"]["examples_per_second"] == 1234.0
+    assert "learner=10/unlimited" in monitor.format_text(snapshot)
+
+
 def test_snapshot_surfaces_stale_restart_quarantine_and_hardware(
     tmp_path, monkeypatch
 ) -> None:
@@ -280,7 +331,7 @@ def test_run_monitor_once_emits_one_json_record(tmp_path, monkeypatch, capsys) -
     monkeypatch.setattr(
         monitor,
         "collect_snapshot",
-        lambda _root, unit=None: {
+        lambda _root, unit=None, profile_path=None: {
             "schema_version": 1,
             "timestamp": "2026-07-11T00:00:00Z",
             "status": "OK",
@@ -289,6 +340,7 @@ def test_run_monitor_once_emits_one_json_record(tmp_path, monkeypatch, capsys) -
     )
     monitor.run_monitor(
         tmp_path,
+        profile_path=None,
         unit="unit",
         interval=60,
         once=True,

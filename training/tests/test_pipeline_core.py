@@ -18,6 +18,7 @@ from startrain.config import (
     DataConfig,
     LearnerConfig,
     RingMixtureConfig,
+    RingWeightStage,
     SchedulerConfig,
     TrainConfig,
 )
@@ -39,6 +40,7 @@ from startrain.learner import (
     LazyShardReplayDataset,
     LearnerLoop,
     UniqueReplayBatchSampler,
+    _weighted_ring_quotas,
     plateau_policy_decision,
 )
 from startrain.losses import LossWeights
@@ -343,6 +345,13 @@ def test_curriculum_and_selfplay_reject_noncanonical_rings() -> None:
     assert mixture.active_rings(0) == (4,)
     assert mixture.active_rings(10) == (4, 6)
     assert mixture.active_rings(20) == SUPPORTED_RINGS
+    weighted = RingMixtureConfig(
+        step_weights=(RingWeightStage(1_000_000, (0.1, 0.1, 0.1, 0.7)),)
+    )
+    assert weighted.weights_for_step(999_999) is None
+    assert weighted.weights_for_step(1_000_000) == (0.1, 0.1, 0.1, 0.7)
+    assert weighted.next_weight_step(999_999) == 1_000_000
+    assert weighted.next_weight_step(1_000_000) is None
 
     with pytest.raises(ValueError, match="one of"):
         SelfPlayConfig(rings=5)
@@ -350,6 +359,12 @@ def test_curriculum_and_selfplay_reject_noncanonical_rings() -> None:
         SelfPlayConfig(rings=4.0)  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="selected"):
         CurriculumStage(10, (4, 5))
+    with pytest.raises(ValueError, match="unlimited"):
+        LearnerConfig(unlimited="yes")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="recovery_interval_steps"):
+        LearnerConfig(candidate_interval=10, recovery_interval_steps=11)
+    with pytest.raises(ValueError, match="match configured rings"):
+        RingMixtureConfig(step_weights=(RingWeightStage(10, (0.3, 0.7)),))
 
 
 def test_inference_response_submit_contract_is_stable() -> None:
@@ -844,6 +859,7 @@ def test_learner_runs_batch_publishes_metrics_and_resumes_example_cadence(
         manifest = json.loads(manifest_path.read_text())
         assert manifest["model_step"] == 1
         assert manifest["role"] == "candidate"
+        manifest_path.write_text("{broken", encoding="utf-8")
         published = learner.publisher.publish(
             model=learner.model,
             optimizer=learner.optimizer,
@@ -950,6 +966,23 @@ def test_learner_runs_batch_publishes_metrics_and_resumes_example_cadence(
         assert restored.examples_consumed == before_examples
         for name, value in restored.model.state_dict().items():
             torch.testing.assert_close(value, before_rejected_resume[name])
+
+        completion_path = tmp_path / "restored" / "learner-complete.json"
+        completion_path.write_text("{}", encoding="utf-8")
+        restored.learner_config = replace(
+            restored.learner_config,
+            steps=1,
+            unlimited=True,
+            recovery_interval_steps=1,
+            target_updates_per_new_sample=None,
+            candidate_interval_examples=None,
+        )
+        assert restored.run(stop_requested=lambda: restored.step >= 2) == 2
+        assert not completion_path.exists()
+        recovery = json.loads(
+            (tmp_path / "restored" / "recovery.json").read_text(encoding="utf-8")
+        )
+        assert recovery["step"] == 2
 
 
 def test_learner_publishes_initial_ema_then_times_out_on_short_batch(
@@ -1071,6 +1104,71 @@ def test_lazy_replay_sampler_is_unique_deterministic_and_homogeneous(
     assert len(flattened) == len(set(flattened)) == 8
     for batch in selected:
         assert len({dataset[index].rings for index in batch}) == 1
+
+
+def test_lazy_replay_sampler_applies_weighted_ring_quotas(tmp_path) -> None:
+    spans = []
+    samples_by_ring = {}
+    for shard_id, ring in enumerate(SUPPORTED_RINGS, start=1):
+        samples = [
+            make_replay_sample(ring, game_id=f"weighted-{ring}-{index}")
+            for index in range(100)
+        ]
+        path = write_replay_shard(tmp_path / f"ring-{ring}.npz", samples)
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        spans.append(
+            ReplaySpan(
+                ShardRecord(
+                    shard_id=shard_id,
+                    path=path,
+                    created_ns=shard_id,
+                    sample_count=100,
+                    ring=ring,
+                    phase_min=0,
+                    phase_max=0,
+                    model_version="sha256-" + "1" * 64,
+                    model_step=0,
+                    model_identity="sha256-" + "1" * 64,
+                    run_id="run-test",
+                    generation_family="family-test",
+                    actor_id="actor-test",
+                    generation=0,
+                    game_count=100,
+                    checksum_sha256=digest,
+                    state="ready",
+                    quarantine_reason=None,
+                ),
+                0,
+                100,
+            )
+        )
+        samples_by_ring[ring] = 100
+    dataset = LazyShardReplayDataset(
+        ReplaySelection(tuple(spans), samples_by_ring, 4),
+        seed=17,
+        epoch=1,
+        augmentation_enabled=False,
+        shard_cache_size=4,
+    )
+    sampler = UniqueReplayBatchSampler(
+        dataset,
+        batch_size=1,
+        batches=100,
+        seed=17,
+        epoch=1,
+        ring_stratified=True,
+        ring_weights={4: 0.1, 6: 0.1, 8: 0.1, 10: 0.7},
+    )
+    counts = {ring: 0 for ring in SUPPORTED_RINGS}
+    for batch in sampler:
+        counts[dataset[batch[0]].rings] += 1
+    assert counts == {4: 10, 6: 10, 8: 10, 10: 70}
+    with pytest.raises(ValueError, match="cannot satisfy configured proportions"):
+        _weighted_ring_quotas(
+            100,
+            capacities={4: 100, 6: 100, 8: 100, 10: 8},
+            weights={4: 0.1, 6: 0.1, 8: 0.1, 10: 0.7},
+        )
 
 
 def test_shard_aware_large_batch_decodes_once_and_materializes_selected_rows(

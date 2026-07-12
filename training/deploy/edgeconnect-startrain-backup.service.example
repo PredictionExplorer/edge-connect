@@ -1,0 +1,10 @@
+[Unit]
+Description=EdgeConnect StarTrain replay-ledger backup
+
+[Service]
+Type=oneshot
+User=@USER@
+WorkingDirectory=@TRAINING_DIR@
+ExecStart=@TRAINING_DIR@/.venv/bin/python @TRAINING_DIR@/scripts/replay_manifest_backup.py backup --run-root @RUN_ROOT@ --retain 3
+NoNewPrivileges=true
+UMask=0027

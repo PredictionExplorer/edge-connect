@@ -6,6 +6,7 @@ import json
 import os
 import re
 import signal
+import socket
 import tempfile
 import threading
 import time
@@ -143,6 +144,40 @@ class SignalLatch:
 
     def is_set(self) -> bool:
         return self.event.is_set()
+
+
+class SystemdNotifier:
+    """Best-effort sd_notify client without an optional systemd dependency."""
+
+    def __init__(self, socket_path: str | None = None) -> None:
+        self.socket_path = (
+            socket_path if socket_path is not None else os.getenv("NOTIFY_SOCKET")
+        )
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.socket_path)
+
+    def ready(self, status: str) -> None:
+        self._send(f"READY=1\nSTATUS={status}")
+
+    def watchdog(self, status: str) -> None:
+        self._send(f"WATCHDOG=1\nSTATUS={status}")
+
+    def stopping(self, status: str) -> None:
+        self._send(f"STOPPING=1\nSTATUS={status}")
+
+    def _send(self, message: str) -> None:
+        if not self.socket_path:
+            return
+        address: str | bytes = self.socket_path
+        if self.socket_path.startswith("@"):
+            address = b"\0" + self.socket_path[1:].encode()
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as client:
+                client.sendto(message.encode(), address)
+        except OSError:
+            return
 
 
 class HeartbeatReporter:

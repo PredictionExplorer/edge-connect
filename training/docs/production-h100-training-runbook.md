@@ -336,6 +336,28 @@ print("Run root:", run_root)
 PY
 ```
 
+For an explicitly operator-controlled continuous run, add the following before
+freezing the profile. Finite profiles remain the default:
+
+```yaml
+learner:
+  steps: 1000000
+  unlimited: true
+  recovery_interval_steps: 1000
+orchestration:
+  ring_mixture:
+    step_weights:
+      - from_step: 1000000
+        weights: [0.1, 0.1, 0.1, 0.7]
+  retention:
+    enabled: true
+    recovery_dry_run: false
+```
+
+`steps` remains the monitoring milestone. The cosine scheduler still reaches
+`min_lr_ratio` at one million and then holds that floor. Recovery checkpoints
+are not promotion candidates and do not change the 15,000-step arena cadence.
+
 Validate and print the effective topology:
 
 ```bash
@@ -539,6 +561,7 @@ sed \
   -e "s|@USER@|$USER|g" \
   -e "s|@TRAINING_DIR@|$PWD|g" \
   -e "s|@PROFILE@|$PROFILE|g" \
+  -e "s|@RUN_ROOT@|$RUN_ROOT|g" \
   deploy/edgeconnect-startrain.service.example \
   > "/tmp/edgeconnect-startrain-$RUN_ID.service"
 
@@ -549,6 +572,15 @@ sudo install -m 0644 \
 sudo systemctl daemon-reload
 sudo systemctl enable --now "edgeconnect-startrain-$RUN_ID.service"
 ```
+
+For an unlimited profile, generate the unit from
+`deploy/edgeconnect-startrain-continuous.service.example`. It validates the
+continuous settings, uses `Restart=always`, disables systemd's start-burst
+cutoff, and feeds a watchdog from the coordinator loop. A deliberate
+`systemctl stop` still suppresses restart. Finite profiles must use the regular
+`Restart=on-failure` template. Install the replay-ledger backup service/timer
+from `deploy/edgeconnect-startrain-backup.*.example` with the same `@USER@`,
+`@TRAINING_DIR@`, `@RUN_ROOT@`, and `@RUN_ID@` substitutions.
 
 Keep the template's `KillMode=mixed`: systemd sends the graceful signal only to
 the coordinator, allowing it to unwind learner DataLoader children and actor
@@ -619,12 +651,13 @@ screen -DmS "$MONITOR_SESSION" bash -lc '
   cd "$1"
   "$2" -u scripts/monitor_run.py \
     --run-root "$3" \
-    --unit "$4" \
+    --profile "$4" \
+    --unit "$5" \
     --interval 60 \
     --format text 2>&1 |
-  tee -a "$5"
+  tee -a "$6"
 ' monitor "$MONITOR_TRAINING" "$MONITOR_PYTHON" \
-  "$RUN_ROOT" "$UNIT" "$MONITOR_LOG"
+  "$RUN_ROOT" "$PROFILE" "$UNIT" "$MONITOR_LOG"
 ```
 
 Inspect and detach:
@@ -646,7 +679,7 @@ For structured ingestion, use `--format jsonl`. A one-shot status check is:
 
 ```bash
 "$MONITOR_PYTHON" -u "$MONITOR_TRAINING/scripts/monitor_run.py" \
-  --run-root "$RUN_ROOT" --unit "$UNIT" --once
+  --run-root "$RUN_ROOT" --profile "$PROFILE" --unit "$UNIT" --once
 ```
 
 GPU health:
@@ -756,6 +789,13 @@ For systemd:
 sudo systemctl stop "edgeconnect-startrain-$RUN_ID.service"
 ```
 
+To keep a continuous unit stopped across reboot:
+
+```bash
+sudo systemctl disable --now "edgeconnect-startrain-$RUN_ID.service"
+sudo systemctl disable --now "edgeconnect-startrain-$RUN_ID-backup.timer"
+```
+
 The profile allows up to 900 seconds for worker termination and complete-cohort
 drain. Wait for the coordinator to exit before considering the stop complete.
 
@@ -794,13 +834,27 @@ tmux new-session -d -s "$RUN_ID" \
   "bash -lc 'set -o pipefail; cd \"$PWD\" && source .venv/bin/activate && startrain-orchestrate --config \"$PROFILE\" 2>&1 | tee \"$RUN_ROOT/coordinator-console.log\"'"
 ```
 
-The coordinator reuses `run.json`, reconciles replay files, loads the latest
-candidate, and resumes progress. It rejects a profile run ID that disagrees
-with the existing run identity.
+The coordinator reuses `run.json`, reconciles replay files, and resumes the
+highest-step valid state. Resolution checks the recovery head and journal,
+candidate pointer and immutable manifest history, then the champion as a last
+resort. Every checkpoint is checked for size, SHA-256, run identity, generation
+family, model, and rules compatibility. Rejected artifacts are recorded in
+learner metrics instead of trapping the service in a crash loop.
+
+The backup timer uses SQLite's online backup API. Before service start,
+`replay_manifest_backup.py check-and-restore` verifies the replay ledger; if it
+is corrupt, it preserves the damaged DB/WAL and restores only a verified recent
+backup. Replay reconciliation then handles shards newer than that backup.
 
 Do not delete `coordinator.lock` while a coordinator PID is alive. The
 coordinator removes an abandoned lock only when the recorded PID is no longer
 live.
+
+For indefinite operation, review at least one retention dry-run event before
+setting `orchestration.retention.dry_run: false`. Active replay watermarks,
+current candidate/champion, arena-referenced manifests, and recent recovery
+checkpoints remain protected. Whole-volume loss and persistent GPU/driver
+failure still require operator intervention.
 
 ## 19. Troubleshooting
 

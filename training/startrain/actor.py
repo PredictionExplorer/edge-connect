@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import random
 import statistics
 import time
@@ -27,10 +28,17 @@ class RingMixtureScheduler:
         self.config = config
         self.random = random.Random(seed)
 
-    def choose(self, sample_counts: Mapping[int, int]) -> int:
+    def choose(self, sample_counts: Mapping[int, int], *, learner_step: int = 0) -> int:
         counts = {ring: int(sample_counts.get(ring, 0)) for ring in self.config.rings}
         if any(value < 0 for value in counts.values()):
             raise ValueError("ring sample counts must be non-negative")
+        step_weights = self.config.weights_for_step(learner_step)
+        if step_weights is not None:
+            return self.random.choices(
+                self.config.rings,
+                weights=step_weights,
+                k=1,
+            )[0]
         total = sum(counts.values())
         eligible = self.config.active_rings(total)
         target = max((counts[ring] for ring in eligible), default=0)
@@ -157,6 +165,7 @@ class ActorSupervisor:
         run_identity: RunIdentity,
         heartbeat_path: str | Path,
         metrics_path: str | Path,
+        learner_heartbeat_path: str | Path | None = None,
         device: str = "cuda",
         lane_id: int = 0,
     ) -> None:
@@ -215,6 +224,11 @@ class ActorSupervisor:
             interval_seconds=experiment.orchestration.shutdown.heartbeat_interval_seconds,
         )
         self.metrics_path = Path(metrics_path)
+        self.learner_heartbeat_path = (
+            Path(learner_heartbeat_path)
+            if learner_heartbeat_path is not None
+            else run_identity.path.parent / "status" / "learner.heartbeat.json"
+        )
         self.scheduler = RingMixtureScheduler(
             experiment.orchestration.ring_mixture,
             seed=(
@@ -284,7 +298,20 @@ class ActorSupervisor:
                         run_id=self.run_identity.run_id,
                         generation_family=self.run_identity.generation_family,
                     )
-                    ring = self.scheduler.choose(counts)
+                    scheduling_step, scheduling_step_source = (
+                        self._read_learner_scheduling_step(
+                            fallback_step=candidate.model_step
+                        )
+                    )
+                    active_ring_weights = (
+                        self.experiment.orchestration.ring_mixture.weights_for_step(
+                            scheduling_step
+                        )
+                    )
+                    ring = self.scheduler.choose(
+                        counts,
+                        learner_step=scheduling_step,
+                    )
                     generation = store.lease_generation(
                         self.run_identity, self.actor_id
                     )
@@ -302,6 +329,9 @@ class ActorSupervisor:
                         model_role=model_role,
                         model_version=evaluator.model_version,
                         model_step=evaluator.model_step,
+                        scheduling_step=scheduling_step,
+                        scheduling_step_source=scheduling_step_source,
+                        active_ring_weights=active_ring_weights,
                     )
                     evaluator_calls_before = int(
                         getattr(evaluator, "evaluator_calls", 0)
@@ -399,6 +429,9 @@ class ActorSupervisor:
                             "generation": generation,
                             "batch": batches,
                             "ring": ring,
+                            "scheduling_step": scheduling_step,
+                            "scheduling_step_source": scheduling_step_source,
+                            "active_ring_weights": active_ring_weights,
                             "games": len(summaries),
                             "samples": samples,
                             "policy_samples": policy_samples,
@@ -543,3 +576,21 @@ class ActorSupervisor:
         self._candidate_signature = signature
         self._candidate_manifest = manifest
         return manifest
+
+    def _read_learner_scheduling_step(self, *, fallback_step: int) -> tuple[int, str]:
+        try:
+            stat = self.learner_heartbeat_path.stat()
+            if (
+                time.time() - stat.st_mtime
+                > self.experiment.orchestration.shutdown.stale_heartbeat_seconds
+            ):
+                raise ValueError("learner heartbeat is stale")
+            payload = json.loads(
+                self.learner_heartbeat_path.read_text(encoding="utf-8")
+            )
+            step = payload.get("step") if isinstance(payload, dict) else None
+            if isinstance(step, bool) or not isinstance(step, int) or step < 0:
+                raise ValueError("learner heartbeat step is invalid")
+            return step, "learner_heartbeat"
+        except (OSError, json.JSONDecodeError, ValueError):
+            return fallback_step, "candidate_manifest"

@@ -6,13 +6,14 @@ import shutil
 import time
 from dataclasses import asdict, replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import torch
 import pytest
 
 import startrain.orchestration as orchestration_module
-from startrain.actor import RingMixtureScheduler
+from startrain.actor import ActorSupervisor, RingMixtureScheduler
 from startrain.checkpoint import (
     ExponentialMovingAverage,
     latest_checkpoint,
@@ -27,6 +28,7 @@ from startrain.config import (
     GPUWorkerConfig,
     RestartPolicyConfig,
     RingMixtureConfig,
+    RingWeightStage,
     RunDirectoryConfig,
     SchedulerConfig,
     ShutdownConfig,
@@ -50,6 +52,20 @@ from startrain.training import build_scheduler
 
 
 CONFIGS = Path(__file__).parents[1] / "configs"
+DEPLOY = Path(__file__).parents[1] / "deploy"
+
+
+def test_finite_and_continuous_systemd_restart_policies_are_distinct() -> None:
+    finite = (DEPLOY / "edgeconnect-startrain.service.example").read_text()
+    continuous = (
+        DEPLOY / "edgeconnect-startrain-continuous.service.example"
+    ).read_text()
+    assert "Restart=on-failure" in finite
+    assert "Restart=always" not in finite
+    assert "Restart=always" in continuous
+    assert "validate_continuous_profile.py" in continuous
+    assert "WatchdogSignal=SIGTERM" in finite
+    assert "WatchdogSignal=SIGTERM" in continuous
 
 
 def test_graceful_stop_signals_only_worker_leader_before_group_kill(
@@ -252,6 +268,18 @@ def test_ring_scheduler_curriculum_then_favors_deficits() -> None:
     assert set(selections) == {4, 6, 8, 10}
     assert selections.count(10) > selections.count(4) * 2
 
+    weighted = RingMixtureScheduler(
+        RingMixtureConfig(
+            step_weights=(RingWeightStage(1_000_000, (0.1, 0.1, 0.1, 0.7)),)
+        ),
+        seed=11,
+    )
+    post_million = [
+        weighted.choose(mature, learner_step=1_000_000) for _ in range(20_000)
+    ]
+    ring_ten_fraction = post_million.count(10) / len(post_million)
+    assert 0.68 <= ring_ten_fraction <= 0.72
+
 
 def test_ring_mixture_stage_selection_uses_aggregate_sample_boundaries() -> None:
     mixture = RingMixtureConfig(
@@ -265,6 +293,31 @@ def test_ring_mixture_stage_selection_uses_aggregate_sample_boundaries() -> None
     assert mixture.active_rings(100) == (4, 6)
     assert mixture.active_rings(499) == (4, 6)
     assert mixture.active_rings(500) == (4, 6, 8, 10)
+
+
+def test_actor_scheduling_step_uses_fresh_learner_heartbeat_with_fallback(
+    tmp_path,
+) -> None:
+    actor = object.__new__(ActorSupervisor)
+    actor.learner_heartbeat_path = tmp_path / "learner.heartbeat.json"
+    actor.experiment = SimpleNamespace(
+        orchestration=SimpleNamespace(
+            shutdown=SimpleNamespace(stale_heartbeat_seconds=60.0)
+        )
+    )
+    actor.learner_heartbeat_path.write_text(
+        json.dumps({"step": 1_000_000}),
+        encoding="utf-8",
+    )
+    assert actor._read_learner_scheduling_step(fallback_step=990_000) == (
+        1_000_000,
+        "learner_heartbeat",
+    )
+    actor.learner_heartbeat_path.write_text("{broken", encoding="utf-8")
+    assert actor._read_learner_scheduling_step(fallback_step=990_000) == (
+        990_000,
+        "candidate_manifest",
+    )
 
 
 def test_explicit_ddp_builds_one_torchrun_job_and_partitions_batches(

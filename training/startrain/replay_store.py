@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import fcntl
 import os
 import sqlite3
 import time
@@ -13,7 +14,7 @@ from typing import Iterator, Sequence
 
 from .contracts import FEATURE_SCHEMA_HASH, RULES_HASH, RULES_HASH_WIRE
 from .replay import ReplaySample, read_replay_shard, write_replay_shard
-from .runtime import RunIdentity, validate_identifier
+from .runtime import RunIdentity, atomic_json, validate_identifier
 from .topology import SUPPORTED_RINGS, get_topology
 
 MANIFEST_SCHEMA_VERSION = 4
@@ -300,6 +301,17 @@ class ReplayStore:
                 time.time_ns(),
             ),
         )
+        initialized_path = self.root / "initialized.json"
+        if not initialized_path.is_file():
+            atomic_json(
+                initialized_path,
+                {
+                    "schema_version": 1,
+                    "run_id": identity.run_id,
+                    "generation_family": identity.generation_family,
+                    "initialized_ns": time.time_ns(),
+                },
+            )
 
     def lease_generation(self, identity: RunIdentity, actor_id: str) -> int:
         actor = validate_identifier("actor_id", actor_id)
@@ -338,11 +350,24 @@ class ReplayStore:
         return generation
 
     def reconcile_orphans(self) -> dict[str, int]:
+        lock_path = self.root / ".reconcile.lock"
+        descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o640)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            return self._reconcile_orphans_locked()
+        finally:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+            os.close(descriptor)
+
+    def _reconcile_orphans_locked(self) -> dict[str, int]:
         referenced = {
             str(row["relative_path"])
             for row in self.connection.execute("SELECT relative_path FROM shards")
         }
         removed_files = 0
+        preserved_files = 0
+        restore_marker = self.root / "restore-marker.json"
+        restored_ledger = restore_marker.is_file()
         now = time.time()
         for path in self.shard_directory.glob("*"):
             relative = str(path.relative_to(self.root))
@@ -350,10 +375,20 @@ class ReplayStore:
                 path.is_file()
                 and (path.suffix == ".npz" or path.name.endswith(".tmp"))
                 and relative not in referenced
-                and now - path.stat().st_mtime >= 300.0
+                and (restored_ledger or now - path.stat().st_mtime >= 300.0)
             ):
-                path.unlink(missing_ok=True)
-                removed_files += 1
+                if restored_ledger:
+                    quarantine = self.quarantine_directory / (
+                        f"post-restore-orphan-{time.time_ns()}-{path.name}"
+                    )
+                    try:
+                        os.replace(path, quarantine)
+                    except FileNotFoundError:
+                        continue
+                    preserved_files += 1
+                else:
+                    path.unlink(missing_ok=True)
+                    removed_files += 1
         missing: list[int] = []
         corrupt: list[tuple[int, str, str]] = []
         for row in self.connection.execute(
@@ -405,8 +440,11 @@ class ReplayStore:
             except Exception:
                 self.connection.execute("ROLLBACK")
                 raise
+        if restored_ledger:
+            restore_marker.unlink(missing_ok=True)
         return {
             "orphan_files": removed_files,
+            "post_restore_orphans": preserved_files,
             "missing_committed": len(missing),
             "corrupt_committed": len(corrupt),
         }

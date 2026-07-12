@@ -18,6 +18,7 @@ from typing import Protocol, TextIO
 from .config import ExperimentConfig, load_config, parse_cpu_affinity
 from .runtime import (
     SignalLatch,
+    SystemdNotifier,
     append_jsonl,
     atomic_json,
     load_or_create_run_identity,
@@ -323,6 +324,8 @@ def build_worker_specs(
                         str(directories.run_identity),
                         "--heartbeat",
                         str(directories.status / f"{name}.heartbeat.json"),
+                        "--learner-heartbeat",
+                        str(directories.status / "learner.heartbeat.json"),
                         "--metrics",
                         str(directories.metrics / f"{name}.jsonl"),
                         "--device",
@@ -482,6 +485,7 @@ class Coordinator:
         stop_requested: Callable[[], bool],
         max_monitor_cycles: int | None = None,
     ) -> int:
+        notifier = SystemdNotifier()
         self.directories.create()
         self.lock.acquire()
         exit_code = 0
@@ -495,6 +499,7 @@ class Coordinator:
                 return 0
             for worker in self.workers.values():
                 self._start_or_schedule(worker)
+            notifier.ready("StarTrain coordinator is running")
             while not stop_requested():
                 now = self.clock()
                 self._reconcile_pause_lease(now)
@@ -503,6 +508,11 @@ class Coordinator:
                     exhausted = self._monitor_worker(worker, now) or exhausted
                 exhausted = self.pause_failed or exhausted
                 self._write_status()
+                notifier.watchdog(
+                    "StarTrain coordinator healthy"
+                    if not exhausted
+                    else "StarTrain coordinator restarting after worker failure"
+                )
                 if self.draining and self._drain_complete():
                     exit_code = 0
                     break
@@ -521,6 +531,7 @@ class Coordinator:
                 )
             return exit_code
         finally:
+            notifier.stopping("StarTrain coordinator is stopping")
             self.stopping = True
             self._stop_all()
             self._write_status(final=True)

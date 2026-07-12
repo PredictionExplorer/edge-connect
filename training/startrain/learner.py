@@ -22,12 +22,15 @@ from .checkpoint import (
     MODEL_MANIFEST_VERSION,
     ExponentialMovingAverage,
     ModelManifest,
+    collect_recovery_garbage,
     load_checkpoint,
     load_model_manifest,
     save_checkpoint,
     sha256_file,
     verify_file,
+    write_recovery_checkpoint,
     write_model_pointer,
+    write_resume_cutover,
 )
 from .config import (
     DataConfig,
@@ -239,6 +242,7 @@ class UniqueReplayBatchSampler(Sampler[list[int]]):
         seed: int,
         epoch: int,
         ring_stratified: bool,
+        ring_weights: Mapping[int, float] | None = None,
         rank: int = 0,
         world_size: int = 1,
     ) -> None:
@@ -255,6 +259,11 @@ class UniqueReplayBatchSampler(Sampler[list[int]]):
         self.epoch = epoch
         self.dataset = dataset
         self.ring_stratified = ring_stratified
+        self.ring_weights = (
+            {int(ring): float(weight) for ring, weight in ring_weights.items()}
+            if ring_weights is not None
+            else None
+        )
         self.rank = rank
         self.world_size = world_size
         self.chunks = dataset.shard_batch_chunks(batch_size)
@@ -265,6 +274,11 @@ class UniqueReplayBatchSampler(Sampler[list[int]]):
                 raise ValueError(
                     "ring-stratified replay lacks enough homogeneous unique batches"
                 )
+            if self.ring_weights is not None and (
+                any(weight < 0 for weight in self.ring_weights.values())
+                or not any(weight > 0 for weight in self.ring_weights.values())
+            ):
+                raise ValueError("ring weights must be non-negative with positive sum")
 
     def __len__(self) -> int:
         return self.batches
@@ -279,18 +293,31 @@ class UniqueReplayBatchSampler(Sampler[list[int]]):
             for chunk in self.chunks:
                 by_ring[chunk.ring].append(chunk)
             capacities = {ring: len(chunks) for ring, chunks in by_ring.items()}
-            order: list[int] = []
-            used = {ring: 0 for ring in capacities}
-            while len(order) < total_chunks:
-                available = [
-                    ring for ring in capacities if used[ring] < capacities[ring]
+            if self.ring_weights is None:
+                order = []
+                used = {ring: 0 for ring in capacities}
+                while len(order) < total_chunks:
+                    available = [
+                        ring for ring in capacities if used[ring] < capacities[ring]
+                    ]
+                    rng.shuffle(available)
+                    for ring in available:
+                        order.append(ring)
+                        used[ring] += 1
+                        if len(order) == total_chunks:
+                            break
+            else:
+                used = _weighted_ring_quotas(
+                    total_chunks,
+                    capacities=capacities,
+                    weights={
+                        ring: self.ring_weights.get(ring, 0.0) for ring in capacities
+                    },
+                )
+                order = [
+                    ring for ring, count in sorted(used.items()) for _ in range(count)
                 ]
-                rng.shuffle(available)
-                for ring in available:
-                    order.append(ring)
-                    used[ring] += 1
-                    if len(order) == total_chunks:
-                        break
+                rng.shuffle(order)
             ring_chunks: dict[int, Iterator[ShardBatchChunk]] = {}
             for ring, count in used.items():
                 ring_chunks[ring] = iter(rng.sample(by_ring[ring], count))
@@ -304,6 +331,39 @@ class UniqueReplayBatchSampler(Sampler[list[int]]):
         if len(local) != self.batches:
             raise RuntimeError("distributed sampler emitted uneven batches")
         yield from local
+
+
+def _weighted_ring_quotas(
+    total: int,
+    *,
+    capacities: Mapping[int, int],
+    weights: Mapping[int, float],
+) -> dict[int, int]:
+    if total <= 0:
+        raise ValueError("weighted ring quota total must be positive")
+    eligible = [ring for ring, weight in weights.items() if weight > 0]
+    if any(capacities.get(ring, 0) <= 0 for ring in eligible):
+        raise ValueError("weighted ring replay is missing a configured ring")
+    if sum(capacities[ring] for ring in eligible) < total:
+        raise ValueError("weighted ring replay lacks enough configured capacity")
+    total_weight = sum(float(weights[ring]) for ring in eligible)
+    targets = {ring: total * float(weights[ring]) / total_weight for ring in eligible}
+    quotas = {ring: int(targets[ring]) for ring in eligible}
+    remaining = total - sum(quotas.values())
+    remainders = sorted(
+        eligible,
+        key=lambda ring: (
+            targets[ring] - quotas[ring],
+            float(weights[ring]),
+            -ring,
+        ),
+        reverse=True,
+    )
+    for ring in remainders[:remaining]:
+        quotas[ring] += 1
+    if any(quotas[ring] > capacities[ring] for ring in eligible):
+        raise ValueError("weighted ring replay cannot satisfy configured proportions")
+    return {ring: quotas.get(ring, 0) for ring in capacities}
 
 
 class JSONLMetrics:
@@ -376,13 +436,17 @@ class ImmutableModelPublisher:
         global_batch_size: int | None = None,
     ) -> ModelManifest:
         if self.candidate_path.is_file():
-            current = load_model_manifest(self.candidate_path)
-            if (
-                current.model_step == step
-                and current.run_id == self.run_identity.run_id
-                and current.generation_family == self.run_identity.generation_family
-            ):
-                return current
+            try:
+                current = load_model_manifest(self.candidate_path)
+            except ValueError:
+                current = None
+            if current is not None:
+                if (
+                    current.model_step == step
+                    and current.run_id == self.run_identity.run_id
+                    and current.generation_family == self.run_identity.generation_family
+                ):
+                    return current
         staged = self.checkpoint_directory / f".candidate-{step:012d}.staging.pt"
         save_checkpoint(
             staged,
@@ -525,6 +589,7 @@ class LearnerLoop:
         self.step = 0
         self.epoch = 0
         self.examples_consumed = 0
+        self._last_recovery_step = 0
         self._latest_total_replay_samples = 0
         # Replay batches are fixed-size and ring-homogeneous. Static compilation
         # avoids Inductor's dynamic backward reductions (which fail on variable
@@ -624,6 +689,7 @@ class LearnerLoop:
         self.step = int(metadata["step"])
         self.epoch = int(metadata["epoch"])
         self.examples_consumed = self._resume_examples_consumed(metadata)
+        self._last_recovery_step = self.step
 
     def _resume_examples_consumed(self, metadata: Mapping[str, object]) -> int:
         extra = metadata.get("extra")
@@ -655,11 +721,15 @@ class LearnerLoop:
         stop_requested: Callable[[], bool] = lambda: False,
         progress: Callable[..., None] | None = None,
     ) -> int:
-        target = self.step + steps if steps is not None else self.learner_config.steps
+        target = (
+            self.step + steps
+            if steps is not None
+            else (None if self.learner_config.unlimited else self.learner_config.steps)
+        )
         completion_path = self.publisher.root / "learner-complete.json"
-        if self.rank == 0 and self.step < target:
+        if self.rank == 0 and (target is None or self.step < target):
             completion_path.unlink(missing_ok=True)
-        if self.rank == 0:
+        if self.rank == 0 and not self.publisher.candidate_path.is_file():
             self._publish()
         self._distributed_barrier()
         interval_started = time.perf_counter()
@@ -669,7 +739,7 @@ class LearnerLoop:
         interval_cpu_device_seconds = 0.0
         interval_device_events: list[tuple[torch.cuda.Event, torch.cuda.Event]] = []
         interval_copy_events: list[tuple[torch.cuda.Event, torch.cuda.Event]] = []
-        while self.step < target:
+        while target is None or self.step < target:
             if self._collective_stop(stop_requested()):
                 break
             if not self._gpu_pause_control(
@@ -688,9 +758,31 @@ class LearnerLoop:
                 break
             selection = self._select_replay_spans()
             maximum_batches = self._maximum_unique_batches(selection)
+            target_budget = (
+                self.learner_config.steps_per_window
+                if target is None
+                else target - self.step
+            )
+            next_weight_step = self.ring_mixture_config.next_weight_step(self.step)
+            weight_budget = (
+                self.learner_config.steps_per_window
+                if next_weight_step is None
+                else next_weight_step - self.step
+            )
+            recovery_interval = self.learner_config.recovery_interval_steps
+            recovery_budget = (
+                self.learner_config.steps_per_window
+                if recovery_interval is None
+                else max(
+                    1,
+                    self._last_recovery_step + recovery_interval - self.step,
+                )
+            )
             batches = min(
                 self.learner_config.steps_per_window,
-                target - self.step,
+                target_budget,
+                weight_budget,
+                recovery_budget,
                 maximum_batches,
                 self._plateau_step_budget(),
                 self._utd_step_budget(),
@@ -839,6 +931,7 @@ class LearnerLoop:
                             "feature_path": batch.feature_path,
                             "replay_samples": selection.sample_count,
                             "replay_samples_by_ring": selection.samples_by_ring,
+                            "ring_batch_weights": self._active_ring_weights(),
                             "replay_max_shard_id": selection.max_shard_id,
                             "effective_unique_samples": (
                                 batches
@@ -861,15 +954,18 @@ class LearnerLoop:
                     interval_copy_events.clear()
                 if self.rank == 0 and self._candidate_due():
                     self._publish()
+                    self._last_recovery_step = self.step
                 if progress is not None and self.rank == 0:
                     progress(phase="training", step=self.step, epoch=self.epoch)
             if self.rank == 0:
                 self.store.clear_gc_watermark(watermark_name)
+                self._maybe_write_recovery_checkpoint()
                 self._maybe_collect_replay_garbage()
             self.epoch += 1
         if self.rank == 0:
-            final_manifest = self._publish()
-            if self.step >= target:
+            completed = target is not None and self.step >= target
+            if completed:
+                final_manifest = self._publish()
                 atomic_json(
                     completion_path,
                     {
@@ -881,6 +977,8 @@ class LearnerLoop:
                         "completed_ns": time.time_ns(),
                     },
                 )
+            else:
+                self._maybe_write_recovery_checkpoint(force=True)
         self._distributed_barrier()
         return self.step
 
@@ -899,6 +997,7 @@ class LearnerLoop:
             seed=self.seed,
             epoch=self.epoch,
             ring_stratified=self.data_config.ring_stratified,
+            ring_weights=self._active_ring_weights(),
             rank=self.rank,
             world_size=self.world_size,
         )
@@ -934,6 +1033,64 @@ class LearnerLoop:
             global_batch_size=self.train_config.global_batch_size(self.world_size),
         )
 
+    def _active_ring_weights(self) -> dict[int, float] | None:
+        weights = self.ring_mixture_config.weights_for_step(self.step)
+        if weights is None:
+            return None
+        return dict(zip(self.ring_mixture_config.rings, weights, strict=True))
+
+    def _maybe_write_recovery_checkpoint(self, *, force: bool = False) -> None:
+        interval = self.learner_config.recovery_interval_steps
+        if interval is None:
+            return
+        if not force and (
+            self.step <= self._last_recovery_step
+            or self.step - self._last_recovery_step < interval
+        ):
+            return
+        recovery = write_recovery_checkpoint(
+            self.publisher.root,
+            model=unwrap_model(self.compiled_model),
+            optimizer=self.optimizer,
+            scheduler=self.scheduler,
+            ema=self.ema,
+            step=self.step,
+            epoch=self.epoch,
+            config=self.serialized_config,
+            run_id=self.run_identity.run_id,
+            generation_family=self.run_identity.generation_family,
+            examples_consumed=self.examples_consumed,
+            global_batch_size=self.train_config.global_batch_size(self.world_size),
+        )
+        self._last_recovery_step = self.step
+        self.metrics.append(
+            {
+                "schema_version": 1,
+                "timestamp_ns": time.time_ns(),
+                "worker": "learner",
+                "event": "recovery_checkpoint",
+                "step": recovery.step,
+                "checkpoint_sha256": recovery.checkpoint_sha256,
+                "checkpoint_bytes": recovery.checkpoint_bytes,
+            }
+        )
+        retention = self._retention_config()
+        if self.epoch % retention.gc_interval_windows == 0:
+            metrics = collect_recovery_garbage(
+                self.publisher.root,
+                retain_checkpoints=retention.recovery_checkpoints,
+                dry_run=retention.recovery_dry_run,
+            )
+            self.metrics.append(
+                {
+                    "schema_version": 1,
+                    "timestamp_ns": time.time_ns(),
+                    "worker": "learner",
+                    "event": "recovery_gc",
+                    **metrics,
+                }
+            )
+
     def _wait_for_replay(
         self,
         *,
@@ -968,8 +1125,28 @@ class LearnerLoop:
 
     def _maximum_unique_batches(self, selection: ReplaySelection) -> int:
         batch = self.train_config.per_rank_batch_size
-        capacity = sum(span.sample_count // batch for span in selection.spans)
-        return capacity // self.world_size
+        capacities: dict[int, int] = defaultdict(int)
+        for span in selection.spans:
+            capacities[span.record.ring] += span.sample_count // batch
+        capacity = sum(capacities.values()) // self.world_size
+        weights = self._active_ring_weights()
+        if not self.data_config.ring_stratified or weights is None:
+            return capacity
+        for batches in range(
+            min(capacity, self.learner_config.steps_per_window),
+            0,
+            -1,
+        ):
+            try:
+                _weighted_ring_quotas(
+                    batches * self.world_size,
+                    capacities=capacities,
+                    weights=weights,
+                )
+            except ValueError:
+                continue
+            return batches
+        return 0
 
     def _select_replay_spans(self) -> ReplaySelection:
         rings = self.ring_mixture_config.rings
@@ -1002,6 +1179,15 @@ class LearnerLoop:
         )
 
     def _active_replay_rings(self, counts: Mapping[int, int]) -> tuple[int, ...]:
+        step_weights = self.ring_mixture_config.weights_for_step(self.step)
+        if step_weights is not None:
+            return tuple(
+                ring
+                for ring, weight in zip(
+                    self.ring_mixture_config.rings, step_weights, strict=True
+                )
+                if weight > 0
+            )
         if not self.learner_config.use_ring_mixture_curriculum:
             return self.ring_mixture_config.rings
         total = sum(int(counts.get(ring, 0)) for ring in self.ring_mixture_config.rings)
@@ -1104,11 +1290,33 @@ class LearnerLoop:
                 return True
             if kind == "reset":
                 checkpoint = Path(str(action["checkpoint"]))
+                champion_manifest = None
+                if self.rank == 0:
+                    champion_manifest = load_model_manifest(
+                        self.publisher.champion_path
+                    )
+                    write_resume_cutover(
+                        self.publisher.root,
+                        manifest=champion_manifest,
+                        run_id=self.run_identity.run_id,
+                        generation_family=self.run_identity.generation_family,
+                    )
+                self._distributed_barrier()
                 self.resume(
                     checkpoint,
                     expected_sha256=str(action["sha256"]),
                     expected_bytes=int(action["bytes"]),
                 )
+                if self.rank == 0:
+                    assert champion_manifest is not None
+                    write_model_pointer(
+                        self.publisher.candidate_path,
+                        champion_manifest,
+                        role="candidate",
+                    )
+                    self._last_recovery_step = max(0, self.step - 1)
+                    self._maybe_write_recovery_checkpoint(force=True)
+                self._distributed_barrier()
                 self._last_plateau_reset = (
                     str(action["champion_identity"]),
                     str(action["candidate_identity"]),

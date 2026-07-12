@@ -10,7 +10,7 @@ import tempfile
 import time
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -24,7 +24,7 @@ from .contracts import (
     RULES_SCHEMA_ID,
 )
 from .model import MODEL_SCHEMA_VERSION
-from .runtime import atomic_json, validate_identifier
+from .runtime import append_jsonl, atomic_json, validate_identifier
 
 CHECKPOINT_FORMAT = "startrain.checkpoint"
 CHECKPOINT_VERSION = 3
@@ -33,6 +33,10 @@ MODEL_MANIFEST_FORMAT = "startrain.model-manifest"
 MODEL_POINTER_FORMAT = "startrain.model-pointer"
 MODEL_MANIFEST_VERSION = 3
 MODEL_POINTER_VERSION = 2
+RECOVERY_POINTER_FORMAT = "startrain.recovery-pointer"
+RECOVERY_POINTER_VERSION = 1
+RESUME_CUTOVER_FORMAT = "startrain.resume-cutover"
+RESUME_CUTOVER_VERSION = 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,6 +55,19 @@ class ModelManifest:
     manifest_sha256: str = ""
     manifest_bytes: int = 0
     role: str = "direct"
+
+
+@dataclass(frozen=True, slots=True)
+class ResumeCheckpoint:
+    checkpoint: Path
+    checkpoint_sha256: str
+    checkpoint_bytes: int
+    step: int
+    epoch: int
+    run_id: str
+    generation_family: str
+    source: str
+    manifest_path: Path | None = None
 
 
 class ExponentialMovingAverage:
@@ -407,6 +424,548 @@ def write_model_pointer(
         )
     atomic_json(destination, payload)
     return Path(destination)
+
+
+def write_recovery_checkpoint(
+    root: str | Path,
+    *,
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler.LRScheduler,
+    ema: ExponentialMovingAverage,
+    step: int,
+    epoch: int,
+    config: Mapping[str, Any],
+    run_id: str,
+    generation_family: str,
+    examples_consumed: int,
+    global_batch_size: int,
+) -> ResumeCheckpoint:
+    directory = Path(root)
+    recovery_directory = directory / "recovery"
+    recovery_directory.mkdir(parents=True, exist_ok=True)
+    run_id = validate_identifier("run_id", run_id)
+    family = validate_identifier("generation_family", generation_family)
+    staged = recovery_directory / f".recovery-{step:012d}.staging.pt"
+    save_checkpoint(
+        staged,
+        model=model,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        ema=ema,
+        step=step,
+        epoch=epoch,
+        config=config,
+        extra={
+            "training_step_version": f"step-{step:012d}",
+            "run_id": run_id,
+            "generation_family": family,
+            "examples_consumed": examples_consumed,
+            "global_batch_size": global_batch_size,
+        },
+    )
+    checkpoint_sha256 = sha256_file(staged)
+    checkpoint = recovery_directory / f"sha256-{checkpoint_sha256}.pt"
+    checkpoint_bytes = staged.stat().st_size
+    if checkpoint.exists():
+        verify_file(
+            checkpoint,
+            expected_sha256=checkpoint_sha256,
+            expected_bytes=checkpoint_bytes,
+        )
+        staged.unlink()
+    else:
+        os.replace(staged, checkpoint)
+        descriptor = os.open(recovery_directory, os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    payload: dict[str, object] = {
+        "format": RECOVERY_POINTER_FORMAT,
+        "schema_version": RECOVERY_POINTER_VERSION,
+        "checkpoint": os.path.relpath(checkpoint, directory),
+        "checkpoint_sha256": checkpoint_sha256,
+        "checkpoint_bytes": checkpoint_bytes,
+        "step": step,
+        "epoch": epoch,
+        "examples_consumed": examples_consumed,
+        "run_id": run_id,
+        "generation_family": family,
+        "updated_ns": time.time_ns(),
+    }
+    append_jsonl(directory / "recovery.journal.jsonl", payload, durable=True)
+    atomic_json(directory / "recovery.json", payload)
+    return _parse_recovery_pointer(
+        directory / "recovery.json",
+        payload,
+        expected_run_id=run_id,
+        expected_generation_family=family,
+        source_name="recovery",
+    )
+
+
+def write_resume_cutover(
+    root: str | Path,
+    *,
+    manifest: ModelManifest,
+    run_id: str,
+    generation_family: str,
+) -> ResumeCheckpoint:
+    directory = Path(root)
+    run_id = validate_identifier("run_id", run_id)
+    family = validate_identifier("generation_family", generation_family)
+    if manifest.run_id != run_id or manifest.generation_family != family:
+        raise ValueError("resume cutover manifest belongs to another run")
+    payload: dict[str, object] = {
+        "format": RESUME_CUTOVER_FORMAT,
+        "schema_version": RESUME_CUTOVER_VERSION,
+        "checkpoint": os.path.relpath(manifest.checkpoint, directory),
+        "checkpoint_sha256": manifest.checkpoint_sha256,
+        "checkpoint_bytes": manifest.checkpoint_bytes,
+        "step": manifest.model_step,
+        "run_id": run_id,
+        "generation_family": family,
+        "created_ns": time.time_ns(),
+    }
+    path = directory / "resume-cutover.json"
+    atomic_json(path, payload)
+    return _parse_resume_cutover(
+        path,
+        payload,
+        expected_run_id=run_id,
+        expected_generation_family=family,
+    )
+
+
+def discover_resume_checkpoints(
+    root: str | Path,
+    *,
+    run_id: str,
+    generation_family: str,
+) -> tuple[list[ResumeCheckpoint], list[str]]:
+    directory = Path(root)
+    run_id = validate_identifier("run_id", run_id)
+    family = validate_identifier("generation_family", generation_family)
+    discovered: list[ResumeCheckpoint] = []
+    failures: list[str] = []
+    cutover: ResumeCheckpoint | None = None
+    cutover_ns = 0
+    cutover_path = directory / "resume-cutover.json"
+    if cutover_path.is_file():
+        try:
+            cutover_payload = _read_json(cutover_path, "resume cutover")
+            cutover = _parse_resume_cutover(
+                cutover_path,
+                cutover_payload,
+                expected_run_id=run_id,
+                expected_generation_family=family,
+                verify_artifact=False,
+            )
+            cutover_ns = _positive_int("created_ns", cutover_payload.get("created_ns"))
+            discovered.append(cutover)
+        except ValueError as exc:
+            failures.append(f"resume-cutover.json: {exc}")
+            return [], failures
+
+    recovery_pointer = directory / "recovery.json"
+    if recovery_pointer.exists():
+        try:
+            recovery_payload = _read_json(recovery_pointer, "recovery pointer")
+            if _artifact_is_after_cutover(
+                recovery_payload,
+                cutover=cutover,
+                cutover_ns=cutover_ns,
+                timestamp_key="updated_ns",
+            ):
+                discovered.append(
+                    _parse_recovery_pointer(
+                        recovery_pointer,
+                        recovery_payload,
+                        expected_run_id=run_id,
+                        expected_generation_family=family,
+                        source_name="recovery",
+                        verify_artifact=False,
+                    )
+                )
+        except ValueError as exc:
+            failures.append(f"recovery.json: {exc}")
+
+    journal_path = directory / "recovery.journal.jsonl"
+    if journal_path.is_file():
+        try:
+            journal_lines = journal_path.read_text(encoding="utf-8").splitlines()
+        except OSError as exc:
+            failures.append(f"recovery journal: {exc}")
+        else:
+            first_index = max(0, len(journal_lines) - 64)
+            recent_lines = journal_lines[first_index:]
+            for index, line in reversed(
+                list(enumerate(recent_lines, start=first_index + 1))
+            ):
+                try:
+                    payload = json.loads(line)
+                    if not isinstance(payload, dict):
+                        raise ValueError("entry is not an object")
+                    if not _artifact_is_after_cutover(
+                        payload,
+                        cutover=cutover,
+                        cutover_ns=cutover_ns,
+                        timestamp_key="updated_ns",
+                    ):
+                        continue
+                    discovered.append(
+                        _parse_recovery_pointer(
+                            journal_path,
+                            payload,
+                            expected_run_id=run_id,
+                            expected_generation_family=family,
+                            source_name=f"recovery-journal:{index}",
+                            verify_artifact=False,
+                        )
+                    )
+                except (json.JSONDecodeError, ValueError) as exc:
+                    failures.append(f"recovery journal line {index}: {exc}")
+
+    candidate_pointer = directory / "candidate.json"
+    candidate_valid = False
+    if candidate_pointer.is_file():
+        try:
+            manifest = load_model_manifest(candidate_pointer)
+            if manifest.run_id != run_id or manifest.generation_family != family:
+                raise ValueError("run identity mismatch")
+            if _manifest_is_after_cutover(
+                manifest, cutover=cutover, cutover_ns=cutover_ns
+            ):
+                discovered.append(
+                    _resume_from_manifest(manifest, source="candidate.json")
+                )
+                candidate_valid = True
+            else:
+                failures.append("candidate.json: predates the durable resume cutover")
+        except ValueError as exc:
+            failures.append(f"candidate.json: {exc}")
+
+    if not candidate_valid:
+        for manifest_path in (directory / "manifests").glob("manifest-*.json"):
+            try:
+                manifest = load_model_manifest(manifest_path)
+                if manifest.run_id != run_id or manifest.generation_family != family:
+                    continue
+                if not _manifest_is_after_cutover(
+                    manifest, cutover=cutover, cutover_ns=cutover_ns
+                ):
+                    continue
+                discovered.append(
+                    _resume_from_manifest(manifest, source="manifest-history")
+                )
+            except ValueError as exc:
+                failures.append(f"{manifest_path.name}: {exc}")
+
+    champion_pointer = directory / "champion.json"
+    if champion_pointer.is_file():
+        try:
+            manifest = load_model_manifest(champion_pointer)
+            if manifest.run_id != run_id or manifest.generation_family != family:
+                raise ValueError("run identity mismatch")
+            if not _manifest_is_after_cutover(
+                manifest, cutover=cutover, cutover_ns=cutover_ns
+            ):
+                raise ValueError("champion predates the durable resume cutover")
+            discovered.append(_resume_from_manifest(manifest, source="champion.json"))
+        except ValueError as exc:
+            failures.append(f"champion.json: {exc}")
+
+    unique: dict[tuple[Path, int], ResumeCheckpoint] = {}
+    source_priority = {
+        "cutover": 5,
+        "recovery": 4,
+        "recovery-journal": 4,
+        "candidate.json": 3,
+        "manifest-history": 2,
+        "champion.json": 1,
+    }
+    for candidate in discovered:
+        key = (candidate.checkpoint.resolve(), candidate.step)
+        current = unique.get(key)
+        candidate_priority = source_priority.get(
+            candidate.source.split(":", maxsplit=1)[0], 0
+        )
+        current_priority = (
+            source_priority.get(current.source.split(":", maxsplit=1)[0], 0)
+            if current is not None
+            else -1
+        )
+        if current is None or candidate_priority > current_priority:
+            if candidate.manifest_path is None and current is not None:
+                candidate = replace(candidate, manifest_path=current.manifest_path)
+            unique[key] = candidate
+        elif current.manifest_path is None and candidate.manifest_path is not None:
+            unique[key] = replace(current, manifest_path=candidate.manifest_path)
+    ordered = sorted(
+        unique.values(),
+        key=lambda item: (
+            item.step,
+            source_priority.get(item.source.split(":", maxsplit=1)[0], 0),
+            item.checkpoint.name,
+        ),
+        reverse=True,
+    )
+    return ordered, failures
+
+
+def collect_recovery_garbage(
+    root: str | Path, *, retain_checkpoints: int, dry_run: bool
+) -> dict[str, int]:
+    if retain_checkpoints <= 0:
+        raise ValueError("retain_checkpoints must be positive")
+    directory = Path(root)
+    cutover: ResumeCheckpoint | None = None
+    cutover_ns = 0
+    cutover_invalid = False
+    cutover_path = directory / "resume-cutover.json"
+    if cutover_path.is_file():
+        try:
+            raw_cutover = _read_json(cutover_path, "resume cutover")
+            cutover = _parse_resume_cutover(
+                cutover_path,
+                raw_cutover,
+                expected_run_id=validate_identifier(
+                    "run_id", raw_cutover.get("run_id")
+                ),
+                expected_generation_family=validate_identifier(
+                    "generation_family", raw_cutover.get("generation_family")
+                ),
+            )
+            cutover_ns = _positive_int("created_ns", raw_cutover.get("created_ns"))
+        except ValueError:
+            cutover_invalid = True
+    payloads: list[ResumeCheckpoint] = []
+    seen_checkpoints: set[Path] = set()
+
+    def add_if_valid(source: Path, raw: Mapping[str, Any], source_name: str) -> None:
+        if not _artifact_is_after_cutover(
+            raw,
+            cutover=cutover,
+            cutover_ns=cutover_ns,
+            timestamp_key="updated_ns",
+        ):
+            return
+        item = _parse_recovery_pointer(
+            source,
+            raw,
+            expected_run_id=validate_identifier("run_id", raw.get("run_id")),
+            expected_generation_family=validate_identifier(
+                "generation_family", raw.get("generation_family")
+            ),
+            source_name=source_name,
+            verify_artifact=False,
+        )
+        resolved = item.checkpoint.resolve()
+        if resolved in seen_checkpoints:
+            return
+        verify_file(
+            item.checkpoint,
+            expected_sha256=item.checkpoint_sha256,
+            expected_bytes=item.checkpoint_bytes,
+        )
+        seen_checkpoints.add(resolved)
+        payloads.append(item)
+
+    pointer = directory / "recovery.json"
+    if pointer.is_file():
+        try:
+            raw = _read_json(pointer, "recovery pointer")
+            add_if_valid(pointer, raw, "recovery")
+        except ValueError:
+            pass
+    journal = directory / "recovery.journal.jsonl"
+    if journal.is_file():
+        lines = journal.read_text(encoding="utf-8").splitlines()[-64:]
+        for line in reversed(lines):
+            if len(payloads) >= retain_checkpoints:
+                break
+            try:
+                raw = json.loads(line)
+                if not isinstance(raw, dict):
+                    continue
+                add_if_valid(journal, raw, "recovery-journal")
+            except (json.JSONDecodeError, ValueError):
+                continue
+    payloads.sort(key=lambda item: (item.step, item.checkpoint.name), reverse=True)
+    protected = {item.checkpoint.resolve() for item in payloads[:retain_checkpoints]}
+    recovery_files = list((directory / "recovery").glob("sha256-*.pt"))
+    candidates = [path for path in recovery_files if path.resolve() not in protected]
+    bytes_reclaimable = sum(path.stat().st_size for path in candidates)
+    metrics = {
+        "recovery_checkpoints": len(candidates),
+        "recovery_bytes": bytes_reclaimable,
+        "deleted_recovery_checkpoints": 0,
+        "deleted_recovery_bytes": 0,
+        "dry_run": int(dry_run),
+        "valid_recovery_checkpoints": len(protected),
+        "gc_skipped": 0,
+    }
+    if cutover_invalid or (recovery_files and not protected):
+        metrics["gc_skipped"] = 1
+        return metrics
+    if dry_run:
+        return metrics
+    for path in candidates:
+        path.unlink(missing_ok=True)
+    metrics["deleted_recovery_checkpoints"] = len(candidates)
+    metrics["deleted_recovery_bytes"] = bytes_reclaimable
+    return metrics
+
+
+def _parse_resume_cutover(
+    source: Path,
+    payload: Mapping[str, Any],
+    *,
+    expected_run_id: str,
+    expected_generation_family: str,
+    verify_artifact: bool = True,
+) -> ResumeCheckpoint:
+    if (
+        payload.get("format") != RESUME_CUTOVER_FORMAT
+        or payload.get("schema_version") != RESUME_CUTOVER_VERSION
+    ):
+        raise ValueError("unsupported resume cutover")
+    run_id = validate_identifier("run_id", payload.get("run_id"))
+    family = validate_identifier("generation_family", payload.get("generation_family"))
+    if run_id != expected_run_id or family != expected_generation_family:
+        raise ValueError("resume cutover run identity mismatch")
+    checkpoint_value = payload.get("checkpoint")
+    if not isinstance(checkpoint_value, str) or not checkpoint_value:
+        raise ValueError("resume cutover checkpoint path is invalid")
+    checkpoint = Path(checkpoint_value)
+    if not checkpoint.is_absolute():
+        checkpoint = source.parent / checkpoint
+    checkpoint = checkpoint.resolve()
+    allowed_directories = {
+        (source.parent / "checkpoints").resolve(),
+        (source.parent / "recovery").resolve(),
+    }
+    if checkpoint.parent not in allowed_directories:
+        raise ValueError("resume cutover checkpoint escaped its artifact directories")
+    checkpoint_sha256 = _sha256_text(payload.get("checkpoint_sha256"))
+    checkpoint_bytes = _positive_int(
+        "checkpoint_bytes", payload.get("checkpoint_bytes")
+    )
+    if verify_artifact:
+        verify_file(
+            checkpoint,
+            expected_sha256=checkpoint_sha256,
+            expected_bytes=checkpoint_bytes,
+        )
+    _positive_int("created_ns", payload.get("created_ns"))
+    return ResumeCheckpoint(
+        checkpoint=checkpoint,
+        checkpoint_sha256=checkpoint_sha256,
+        checkpoint_bytes=checkpoint_bytes,
+        step=_nonnegative_int("step", payload.get("step")),
+        epoch=0,
+        run_id=run_id,
+        generation_family=family,
+        source="cutover",
+    )
+
+
+def _artifact_is_after_cutover(
+    payload: Mapping[str, Any],
+    *,
+    cutover: ResumeCheckpoint | None,
+    cutover_ns: int,
+    timestamp_key: str,
+) -> bool:
+    if cutover is None:
+        return True
+    if payload.get("checkpoint_sha256") == cutover.checkpoint_sha256:
+        return True
+    timestamp = payload.get(timestamp_key)
+    return (
+        isinstance(timestamp, int)
+        and not isinstance(timestamp, bool)
+        and timestamp >= cutover_ns
+    )
+
+
+def _manifest_is_after_cutover(
+    manifest: ModelManifest,
+    *,
+    cutover: ResumeCheckpoint | None,
+    cutover_ns: int,
+) -> bool:
+    return (
+        cutover is None
+        or manifest.checkpoint_sha256 == cutover.checkpoint_sha256
+        or manifest.published_ns >= cutover_ns
+    )
+
+
+def _parse_recovery_pointer(
+    source: Path,
+    payload: Mapping[str, Any],
+    *,
+    expected_run_id: str,
+    expected_generation_family: str,
+    source_name: str,
+    verify_artifact: bool = True,
+) -> ResumeCheckpoint:
+    if (
+        payload.get("format") != RECOVERY_POINTER_FORMAT
+        or payload.get("schema_version") != RECOVERY_POINTER_VERSION
+    ):
+        raise ValueError("unsupported recovery pointer")
+    run_id = validate_identifier("run_id", payload.get("run_id"))
+    family = validate_identifier("generation_family", payload.get("generation_family"))
+    if run_id != expected_run_id or family != expected_generation_family:
+        raise ValueError("recovery pointer run identity mismatch")
+    checkpoint_value = payload.get("checkpoint")
+    if not isinstance(checkpoint_value, str) or not checkpoint_value:
+        raise ValueError("recovery checkpoint path is invalid")
+    checkpoint = Path(checkpoint_value)
+    base = source.parent
+    if not checkpoint.is_absolute():
+        checkpoint = base / checkpoint
+    checkpoint = checkpoint.resolve()
+    recovery_directory = (base / "recovery").resolve()
+    if checkpoint.parent != recovery_directory:
+        raise ValueError("recovery checkpoint escaped its artifact directory")
+    checkpoint_sha256 = _sha256_text(payload.get("checkpoint_sha256"))
+    checkpoint_bytes = _positive_int(
+        "checkpoint_bytes", payload.get("checkpoint_bytes")
+    )
+    if verify_artifact:
+        verify_file(
+            checkpoint,
+            expected_sha256=checkpoint_sha256,
+            expected_bytes=checkpoint_bytes,
+        )
+    return ResumeCheckpoint(
+        checkpoint=checkpoint,
+        checkpoint_sha256=checkpoint_sha256,
+        checkpoint_bytes=checkpoint_bytes,
+        step=_nonnegative_int("step", payload.get("step")),
+        epoch=_nonnegative_int("epoch", payload.get("epoch")),
+        run_id=run_id,
+        generation_family=family,
+        source=source_name,
+    )
+
+
+def _resume_from_manifest(manifest: ModelManifest, *, source: str) -> ResumeCheckpoint:
+    return ResumeCheckpoint(
+        checkpoint=manifest.checkpoint,
+        checkpoint_sha256=manifest.checkpoint_sha256,
+        checkpoint_bytes=manifest.checkpoint_bytes,
+        step=manifest.model_step,
+        epoch=0,
+        run_id=manifest.run_id,
+        generation_family=manifest.generation_family,
+        source=source,
+        manifest_path=manifest.artifact_manifest or manifest.path,
+    )
 
 
 def _parse_model_manifest(

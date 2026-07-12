@@ -336,22 +336,26 @@ sqlite3 "$RUN/replay/manifest.sqlite3" \
 
 The coordinator treats a heartbeat older than 180 seconds or unchanged progress for
 1,800 seconds as a failure. It restarts workers with bounded exponential backoff, up to
-eight restarts. If it exits nonzero:
+eight restarts before allowing systemd to restart the complete coordinator. The
+continuous systemd template retries indefinitely with a watchdog and a delay between
+attempts. If it cannot recover:
 
 1. inspect `status/coordinator.json` and the named worker log;
 2. correct the external cause (CUDA OOM, disk full, driver failure or invalid artifact);
 3. rerun the same orchestration command against the same run root.
 
-`resume_latest` reloads the last candidate, replay reopening reconciles orphaned files,
-and committed corrupt/missing shards are quarantined. Do not delete or regenerate
+`resume_latest` chooses the newest valid recovery checkpoint or candidate and can fall
+back through the recovery journal and immutable model history. Replay reopening
+reconciles orphaned files, and committed corrupt/missing shards are quarantined. Do not delete or regenerate
 `run.json`, manually repoint candidate/champion files, or mix replay schema v4 from
 different run identities. Use a new run root for an incompatible config or schema.
 
 Stop with SIGINT/SIGTERM and allow the configured grace period so complete cohorts and
 SQLite/checkpoint writes can finish. A live `coordinator.lock` prevents two
 coordinators from owning one root; an abandoned lock is removed only when its PID is no
-longer live. Retention is enabled in dry-run mode, so review GC metrics before enabling
-deletion.
+longer live. Review retention dry-run metrics before enabling deletion. Continuous
+runs should also install the replay-ledger backup timer described in the production
+runbook.
 
 ## Benchmark and recalibration gates
 

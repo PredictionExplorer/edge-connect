@@ -82,6 +82,7 @@ learner:
   max_replay_lag_steps: 50000
   steps_per_window: 1000
   candidate_interval: 15000
+  recovery_interval_steps: 1000
   metrics_interval: 10
   replay_poll_seconds: 2.0
   replay_wait_timeout_seconds: 0.0
@@ -206,6 +207,7 @@ orchestration:
   retention:
     enabled: true
     dry_run: true
+    recovery_dry_run: false
     replay_shards_per_ring: 2000
     candidate_manifests: 20
     gc_interval_windows: 10

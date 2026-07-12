@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import shutil
@@ -19,11 +20,13 @@ from pathlib import Path
 import yaml
 
 SEVERITY = {"OK": 0, "WARN": 1, "ERROR": 2}
+_DIGEST_CACHE: dict[Path, tuple[int, int, int, str]] = {}
 
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run-root", type=Path, required=True)
+    parser.add_argument("--profile", type=Path)
     parser.add_argument("--unit")
     parser.add_argument("--interval", type=float, default=60.0)
     parser.add_argument("--once", action="store_true")
@@ -49,7 +52,12 @@ def _read_json(path: Path, *, attempts: int = 3) -> dict[str, object] | None:
     return None
 
 
-def _latest_jsonl(path: Path, *, maximum_bytes: int = 2 * 1024 * 1024):
+def _latest_jsonl(
+    path: Path,
+    *,
+    maximum_bytes: int = 2 * 1024 * 1024,
+    predicate: Callable[[Mapping[str, object]], bool] | None = None,
+):
     try:
         with path.open("rb") as stream:
             size = stream.seek(0, 2)
@@ -68,7 +76,7 @@ def _latest_jsonl(path: Path, *, maximum_bytes: int = 2 * 1024 * 1024):
             payload = json.loads(line)
         except (UnicodeDecodeError, json.JSONDecodeError):
             continue
-        if isinstance(payload, dict):
+        if isinstance(payload, dict) and (predicate is None or predicate(payload)):
             return payload
     return None
 
@@ -101,6 +109,41 @@ def _age_seconds(timestamp_ns: object, now_ns: int) -> float | None:
     if isinstance(timestamp_ns, bool) or not isinstance(timestamp_ns, int):
         return None
     return max(0.0, (now_ns - timestamp_ns) / 1_000_000_000.0)
+
+
+def _verified_artifact(
+    path: Path, *, expected_bytes: object, expected_sha256: object
+) -> tuple[bool, float | None]:
+    if (
+        isinstance(expected_bytes, bool)
+        or not isinstance(expected_bytes, int)
+        or expected_bytes <= 0
+        or not isinstance(expected_sha256, str)
+        or len(expected_sha256) != 64
+        or any(character not in "0123456789abcdef" for character in expected_sha256)
+    ):
+        return False, None
+    try:
+        before = path.stat()
+        if before.st_size != expected_bytes:
+            return False, None
+        key = (before.st_ino, before.st_mtime_ns, before.st_size)
+        cached = _DIGEST_CACHE.get(path)
+        if cached is not None and cached[:3] == key:
+            digest = cached[3]
+        else:
+            hasher = hashlib.sha256()
+            with path.open("rb") as stream:
+                for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                    hasher.update(chunk)
+            after = path.stat()
+            if (after.st_ino, after.st_mtime_ns, after.st_size) != key:
+                return False, None
+            digest = hasher.hexdigest()
+            _DIGEST_CACHE[path] = (*key, digest)
+        return digest == expected_sha256, before.st_mtime
+    except OSError:
+        return False, None
 
 
 def _systemd_status(unit: str | None) -> dict[str, object]:
@@ -262,15 +305,21 @@ def collect_snapshot(
     run_root: Path,
     *,
     unit: str | None = None,
+    profile_path: Path | None = None,
     now_ns: int | None = None,
 ) -> dict[str, object]:
     root = run_root.expanduser().resolve()
     now = time.time_ns() if now_ns is None else now_ns
     warnings: list[dict[str, str]] = []
-    profile = _read_json(root / "profile.json")
+    profile_source = (
+        profile_path.expanduser().resolve()
+        if profile_path is not None
+        else root / "profile.yaml"
+    )
+    profile = _read_json(profile_source) if profile_source.suffix == ".json" else None
     if profile is None:
         try:
-            loaded = yaml.safe_load((root / "profile.yaml").read_text(encoding="utf-8"))
+            loaded = yaml.safe_load(profile_source.read_text(encoding="utf-8"))
             profile = loaded if isinstance(loaded, dict) else {}
         except (OSError, yaml.YAMLError):
             profile = {}
@@ -278,7 +327,12 @@ def collect_snapshot(
     shutdown = _mapping(orchestration.get("shutdown"))
     stale_threshold = _number(shutdown.get("stale_heartbeat_seconds")) or 180.0
     stall_threshold = _number(shutdown.get("stall_timeout_seconds")) or 1_800.0
-    target_steps = _mapping(profile.get("learner")).get("steps")
+    learner_config = _mapping(profile.get("learner"))
+    target_steps = (
+        "unlimited"
+        if learner_config.get("unlimited") is True
+        else learner_config.get("steps")
+    )
 
     service = _systemd_status(unit)
     if service.get("query_error"):
@@ -366,7 +420,13 @@ def collect_snapshot(
     else:
         _add_warning(warnings, "ERROR", "workers_missing", "worker map is missing")
 
-    learner_metric = _latest_jsonl(root / "learner" / "metrics.jsonl") or {}
+    learner_metric = (
+        _latest_jsonl(
+            root / "learner" / "metrics.jsonl",
+            predicate=lambda row: isinstance(row.get("losses"), dict),
+        )
+        or {}
+    )
     learner_heartbeat = _read_json(root / "status" / "learner.heartbeat.json") or {}
     losses = learner_metric.get("losses")
     if isinstance(losses, dict) and any(
@@ -458,6 +518,190 @@ def collect_snapshot(
             f"quarantined shards={quarantined}",
         )
 
+    learner_root = root / "learner"
+    recovery_pointer = _read_json(learner_root / "recovery.json") or {}
+    recovery_step = None
+    recovery_age = None
+    if recovery_pointer:
+        checkpoint_value = recovery_pointer.get("checkpoint")
+        checkpoint_bytes = recovery_pointer.get("checkpoint_bytes")
+        checkpoint_sha256 = recovery_pointer.get("checkpoint_sha256")
+        step = recovery_pointer.get("step")
+        valid_pointer = (
+            recovery_pointer.get("format") == "startrain.recovery-pointer"
+            and recovery_pointer.get("schema_version") == 1
+            and isinstance(checkpoint_value, str)
+            and bool(checkpoint_value)
+            and isinstance(checkpoint_bytes, int)
+            and not isinstance(checkpoint_bytes, bool)
+            and checkpoint_bytes > 0
+            and isinstance(checkpoint_sha256, str)
+            and len(checkpoint_sha256) == 64
+            and isinstance(step, int)
+            and not isinstance(step, bool)
+            and step >= 0
+        )
+        checkpoint = (
+            (learner_root / checkpoint_value).resolve()
+            if valid_pointer and isinstance(checkpoint_value, str)
+            else None
+        )
+        artifact_valid, artifact_mtime = (
+            _verified_artifact(
+                checkpoint,
+                expected_bytes=checkpoint_bytes,
+                expected_sha256=checkpoint_sha256,
+            )
+            if checkpoint is not None
+            and checkpoint.parent == (learner_root / "recovery").resolve()
+            else (False, None)
+        )
+        valid_pointer = bool(valid_pointer and artifact_valid)
+        if valid_pointer and checkpoint is not None:
+            recovery_step = step
+            recovery_age = (
+                max(0.0, time.time() - artifact_mtime)
+                if artifact_mtime is not None
+                else None
+            )
+        else:
+            _add_warning(
+                warnings,
+                "ERROR",
+                "recovery_checkpoint_invalid",
+                "learner recovery pointer or artifact is invalid",
+            )
+
+    candidate_pointer = _read_json(learner_root / "candidate.json") or {}
+    candidate_step = None
+    if candidate_pointer:
+        manifest_value = candidate_pointer.get("manifest")
+        manifest = (
+            (learner_root / manifest_value).resolve()
+            if isinstance(manifest_value, str) and manifest_value
+            else None
+        )
+        manifest_valid, _ = (
+            _verified_artifact(
+                manifest,
+                expected_bytes=candidate_pointer.get("manifest_bytes"),
+                expected_sha256=candidate_pointer.get("manifest_sha256"),
+            )
+            if manifest is not None
+            and manifest.parent == (learner_root / "manifests").resolve()
+            else (False, None)
+        )
+        manifest_payload = _read_json(manifest) if manifest_valid and manifest else None
+        manifest_payload = manifest_payload or {}
+        checkpoint_value = manifest_payload.get("checkpoint")
+        checkpoint = (
+            (manifest.parent / checkpoint_value).resolve()
+            if manifest is not None
+            and isinstance(checkpoint_value, str)
+            and checkpoint_value
+            else None
+        )
+        checkpoint_valid, _ = (
+            _verified_artifact(
+                checkpoint,
+                expected_bytes=manifest_payload.get("checkpoint_bytes"),
+                expected_sha256=manifest_payload.get("checkpoint_sha256"),
+            )
+            if checkpoint is not None
+            and checkpoint.parent == (learner_root / "checkpoints").resolve()
+            else (False, None)
+        )
+        pointer_step = candidate_pointer.get("model_step")
+        manifest_step = manifest_payload.get("model_step")
+        candidate_valid = (
+            candidate_pointer.get("format") == "startrain.model-pointer"
+            and candidate_pointer.get("schema_version") == 2
+            and manifest_payload.get("format") == "startrain.model-manifest"
+            and manifest_valid
+            and checkpoint_valid
+            and isinstance(pointer_step, int)
+            and not isinstance(pointer_step, bool)
+            and pointer_step >= 0
+            and pointer_step == manifest_step
+        )
+        if candidate_valid:
+            candidate_step = pointer_step
+        else:
+            _add_warning(
+                warnings,
+                "ERROR",
+                "candidate_checkpoint_invalid",
+                "candidate pointer, manifest, or checkpoint is invalid",
+            )
+
+    backup_directory = root / "recovery" / "replay-manifest"
+    latest_backup = _read_json(backup_directory / "latest.json") or {}
+    backup_path = None
+    backup_age = None
+    backup_valid = False
+    backup_value = latest_backup.get("path")
+    backup_bytes = latest_backup.get("bytes")
+    backup_sha256 = latest_backup.get("sha256")
+    if isinstance(backup_value, str) and Path(backup_value).name == backup_value:
+        backup_path = backup_directory / backup_value
+        backup_valid, backup_mtime = _verified_artifact(
+            backup_path,
+            expected_bytes=backup_bytes,
+            expected_sha256=backup_sha256,
+        )
+        if backup_valid and backup_mtime is not None:
+            backup_age = max(0.0, time.time() - backup_mtime)
+    recovery_interval = _number(learner_config.get("recovery_interval_steps"))
+    learner_step = learner_heartbeat.get("step", learner_metric.get("step"))
+    durable_steps = [
+        value for value in (recovery_step, candidate_step) if isinstance(value, int)
+    ]
+    durable_step = max(durable_steps, default=None)
+    if recovery_interval is not None and isinstance(learner_step, int):
+        if durable_step is None and learner_step > recovery_interval:
+            _add_warning(
+                warnings,
+                "WARN",
+                "recovery_checkpoint_missing",
+                "learner recovery checkpoint is missing",
+            )
+        elif (
+            durable_step is not None
+            and learner_step - durable_step > recovery_interval * 2
+        ):
+            _add_warning(
+                warnings,
+                "WARN",
+                "recovery_checkpoint_lag",
+                f"durable learner state lags by {learner_step - durable_step} steps",
+            )
+    continuous_recovery = (
+        learner_config.get("unlimited") is True
+        or learner_config.get("recovery_interval_steps") is not None
+    )
+    if continuous_recovery and not backup_valid:
+        _add_warning(
+            warnings,
+            "WARN",
+            "replay_backup_missing",
+            "replay manifest backup is missing",
+        )
+    elif continuous_recovery and backup_age is not None and backup_age > 2 * 60 * 60:
+        _add_warning(
+            warnings,
+            "WARN",
+            "replay_backup_stale",
+            f"latest replay backup age={backup_age:.0f}s",
+        )
+    recovery = {
+        "step": recovery_step,
+        "candidate_step": candidate_step,
+        "durable_step": durable_step,
+        "checkpoint_age_seconds": recovery_age,
+        "replay_backup_age_seconds": backup_age,
+        "replay_backup_valid": backup_valid,
+    }
+
     arena = _read_json(root / "arena" / "promotion-status.json") or {}
     pause_request = _read_json(root / "status" / "arena-gpu-pause.json")
     pause_ack = _read_json(root / "status" / "arena-gpu-pause.ack.json")
@@ -534,6 +778,7 @@ def collect_snapshot(
         "learner": learner,
         "actors": actor_fleet,
         "replay": replay,
+        "recovery": recovery,
         "arena": arena,
         "pause": pause,
         "disk": disk,
@@ -592,6 +837,7 @@ def _compact(value: object) -> str:
 def run_monitor(
     run_root: Path,
     *,
+    profile_path: Path | None,
     unit: str | None,
     interval: float,
     once: bool,
@@ -601,7 +847,11 @@ def run_monitor(
     next_tick = time.monotonic()
     while not stop_requested():
         try:
-            snapshot = collect_snapshot(run_root, unit=unit)
+            snapshot = collect_snapshot(
+                run_root,
+                unit=unit,
+                profile_path=profile_path,
+            )
         except Exception as error:  # monitor must report and continue
             snapshot = {
                 "schema_version": 1,
@@ -645,6 +895,7 @@ def main(argv: list[str] | None = None) -> int:
     signal.signal(signal.SIGTERM, request_stop)
     run_monitor(
         arguments.run_root,
+        profile_path=arguments.profile,
         unit=arguments.unit,
         interval=arguments.interval,
         once=arguments.once,

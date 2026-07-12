@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import sys
+import time
 from dataclasses import asdict, replace
 from pathlib import Path
 
@@ -16,8 +17,10 @@ from .actor import ActorSupervisor
 from .arena import ArenaRunner, internal_elo_target_assessment
 from .baselines import FROZEN_BASELINE_CHOICES, create_frozen_baseline
 from .checkpoint import (
+    discover_resume_checkpoints,
     load_ema_checkpoint,
     load_model_manifest,
+    write_model_pointer,
 )
 from .config import load_config
 from .distill import distill_main
@@ -207,30 +210,127 @@ def train_main(argv: list[str] | None = None) -> None:
                 rank=rank,
                 world_size=world_size,
             )
-            resume_manifest = (
-                load_model_manifest(arguments.resume) if arguments.resume else None
-            )
-            if (
-                resume_manifest is None
-                and (arguments.resume_latest or experiment.learner.resume_latest)
-                and learner.publisher.candidate_path.is_file()
-            ):
-                resume_manifest = load_model_manifest(learner.publisher.candidate_path)
-            if resume_manifest is not None:
+            resumed_from: str | None = None
+            if arguments.resume:
+                resume_manifest = load_model_manifest(arguments.resume)
                 learner.resume(
                     resume_manifest.checkpoint,
                     expected_sha256=resume_manifest.checkpoint_sha256,
                     expected_bytes=resume_manifest.checkpoint_bytes,
                 )
+                resumed_from = str(resume_manifest.path)
+            elif arguments.resume_latest or experiment.learner.resume_latest:
+                candidates, discovery_failures = discover_resume_checkpoints(
+                    arguments.output,
+                    run_id=run_identity.run_id,
+                    generation_family=run_identity.generation_family,
+                )
+                for failure in discovery_failures:
+                    learner.metrics.append(
+                        {
+                            "schema_version": 1,
+                            "timestamp_ns": time.time_ns(),
+                            "worker": "learner",
+                            "event": "resume_artifact_rejected",
+                            "reason": failure,
+                        }
+                    )
+                resume_failures: list[str] = []
+                for candidate in candidates:
+                    try:
+                        learner.resume(
+                            candidate.checkpoint,
+                            expected_sha256=candidate.checkpoint_sha256,
+                            expected_bytes=candidate.checkpoint_bytes,
+                        )
+                    except Exception as exc:
+                        resume_failures.append(f"{candidate.source}: {exc}")
+                        learner.metrics.append(
+                            {
+                                "schema_version": 1,
+                                "timestamp_ns": time.time_ns(),
+                                "worker": "learner",
+                                "event": "resume_checkpoint_rejected",
+                                "source": candidate.source,
+                                "step": candidate.step,
+                                "reason": str(exc),
+                            }
+                        )
+                        continue
+                    resumed_from = f"{candidate.source}:{candidate.checkpoint}"
+                    break
+                learner_root = Path(arguments.output)
+                persisted_artifacts = any(
+                    path.exists()
+                    for path in (
+                        learner_root / "recovery.json",
+                        learner_root / "recovery.journal.jsonl",
+                        learner_root / "resume-cutover.json",
+                        learner_root / "candidate.json",
+                        learner_root / "champion.json",
+                    )
+                ) or any(
+                    path
+                    for directory, pattern in (
+                        ("checkpoints", "*.pt"),
+                        ("manifests", "*.json"),
+                        ("recovery", "*.pt"),
+                    )
+                    for path in (learner_root / directory).glob(pattern)
+                )
+                if resumed_from is None and (
+                    candidates or discovery_failures or persisted_artifacts
+                ):
+                    raise RuntimeError(
+                        "all automatic resume checkpoints were rejected: "
+                        + "; ".join((*discovery_failures, *resume_failures))
+                    )
+                if any(
+                    failure.startswith("candidate.json:")
+                    for failure in discovery_failures
+                ):
+                    fallback_manifest = next(
+                        (
+                            candidate.manifest_path
+                            for candidate in candidates
+                            if candidate.manifest_path is not None
+                        ),
+                        None,
+                    )
+                    if fallback_manifest is not None:
+                        repaired = load_model_manifest(fallback_manifest)
+                        write_model_pointer(
+                            learner.publisher.candidate_path,
+                            repaired,
+                            role="candidate",
+                        )
+                        learner.metrics.append(
+                            {
+                                "schema_version": 1,
+                                "timestamp_ns": time.time_ns(),
+                                "worker": "learner",
+                                "event": "candidate_pointer_repaired",
+                                "model_step": repaired.model_step,
+                                "model_identity": repaired.model_identity,
+                            }
+                        )
+                    elif resumed_from is not None:
+                        repaired = learner._publish()
+                        learner.metrics.append(
+                            {
+                                "schema_version": 1,
+                                "timestamp_ns": time.time_ns(),
+                                "worker": "learner",
+                                "event": "candidate_pointer_rebuilt",
+                                "model_step": repaired.model_step,
+                                "model_identity": repaired.model_identity,
+                            }
+                        )
             if heartbeat is not None:
                 heartbeat.update(
                     phase="training",
                     step=learner.step,
-                    resumed_from=(
-                        str(resume_manifest.path)
-                        if resume_manifest is not None
-                        else None
-                    ),
+                    resumed_from=resumed_from,
                 )
             final_step = learner.run(
                 steps=arguments.steps,
@@ -258,6 +358,7 @@ def actor_main(argv: list[str] | None = None) -> None:
     parser.add_argument("--candidate-manifest", required=True)
     parser.add_argument("--run-identity", required=True)
     parser.add_argument("--heartbeat", required=True)
+    parser.add_argument("--learner-heartbeat")
     parser.add_argument("--metrics", required=True)
     parser.add_argument("--device", default="cuda")
     arguments = parser.parse_args(argv)
@@ -287,6 +388,7 @@ def actor_main(argv: list[str] | None = None) -> None:
         run_identity=run_identity,
         heartbeat_path=arguments.heartbeat,
         metrics_path=arguments.metrics,
+        learner_heartbeat_path=arguments.learner_heartbeat,
         device=arguments.device,
         lane_id=arguments.lane_id,
     ).run(stop_requested=stop.is_set)

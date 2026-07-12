@@ -1,0 +1,12 @@
+[Unit]
+Description=Hourly EdgeConnect StarTrain replay-ledger backup
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=1h
+RandomizedDelaySec=5min
+Persistent=true
+Unit=edgeconnect-startrain-@RUN_ID@-backup.service
+
+[Install]
+WantedBy=timers.target

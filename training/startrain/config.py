@@ -125,6 +125,7 @@ class DataConfig:
 @dataclass(frozen=True, slots=True)
 class LearnerConfig:
     steps: int = 10_000
+    unlimited: bool = False
     minimum_replay_samples: int = 1
     recent_samples_per_ring: int = 10_000
     minimum_unique_samples_per_ring: int = 1
@@ -133,6 +134,7 @@ class LearnerConfig:
     steps_per_window: int = 100
     candidate_interval: int = 1_000
     candidate_interval_examples: int | None = None
+    recovery_interval_steps: int | None = None
     target_updates_per_new_sample: float | None = None
     metrics_interval: int = 10
     replay_poll_seconds: float = 2.0
@@ -141,6 +143,8 @@ class LearnerConfig:
     device: str = "cpu"
 
     def __post_init__(self) -> None:
+        if type(self.unlimited) is not bool:
+            raise ConfigError("unlimited must be boolean")
         if type(self.use_ring_mixture_curriculum) is not bool:
             raise ConfigError("use_ring_mixture_curriculum must be boolean")
         if type(self.resume_latest) is not bool:
@@ -164,6 +168,16 @@ class LearnerConfig:
             or self.candidate_interval_examples <= 0
         ):
             raise ConfigError("candidate_interval_examples must be positive")
+        if self.recovery_interval_steps is not None and (
+            isinstance(self.recovery_interval_steps, bool)
+            or not isinstance(self.recovery_interval_steps, int)
+            or self.recovery_interval_steps <= 0
+            or self.recovery_interval_steps > self.candidate_interval
+        ):
+            raise ConfigError(
+                "recovery_interval_steps must be positive and no larger than "
+                "candidate_interval"
+            )
         if self.target_updates_per_new_sample is not None and (
             isinstance(self.target_updates_per_new_sample, bool)
             or not isinstance(self.target_updates_per_new_sample, int | float)
@@ -247,6 +261,30 @@ class CurriculumStage:
 
 
 @dataclass(frozen=True, slots=True)
+class RingWeightStage:
+    from_step: int
+    weights: tuple[float, ...]
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.from_step, bool)
+            or not isinstance(self.from_step, int)
+            or self.from_step < 0
+        ):
+            raise ConfigError("ring-weight from_step must be non-negative")
+        if not self.weights or any(
+            isinstance(weight, bool)
+            or not isinstance(weight, int | float)
+            or not math.isfinite(float(weight))
+            or weight < 0
+            for weight in self.weights
+        ):
+            raise ConfigError("ring weights must be finite and non-negative")
+        if not any(weight > 0 for weight in self.weights):
+            raise ConfigError("at least one ring weight must be positive")
+
+
+@dataclass(frozen=True, slots=True)
 class RingMixtureConfig:
     rings: tuple[int, ...] = SUPPORTED_RINGS
     curriculum: tuple[CurriculumStage, ...] = (
@@ -255,6 +293,7 @@ class RingMixtureConfig:
     )
     uniform_weight: float = 1.0
     deficit_weights: tuple[float, ...] = (1.0,) * len(SUPPORTED_RINGS)
+    step_weights: tuple[RingWeightStage, ...] = ()
 
     def __post_init__(self) -> None:
         if (
@@ -281,6 +320,15 @@ class RingMixtureConfig:
             if any(ring not in self.rings for ring in stage.rings):
                 raise ConfigError("curriculum stage contains an unavailable ring")
             previous = stage.until_samples
+        previous_step = -1
+        for stage in self.step_weights:
+            if len(stage.weights) != len(self.rings):
+                raise ConfigError("step ring weights must match configured rings")
+            if stage.from_step <= previous_step:
+                raise ConfigError(
+                    "step ring-weight stages must have increasing boundaries"
+                )
+            previous_step = stage.from_step
 
     def active_rings(self, total_samples: int) -> tuple[int, ...]:
         """Return the curriculum rings active at an aggregate sample count."""
@@ -297,6 +345,24 @@ class RingMixtureConfig:
             if total_samples < stage.until_samples:
                 return stage.rings
         return self.rings
+
+    def weights_for_step(self, step: int) -> tuple[float, ...] | None:
+        if isinstance(step, bool) or not isinstance(step, int) or step < 0:
+            raise ValueError("ring-mixture step must be a non-negative integer")
+        selected: tuple[float, ...] | None = None
+        for stage in self.step_weights:
+            if step < stage.from_step:
+                break
+            selected = tuple(float(weight) for weight in stage.weights)
+        return selected
+
+    def next_weight_step(self, step: int) -> int | None:
+        if isinstance(step, bool) or not isinstance(step, int) or step < 0:
+            raise ValueError("ring-mixture step must be a non-negative integer")
+        return next(
+            (stage.from_step for stage in self.step_weights if stage.from_step > step),
+            None,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -481,17 +547,24 @@ class PlateauConfig:
 class RetentionConfig:
     enabled: bool = False
     dry_run: bool = True
+    recovery_dry_run: bool = False
     replay_shards_per_ring: int = 2_000
     candidate_manifests: int = 20
+    recovery_checkpoints: int = 8
     gc_interval_windows: int = 10
 
     def __post_init__(self) -> None:
-        if type(self.enabled) is not bool or type(self.dry_run) is not bool:
+        if (
+            type(self.enabled) is not bool
+            or type(self.dry_run) is not bool
+            or type(self.recovery_dry_run) is not bool
+        ):
             raise ConfigError("retention booleans must be boolean")
         if (
             min(
                 self.replay_shards_per_ring,
                 self.candidate_manifests,
+                self.recovery_checkpoints,
                 self.gc_interval_windows,
             )
             <= 0
@@ -738,6 +811,12 @@ def _curriculum_values(values: object) -> dict[str, Any]:
     return output
 
 
+def _ring_weight_values(values: object) -> dict[str, Any]:
+    output = _mapping("ring weight stage", values)
+    output["weights"] = tuple(output.get("weights", ()))
+    return output
+
+
 def load_config(path: str | Path) -> ExperimentConfig:
     with Path(path).open("r", encoding="utf-8") as stream:
         raw = yaml.safe_load(stream)
@@ -793,6 +872,10 @@ def load_config(path: str | Path) -> ExperimentConfig:
                 {"until_samples": 500_000, "rings": (4, 6)},
             ),
         )
+    )
+    ring_values["step_weights"] = tuple(
+        _construct(RingWeightStage, _ring_weight_values(value))
+        for value in ring_values.get("step_weights", ())
     )
     orchestration_values["ring_mixture"] = _construct(RingMixtureConfig, ring_values)
     for key, cls in (
