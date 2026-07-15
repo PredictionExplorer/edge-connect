@@ -22,6 +22,7 @@ interface GroupPresentation {
   groupSize: Int32Array;
   connectionPaths: [string, string];
   starConnectionPaths: [string, string];
+  syntheticConnectionPaths: [string, string];
   groupPaths: string[];
 }
 
@@ -29,6 +30,7 @@ function buildGroupPresentation(
   board: Board,
   stones: ArrayLike<number>,
   aliveStone?: ArrayLike<number> | null,
+  syntheticStone?: ArrayLike<number> | null,
 ): GroupPresentation {
   const parent = new Int32Array(board.n).fill(-1);
   for (let node = 0; node < board.n; node++) {
@@ -67,6 +69,7 @@ function buildGroupPresentation(
 
   const connections: [string[], string[]] = [[], []];
   const starConnections: [string[], string[]] = [[], []];
+  const syntheticConnections: [string[], string[]] = [[], []];
   const groupSegments = Array.from({ length: board.n }, () => [] as string[]);
   for (let node = 0; node < board.n; node++) {
     const color = stones[node];
@@ -77,8 +80,15 @@ function buildGroupPresentation(
       const segment =
         `M${(board.xs[node] * S).toFixed(2)} ${(board.ys[node] * S).toFixed(2)}` +
         `L${(board.xs[neighbor] * S).toFixed(2)} ${(board.ys[neighbor] * S).toFixed(2)}`;
-      connections[color].push(segment);
-      if (aliveStone?.[node] === 1 && aliveStone[neighbor] === 1) {
+      const synthetic =
+        syntheticStone?.[node] === 1 || syntheticStone?.[neighbor] === 1;
+      if (synthetic) syntheticConnections[color].push(segment);
+      else connections[color].push(segment);
+      if (
+        !synthetic &&
+        aliveStone?.[node] === 1 &&
+        aliveStone[neighbor] === 1
+      ) {
         starConnections[color].push(segment);
       }
       groupSegments[groupOf[node]].push(segment);
@@ -90,6 +100,10 @@ function buildGroupPresentation(
     groupSize,
     connectionPaths: [connections[0].join(''), connections[1].join('')],
     starConnectionPaths: [starConnections[0].join(''), starConnections[1].join('')],
+    syntheticConnectionPaths: [
+      syntheticConnections[0].join(''),
+      syntheticConnections[1].join(''),
+    ],
     groupPaths: groupSegments.map((segments) => segments.join('')),
   };
 }
@@ -103,6 +117,10 @@ export interface StarBoardProps {
   aliveStone?: ArrayLike<number> | null;
   /** 1 = existing stone cannot form a living star in any completion. */
   provablyDeadStone?: ArrayLike<number> | null;
+  /** 1 = stone is hypothetical and was added only for a completion proof. */
+  syntheticStone?: ArrayLike<number> | null;
+  /** Accessible summary for a synthetic proof board. */
+  proofDescription?: string;
   showTerritory?: boolean;
   lastMove?: number;
   currentTurnMoves?: number[];
@@ -166,6 +184,8 @@ export const StarBoard = memo(function StarBoard({
   nodeOwner,
   aliveStone,
   provablyDeadStone,
+  syntheticStone,
+  proofDescription,
   showTerritory = false,
   lastMove = -1,
   currentTurnMoves = [],
@@ -182,11 +202,13 @@ export const StarBoard = memo(function StarBoard({
   const svgRef = useRef<SVGSVGElement>(null);
   const nodeRefs = useRef(new Map<number, SVGCircleElement>());
   const instructionsId = useId();
+  const proofPatternId = `${instructionsId.replaceAll(':', '')}-proof-hatch`;
+  const boardInteractive = interactive && syntheticStone == null;
 
   const stoneR = Math.min(board.minEdge * 0.46 * S, 9.5);
   const groups = useMemo(
-    () => buildGroupPresentation(board, stones, aliveStone),
-    [aliveStone, board, stones],
+    () => buildGroupPresentation(board, stones, aliveStone, syntheticStone),
+    [aliveStone, board, stones, syntheticStone],
   );
 
   const { meshPath, bridgeChordPath, bridgeStarPoints, periRingPath } = useMemo(() => {
@@ -279,20 +301,20 @@ export const StarBoard = memo(function StarBoard({
 
   const handlePointerMove = useCallback(
     (event: PointerEvent<SVGSVGElement>) => {
-      if (!interactive) return;
+      if (!boardInteractive) return;
       const node = nodeAtPointer(event.clientX, event.clientY);
       if (node !== hovered) hover(node);
     },
-    [hover, hovered, interactive, nodeAtPointer],
+    [boardInteractive, hover, hovered, nodeAtPointer],
   );
 
   const handleBoardClick = useCallback(
     (event: MouseEvent<SVGSVGElement>) => {
-      if (!interactive) return;
+      if (!boardInteractive) return;
       const node = nodeAtPointer(event.clientX, event.clientY);
       if (node >= 0 && stones[node] === EMPTY) onPlace?.(node);
     },
-    [interactive, nodeAtPointer, onPlace, stones],
+    [boardInteractive, nodeAtPointer, onPlace, stones],
   );
 
   const territory = showTerritory && nodeOwner ? nodeOwner : null;
@@ -346,15 +368,21 @@ export const StarBoard = memo(function StarBoard({
       ref={svgRef}
       viewBox="-119 -119 238 238"
       className={className}
-      role={interactive ? 'group' : 'img'}
-      aria-label={`*Star board with ${board.rings} rings, ${occupiedCount} of ${board.n} nodes occupied`}
+      role={boardInteractive ? 'group' : 'img'}
+      aria-label={
+        proofDescription
+          ? 'Clinch proof board'
+          : `*Star board with ${board.rings} rings, ${occupiedCount} of ${board.n} nodes occupied`
+      }
       aria-describedby={instructionsId}
       onPointerMove={handlePointerMove}
       onMouseLeave={() => hover(-1)}
       onClick={handleBoardClick}
     >
       <desc id={instructionsId}>
-        {interactive
+        {proofDescription
+          ? `${proofDescription} This proof board is read-only.`
+          : boardInteractive
           ? 'Use the arrow keys to move between nodes. Press Enter or Space to place a stone on an empty node.'
           : 'A non-interactive preview of the game board.'}
       </desc>
@@ -371,6 +399,22 @@ export const StarBoard = memo(function StarBoard({
             <stop offset="100%" stopColor={c.deep} />
           </radialGradient>
         ))}
+        <pattern
+          id={proofPatternId}
+          patternUnits="userSpaceOnUse"
+          width="3"
+          height="3"
+          patternTransform="rotate(35)"
+        >
+          <line
+            x1="0"
+            y1="0"
+            x2="0"
+            y2="3"
+            stroke="rgba(255,255,255,0.9)"
+            strokeWidth="0.7"
+          />
+        </pattern>
         <filter id="softGlow" x="-80%" y="-80%" width="260%" height="260%">
           <feGaussianBlur stdDeviation="1.6" result="b" />
           <feMerge>
@@ -444,6 +488,20 @@ export const StarBoard = memo(function StarBoard({
             filter="url(#connectionGlow)"
           />
         ))}
+        {PLAYER_COLORS.map((color, player) => (
+          <path
+            key={`proof-connections-${player}`}
+            data-connection-layer="proof"
+            data-player={player}
+            d={groups.syntheticConnectionPaths[player as 0 | 1]}
+            stroke={color.bright}
+            strokeWidth={Math.max(stoneR * 0.24, 0.7)}
+            strokeOpacity="0.5"
+            strokeDasharray="1.4 1.4"
+            fill="none"
+            strokeLinecap="round"
+          />
+        ))}
         {highlightedGroup >= 0 && highlightedColor !== null && (
           <path
             data-connection-layer="highlight"
@@ -469,6 +527,7 @@ export const StarBoard = memo(function StarBoard({
         const peri = board.isPeri[u] === 1;
         const notInStar = !isEmpty && aliveStone ? aliveStone[u] === 0 : false;
         const provablyDead = !isEmpty && provablyDeadStone?.[u] === 1;
+        const synthetic = !isEmpty && syntheticStone?.[u] === 1;
         const dimmed = provablyDead || (showTerritory && notInStar);
         const inHighlightedGroup =
           !isEmpty && highlightedGroup >= 0 && groups.groupOf[u] === highlightedGroup;
@@ -521,7 +580,7 @@ export const StarBoard = memo(function StarBoard({
             )}
 
             {/* hover ghost */}
-            {isEmpty && hovered === u && interactive && (
+            {isEmpty && hovered === u && boardInteractive && (
               <circle
                 cx={x}
                 cy={y}
@@ -534,10 +593,21 @@ export const StarBoard = memo(function StarBoard({
             {/* stone */}
             {!isEmpty && (
               <g
-                className="stone-pop"
-                opacity={provablyDead ? 0.22 : dimmed ? 0.35 : 1}
+                className={synthetic ? 'proof-stone' : 'stone-pop'}
+                opacity={
+                  synthetic
+                    ? dimmed
+                      ? 0.32
+                      : 0.68
+                    : provablyDead
+                      ? 0.22
+                      : dimmed
+                        ? 0.35
+                        : 1
+                }
                 data-group-root={groups.groupOf[u]}
                 data-stone-node={u}
+                data-proof-stone={synthetic ? u : undefined}
               >
                 <circle
                   cx={x}
@@ -548,14 +618,35 @@ export const StarBoard = memo(function StarBoard({
                   strokeWidth="0.5"
                   filter={dimmed ? undefined : 'url(#stoneShadow)'}
                 />
-                <ellipse
-                  cx={x - stoneR * 0.3}
-                  cy={y - stoneR * 0.38}
-                  rx={stoneR * 0.34}
-                  ry={stoneR * 0.22}
-                  fill="rgba(255,255,255,0.55)"
-                  transform={`rotate(-24 ${x - stoneR * 0.3} ${y - stoneR * 0.38})`}
-                />
+                {synthetic ? (
+                  <>
+                    <circle
+                      cx={x}
+                      cy={y}
+                      r={stoneR * 0.86}
+                      fill={`url(#${proofPatternId})`}
+                      opacity="0.72"
+                    />
+                    <circle
+                      cx={x}
+                      cy={y}
+                      r={stoneR * 1.08}
+                      fill="none"
+                      stroke="rgba(255,255,255,0.9)"
+                      strokeWidth="0.75"
+                      strokeDasharray="1.5 1.35"
+                    />
+                  </>
+                ) : (
+                  <ellipse
+                    cx={x - stoneR * 0.3}
+                    cy={y - stoneR * 0.38}
+                    rx={stoneR * 0.34}
+                    ry={stoneR * 0.22}
+                    fill="rgba(255,255,255,0.55)"
+                    transform={`rotate(-24 ${x - stoneR * 0.3} ${y - stoneR * 0.38})`}
+                  />
+                )}
               </g>
             )}
 
@@ -642,7 +733,7 @@ export const StarBoard = memo(function StarBoard({
               </g>
             )}
 
-            {interactive && focusedNode === u && (
+            {boardInteractive && focusedNode === u && (
               <circle
                 aria-hidden
                 cx={x}
@@ -656,7 +747,7 @@ export const StarBoard = memo(function StarBoard({
             )}
 
             {/* hit target */}
-            {interactive && (
+            {boardInteractive && (
               <circle
                 ref={(element) => {
                   if (element) nodeRefs.current.set(u, element);

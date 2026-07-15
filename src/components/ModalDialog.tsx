@@ -14,8 +14,10 @@ interface ModalDialogProps {
   onClose: () => void;
   children: ReactNode;
   labelledBy?: string;
+  describedBy?: string;
   ariaLabel?: string;
   initialFocusRef?: RefObject<HTMLElement | null>;
+  returnFocusRef?: RefObject<HTMLElement | null>;
   closeOnBackdrop?: boolean;
   closeOnEscape?: boolean;
   className?: string;
@@ -34,8 +36,10 @@ export function ModalDialog({
   onClose,
   children,
   labelledBy,
+  describedBy,
   ariaLabel,
   initialFocusRef,
+  returnFocusRef,
   closeOnBackdrop = true,
   closeOnEscape = true,
   className = '',
@@ -55,6 +59,7 @@ export function ModalDialog({
     const opener = document.activeElement instanceof HTMLElement
       ? document.activeElement
       : null;
+    const returnFocusTarget = returnFocusRef?.current ?? opener;
     const previousOverflow = document.body.style.overflow;
     document.body.style.overflow = 'hidden';
     const closeOnDocumentEscape = (event: KeyboardEvent) => {
@@ -79,9 +84,9 @@ export function ModalDialog({
       document.removeEventListener('keydown', closeOnDocumentEscape, true);
       document.body.style.overflow = previousOverflow;
       if (dialog.open && typeof dialog.close === 'function') dialog.close();
-      opener?.focus({ preventScroll: true });
+      returnFocusTarget?.focus({ preventScroll: true });
     };
-  }, [closeOnEscape, initialFocusRef, open]);
+  }, [closeOnEscape, initialFocusRef, open, returnFocusRef]);
 
   if (!open) return null;
 
@@ -116,6 +121,7 @@ export function ModalDialog({
       ref={dialogRef}
       aria-label={ariaLabel}
       aria-labelledby={labelledBy}
+      aria-describedby={describedBy}
       aria-modal="true"
       onCancel={(event) => {
         event.preventDefault();

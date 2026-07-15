@@ -9,6 +9,10 @@ interface ScorePanelProps {
   game: GameState;
   score: ScoreResult;
   completionBounds?: CompletionBounds | null;
+  view?:
+    | { kind: 'live' }
+    | { kind: 'proof'; fillPlayer: 0 | 1 }
+    | { kind: 'ended' };
 }
 
 interface ScoreRow {
@@ -124,8 +128,37 @@ function CompletionForecast({
   );
 }
 
-export function ScorePanel({ game, score, completionBounds }: ScorePanelProps) {
+export function ScorePanel({
+  game,
+  score,
+  completionBounds,
+  view = { kind: 'live' },
+}: ScorePanelProps) {
   const { config } = game;
+  const heading =
+    game.over
+      ? 'Final score'
+      : view.kind === 'proof'
+        ? 'Clinch proof'
+        : view.kind === 'ended'
+          ? 'Position when game ended'
+          : 'Current scoring projection';
+  const headingDetail =
+    game.over
+      ? null
+      : view.kind === 'proof'
+        ? 'hypothetical boundary'
+        : view.kind === 'ended'
+          ? 'projection only'
+          : 'can change';
+  const scoreAriaLabel =
+    game.over
+      ? 'Final player scores'
+      : view.kind === 'proof'
+        ? 'Hypothetical clinch proof scores'
+        : view.kind === 'ended'
+          ? 'Projected player scores when game ended, not final scores'
+          : 'Current player scores';
   const rows: ScoreRow[] = [
     {
       label: 'Peries',
@@ -164,18 +197,21 @@ export function ScorePanel({ game, score, completionBounds }: ScorePanelProps) {
   return (
     <div className="flex flex-col gap-3">
       <div className="flex min-h-5 items-center justify-between px-1 text-xs font-semibold uppercase tracking-[0.14em] text-muted">
-        <span>{game.over ? 'Final score' : 'Current scoring projection'}</span>
-        {!game.over && <span className="normal-case tracking-normal">can change</span>}
+        <span>{heading}</span>
+        {headingDetail && (
+          <span className="normal-case tracking-normal">{headingDetail}</span>
+        )}
       </div>
 
       <section
-        aria-label={game.over ? 'Final player scores' : 'Current player scores'}
+        aria-label={scoreAriaLabel}
         className="overflow-hidden rounded-2xl border border-white/10 bg-white/[0.03] backdrop-blur-sm"
       >
         <div className="grid grid-cols-[minmax(5.5rem,1fr)_minmax(4rem,5.25rem)_minmax(4rem,5.25rem)] items-stretch border-b border-white/10">
           <div className="flex items-end px-3 py-3 text-xs text-muted">Score</div>
           {([0, 1] as const).map((player) => {
-            const active = !game.over && game.toMove === player;
+            const active =
+              !game.over && view.kind === 'live' && game.toMove === player;
             const color = PLAYER_COLORS[player];
             return (
               <div
@@ -233,7 +269,17 @@ export function ScorePanel({ game, score, completionBounds }: ScorePanelProps) {
       </section>
 
       <p className="min-h-8 px-1 text-center text-xs leading-relaxed text-muted">
-        {score.contestedPeries > 0 ? (
+        {view.kind === 'proof' ? (
+          <>
+            every open node is hypothetically assigned to{' '}
+            <span className="text-gold">
+              {config.playerNames[view.fillPlayer]}
+            </span>{' '}
+            — this is not a final score
+          </>
+        ) : view.kind === 'ended' ? (
+          <>this is the live position that was left on the board, not a final score</>
+        ) : score.contestedPeries > 0 ? (
           <>
             <span className="text-gold">{score.contestedPeries}</span> per
             {score.contestedPeries === 1 ? 'i is' : 'ies are'} still contested · totals reach{' '}
@@ -249,9 +295,12 @@ export function ScorePanel({ game, score, completionBounds }: ScorePanelProps) {
         )}
       </p>
 
-      {!game.over && completionBounds && (
+      {!game.over &&
+        view.kind === 'live' &&
+        completionBounds &&
+        completionBounds.guaranteedWinner === null && (
         <CompletionForecast game={game} bounds={completionBounds} />
-      )}
+        )}
     </div>
   );
 }

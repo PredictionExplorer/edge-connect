@@ -284,6 +284,45 @@ describe('StarBoard', () => {
     ).toHaveLength(2);
   });
 
+  it('renders completion stones as a read-only, explicitly hypothetical proof', async () => {
+    const live = emptyBoard();
+    live[0] = 0;
+    const scenario = scoreCompletionBounds(board, live).scenarios[1];
+    const synthetic = Uint8Array.from(
+      { length: board.n },
+      (_, node) => (live[node] === EMPTY ? 1 : 0),
+    );
+    const description =
+      'Proof scenario—not actual moves. Every open node is hypothetically assigned to Grace.';
+    const { container } = render(
+      <StarBoard
+        board={board}
+        stones={scenario.stones}
+        nodeOwner={scenario.score.nodeOwner}
+        aliveStone={scenario.score.aliveStone}
+        syntheticStone={synthetic}
+        proofDescription={description}
+        showTerritory
+        interactive
+        playerNames={['Ada', 'Grace']}
+      />,
+    );
+
+    const proofBoard = screen.getByRole('img', { name: 'Clinch proof board' });
+    expect(proofBoard).toHaveAccessibleDescription(/proof scenario—not actual moves/i);
+    expect(screen.queryByRole('button')).not.toBeInTheDocument();
+    expect(container.querySelectorAll('[data-proof-stone]')).toHaveLength(
+      board.n - 1,
+    );
+    expect(
+      container.querySelector('[data-stone-node="0"]'),
+    ).not.toHaveAttribute('data-proof-stone');
+    expect(
+      container.querySelector('[data-connection-layer="proof"]'),
+    ).toBeInTheDocument();
+    expect((await axe(container)).violations).toEqual([]);
+  });
+
   it('has no detectable accessibility violations', async () => {
     const { container } = render(
       <StarBoard

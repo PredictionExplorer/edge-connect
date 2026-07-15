@@ -35,7 +35,30 @@ describe('completion score bounds', () => {
       expect(bounds.scenarios[1].score.players[1].total).toBe(
         board.periCount - 1,
       );
+      expect(Array.from(bounds.scenarios[0].stones)).toEqual(
+        Array.from({ length: board.n }, () => 0),
+      );
+      expect(Array.from(bounds.scenarios[1].stones)).toEqual(
+        Array.from({ length: board.n }, () => 1),
+      );
       expect(bounds.guaranteedWinner).toBeNull();
+    }
+  });
+
+  it('exposes proof boards without changing any existing stone', () => {
+    const board = getBoard(4);
+    const stones = new Int8Array(board.n).fill(EMPTY);
+    stones[0] = 0;
+    stones[7] = 1;
+
+    const bounds = scoreCompletionBounds(board, stones);
+    expect(stones[1]).toBe(EMPTY);
+    for (const scenario of bounds.scenarios) {
+      expect(scenario.stones).not.toBe(stones);
+      expect(scenario.stones[0]).toBe(0);
+      expect(scenario.stones[7]).toBe(1);
+      expect(scenario.stones[1]).toBe(scenario.fillPlayer);
+      expect(scenario.stones).not.toContain(EMPTY);
     }
   });
 

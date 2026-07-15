@@ -76,6 +76,8 @@ function resetStore(overrides: Partial<AppState> = {}) {
     log: [],
     redoStack: [],
     reviewing: false,
+    earlyOutcome: null,
+    clinchAcknowledgement: null,
     ...overrides,
   });
 }

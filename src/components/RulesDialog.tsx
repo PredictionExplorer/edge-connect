@@ -92,7 +92,8 @@ export function RulesDialog({ open, onClose }: RulesDialogProps) {
               sequences. On a full board, changing an opponent stone to your color can only merge
               your groups or split theirs, so it cannot make your final score worse. If your
               opponent still wins after every open node is assigned to you, they have clinched
-              the game — although you may keep playing.
+              the game. You may inspect that proof on the board, end the game immediately, or
+              keep playing.
             </p>
           </div>
           <p>
@@ -102,7 +103,9 @@ export function RulesDialog({ open, onClose }: RulesDialogProps) {
             crossed-out groups remain valid.
           </p>
           <p>
-            The game ends only when the board is full.
+            A game normally ends when the board is full. It may also end early when the players
+            accept a clinched result or when a human player resigns. Early endings record the
+            winner without claiming a final score for the unfinished board.
           </p>
         </div>
       </article>

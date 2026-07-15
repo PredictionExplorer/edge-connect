@@ -1,5 +1,5 @@
 import { expect, test, type Page } from '@playwright/test';
-import { fillFourRingGame } from './helpers';
+import { fillFourRingGame, reachFourRingClinch } from './helpers';
 
 const health = {
   status: 'ok',
@@ -298,4 +298,43 @@ test('keeps the game-over result usable on a phone', async ({ page }) => {
   expect(dialogBox!.y).toBeGreaterThanOrEqual(0);
   expect(dialogBox!.x + dialogBox!.width).toBeLessThanOrEqual(391);
   expect(dialogBox!.y + dialogBox!.height).toBeLessThanOrEqual(845);
+});
+
+test('keeps the clinch decision and proof controls usable on a small phone', async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 320, height: 568 });
+  await openFreshSetup(page);
+  await page.getByRole('button', { name: /^Mini, 4 rings$/i }).click();
+  await page.getByRole('button', { name: 'Begin the game' }).click();
+  await reachFourRingClinch(page);
+
+  const dialog = page.getByRole('dialog', { name: /cannot be caught/i });
+  await expect(dialog).toBeVisible();
+  await expect(
+    dialog.getByRole('button', { name: 'Continue playing' }),
+  ).toBeFocused();
+  const dialogBox = await dialog.boundingBox();
+  expect(dialogBox).not.toBeNull();
+  expect(dialogBox!.x).toBeGreaterThanOrEqual(0);
+  expect(dialogBox!.y).toBeGreaterThanOrEqual(0);
+  expect(dialogBox!.x + dialogBox!.width).toBeLessThanOrEqual(321);
+  expect(dialogBox!.y + dialogBox!.height).toBeLessThanOrEqual(569);
+  await expect(page).toHaveScreenshot('clinch-phone.png');
+
+  await dialog.getByRole('button', { name: 'Show proof board' }).click();
+  await expect(page.getByRole('region', { name: 'Clinch proof board' })).toBeVisible();
+  const mobileControls = page.locator('[data-mobile-clinch-controls]');
+  await expect(mobileControls).toBeVisible();
+  const controlsBox = await mobileControls.boundingBox();
+  expect(controlsBox).not.toBeNull();
+  expect(controlsBox!.x).toBeGreaterThanOrEqual(0);
+  expect(controlsBox!.x + controlsBox!.width).toBeLessThanOrEqual(321);
+  expect(controlsBox!.y + controlsBox!.height).toBeLessThanOrEqual(569);
+  await expect(page).toHaveScreenshot('clinch-proof-phone.png');
+
+  await mobileControls.getByRole('button', { name: 'End now' }).click();
+  const result = page.getByRole('dialog', { name: 'Game over' });
+  await result.getByRole('button', { name: 'Review proof' }).click();
+  await expect(page.getByRole('button', { name: 'Result' })).toHaveCount(1);
 });

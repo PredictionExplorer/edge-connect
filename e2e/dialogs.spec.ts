@@ -1,5 +1,5 @@
 import { expect, test, type Page } from '@playwright/test';
-import { fillFourRingGame } from './helpers';
+import { fillFourRingGame, reachFourRingClinch } from './helpers';
 
 async function startFreshGame(page: Page) {
   await page.goto('/');
@@ -49,4 +49,58 @@ test('reviews, reopens, and rematches from the game-over dialog', async ({ page 
   await expect(dialog).toBeHidden();
   await expect(page.getByText('Ada to play')).toBeVisible();
   await expect(page.getByRole('button', { name: 'Pass' })).toHaveCount(0);
+});
+
+test('explains a clinch, previews proof, and persists an accepted result', async ({
+  page,
+}) => {
+  await reachFourRingClinch(page);
+
+  const clinch = page.getByRole('dialog', { name: /cannot be caught/i });
+  await expect(clinch).toBeVisible();
+  await expect(
+    clinch.getByRole('button', { name: 'Continue playing' }),
+  ).toBeFocused();
+  await expect(clinch.getByText(/even if every remaining open node/i)).toBeVisible();
+
+  await clinch.getByRole('button', { name: 'Show proof board' }).click();
+  await expect(page.getByRole('region', { name: 'Clinch proof board' })).toBeVisible();
+  await expect(page.getByText(/striped stones are hypothetical/i)).toBeVisible();
+  await page.getByRole('button', { name: /^Return to live board/ }).click();
+  await expect(clinch).toBeVisible();
+
+  await clinch.getByRole('button', { name: 'Continue playing' }).click();
+  await expect(clinch).toBeHidden();
+  await expect(page.getByRole('button', { name: 'End game' })).toBeVisible();
+  await page.reload();
+  await expect(page.getByRole('dialog', { name: /cannot be caught/i })).toBeHidden();
+  await expect(page.getByRole('button', { name: 'End game' })).toBeVisible();
+
+  await page.getByRole('button', { name: 'End game' }).click();
+  const confirmation = page.getByRole('dialog', {
+    name: 'End this clinched game?',
+  });
+  await expect(confirmation.getByRole('button', { name: 'Keep playing' })).toBeFocused();
+  await confirmation.getByRole('button', { name: 'End game' }).click();
+
+  const result = page.getByRole('dialog', { name: 'Game over' });
+  await expect(result).toContainText(/no final score was recorded/i);
+  await expect(result.getByRole('button', { name: 'Review proof' })).toBeVisible();
+
+  await page.reload();
+  await expect(page.getByRole('dialog', { name: 'Game over' })).toContainText(
+    /no final score was recorded/i,
+  );
+});
+
+test('names the resigning player and defaults to keeping the game', async ({ page }) => {
+  await page.getByRole('button', { name: 'Resign Ada' }).click();
+  const dialog = page.getByRole('dialog', { name: 'Resign Ada?' });
+  await expect(dialog.getByRole('button', { name: 'Keep playing' })).toBeFocused();
+  await expect(dialog).toContainText('Grace will win immediately');
+
+  await dialog.getByRole('button', { name: 'Resign Ada' }).click();
+  const result = page.getByRole('dialog', { name: 'Game over' });
+  await expect(result.getByRole('heading', { name: 'Grace wins' })).toBeVisible();
+  await expect(result).toContainText('Ada resigned');
 });

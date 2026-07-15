@@ -131,6 +131,8 @@ function resetPlayingStore(overrides: Partial<AppState> = {}) {
     log: [],
     redoStack: [],
     reviewing: false,
+    earlyOutcome: null,
+    clinchAcknowledgement: null,
     ...overrides,
   });
 }
@@ -461,6 +463,75 @@ describe('GameScreen AI lifecycle', () => {
     expect((await axe(container)).violations).toEqual([]);
     expect(requestServerAiDecision).not.toHaveBeenCalled();
   });
+
+  it('blocks automatic play for the clinch decision and proof view', async () => {
+    const user = userEvent.setup();
+    const flight = deferred<StarAiDecision>();
+    vi.mocked(requestServerAiDecision).mockReturnValue(flight.promise);
+    resetPlayingStore({
+      controllers: ['server', 'server'],
+      log: Array.from({ length: 49 }, (_, node) => ({
+        type: 'place' as const,
+        node,
+      })),
+    });
+    const { container } = render(<GameScreen />);
+
+    const clinch = screen.getByRole('dialog', {
+      name: 'Grace cannot be caught',
+    });
+    expect(requestServerAiDecision).not.toHaveBeenCalled();
+    await user.click(
+      within(clinch).getByRole('button', { name: 'Continue playing' }),
+    );
+    await waitFor(() => expect(requestServerAiDecision).toHaveBeenCalledOnce());
+    const signal = vi.mocked(requestServerAiDecision).mock.calls[0][1]?.signal;
+    expect(signal?.aborted).toBe(false);
+
+    const actionDock = within(
+      container.querySelector('[data-action-dock]') as HTMLElement,
+    );
+    await user.click(
+      actionDock.getByRole('button', { name: /^Show proof board/ }),
+    );
+    await waitFor(() => expect(signal?.aborted).toBe(true));
+    expect(useAppStore.getState().log).toHaveLength(49);
+  });
+
+  it('does not reopen Rules after an AI finishes the game behind it', async () => {
+    const user = userEvent.setup();
+    const flight = deferred<StarAiDecision>();
+    vi.mocked(requestServerAiDecision).mockReturnValue(flight.promise);
+    resetPlayingStore({
+      controllers: ['server', 'server'],
+      log: Array.from({ length: 49 }, (_, node) => ({
+        type: 'place' as const,
+        node,
+      })),
+      clinchAcknowledgement: { winner: 1, atLogLength: 49 },
+    });
+    render(<GameScreen />);
+
+    await screen.findByText(/server ai is thinking/i);
+    await user.click(screen.getByRole('button', { name: 'Rules' }));
+    expect(
+      screen.getByRole('dialog', { name: 'How to play *Star' }),
+    ).toBeInTheDocument();
+
+    const [request] = vi.mocked(requestServerAiDecision).mock.calls[0];
+    flight.resolve(makeDecision(request, { type: 'place', node: 49 }));
+    const result = await screen.findByRole('dialog', { name: 'Game over' });
+    await user.click(
+      within(result).getByRole('button', { name: 'Review board' }),
+    );
+
+    expect(
+      screen.queryByRole('dialog', { name: 'How to play *Star' }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.getByRole('region', { name: 'Game board' }),
+    ).toBeInTheDocument();
+  });
 });
 
 describe('GameScreen score guidance', () => {
@@ -478,7 +549,88 @@ describe('GameScreen score guidance', () => {
     ).toBeInTheDocument();
   });
 
-  it('announces a clinched result without ending the game', () => {
+  it('pauses on a clinch, continues once, and toggles a non-mutating proof', async () => {
+    const user = userEvent.setup();
+    resetPlayingStore({
+      controllers: ['human', 'human'],
+      log: Array.from({ length: 49 }, (_, node) => ({
+        type: 'place' as const,
+        node,
+      })),
+    });
+    const { container } = render(<GameScreen />);
+
+    const dialog = screen.getByRole('dialog', {
+      name: 'Grace cannot be caught',
+    });
+    expect(
+      screen.getByRole('heading', { name: 'Grace has clinched' }),
+    ).toBeInTheDocument();
+    expect(
+      within(dialog).getByText(/even if every remaining open node became ada/i),
+    ).toBeInTheDocument();
+    expect(
+      within(dialog).getByRole('button', { name: 'Continue playing' }),
+    ).toHaveFocus();
+
+    await user.click(
+      within(dialog).getByRole('button', { name: 'Continue playing' }),
+    );
+    expect(dialog).not.toBeInTheDocument();
+    expect(
+      screen.getByRole('region', { name: 'Game board' }),
+    ).toHaveFocus();
+    expect(screen.getByText(/Grace to play/)).toBeInTheDocument();
+    const actionDock = within(
+      container.querySelector('[data-action-dock]') as HTMLElement,
+    );
+    expect(
+      actionDock.getByRole('button', { name: /^Show proof board/ }),
+    ).toBeInTheDocument();
+    expect(actionDock.getByRole('button', { name: 'End game' })).toBeInTheDocument();
+
+    const originalLog = useAppStore.getState().log;
+    await user.click(
+      actionDock.getByRole('button', { name: /^Show proof board/ }),
+    );
+    expect(
+      screen.getByRole('img', { name: 'Clinch proof board' }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole('img', { name: 'Clinch proof board' }),
+    ).toHaveAccessibleDescription(/proof scenario—not actual moves/i);
+    expect(container.querySelectorAll('[data-proof-stone]')).toHaveLength(1);
+    expect(
+      screen.getByLabelText('Hypothetical clinch proof scores'),
+    ).toBeInTheDocument();
+    expect(useAppStore.getState().log).toEqual(originalLog);
+
+    await user.click(
+      actionDock.getByRole('button', { name: /^Return to live board/ }),
+    );
+    expect(container.querySelectorAll('[data-proof-stone]')).toHaveLength(0);
+    expect(
+      screen.getByRole('group', { name: /\*star board with 4 rings/i }),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole('dialog', { name: 'Grace cannot be caught' }),
+    ).not.toBeInTheDocument();
+
+    await user.click(actionDock.getByRole('button', { name: 'End game' }));
+    const endConfirmation = screen.getByRole('dialog', {
+      name: 'End this clinched game?',
+    });
+    expect(
+      within(endConfirmation).getByRole('button', { name: 'Keep playing' }),
+    ).toHaveFocus();
+    await user.click(
+      within(endConfirmation).getByRole('button', { name: 'Keep playing' }),
+    );
+    expect(useAppStore.getState().earlyOutcome).toBeNull();
+  });
+
+  it('ends a clinched game without presenting a projected score as final', async () => {
+    const user = userEvent.setup();
     resetPlayingStore({
       controllers: ['human', 'human'],
       log: Array.from({ length: 49 }, (_, node) => ({
@@ -488,16 +640,105 @@ describe('GameScreen score guidance', () => {
     });
     render(<GameScreen />);
 
+    const clinchDialog = screen.getByRole('dialog', {
+      name: 'Grace cannot be caught',
+    });
+    await user.click(
+      within(clinchDialog).getByRole('button', { name: 'End game now' }),
+    );
+
+    const result = screen.getByRole('dialog', { name: 'Game over' });
     expect(
-      screen.getByText('Grace has clinched the game', { exact: true }),
+      within(result).getByRole('heading', { name: 'Grace wins' }),
     ).toBeInTheDocument();
+    expect(within(result).getByText(/no final score was recorded/i)).toBeInTheDocument();
+    expect(screen.queryByText('Final score')).not.toBeInTheDocument();
+    expect(useAppStore.getState().earlyOutcome).toEqual({
+      reason: 'clinch',
+      winner: 1,
+      loser: 0,
+      emptyNodes: 1,
+    });
+
+    await user.click(
+      within(result).getByRole('button', { name: 'Review proof' }),
+    );
     expect(
-      screen.getByText(/even if every open node went to ada/i),
+      screen.getByRole('img', { name: 'Clinch proof board' }),
     ).toBeInTheDocument();
-    expect(screen.getByLabelText('Ada scores 10')).toBeInTheDocument();
-    expect(screen.getByLabelText('Grace scores 11')).toBeInTheDocument();
-    expect(screen.getByText(/Grace to play/)).toBeInTheDocument();
-    expect(screen.queryByRole('dialog', { name: 'Game over' })).not.toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: 'Rules' }));
+    expect(
+      screen.getByRole('dialog', { name: 'How to play *Star' }),
+    ).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: 'Close rules' }));
+    expect(
+      within(screen.getByRole('navigation', { name: 'Game' })).getByRole(
+        'button',
+        { name: 'Result' },
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it('keeps a normally completed board undoable during review', async () => {
+    const user = userEvent.setup();
+    resetPlayingStore({
+      controllers: ['human', 'human'],
+      log: Array.from({ length: 50 }, (_, node) => ({
+        type: 'place' as const,
+        node,
+      })),
+    });
+    const { container } = render(<GameScreen />);
+
+    const result = screen.getByRole('dialog', { name: 'Game over' });
+    await user.click(
+      within(result).getByRole('button', { name: 'Review board' }),
+    );
+    const undoButton = within(
+      container.querySelector('[data-action-dock]') as HTMLElement,
+    ).getByRole('button', { name: 'Undo' });
+    expect(undoButton).toBeEnabled();
+    await user.click(undoButton);
+    expect(useAppStore.getState().log).toHaveLength(49);
+  });
+
+  it('confirms a named resignation and applies the human-owned-side policy', async () => {
+    const user = userEvent.setup();
+    resetPlayingStore({ controllers: ['human', 'human'] });
+    const { rerender } = render(<GameScreen />);
+
+    await user.click(screen.getByRole('button', { name: 'Resign Ada' }));
+    const resignation = screen.getByRole('dialog', { name: 'Resign Ada?' });
+    expect(
+      within(resignation).getByRole('button', { name: 'Keep playing' }),
+    ).toHaveFocus();
+    await user.click(
+      within(resignation).getByRole('button', { name: 'Resign Ada' }),
+    );
+    expect(
+      screen.getByRole('heading', { name: 'Grace wins' }),
+    ).toBeInTheDocument();
+    expect(useAppStore.getState().earlyOutcome).toEqual({
+      reason: 'resignation',
+      winner: 1,
+      loser: 0,
+    });
+
+    resetPlayingStore({
+      controllers: ['human', 'server'],
+      log: [{ type: 'place', node: 0 }],
+    });
+    vi.mocked(requestServerAiDecision).mockReturnValue(
+      deferred<StarAiDecision>().promise,
+    );
+    rerender(<GameScreen />);
+    expect(screen.getByRole('button', { name: 'Resign Ada' })).toBeInTheDocument();
+
+    resetPlayingStore({ controllers: ['server', 'local'] });
+    rerender(<GameScreen />);
+    expect(
+      screen.queryByRole('button', { name: /resign/i }),
+    ).not.toBeInTheDocument();
   });
 
   it('suppresses completion guidance while a pie swap can recolor the opening', () => {

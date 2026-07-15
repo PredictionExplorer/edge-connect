@@ -1,9 +1,14 @@
-import { render, screen } from '@testing-library/react';
+import { render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { axe } from 'vitest-axe';
 import { describe, expect, it, vi } from 'vitest';
 import { initialState } from '@/lib/star/game';
 import type { ScoreResult } from '@/lib/star/scoring';
+import {
+  ClinchDialog,
+  EndGameConfirmDialog,
+  ResignDialog,
+} from '../EndGameDialogs';
 import { GameOverOverlay } from '../GameOverOverlay';
 import { RulesDialog } from '../RulesDialog';
 import { Starfield } from '../Starfield';
@@ -94,8 +99,7 @@ describe('GameOverOverlay', () => {
       <GameOverOverlay
         open
         game={game}
-        score={score()}
-        winner={0}
+        result={{ reason: 'full-board', winner: 0, score: score() }}
         onReview={onReview}
         onRematch={onRematch}
         onSetup={onSetup}
@@ -124,8 +128,7 @@ describe('GameOverOverlay', () => {
       <GameOverOverlay
         open
         game={game}
-        score={score()}
-        winner={1}
+        result={{ reason: 'full-board', winner: 1, score: score() }}
         {...callbacks}
       />,
     );
@@ -134,14 +137,111 @@ describe('GameOverOverlay', () => {
       <GameOverOverlay
         open={false}
         game={game}
-        score={score()}
-        winner={1}
+        result={{ reason: 'full-board', winner: 1, score: score() }}
         {...callbacks}
       />,
     );
     expect(
       screen.queryByRole('dialog', { name: 'Game over' }),
     ).not.toBeInTheDocument();
+  });
+
+  it('distinguishes a clinched result from a real final score', async () => {
+    const user = userEvent.setup();
+    const onReview = vi.fn();
+    const { container } = render(
+      <GameOverOverlay
+        open
+        game={game}
+        result={{
+          reason: 'clinch',
+          winner: 1,
+          loser: 0,
+          emptyNodes: 7,
+        }}
+        onReview={onReview}
+        onRematch={vi.fn()}
+        onSetup={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByRole('heading', { name: 'Vega wins' })).toBeInTheDocument();
+    expect(screen.getByText(/no final score was recorded/i)).toBeInTheDocument();
+    expect(screen.queryByText('11')).not.toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: 'Review proof' }));
+    expect(onReview).toHaveBeenCalledOnce();
+    expect((await axe(container)).violations).toEqual([]);
+  });
+});
+
+describe('end-game decision dialogs', () => {
+  it('keeps the clinch decision non-destructive by default', async () => {
+    const user = userEvent.setup();
+    const onContinue = vi.fn();
+    const onProof = vi.fn();
+    const onEnd = vi.fn();
+    const { container } = render(
+      <ClinchDialog
+        open
+        winner={1}
+        winnerName="Grace"
+        loserName="Ada"
+        emptyNodes={3}
+        proofScores={[10, 11]}
+        onContinue={onContinue}
+        onProof={onProof}
+        onEnd={onEnd}
+      />,
+    );
+
+    const dialog = screen.getByRole('dialog', {
+      name: 'Grace cannot be caught',
+    });
+    expect(dialog).toHaveAccessibleDescription(
+      /even if every remaining open node became ada/i,
+    );
+    expect(
+      within(dialog).getByRole('button', { name: 'Continue playing' }),
+    ).toHaveFocus();
+    await user.click(
+      within(dialog).getByRole('button', { name: 'Show proof board' }),
+    );
+    await user.click(
+      within(dialog).getByRole('button', { name: 'End game now' }),
+    );
+    await user.keyboard('{Escape}');
+    expect(onProof).toHaveBeenCalledOnce();
+    expect(onEnd).toHaveBeenCalledOnce();
+    expect(onContinue).toHaveBeenCalledOnce();
+    expect((await axe(container)).violations).toEqual([]);
+  });
+
+  it('names safe and destructive confirmation actions', () => {
+    const { rerender } = render(
+      <EndGameConfirmDialog
+        open
+        winnerName="Grace"
+        emptyNodes={4}
+        onCancel={vi.fn()}
+        onConfirm={vi.fn()}
+      />,
+    );
+    expect(
+      screen.getByRole('dialog', { name: 'End this clinched game?' }),
+    ).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Keep playing' })).toHaveFocus();
+
+    rerender(
+      <ResignDialog
+        open
+        loserName="Ada"
+        winnerName="Grace"
+        onCancel={vi.fn()}
+        onConfirm={vi.fn()}
+      />,
+    );
+    expect(screen.getByRole('dialog', { name: 'Resign Ada?' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Resign Ada' })).toBeInTheDocument();
   });
 });
 

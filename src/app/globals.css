@@ -127,6 +127,19 @@ summary {
   }
 }
 
+[data-proof-active="true"] svg {
+  animation: proof-reveal 0.2s ease-out both;
+}
+
+@keyframes proof-reveal {
+  from {
+    opacity: 0.62;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
 /*
  * Entrance animations are pure CSS (not JS/rAF-driven) so they always settle
  * even in throttled or background tabs. `both` fill keeps the final state.
@@ -205,10 +218,24 @@ summary {
   .last-move-pulse {
     display: none;
   }
+  [data-proof-active="true"] svg {
+    animation: none;
+  }
   .fade-up,
   .fade-in,
   .pop-in {
     animation: none;
+  }
+}
+
+@media (forced-colors: active) {
+  [data-proof-stone] circle {
+    fill: Canvas !important;
+    stroke: CanvasText !important;
+  }
+
+  [data-connection-layer="proof"] {
+    stroke: CanvasText !important;
   }
 }
 

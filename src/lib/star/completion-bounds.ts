@@ -8,6 +8,8 @@ import {
 export interface CompletionScenario {
   /** Player assigned every currently empty node in this synthetic full board. */
   fillPlayer: 0 | 1;
+  /** Synthetic full board used to calculate this boundary score. */
+  stones: Int8Array;
   score: ScoreResult & { leader: 0 | 1 };
   winner: 0 | 1;
   /** Player-zero total minus player-one total. */
@@ -80,12 +82,11 @@ export function scoreCompletionBounds(
   }
 
   const scenarios = ([0, 1] as const).map((fillPlayer) => {
-    const terminal = validateTerminalWinner(
-      board,
-      fillEmptyNodes(board, stones, fillPlayer),
-    );
+    const completedStones = fillEmptyNodes(board, stones, fillPlayer);
+    const terminal = validateTerminalWinner(board, completedStones);
     return {
       fillPlayer,
+      stones: completedStones,
       score: terminal.score,
       winner: terminal.winner,
       margin: terminal.margin,

@@ -1,5 +1,6 @@
 import AxeBuilder from '@axe-core/playwright';
 import { expect, test } from '@playwright/test';
+import { reachFourRingClinch } from './helpers';
 
 test('setup and gameplay have no automatically detectable accessibility violations', async ({
   page,
@@ -37,5 +38,20 @@ test('reduced motion suppresses the repeating last-move pulse', async ({ page })
   await page.getByRole('button', { name: 'Begin the game' }).click();
   await page.getByRole('button', { name: /Node .*empty/ }).first().click();
   await expect(page.locator('.last-move-pulse')).toBeHidden();
+});
+
+test('clinch decisions and proof remain accessible', async ({ page }) => {
+  await page.goto('/');
+  await page.getByRole('button', { name: 'Mini, 4 rings' }).click();
+  await page.getByRole('button', { name: 'Begin the game' }).click();
+  await reachFourRingClinch(page);
+
+  const clinch = page.getByRole('dialog', { name: /cannot be caught/i });
+  await expect(clinch).toBeVisible();
+  expect((await new AxeBuilder({ page }).analyze()).violations).toEqual([]);
+
+  await clinch.getByRole('button', { name: 'Show proof board' }).click();
+  await expect(page.getByRole('region', { name: 'Clinch proof board' })).toBeVisible();
+  expect((await new AxeBuilder({ page }).analyze()).violations).toEqual([]);
 });
 

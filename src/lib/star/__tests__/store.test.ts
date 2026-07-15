@@ -19,6 +19,15 @@ const double: GameConfig = {
   pieRule: false,
   playerNames: ['A', 'B'],
 };
+const mini: GameConfig = {
+  ...double,
+  rings: 4,
+  playerNames: ['Ada', 'Grace'],
+};
+const clinchedLog = Array.from({ length: 49 }, (_, node) => ({
+  type: 'place' as const,
+  node,
+}));
 
 afterEach(() => {
   useAppStore.setState({
@@ -33,6 +42,8 @@ afterEach(() => {
     log: [],
     redoStack: [],
     reviewing: false,
+    earlyOutcome: null,
+    clinchAcknowledgement: null,
   });
 });
 
@@ -93,6 +104,72 @@ describe('persisted app-state validation', () => {
     expect(illegal.log).toEqual([]);
   });
 
+  it('rehydrates only outcomes and acknowledgements that match the position', () => {
+    const persisted = {
+      phase: 'playing',
+      config: mini,
+      controllers: ['human', 'human'],
+      aiPaused: false,
+      log: clinchedLog,
+      redoStack: [],
+      earlyOutcome: {
+        reason: 'clinch',
+        winner: 1,
+        loser: 0,
+        emptyNodes: 1,
+      },
+      clinchAcknowledgement: {
+        winner: 1,
+        atLogLength: 49,
+      },
+    };
+
+    expect(sanitizePersistedState(persisted)).toMatchObject({
+      earlyOutcome: persisted.earlyOutcome,
+      clinchAcknowledgement: persisted.clinchAcknowledgement,
+    });
+    expect(
+      sanitizePersistedState({
+        ...persisted,
+        log: clinchedLog.slice(0, -1),
+        redoStack: [clinchedLog[48]],
+        earlyOutcome: null,
+      }),
+    ).toMatchObject({
+      clinchAcknowledgement: persisted.clinchAcknowledgement,
+    });
+    expect(
+      sanitizePersistedState({
+        ...persisted,
+        earlyOutcome: {
+          reason: 'clinch',
+          winner: 0,
+          loser: 1,
+          emptyNodes: 1,
+        },
+        clinchAcknowledgement: {
+          winner: 0,
+          atLogLength: 49,
+        },
+      }),
+    ).toMatchObject({
+      earlyOutcome: null,
+      clinchAcknowledgement: null,
+    });
+    expect(
+      sanitizePersistedState({
+        ...persisted,
+        earlyOutcome: null,
+        clinchAcknowledgement: {
+          winner: 1,
+          atLogLength: 1,
+        },
+      }),
+    ).toMatchObject({
+      clinchAcknowledgement: null,
+    });
+  });
+
   it('has no legacy pass parser path', () => {
     expect(parseGameAction({ type: 'pass' })).toBeNull();
     expect(parseGameAction({ type: 'place', node: 2 })).toEqual({
@@ -115,7 +192,7 @@ describe('persisted app-state validation', () => {
     expect(result.controllers).toEqual(['human', 'human']);
   });
 
-  it('resets old games without replay migration and preserves valid preferences', () => {
+  it('migrates version 5 games without discarding replayable history', () => {
     const migrated = migratePersistedState(
       {
         phase: 'playing',
@@ -132,6 +209,30 @@ describe('persisted app-state validation', () => {
       },
       APP_STORE_VERSION - 1,
     );
+    expect(migrated).toMatchObject({
+      phase: 'playing',
+      controllers: ['server', 'local'],
+      aiPaused: true,
+      log: [{ type: 'place', node: 0 }],
+      redoStack: [{ type: 'place', node: 1 }],
+      earlyOutcome: null,
+      clinchAcknowledgement: null,
+    });
+  });
+
+  it('still resets pre-version-5 games while preserving valid preferences', () => {
+    const migrated = migratePersistedState(
+      {
+        config: {
+          rings: 8,
+          mode: 'double',
+          pieRule: false,
+          playerNames: ['Ada', 'Grace'],
+        },
+        controllers: ['server', 'local'],
+      },
+      APP_STORE_VERSION - 2,
+    );
     expect(migrated).toEqual({
       phase: 'setup',
       config: {
@@ -145,6 +246,8 @@ describe('persisted app-state validation', () => {
       aiPaused: false,
       log: [],
       redoStack: [],
+      earlyOutcome: null,
+      clinchAcknowledgement: null,
     });
   });
 
@@ -303,5 +406,67 @@ describe('gameplay store actions', () => {
     expect(useAppStore.getState().controllers).toEqual(['human', 'human']);
     useAppStore.getState().resumeAi();
     expect(useAppStore.getState().aiPaused).toBe(false);
+  });
+
+  it('acknowledges, ends, and resets a clinched game without changing its log', () => {
+    useAppStore.setState({
+      phase: 'playing',
+      config: mini,
+      controllers: ['human', 'human'],
+      log: clinchedLog,
+      redoStack: [],
+      earlyOutcome: null,
+      clinchAcknowledgement: null,
+    });
+
+    useAppStore.getState().acknowledgeClinch(1);
+    expect(useAppStore.getState().clinchAcknowledgement).toEqual({
+      winner: 1,
+      atLogLength: 49,
+    });
+
+    useAppStore.getState().endClinchedGame(1);
+    expect(useAppStore.getState()).toMatchObject({
+      log: clinchedLog,
+      earlyOutcome: {
+        reason: 'clinch',
+        winner: 1,
+        loser: 0,
+        emptyNodes: 1,
+      },
+    });
+    useAppStore.getState().act({ type: 'place', node: 49 });
+    expect(useAppStore.getState().log).toEqual(clinchedLog);
+
+    useAppStore.getState().rematch();
+    expect(useAppStore.getState()).toMatchObject({
+      log: [],
+      earlyOutcome: null,
+      clinchAcknowledgement: null,
+    });
+  });
+
+  it('records the named resigning player and clears the outcome on undo', () => {
+    useAppStore.setState({
+      phase: 'playing',
+      config: mini,
+      controllers: ['human', 'human'],
+      log: [{ type: 'place', node: 0 }],
+      redoStack: [],
+      earlyOutcome: null,
+      clinchAcknowledgement: null,
+    });
+
+    useAppStore.getState().resign(0);
+    expect(useAppStore.getState().earlyOutcome).toEqual({
+      reason: 'resignation',
+      winner: 1,
+      loser: 0,
+    });
+    useAppStore.getState().undo();
+    expect(useAppStore.getState()).toMatchObject({
+      log: [],
+      earlyOutcome: null,
+    });
   });
 });

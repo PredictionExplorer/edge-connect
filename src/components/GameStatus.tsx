@@ -1,13 +1,23 @@
 import {
   CircleAlert,
+  Eye,
   LoaderCircle,
   PauseCircle,
+  ShieldCheck,
   Sparkles,
   Trophy,
 } from 'lucide-react';
 import type { Mode } from '@/lib/star/game';
 
-export type GameStatusState = 'human' | 'thinking' | 'paused' | 'error' | 'over';
+export type GameStatusState =
+  | 'human'
+  | 'thinking'
+  | 'paused'
+  | 'error'
+  | 'clinch'
+  | 'proof'
+  | 'confirming'
+  | 'over';
 
 interface GameStatusProps {
   state: GameStatusState;
@@ -37,8 +47,26 @@ export function GameStatus({
       ? {
           icon: Trophy,
           title: 'The sky is settled',
-          detail: 'Review the final position or start another game.',
+          detail: 'Review the result or start another game.',
         }
+      : state === 'clinch'
+        ? {
+            icon: ShieldCheck,
+            title: `${playerName} has clinched`,
+            detail: 'Choose whether to end now or continue playing.',
+          }
+        : state === 'proof'
+          ? {
+              icon: Eye,
+              title: 'Clinch proof on board',
+              detail: `${playerName} still wins in this strongest-case scenario.`,
+            }
+          : state === 'confirming'
+            ? {
+                icon: PauseCircle,
+                title: 'Play paused for confirmation',
+                detail: 'Confirm the choice or return to the game.',
+              }
       : state === 'thinking'
         ? {
             icon: LoaderCircle,
@@ -73,11 +101,14 @@ export function GameStatus({
       aria-busy={state === 'thinking'}
       aria-live="polite"
       data-game-status={state}
-      className={`panel-surface flex h-[4.5rem] min-w-0 items-center gap-3 overflow-hidden rounded-2xl px-4 ${className}`}
+      className={`panel-surface flex min-h-[4.875rem] min-w-0 items-center gap-3 rounded-2xl px-4 py-3 ${className}`}
       style={{
-        borderColor: state === 'over' ? 'rgba(232,196,139,0.5)' : `${color.base}66`,
+        borderColor:
+          state === 'over' || state === 'clinch' || state === 'proof'
+            ? 'rgba(232,196,139,0.5)'
+            : `${color.base}66`,
         background:
-          state === 'over'
+          state === 'over' || state === 'clinch' || state === 'proof'
             ? 'linear-gradient(145deg, rgba(232,196,139,0.14), rgba(16,21,42,0.9))'
             : `linear-gradient(145deg, ${color.soft}, rgba(16,21,42,0.9))`,
       }}
@@ -92,10 +123,10 @@ export function GameStatus({
         />
       </span>
       <div className="min-w-0">
-        <p className="truncate text-sm font-medium" style={{ color: color.bright }}>
+        <p className="text-sm font-medium leading-tight" style={{ color: color.bright }}>
           {presentation.title}
         </p>
-        <p className="truncate text-xs text-muted">{presentation.detail}</p>
+        <p className="mt-0.5 text-xs leading-tight text-muted">{presentation.detail}</p>
       </div>
     </section>
   );
