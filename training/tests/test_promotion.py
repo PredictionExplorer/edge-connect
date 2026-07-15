@@ -13,6 +13,7 @@ from startrain.checkpoint import (
     ExponentialMovingAverage,
     collect_model_garbage,
     load_model_manifest,
+    write_resume_cutover,
 )
 from startrain.arena import ARENA_RESULT_SCHEMA_VERSION, ArenaPair
 from startrain.config import (
@@ -69,6 +70,109 @@ def test_arena_manifest_evaluator_uses_compiled_inference_model(
 
     assert evaluator.model is model
     assert compile_calls == [{"enabled": True, "dynamic": True, "fullgraph": True}]
+
+
+def test_promotion_candidates_respect_durable_resume_cutover(tmp_path) -> None:
+    experiment = load_config(Path(__file__).parents[1] / "configs" / "small.yaml")
+    identity = RunIdentity(tmp_path / "run.json", "run-cutover", "family-cutover", 1)
+    model = GraphResTNet(experiment.model)
+    optimizer = build_optimizer(model, OptimizerConfig(kind="adamw"))
+    scheduler = build_scheduler(
+        optimizer, SchedulerConfig(warmup_steps=0, total_steps=10)
+    )
+    ema = ExponentialMovingAverage(model, decay=0.9)
+    publisher = ImmutableModelPublisher(tmp_path / "learner", identity)
+    first = publisher.publish(
+        model=model,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        ema=ema,
+        step=0,
+        epoch=0,
+        config=experiment.as_dict(),
+    )
+    with torch.no_grad():
+        next(model.parameters()).add_(0.01)
+    ema.update(model)
+    cutover = publisher.publish(
+        model=model,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        ema=ema,
+        step=1,
+        epoch=1,
+        config=experiment.as_dict(),
+    )
+    write_resume_cutover(
+        publisher.root,
+        manifest=cutover,
+        run_id=identity.run_id,
+        generation_family=identity.generation_family,
+    )
+    with torch.no_grad():
+        next(model.parameters()).add_(0.01)
+    ema.update(model)
+    after = publisher.publish(
+        model=model,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        ema=ema,
+        step=2,
+        epoch=2,
+        config=experiment.as_dict(),
+    )
+    supervisor = PromotionSupervisor(
+        experiment=experiment,
+        run_identity=identity,
+        candidate_path=publisher.candidate_path,
+        champion_path=publisher.champion_path,
+        results_directory=tmp_path / "arena",
+        native_module=object(),
+        device="cpu",
+    )
+
+    identities = {
+        manifest.model_identity for manifest in supervisor._candidate_manifests()
+    }
+    assert first.model_identity not in identities
+    assert identities == {cutover.model_identity, after.model_identity}
+    atomic_json(
+        supervisor.status_path,
+        {
+            "schema_version": 1,
+            "candidate_identity": first.model_identity,
+            "candidate_step": first.model_step,
+            "champion_identity": cutover.model_identity,
+            "champion_step": cutover.model_step,
+            "decision": "reject",
+            "terminal": True,
+            "consecutive_terminal_rejections": 9,
+            "cutover_created_ns": 0,
+            "updated_ns": 1,
+        },
+    )
+    supervisor._write_status(
+        candidate=after,
+        champion=cutover,
+        decision="reject",
+        terminal=True,
+    )
+    status = json.loads(supervisor.status_path.read_text())
+    cutover_payload = json.loads((publisher.root / "resume-cutover.json").read_text())
+    assert status["cutover_created_ns"] == cutover_payload["created_ns"]
+    assert status["consecutive_terminal_rejections"] == 1
+    collect_model_garbage(
+        publisher.root,
+        retain_candidate_manifests=1,
+        dry_run=False,
+    )
+    assert cutover.checkpoint.is_file()
+    collect_model_garbage(
+        publisher.root,
+        retain_candidate_manifests=1,
+        dry_run=False,
+    )
+    assert cutover.checkpoint.is_file()
 
 
 def test_promotion_supervisor_bootstraps_and_only_promotes_arena_pass(
@@ -235,6 +339,27 @@ def test_promotion_supervisor_bootstraps_and_only_promotes_arena_pass(
     retained = load_model_manifest(tmp_path / "learner" / "champion.json")
     assert retained.model_identity == newest.model_identity
     assert retained.model_identity != rejected.model_identity
+    idle_polls = 0
+    idle_progress: list[dict[str, object]] = []
+
+    def idle_sleep(_seconds: float) -> None:
+        nonlocal idle_polls
+        idle_polls += 1
+
+    supervisor.sleep = idle_sleep
+    assert (
+        supervisor.run(
+            stop_requested=lambda: idle_polls >= 2,
+            progress=lambda **details: idle_progress.append(details),
+        )
+        == 0
+    )
+    assert idle_polls == 2
+    assert [
+        item["phase"]
+        for item in idle_progress
+        if item.get("phase") == "awaiting_new_candidate"
+    ] == ["awaiting_new_candidate", "awaiting_new_candidate"]
     dry_gc = collect_model_garbage(
         tmp_path / "learner",
         retain_candidate_manifests=1,

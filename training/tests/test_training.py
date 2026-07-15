@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 import torch
 
+from scripts.validate_continuous_profile import validate_continuous_config
 from startrain.checkpoint import (
     ExponentialMovingAverage,
     load_checkpoint,
@@ -131,6 +132,25 @@ def test_yaml_configs_load_strictly() -> None:
         == 1
     )
     assert throughput.selfplay.fast_policy_weight == 0.25
+    assert throughput.selfplay.record_fast_policy_targets is True
+    assert throughput.selfplay.considered_actions() == 16
+    assert replace(throughput.selfplay, rings=10).considered_actions() == 27
+    assert throughput.learner.unlimited is True
+    assert throughput.orchestration.ring_mixture.weights_for_step(360_000) == (
+        0.15,
+        0.15,
+        0.15,
+        0.55,
+    )
+    assert throughput.orchestration.ring_mixture.weights_for_step(1_000_000) == (
+        0.1,
+        0.1,
+        0.1,
+        0.7,
+    )
+    assert throughput.orchestration.plateau.consecutive_terminal_rejections == 2
+    assert throughput.orchestration.plateau.reset_learning_rate_scale == 0.5
+    validate_continuous_config(throughput)
 
 
 def test_yaml_parses_opt_in_learner_ring_mixture_curriculum(tmp_path) -> None:

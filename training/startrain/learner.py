@@ -22,6 +22,7 @@ from .checkpoint import (
     MODEL_MANIFEST_VERSION,
     ExponentialMovingAverage,
     ModelManifest,
+    ResumeCheckpoint,
     collect_recovery_garbage,
     load_checkpoint,
     load_model_manifest,
@@ -393,6 +394,14 @@ def plateau_policy_decision(
 ) -> str:
     if lag_steps < soft_lag_steps:
         return "proceed"
+    if (
+        status_matches_candidate
+        and terminal_rejection
+        and lag_steps >= hard_replay_lag_steps
+        and action == "reset_from_champion"
+        and not reset_already_applied
+    ):
+        return "reset"
     if (
         status_matches_candidate
         and terminal_rejection
@@ -1033,21 +1042,41 @@ class LearnerLoop:
             global_batch_size=self.train_config.global_batch_size(self.world_size),
         )
 
+    def _scale_learning_rates(self, scale: float) -> None:
+        if scale == 1.0:
+            return
+        if not 0 < scale <= 1:
+            raise ValueError("learning-rate scale must be in (0, 1]")
+        for group in self.optimizer.param_groups:
+            group["lr"] = float(group["lr"]) * scale
+            if "initial_lr" in group:
+                group["initial_lr"] = float(group["initial_lr"]) * scale
+        self.scheduler.base_lrs = [
+            float(learning_rate) * scale for learning_rate in self.scheduler.base_lrs
+        ]
+        if hasattr(self.scheduler, "_last_lr"):
+            self.scheduler._last_lr = [
+                float(group["lr"]) for group in self.optimizer.param_groups
+            ]
+
     def _active_ring_weights(self) -> dict[int, float] | None:
         weights = self.ring_mixture_config.weights_for_step(self.step)
         if weights is None:
             return None
         return dict(zip(self.ring_mixture_config.rings, weights, strict=True))
 
-    def _maybe_write_recovery_checkpoint(self, *, force: bool = False) -> None:
+    def _maybe_write_recovery_checkpoint(
+        self, *, force: bool = False
+    ) -> ResumeCheckpoint | None:
         interval = self.learner_config.recovery_interval_steps
-        if interval is None:
-            return
+        if interval is None and not force:
+            return None
         if not force and (
             self.step <= self._last_recovery_step
+            or interval is None
             or self.step - self._last_recovery_step < interval
         ):
-            return
+            return None
         recovery = write_recovery_checkpoint(
             self.publisher.root,
             model=unwrap_model(self.compiled_model),
@@ -1090,6 +1119,7 @@ class LearnerLoop:
                     **metrics,
                 }
             )
+        return recovery
 
     def _wait_for_replay(
         self,
@@ -1290,16 +1320,11 @@ class LearnerLoop:
                 return True
             if kind == "reset":
                 checkpoint = Path(str(action["checkpoint"]))
+                previous_step = self.step
                 champion_manifest = None
                 if self.rank == 0:
                     champion_manifest = load_model_manifest(
                         self.publisher.champion_path
-                    )
-                    write_resume_cutover(
-                        self.publisher.root,
-                        manifest=champion_manifest,
-                        run_id=self.run_identity.run_id,
-                        generation_family=self.run_identity.generation_family,
                     )
                 self._distributed_barrier()
                 self.resume(
@@ -1307,15 +1332,63 @@ class LearnerLoop:
                     expected_sha256=str(action["sha256"]),
                     expected_bytes=int(action["bytes"]),
                 )
+                self._scale_learning_rates(configured.reset_learning_rate_scale)
                 if self.rank == 0:
                     assert champion_manifest is not None
+                    self._last_recovery_step = max(0, self.step - 1)
+                    recovery = self._maybe_write_recovery_checkpoint(force=True)
+                    if recovery is None:
+                        raise RuntimeError(
+                            "plateau reset did not create a recovery checkpoint"
+                        )
+                    cutover_created_ns = time.time_ns()
+                    write_resume_cutover(
+                        self.publisher.root,
+                        manifest=recovery,
+                        run_id=self.run_identity.run_id,
+                        generation_family=self.run_identity.generation_family,
+                        created_ns=cutover_created_ns,
+                    )
                     write_model_pointer(
                         self.publisher.candidate_path,
                         champion_manifest,
                         role="candidate",
                     )
-                    self._last_recovery_step = max(0, self.step - 1)
-                    self._maybe_write_recovery_checkpoint(force=True)
+                    if self.promotion_status_path is not None:
+                        atomic_json(
+                            self.promotion_status_path,
+                            {
+                                "schema_version": 1,
+                                "candidate_identity": champion_manifest.model_identity,
+                                "candidate_step": champion_manifest.model_step,
+                                "champion_identity": champion_manifest.model_identity,
+                                "champion_step": champion_manifest.model_step,
+                                "decision": "plateau_reset",
+                                "terminal": True,
+                                "consecutive_terminal_rejections": 0,
+                                "cutover_created_ns": cutover_created_ns,
+                                "updated_ns": time.time_ns(),
+                            },
+                        )
+                    self.metrics.append(
+                        {
+                            "schema_version": 1,
+                            "timestamp_ns": time.time_ns(),
+                            "worker": "learner",
+                            "event": "plateau_reset",
+                            "reason": action.get("reset_reason"),
+                            "from_step": previous_step,
+                            "to_step": self.step,
+                            "champion_identity": champion_manifest.model_identity,
+                            "learning_rate_scale": (
+                                configured.reset_learning_rate_scale
+                            ),
+                            "learning_rates": [
+                                float(group["lr"])
+                                for group in self.optimizer.param_groups
+                            ],
+                        }
+                    )
                 self._distributed_barrier()
                 self._last_plateau_reset = (
                     str(action["champion_identity"]),
@@ -1326,6 +1399,7 @@ class LearnerLoop:
                         phase="plateau_reset",
                         step=self.step,
                         champion_identity=action["champion_identity"],
+                        reason=action.get("reset_reason"),
                     )
                 return True
             if kind != "pause":
@@ -1481,6 +1555,12 @@ class LearnerLoop:
         if decision == "reset":
             return {
                 "kind": "reset",
+                "reset_reason": (
+                    "hard_replay_lag"
+                    if lag >= self.learner_config.max_replay_lag_steps
+                    and streak < configured.consecutive_terminal_rejections
+                    else "terminal_rejection_streak"
+                ),
                 "checkpoint": str(champion.checkpoint),
                 "sha256": champion.checkpoint_sha256,
                 "bytes": champion.checkpoint_bytes,

@@ -277,11 +277,12 @@ For the 8-GPU profile, `runs/h100-8gpu/` contains:
 At startup the learner publishes an initial candidate. The shipped H100 profiles
 explicitly allow the promotion supervisor to bootstrap that first candidate as
 champion, which releases actors waiting for `champion.json`. Later candidates are
-immutable EMA checkpoints emitted every 5,000 learner steps.
+immutable EMA checkpoints emitted at the configured cadence (15,000 learner
+steps in the continuous throughput profile).
 
 The arena compares each candidate with the current champion using reversed-role pairs,
 all rings, forced and unforced openings, a pair-level mixture-betting e-process and
-anytime-valid per-ring regression checks. The shipped gate takes 25 new pairs per ring
+anytime-valid per-ring regression checks. The continuous gate takes 50 new pairs per ring
 per look, requires at least 50, allows at most 200, tests a +35 Elo alternative against
 0 Elo, and rejects a material ring regression. Only a `promote` result atomically
 advances `champion.json`; inconclusive results accumulate more non-overlapping pairs.
@@ -309,10 +310,11 @@ startrain-arena \
 This is an internal engineering milestone, not evidence of superhuman strength.
 
 If candidate/champion lag reaches the configured plateau, the learner pauses for a
-terminal arena result. After three terminal rejections, the shipped profile resets
-learner/optimizer/EMA state from the champion. At the target step, actors drain at a
-complete cohort boundary and the coordinator waits for the final candidate's terminal
-arena decision.
+terminal arena result. After two terminal rejections—or one terminal rejection at
+the hard replay-lag boundary—the continuous profile resets learner/optimizer/EMA
+state from the champion and scales restored learning rates by 0.5. Finite runs
+drain actors at the target step and wait for the final candidate's terminal arena
+decision.
 
 ## Monitoring and recovery
 

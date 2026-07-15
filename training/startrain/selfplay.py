@@ -127,9 +127,11 @@ class SelfPlayConfig:
         return max(1, int(round(base * scale)))
 
     def considered_actions(self) -> int:
-        scale = (
-            self.rings / self.simulation_reference_rings
-        ) ** self.max_considered_ring_exponent
+        scale = max(
+            1.0,
+            (self.rings / self.simulation_reference_rings)
+            ** self.max_considered_ring_exponent,
+        )
         return min(
             self.max_considered_cap,
             max(1, int(round(self.max_considered * scale))),

@@ -6,7 +6,6 @@ import torch
 
 from startrain.checkpoint import (
     ExponentialMovingAverage,
-    ModelManifest,
     collect_recovery_garbage,
     discover_resume_checkpoints,
     load_checkpoint,
@@ -125,18 +124,7 @@ def test_resume_cutover_prevents_rejected_high_step_resurrection(tmp_path) -> No
     rejected = _write(tmp_path, step=20)
     write_resume_cutover(
         tmp_path,
-        manifest=ModelManifest(
-            path=tmp_path / "champion.json",
-            checkpoint=champion.checkpoint,
-            model_version="sha256-" + champion.checkpoint_sha256,
-            model_step=champion.step,
-            published_ns=1,
-            model_identity="sha256-" + champion.checkpoint_sha256,
-            checkpoint_sha256=champion.checkpoint_sha256,
-            checkpoint_bytes=champion.checkpoint_bytes,
-            run_id=champion.run_id,
-            generation_family=champion.generation_family,
-        ),
+        manifest=champion,
         run_id="run-test",
         generation_family="family-test",
     )
@@ -155,6 +143,14 @@ def test_resume_cutover_prevents_rejected_high_step_resurrection(tmp_path) -> No
         generation_family="family-test",
     )
     assert candidates[0].checkpoint == continued.checkpoint
+    collect_recovery_garbage(
+        tmp_path,
+        retain_checkpoints=1,
+        dry_run=False,
+    )
+    assert champion.checkpoint.is_file()
+    assert continued.checkpoint.is_file()
+    assert not rejected.checkpoint.exists()
 
 
 def test_recovery_interval_rejects_cross_directory_path(tmp_path) -> None:

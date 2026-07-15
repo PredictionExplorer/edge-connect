@@ -65,9 +65,9 @@ selfplay:
   simulation_reference_rings: 6
   simulation_ring_exponent: 1.0
   max_considered: 16
-  max_considered_ring_exponent: 0.0
-  max_considered_cap: 64
-  record_fast_policy_targets: false
+  max_considered_ring_exponent: 1.0
+  max_considered_cap: 32
+  record_fast_policy_targets: true
   fast_policy_weight: 0.25
   c_visit: 50.0
   c_scale: 1.0
@@ -76,6 +76,7 @@ selfplay:
   seed: 17
 learner:
   steps: 1000000
+  unlimited: true
   minimum_replay_samples: 100000
   recent_samples_per_ring: 500000
   minimum_unique_samples_per_ring: 4096
@@ -159,6 +160,19 @@ orchestration:
     - 1.25
     - 1.5
     - 2.0
+    step_weights:
+    - from_step: 360000
+      weights:
+      - 0.15
+      - 0.15
+      - 0.15
+      - 0.55
+    - from_step: 1000000
+      weights:
+      - 0.1
+      - 0.1
+      - 0.1
+      - 0.7
   model_refresh:
     manifest_poll_seconds: 2.0
     startup_timeout_seconds: 900.0
@@ -201,12 +215,13 @@ orchestration:
   plateau:
     enabled: true
     max_learner_champion_lag_steps: 45000
-    consecutive_terminal_rejections: 3
+    consecutive_terminal_rejections: 2
     action: reset_from_champion
+    reset_learning_rate_scale: 0.5
     poll_seconds: 10.0
   retention:
     enabled: true
-    dry_run: true
+    dry_run: false
     recovery_dry_run: false
     replay_shards_per_ring: 2000
     candidate_manifests: 20

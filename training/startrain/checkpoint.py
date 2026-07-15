@@ -508,25 +508,27 @@ def write_recovery_checkpoint(
 def write_resume_cutover(
     root: str | Path,
     *,
-    manifest: ModelManifest,
+    manifest: ModelManifest | ResumeCheckpoint,
     run_id: str,
     generation_family: str,
+    created_ns: int | None = None,
 ) -> ResumeCheckpoint:
     directory = Path(root)
     run_id = validate_identifier("run_id", run_id)
     family = validate_identifier("generation_family", generation_family)
     if manifest.run_id != run_id or manifest.generation_family != family:
         raise ValueError("resume cutover manifest belongs to another run")
+    step = manifest.model_step if isinstance(manifest, ModelManifest) else manifest.step
     payload: dict[str, object] = {
         "format": RESUME_CUTOVER_FORMAT,
         "schema_version": RESUME_CUTOVER_VERSION,
         "checkpoint": os.path.relpath(manifest.checkpoint, directory),
         "checkpoint_sha256": manifest.checkpoint_sha256,
         "checkpoint_bytes": manifest.checkpoint_bytes,
-        "step": manifest.model_step,
+        "step": step,
         "run_id": run_id,
         "generation_family": family,
-        "created_ns": time.time_ns(),
+        "created_ns": time.time_ns() if created_ns is None else created_ns,
     }
     path = directory / "resume-cutover.json"
     atomic_json(path, payload)
@@ -794,6 +796,11 @@ def collect_recovery_garbage(
                 continue
     payloads.sort(key=lambda item: (item.step, item.checkpoint.name), reverse=True)
     protected = {item.checkpoint.resolve() for item in payloads[:retain_checkpoints]}
+    if (
+        cutover is not None
+        and cutover.checkpoint.parent == (directory / "recovery").resolve()
+    ):
+        protected.add(cutover.checkpoint.resolve())
     recovery_files = list((directory / "recovery").glob("sha256-*.pt"))
     candidates = [path for path in recovery_files if path.resolve() not in protected]
     bytes_reclaimable = sum(path.stat().st_size for path in candidates)
@@ -1145,6 +1152,22 @@ def collect_model_garbage(
         (item.artifact_manifest or item.path).resolve()
         for item in manifests[-retain_candidate_manifests:]
     )
+    cutover_checkpoints: set[Path] = set()
+    cutover_path = directory / "resume-cutover.json"
+    if cutover_path.is_file():
+        cutover_payload = _read_json(cutover_path, "resume cutover")
+        cutover = _parse_resume_cutover(
+            cutover_path,
+            cutover_payload,
+            expected_run_id=validate_identifier(
+                "run_id", cutover_payload.get("run_id")
+            ),
+            expected_generation_family=validate_identifier(
+                "generation_family",
+                cutover_payload.get("generation_family"),
+            ),
+        )
+        cutover_checkpoints.add(cutover.checkpoint.resolve())
     if referenced_result_directory is not None:
         for result_path in Path(referenced_result_directory).glob("*.json"):
             try:
@@ -1166,6 +1189,7 @@ def collect_model_garbage(
     retained_checkpoints = {
         item.checkpoint.resolve() for item in manifests if item not in candidates
     }
+    retained_checkpoints.update(cutover_checkpoints)
     checkpoint_candidates = {
         item.checkpoint.resolve()
         for item in candidates
@@ -1176,6 +1200,7 @@ def collect_model_garbage(
         path.resolve()
         for path in (directory / "checkpoints").glob("sha256-*.pt")
         if path.resolve() not in referenced_checkpoints
+        and path.resolve() not in retained_checkpoints
     )
     bytes_reclaimable = sum(
         path.stat().st_size

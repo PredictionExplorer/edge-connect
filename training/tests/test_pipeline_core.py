@@ -1281,8 +1281,39 @@ def test_plateau_policy_keeps_replay_live_and_resets_after_rejections() -> None:
             rejection_streak=2,
             **common,
         )
+        == "reset"
+    )
+    assert (
+        plateau_policy_decision(
+            lag_steps=50,
+            terminal_rejection=False,
+            rejection_streak=2,
+            **common,
+        )
         == "pause"
     )
+
+
+def test_plateau_learning_rate_scale_updates_optimizer_and_scheduler() -> None:
+    parameter = torch.nn.Parameter(torch.ones(()))
+    optimizer = torch.optim.SGD([parameter], lr=1.0)
+    scheduler = build_scheduler(
+        optimizer,
+        SchedulerConfig(warmup_steps=0, total_steps=10, min_lr_ratio=0.1),
+    )
+    learner = object.__new__(LearnerLoop)
+    learner.optimizer = optimizer
+    learner.scheduler = scheduler
+
+    learner._scale_learning_rates(0.5)
+
+    assert optimizer.param_groups[0]["lr"] == pytest.approx(0.5)
+    assert optimizer.param_groups[0]["initial_lr"] == pytest.approx(0.5)
+    assert scheduler.base_lrs == pytest.approx([0.5])
+    assert scheduler.get_last_lr() == pytest.approx([0.5])
+    optimizer.step()
+    scheduler.step()
+    assert optimizer.param_groups[0]["lr"] < 0.5
 
 
 def test_ddp_replay_selection_metadata_is_broadcast_from_rank_zero(

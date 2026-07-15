@@ -529,6 +529,7 @@ class PlateauConfig:
     max_learner_champion_lag_steps: int = 20_000
     consecutive_terminal_rejections: int = 3
     action: Literal["pause", "reset_from_champion"] = "pause"
+    reset_learning_rate_scale: float = 1.0
     poll_seconds: float = 10.0
 
     def __post_init__(self) -> None:
@@ -537,6 +538,7 @@ class PlateauConfig:
         if (
             self.max_learner_champion_lag_steps < 0
             or self.consecutive_terminal_rejections <= 0
+            or not 0 < self.reset_learning_rate_scale <= 1
             or self.poll_seconds <= 0
             or self.action not in ("pause", "reset_from_champion")
         ):

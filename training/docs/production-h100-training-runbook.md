@@ -340,6 +340,11 @@ For an explicitly operator-controlled continuous run, add the following before
 freezing the profile. Finite profiles remain the default:
 
 ```yaml
+selfplay:
+  max_considered_ring_exponent: 1.0
+  max_considered_cap: 32
+  record_fast_policy_targets: true
+  fast_policy_weight: 0.25
 learner:
   steps: 1000000
   unlimited: true
@@ -347,16 +352,25 @@ learner:
 orchestration:
   ring_mixture:
     step_weights:
+      - from_step: 360000
+        weights: [0.15, 0.15, 0.15, 0.55]
       - from_step: 1000000
         weights: [0.1, 0.1, 0.1, 0.7]
+  plateau:
+    consecutive_terminal_rejections: 2
+    reset_learning_rate_scale: 0.5
   retention:
     enabled: true
+    dry_run: false
     recovery_dry_run: false
 ```
 
 `steps` remains the monitoring milestone. The cosine scheduler still reaches
 `min_lr_ratio` at one million and then holds that floor. Recovery checkpoints
 are not promotion candidates and do not change the 15,000-step arena cadence.
+At the hard replay-lag boundary, a terminal rejection resets to the champion
+even if candidate supersession prevented the configured rejection streak.
+Each plateau reset scales the restored optimizer and scheduler rates by 0.5.
 
 Validate and print the effective topology:
 

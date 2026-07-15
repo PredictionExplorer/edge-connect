@@ -414,7 +414,15 @@ class PromotionSupervisor:
                     stale.model_identity != champion.model_identity
                     and stale.model_step < champion.model_step
                 ):
-                    self._mark_superseded(stale, champion, superseded_by=champion)
+                    if (
+                        self._mark_superseded(stale, champion, superseded_by=champion)
+                        and progress is not None
+                    ):
+                        progress(
+                            phase="candidate_superseded",
+                            candidate_step=stale.model_step,
+                            superseded_by_step=champion.model_step,
+                        )
             viable = [
                 item
                 for item in candidates
@@ -462,12 +470,31 @@ class PromotionSupervisor:
             if not started:
                 for skipped in viable:
                     if skipped.model_identity != candidate.model_identity:
-                        self._mark_superseded(
+                        marked = self._mark_superseded(
                             skipped,
                             champion,
                             superseded_by=candidate,
                         )
+                        if marked and progress is not None:
+                            progress(
+                                phase="candidate_superseded",
+                                candidate_step=skipped.model_step,
+                                superseded_by_step=candidate.model_step,
+                            )
             if previous is not None and bool(previous.get("terminal")):
+                if progress is not None:
+                    previous_promotion = previous.get("promotion")
+                    decision = (
+                        previous_promotion.get("decision")
+                        if isinstance(previous_promotion, dict)
+                        else None
+                    )
+                    progress(
+                        phase="awaiting_new_candidate",
+                        champion_step=champion.model_step,
+                        candidate_step=candidate.model_step,
+                        last_decision=decision,
+                    )
                 if once:
                     return evaluated
                 self.sleep(promotion.poll_seconds)
@@ -506,6 +533,13 @@ class PromotionSupervisor:
                     decision="reject_max_pairs",
                     terminal=True,
                 )
+                if progress is not None:
+                    progress(
+                        phase="candidate_terminal",
+                        champion_step=champion.model_step,
+                        candidate_step=candidate.model_step,
+                        decision="reject_max_pairs",
+                    )
                 if once:
                     return evaluated
                 continue
@@ -706,8 +740,32 @@ class PromotionSupervisor:
         seed = int.from_bytes(hashlib.sha256(material).digest()[:8], "big")
         return replace(self.experiment.arena, seed=seed)
 
+    def _resume_cutover(self) -> tuple[int, str] | None:
+        cutover_path = self.candidate_path.parent / "resume-cutover.json"
+        if not cutover_path.is_file():
+            return None
+        try:
+            payload = json.loads(cutover_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError(f"cannot read resume cutover: {exc}") from exc
+        if (
+            not isinstance(payload, dict)
+            or payload.get("format") != "startrain.resume-cutover"
+            or payload.get("schema_version") != 1
+            or payload.get("run_id") != self.run_identity.run_id
+            or payload.get("generation_family") != self.run_identity.generation_family
+            or isinstance(payload.get("created_ns"), bool)
+            or not isinstance(payload.get("created_ns"), int)
+            or not isinstance(payload.get("checkpoint_sha256"), str)
+        ):
+            raise ValueError("resume cutover is invalid for promotion")
+        return int(payload["created_ns"]), str(payload["checkpoint_sha256"])
+
     def _candidate_manifests(self) -> list[ModelManifest]:
         output: list[ModelManifest] = []
+        cutover = self._resume_cutover()
+        cutover_ns = cutover[0] if cutover is not None else 0
+        cutover_sha256 = cutover[1] if cutover is not None else None
         for path in self.manifest_directory.glob("manifest-*.json"):
             manifest = self._manifest_cache.get(path)
             if manifest is None:
@@ -716,6 +774,11 @@ class PromotionSupervisor:
             if (
                 manifest.run_id == self.run_identity.run_id
                 and manifest.generation_family == self.run_identity.generation_family
+                and (
+                    cutover_sha256 is None
+                    or manifest.checkpoint_sha256 == cutover_sha256
+                    or manifest.published_ns >= cutover_ns
+                )
             ):
                 output.append(manifest)
         return sorted(output, key=lambda item: (item.model_step, item.model_identity))
@@ -809,10 +872,10 @@ class PromotionSupervisor:
         champion: ModelManifest,
         *,
         superseded_by: ModelManifest,
-    ) -> None:
+    ) -> bool:
         previous = self._read_result(candidate, champion)
         if previous is not None and bool(previous.get("terminal")):
-            return
+            return False
         payload: dict[str, object] = previous or {
             "schema_version": ARENA_RESULT_SCHEMA_VERSION,
             "candidate": candidate.model_identity,
@@ -828,6 +891,7 @@ class PromotionSupervisor:
             "superseded_by": superseded_by.model_identity,
         }
         atomic_json(self._result_path(candidate, champion), payload)
+        return True
 
     def _write_status(
         self,
@@ -852,6 +916,10 @@ class PromotionSupervisor:
             if isinstance(raw_streak, int) and not isinstance(raw_streak, bool)
             else 0
         )
+        cutover = self._resume_cutover()
+        cutover_created_ns = cutover[0] if cutover is not None else None
+        if prior.get("cutover_created_ns") != cutover_created_ns:
+            streak = 0
         prior_candidate = prior.get("candidate_identity")
         prior_terminal = bool(prior.get("terminal"))
         prior_decision = prior.get("decision")
@@ -884,6 +952,7 @@ class PromotionSupervisor:
                 "decision": decision,
                 "terminal": terminal,
                 "consecutive_terminal_rejections": streak,
+                "cutover_created_ns": cutover_created_ns,
                 "updated_ns": time.time_ns(),
             },
         )

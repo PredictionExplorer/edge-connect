@@ -25,6 +25,14 @@ def test_candidate_limit_scaling_is_explicit_and_capped() -> None:
         max_considered_cap=24,
     )
     assert scaled.considered_actions() == 24
+    small_ring = SelfPlayConfig(
+        rings=4,
+        simulation_reference_rings=6,
+        max_considered=16,
+        max_considered_ring_exponent=1.0,
+        max_considered_cap=32,
+    )
+    assert small_ring.considered_actions() == 16
     with pytest.raises(ValueError, match="candidate scaling"):
         SelfPlayConfig(max_considered=16, max_considered_cap=8)
     with pytest.raises(ValueError, match="fast_policy_weight"):

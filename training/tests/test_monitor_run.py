@@ -171,6 +171,24 @@ def _healthy_dependencies(monkeypatch) -> None:
 def test_collect_snapshot_reports_healthy_run(tmp_path, monkeypatch) -> None:
     now_ns = 10_000_000_000
     root = _fixture(tmp_path, now_ns=now_ns)
+    _write_json(
+        root / "arena" / "evaluation.json",
+        {
+            "schema_version": 1,
+            "candidate": "candidate",
+            "baseline": "baseline",
+            "completed_ns": now_ns,
+            "promotion": {"decision": "promote"},
+            "aggregate": {
+                "elo_difference": 42.0,
+                "anytime_confidence_sequence": [0.51, 0.7],
+                "wins": 60,
+                "losses": 40,
+                "games": 100,
+            },
+            "per_ring": {"10": {"elo_difference": 25.0}},
+        },
+    )
     _healthy_dependencies(monkeypatch)
 
     snapshot: Any = monitor.collect_snapshot(
@@ -188,7 +206,10 @@ def test_collect_snapshot_reports_healthy_run(tmp_path, monkeypatch) -> None:
     }
     assert snapshot["replay"]["states"]["ready"]["samples"] == 1000
     assert snapshot["replay"]["games"] == 1
+    assert snapshot["arena_history"]["recent"][-1]["elo_difference"] == 42.0
+    assert snapshot["arena_history"]["recent"][-1]["per_ring_elo"]["10"] == 25.0
     assert "learner=10/100" in monitor.format_text(snapshot)
+    assert "elo=42.00" in monitor.format_text(snapshot)
 
 
 def test_collect_snapshot_reports_unlimited_recovery_state(
@@ -239,6 +260,36 @@ def test_collect_snapshot_reports_unlimited_recovery_state(
     assert snapshot["recovery"]["replay_backup_valid"] is True
     assert snapshot["learner"]["examples_per_second"] == 1234.0
     assert "learner=10/unlimited" in monitor.format_text(snapshot)
+
+
+def test_snapshot_surfaces_per_lane_training_policy_drift(
+    tmp_path, monkeypatch
+) -> None:
+    now_ns = 10_000_000_000
+    root = _fixture(tmp_path, now_ns=now_ns)
+    profile = yaml.safe_load((root / "profile.yaml").read_text(encoding="utf-8"))
+    profile["selfplay"] = {"record_fast_policy_targets": True}
+    profile["orchestration"]["ring_mixture"] = {
+        "step_weights": [{"from_step": 0, "weights": [0.15, 0.15, 0.15, 0.55]}]
+    }
+    (root / "profile.yaml").write_text(yaml.safe_dump(profile), encoding="utf-8")
+    metrics_path = root / "metrics" / "actor-gpu-1.jsonl"
+    metric = json.loads(metrics_path.read_text())
+    metric.update(
+        {
+            "samples": 100,
+            "policy_samples": 0,
+            "active_ring_weights": [0.15, 0.15, 0.15, 0.55],
+        }
+    )
+    metrics_path.write_text(json.dumps(metric) + "\n", encoding="utf-8")
+    _healthy_dependencies(monkeypatch)
+
+    snapshot: Any = monitor.collect_snapshot(root, now_ns=now_ns)
+    codes = {warning["code"] for warning in snapshot["warnings"]}
+    assert "actor_ring_weight_mismatch" in codes
+    assert "policy_supervision_low" in codes
+    assert snapshot["status"] == "ERROR"
 
 
 def test_snapshot_surfaces_stale_restart_quarantine_and_hardware(
