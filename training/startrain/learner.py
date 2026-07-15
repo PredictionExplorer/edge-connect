@@ -24,6 +24,7 @@ from .checkpoint import (
     ExponentialMovingAverage,
     ModelManifest,
     ResumeCheckpoint,
+    collect_model_garbage,
     collect_recovery_garbage,
     load_checkpoint,
     load_model_manifest,
@@ -699,8 +700,17 @@ class LearnerLoop:
         self.rank = rank
         self.world_size = world_size
         self.store.register_run(run_identity)
-        self.publisher = ImmutableModelPublisher(output_directory, run_identity)
-        self.metrics = JSONLMetrics(Path(output_directory) / "metrics.jsonl")
+        output_root = Path(output_directory)
+        self.publisher = ImmutableModelPublisher(output_root, run_identity)
+        self.selfplay_publisher = (
+            ImmutableModelPublisher(output_root / "selfplay", run_identity)
+            if learner_config.selfplay_snapshot_interval_examples is not None
+            else None
+        )
+        self.cadence_path = output_root / "cadence.json"
+        self._last_candidate_examples: int | None = None
+        self._last_selfplay_examples: int | None = None
+        self.metrics = JSONLMetrics(output_root / "metrics.jsonl")
         if rank == 0 and any(store.reconciliation_metrics.values()):
             self.metrics.append(
                 {
@@ -828,6 +838,7 @@ class LearnerLoop:
         uses_example_cadence = (
             self.learner_config.target_updates_per_new_sample is not None
             or self.learner_config.candidate_interval_examples is not None
+            or self.learner_config.selfplay_snapshot_interval_examples is not None
         )
         if uses_example_cadence:
             raise ValueError(
@@ -856,6 +867,9 @@ class LearnerLoop:
             completion_path.unlink(missing_ok=True)
         if self.rank == 0 and not self.publisher.candidate_path.is_file():
             self._publish()
+        if self.rank == 0:
+            self._load_cadence_state()
+            self._publish_due_models()
         self._distributed_barrier()
         interval_started = time.perf_counter()
         interval_steps = 0
@@ -1077,9 +1091,8 @@ class LearnerLoop:
                     interval_cpu_device_seconds = 0.0
                     interval_device_events.clear()
                     interval_copy_events.clear()
-                if self.rank == 0 and self._candidate_due():
-                    self._publish()
-                    self._last_recovery_step = self.step
+                if self.rank == 0:
+                    self._publish_due_models()
                 if progress is not None and self.rank == 0:
                     progress(phase="training", step=self.step, epoch=self.epoch)
             if self.rank == 0:
@@ -1147,7 +1160,10 @@ class LearnerLoop:
         )
 
     def _publish(self) -> ModelManifest:
-        return self.publisher.publish(
+        return self._publish_to(self.publisher)
+
+    def _publish_to(self, publisher: ImmutableModelPublisher) -> ModelManifest:
+        return publisher.publish(
             model=unwrap_model(self.compiled_model),
             optimizer=self.optimizer,
             scheduler=self.scheduler,
@@ -1158,6 +1174,158 @@ class LearnerLoop:
             examples_consumed=self.examples_consumed,
             global_batch_size=self.train_config.global_batch_size(self.world_size),
         )
+
+    def _load_cadence_state(self) -> None:
+        if self._last_candidate_examples is not None:
+            return
+        if self.cadence_path.is_file():
+            try:
+                payload = json.loads(self.cadence_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                raise ValueError(f"cannot read learner cadence state: {exc}") from exc
+            if (
+                not isinstance(payload, dict)
+                or payload.get("schema_version") != 1
+                or payload.get("run_id") != self.run_identity.run_id
+                or payload.get("generation_family")
+                != self.run_identity.generation_family
+            ):
+                raise ValueError("learner cadence state is incompatible")
+            candidate_examples = payload.get("candidate_examples")
+            selfplay_examples = payload.get("selfplay_examples")
+            if (
+                isinstance(candidate_examples, bool)
+                or not isinstance(candidate_examples, int)
+                or candidate_examples < 0
+                or (
+                    selfplay_examples is not None
+                    and (
+                        isinstance(selfplay_examples, bool)
+                        or not isinstance(selfplay_examples, int)
+                        or selfplay_examples < 0
+                    )
+                )
+            ):
+                raise ValueError("learner cadence counters are invalid")
+            self._last_candidate_examples = candidate_examples
+            self._last_selfplay_examples = selfplay_examples
+            return
+
+        self._last_candidate_examples = self._pointer_examples(
+            self.publisher.candidate_path
+        )
+        if self.selfplay_publisher is not None:
+            if not self.selfplay_publisher.candidate_path.is_file():
+                candidate = load_model_manifest(self.publisher.candidate_path)
+                write_model_pointer(
+                    self.selfplay_publisher.candidate_path,
+                    candidate,
+                    role="candidate",
+                )
+            self._last_selfplay_examples = self._pointer_examples(
+                self.selfplay_publisher.candidate_path
+            )
+        self._write_cadence_state()
+
+    def _pointer_examples(self, pointer: Path) -> int:
+        manifest = load_model_manifest(pointer)
+        return manifest.model_step * self.train_config.global_batch_size(
+            self.world_size
+        )
+
+    def _write_cadence_state(self) -> None:
+        if self._last_candidate_examples is None:
+            raise RuntimeError("candidate cadence was not initialized")
+        atomic_json(
+            self.cadence_path,
+            {
+                "schema_version": 1,
+                "run_id": self.run_identity.run_id,
+                "generation_family": self.run_identity.generation_family,
+                "candidate_examples": self._last_candidate_examples,
+                "selfplay_examples": self._last_selfplay_examples,
+                "updated_ns": time.time_ns(),
+            },
+        )
+
+    def _selfplay_snapshot_interval(self) -> int | None:
+        steady = self.learner_config.selfplay_snapshot_interval_examples
+        if steady is None:
+            return None
+        warmup = self.learner_config.selfplay_snapshot_warmup_interval_examples
+        if (
+            warmup is not None
+            and self.examples_consumed
+            < self.learner_config.selfplay_snapshot_warmup_examples
+        ):
+            return warmup
+        return steady
+
+    def _candidate_due(self) -> bool:
+        interval_examples = self.learner_config.candidate_interval_examples
+        if interval_examples is None:
+            current_step = (
+                load_model_manifest(self.publisher.candidate_path).model_step
+                if self.publisher.candidate_path.is_file()
+                else None
+            )
+            return (
+                self.step % self.learner_config.candidate_interval == 0
+                and current_step != self.step
+            )
+        if self._last_candidate_examples is None:
+            raise RuntimeError("candidate cadence was not initialized")
+        return (
+            self.examples_consumed - self._last_candidate_examples >= interval_examples
+        )
+
+    def _selfplay_snapshot_due(self) -> bool:
+        interval = self._selfplay_snapshot_interval()
+        if interval is None:
+            return False
+        if self._last_selfplay_examples is None:
+            raise RuntimeError("self-play cadence was not initialized")
+        return self.examples_consumed - self._last_selfplay_examples >= interval
+
+    def _publish_due_models(self) -> tuple[ModelManifest | None, ModelManifest | None]:
+        self._load_cadence_state()
+        candidate = None
+        selfplay = None
+        if self._candidate_due():
+            candidate = self._publish()
+            self._last_candidate_examples = self.examples_consumed
+            self._last_recovery_step = self.step
+            self.metrics.append(
+                {
+                    "schema_version": 1,
+                    "timestamp_ns": time.time_ns(),
+                    "worker": "learner",
+                    "event": "promotion_candidate",
+                    "model_identity": candidate.model_identity,
+                    "model_step": candidate.model_step,
+                    "examples_consumed": self.examples_consumed,
+                }
+            )
+        if self._selfplay_snapshot_due():
+            if self.selfplay_publisher is None:
+                raise RuntimeError("self-play publisher is unavailable")
+            selfplay = self._publish_to(self.selfplay_publisher)
+            self._last_selfplay_examples = self.examples_consumed
+            self.metrics.append(
+                {
+                    "schema_version": 1,
+                    "timestamp_ns": time.time_ns(),
+                    "worker": "learner",
+                    "event": "selfplay_snapshot",
+                    "model_identity": selfplay.model_identity,
+                    "model_step": selfplay.model_step,
+                    "examples_consumed": self.examples_consumed,
+                    "interval_examples": self._selfplay_snapshot_interval(),
+                }
+            )
+        if candidate is not None or selfplay is not None:
+            self._write_cadence_state()
+        return candidate, selfplay
 
     def _scale_learning_rates(self, scale: float) -> None:
         if scale == 1.0:
@@ -1395,16 +1563,6 @@ class LearnerLoop:
         allowed_examples = int(target * self._latest_total_replay_samples)
         remaining = max(0, allowed_examples - self.examples_consumed)
         return remaining // self.train_config.global_batch_size(self.world_size)
-
-    def _candidate_due(self) -> bool:
-        interval_examples = self.learner_config.candidate_interval_examples
-        if interval_examples is None:
-            return self.step % self.learner_config.candidate_interval == 0
-        batch = self.train_config.global_batch_size(self.world_size)
-        previous = max(0, self.examples_consumed - batch)
-        return (
-            previous // interval_examples < self.examples_consumed // interval_examples
-        )
 
     def _plateau_step_budget(self) -> int:
         configured = self._plateau_config()
@@ -1713,6 +1871,21 @@ class LearnerLoop:
                 **metrics,
             }
         )
+        if self.selfplay_publisher is not None:
+            selfplay_metrics = collect_model_garbage(
+                self.selfplay_publisher.root,
+                retain_candidate_manifests=retention.candidate_manifests,
+                dry_run=retention.dry_run,
+            )
+            self.metrics.append(
+                {
+                    "schema_version": 1,
+                    "timestamp_ns": time.time_ns(),
+                    "worker": "learner",
+                    "event": "selfplay_model_gc",
+                    **selfplay_metrics,
+                }
+            )
 
     def _rank_zero_plateau_action(self, configured) -> dict[str, object]:
         if not self.publisher.champion_path.is_file():

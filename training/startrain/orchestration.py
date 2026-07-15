@@ -296,6 +296,11 @@ def build_worker_specs(
     environment = dict(os.environ if base_environment is None else base_environment)
     config = str(Path(config_path).resolve())
     candidate_manifest = directories.learner / "candidate.json"
+    selfplay_manifest = (
+        directories.learner / "selfplay" / "candidate.json"
+        if experiment.learner.selfplay_snapshot_interval_examples is not None
+        else candidate_manifest
+    )
     champion_manifest = directories.learner / "champion.json"
     learner_gpus = orchestration.learner_gpus
     learner_threads = learner_gpus[0].cpu_threads
@@ -409,7 +414,7 @@ def build_worker_specs(
                         "--manifest",
                         str(champion_manifest),
                         "--candidate-manifest",
-                        str(candidate_manifest),
+                        str(selfplay_manifest),
                         "--run-identity",
                         str(directories.run_identity),
                         "--heartbeat",

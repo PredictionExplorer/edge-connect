@@ -228,6 +228,19 @@ def test_autonomous_run_provenance_rejects_imports_and_profile_drift(
     )
     directories = RunDirectories.from_experiment(configured)
     directories.create()
+    specs = build_worker_specs(
+        configured,
+        config_path=CONFIGS / "h100-8gpu-autonomous.yaml",
+        directories=directories,
+        python_executable="/test/python",
+        base_environment={},
+    )
+    actor = next(spec for spec in specs if spec.role == "actor")
+    actor_candidate = actor.command[actor.command.index("--candidate-manifest") + 1]
+    assert actor_candidate.endswith("/learner/selfplay/candidate.json")
+    promotion = next(spec for spec in specs if spec.role == "arena")
+    promotion_candidate = promotion.command[promotion.command.index("--candidate") + 1]
+    assert promotion_candidate.endswith("/learner/candidate.json")
     (directories.learner / "candidate.json").write_text("{}", encoding="utf-8")
     with pytest.raises(ValueError, match="imported artifacts"):
         validate_autonomous_run_root(configured, directories)

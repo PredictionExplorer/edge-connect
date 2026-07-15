@@ -375,8 +375,9 @@ orchestration:
 `steps` remains the monitoring milestone. The cosine scheduler still reaches
 `min_lr_ratio` at one million and then holds that floor. Recovery checkpoints
 are not promotion candidates and do not change the throughput profile's
-15,000-step arena cadence. Profiles with `candidate_interval_examples` publish
-by consumed examples instead.
+15,000-step arena cadence. Autonomous profiles publish promotion candidates by
+`candidate_interval_examples` while independently refreshing actor models with
+the `selfplay_snapshot_*` example cadence.
 At the hard replay-lag boundary, a terminal rejection resets to the champion
 even if candidate supersession prevented the configured rejection streak.
 Each plateau reset scales the restored optimizer and scheduler rates by 0.5.
@@ -648,10 +649,12 @@ Normal startup order:
    between complete game batches. Every history model belongs to the same run.
 5. Actors produce ring-homogeneous replay shards and commit them to SQLite.
 6. The learner waits until replay count and per-ring uniqueness gates pass.
-7. The learner begins BF16 compiled updates and publishes later candidates at
-   the frozen profile's cadence: 5,000 steps in the historical control, 15,000
-   in the throughput profile, or `candidate_interval_examples` in the
-   autonomous profile.
+7. The learner begins BF16 compiled updates and publishes later promotion
+   candidates at the frozen profile's cadence: 5,000 steps in the historical
+   control, 15,000 in the throughput profile, or
+   `candidate_interval_examples` in the autonomous profile. Autonomous actors
+   refresh from separate self-play snapshots every one million examples during
+   warmup and every three million afterward.
 8. The arena accumulates paired, role-reversed games and applies the
    anytime-valid promotion gate.
 

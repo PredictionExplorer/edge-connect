@@ -885,6 +885,73 @@ def collect_snapshot(
                 "candidate pointer, manifest, or checkpoint is invalid",
             )
 
+    selfplay_pointer = _read_json(learner_root / "selfplay" / "candidate.json") or {}
+    selfplay_step = None
+    if selfplay_pointer:
+        manifest_value = selfplay_pointer.get("manifest")
+        manifest = (
+            ((learner_root / "selfplay") / manifest_value).resolve()
+            if isinstance(manifest_value, str) and manifest_value
+            else None
+        )
+        allowed_manifest_parents = {
+            (learner_root / "manifests").resolve(),
+            (learner_root / "selfplay" / "manifests").resolve(),
+        }
+        manifest_valid, _ = (
+            _verified_artifact(
+                manifest,
+                expected_bytes=selfplay_pointer.get("manifest_bytes"),
+                expected_sha256=selfplay_pointer.get("manifest_sha256"),
+            )
+            if manifest is not None and manifest.parent in allowed_manifest_parents
+            else (False, None)
+        )
+        manifest_payload = _read_json(manifest) if manifest_valid and manifest else None
+        manifest_payload = manifest_payload or {}
+        checkpoint_value = manifest_payload.get("checkpoint")
+        checkpoint = (
+            (manifest.parent / checkpoint_value).resolve()
+            if manifest is not None
+            and isinstance(checkpoint_value, str)
+            and checkpoint_value
+            else None
+        )
+        allowed_checkpoint_parents = {
+            (learner_root / "checkpoints").resolve(),
+            (learner_root / "selfplay" / "checkpoints").resolve(),
+        }
+        checkpoint_valid, _ = (
+            _verified_artifact(
+                checkpoint,
+                expected_bytes=manifest_payload.get("checkpoint_bytes"),
+                expected_sha256=manifest_payload.get("checkpoint_sha256"),
+            )
+            if checkpoint is not None
+            and checkpoint.parent in allowed_checkpoint_parents
+            else (False, None)
+        )
+        pointer_step = selfplay_pointer.get("model_step")
+        if (
+            selfplay_pointer.get("format") == "startrain.model-pointer"
+            and selfplay_pointer.get("schema_version") == 2
+            and manifest_payload.get("format") == "startrain.model-manifest"
+            and manifest_valid
+            and checkpoint_valid
+            and isinstance(pointer_step, int)
+            and not isinstance(pointer_step, bool)
+            and pointer_step >= 0
+            and pointer_step == manifest_payload.get("model_step")
+        ):
+            selfplay_step = pointer_step
+        else:
+            _add_warning(
+                warnings,
+                "ERROR",
+                "selfplay_checkpoint_invalid",
+                "self-play pointer, manifest, or checkpoint is invalid",
+            )
+
     backup_directory = root / "recovery" / "replay-manifest"
     latest_backup = _read_json(backup_directory / "latest.json") or {}
     backup_path = None
@@ -947,11 +1014,22 @@ def collect_snapshot(
     recovery = {
         "step": recovery_step,
         "candidate_step": candidate_step,
+        "selfplay_step": selfplay_step,
         "durable_step": durable_step,
         "checkpoint_age_seconds": recovery_age,
         "replay_backup_age_seconds": backup_age,
         "replay_backup_valid": backup_valid,
     }
+    if isinstance(learner_step, int):
+        learner["candidate_lag_steps"] = (
+            learner_step - candidate_step if isinstance(candidate_step, int) else None
+        )
+        learner["selfplay_lag_steps"] = (
+            learner_step - selfplay_step if isinstance(selfplay_step, int) else None
+        )
+    cadence = _read_json(learner_root / "cadence.json") or {}
+    learner["candidate_examples_published"] = cadence.get("candidate_examples")
+    learner["selfplay_examples_published"] = cadence.get("selfplay_examples")
 
     arena = _read_json(root / "arena" / "promotion-status.json") or {}
     arena_history = _arena_history(root)
@@ -1059,6 +1137,8 @@ def format_text(snapshot: Mapping[str, object]) -> str:
     ready = ready if isinstance(ready, Mapping) else {}
     arena = snapshot.get("arena")
     arena = arena if isinstance(arena, Mapping) else {}
+    recovery = snapshot.get("recovery")
+    recovery = recovery if isinstance(recovery, Mapping) else {}
     arena_history = snapshot.get("arena_history")
     arena_history = arena_history if isinstance(arena_history, Mapping) else {}
     recent_evaluations = arena_history.get("recent")
@@ -1087,6 +1167,8 @@ def format_text(snapshot: Mapping[str, object]) -> str:
         f"samples/s={_compact(rates.get('samples_per_second'))} "
         f"eval_rows/s={_compact(rates.get('evaluator_rows_per_second'))} "
         f"replay_samples={ready.get('samples', 0)} shards={ready.get('shards', 0)} "
+        f"models={recovery.get('selfplay_step')}/"
+        f"{recovery.get('candidate_step')}/{arena.get('champion_step')} "
         f"arena={arena.get('decision', arena.get('phase', 'waiting'))} "
         f"elo={_compact(latest_evaluation.get('elo_difference'))} "
         f"warnings={warning_codes or '-'}"

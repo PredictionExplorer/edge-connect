@@ -7,7 +7,7 @@ import random
 import statistics
 import time
 from collections import OrderedDict
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Literal
@@ -165,11 +165,19 @@ class HistoricalModelPool:
         run_identity: RunIdentity,
         pool_size: int,
         evaluator_cache_size: int = 2,
+        additional_manifest_directories: Sequence[str | Path] = (),
     ) -> None:
         if pool_size <= 0 or evaluator_cache_size <= 0:
             raise ValueError("historical model pool sizes must be positive")
         self.config = config
-        self.manifest_directory = Path(manifest_directory)
+        self.manifest_directories = tuple(
+            dict.fromkeys(
+                (
+                    Path(manifest_directory),
+                    *(Path(path) for path in additional_manifest_directories),
+                )
+            )
+        )
         self.device = device
         self.run_identity = run_identity
         self.pool_size = pool_size
@@ -182,19 +190,22 @@ class HistoricalModelPool:
         random_source: random.Random,
         exclude: set[str],
     ) -> ManifestModelProvider | None:
-        manifests = []
-        for path in sorted(self.manifest_directory.glob("manifest-*.json")):
-            try:
-                manifest = load_model_manifest(path)
-            except (OSError, ValueError):
-                continue
-            if (
-                manifest.role == "direct"
-                and manifest.run_id == self.run_identity.run_id
-                and manifest.generation_family == self.run_identity.generation_family
-                and manifest.model_identity not in exclude
-            ):
-                manifests.append(manifest)
+        by_identity: dict[str, ModelManifest] = {}
+        for directory in self.manifest_directories:
+            for path in sorted(directory.glob("manifest-*.json")):
+                try:
+                    manifest = load_model_manifest(path)
+                except (OSError, ValueError):
+                    continue
+                if (
+                    manifest.role == "direct"
+                    and manifest.run_id == self.run_identity.run_id
+                    and manifest.generation_family
+                    == self.run_identity.generation_family
+                    and manifest.model_identity not in exclude
+                ):
+                    by_identity[manifest.model_identity] = manifest
+        manifests = list(by_identity.values())
         manifests.sort(key=lambda item: (item.model_step, item.model_identity))
         if not manifests:
             return None
@@ -298,6 +309,9 @@ class ActorSupervisor:
                 device=device,
                 run_identity=run_identity,
                 pool_size=experiment.orchestration.model_refresh.history_pool_size,
+                additional_manifest_directories=(
+                    self.candidate_manifest_path.parent.parent / "manifests",
+                ),
             )
             if source == "candidate_champion_history_mix"
             else None

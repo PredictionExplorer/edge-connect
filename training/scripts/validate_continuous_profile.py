@@ -33,9 +33,14 @@ def _validate_autonomous_config(config: ExperimentConfig) -> None:
         learner.target_updates_per_new_sample is None
         or learner.target_updates_per_new_sample > 1.25
         or learner.candidate_interval_examples is None
+        or learner.selfplay_snapshot_interval_examples is None
+        or learner.selfplay_snapshot_warmup_interval_examples is None
+        or learner.selfplay_snapshot_warmup_examples <= 0
+        or learner.selfplay_snapshot_interval_examples
+        > learner.candidate_interval_examples
     ):
         raise ValueError(
-            "autonomous service requires bounded update-to-data and example cadence"
+            "autonomous service requires bounded update-to-data and decoupled cadence"
         )
     refresh = config.orchestration.model_refresh
     if (

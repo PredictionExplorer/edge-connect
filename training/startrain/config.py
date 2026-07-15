@@ -142,6 +142,9 @@ class LearnerConfig:
     steps_per_window: int = 100
     candidate_interval: int = 1_000
     candidate_interval_examples: int | None = None
+    selfplay_snapshot_interval_examples: int | None = None
+    selfplay_snapshot_warmup_examples: int = 0
+    selfplay_snapshot_warmup_interval_examples: int | None = None
     recovery_interval_steps: int | None = None
     target_updates_per_new_sample: float | None = None
     metrics_interval: int = 10
@@ -176,6 +179,50 @@ class LearnerConfig:
             or self.candidate_interval_examples <= 0
         ):
             raise ConfigError("candidate_interval_examples must be positive")
+        for name, interval in (
+            (
+                "selfplay_snapshot_interval_examples",
+                self.selfplay_snapshot_interval_examples,
+            ),
+            (
+                "selfplay_snapshot_warmup_interval_examples",
+                self.selfplay_snapshot_warmup_interval_examples,
+            ),
+        ):
+            if interval is not None and (
+                isinstance(interval, bool)
+                or not isinstance(interval, int)
+                or interval <= 0
+            ):
+                raise ConfigError(f"{name} must be positive")
+        if (
+            isinstance(self.selfplay_snapshot_warmup_examples, bool)
+            or not isinstance(self.selfplay_snapshot_warmup_examples, int)
+            or self.selfplay_snapshot_warmup_examples < 0
+        ):
+            raise ConfigError("selfplay_snapshot_warmup_examples must be non-negative")
+        if self.selfplay_snapshot_interval_examples is None and (
+            self.selfplay_snapshot_warmup_examples
+            or self.selfplay_snapshot_warmup_interval_examples is not None
+        ):
+            raise ConfigError("self-play snapshot warmup requires a steady interval")
+        if (
+            self.selfplay_snapshot_warmup_interval_examples is None
+            and self.selfplay_snapshot_warmup_examples
+        ):
+            raise ConfigError("self-play snapshot warmup requires a warmup interval")
+        if (
+            self.selfplay_snapshot_warmup_interval_examples is not None
+            and self.selfplay_snapshot_warmup_examples <= 0
+        ):
+            raise ConfigError("self-play snapshot warmup requires a positive horizon")
+        if (
+            self.selfplay_snapshot_interval_examples is not None
+            and self.selfplay_snapshot_warmup_interval_examples is not None
+            and self.selfplay_snapshot_warmup_interval_examples
+            > self.selfplay_snapshot_interval_examples
+        ):
+            raise ConfigError("self-play snapshot warmup cannot be slower than steady")
         if self.recovery_interval_steps is not None and (
             isinstance(self.recovery_interval_steps, bool)
             or not isinstance(self.recovery_interval_steps, int)

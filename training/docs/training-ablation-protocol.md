@@ -45,6 +45,9 @@ The following switches are deliberately first-class and recorded in metrics:
 - `learner.target_updates_per_new_sample` and
   `learner.candidate_interval_examples`, which make replay ratio and candidate
   cadence explicit instead of accidental consequences of throughput.
+- `learner.selfplay_snapshot_interval_examples` plus its warmup horizon and
+  interval, which refresh actor models frequently without enqueueing every
+  snapshot for promotion.
 - `data.shards_per_batch`, which mixes positions from several same-ring shards
   while retaining homogeneous tensor shapes.
 - `orchestration.plateau.action: reduce_lr_keep_weights`, which clears stale

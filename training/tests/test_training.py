@@ -159,7 +159,10 @@ def test_yaml_configs_load_strictly() -> None:
     assert autonomous.orchestration.model_refresh.history_probability == 0.25
     assert autonomous.orchestration.plateau.action == "reduce_lr_keep_weights"
     assert autonomous.learner.target_updates_per_new_sample == 1.0
-    assert autonomous.learner.candidate_interval_examples == 20_000_000
+    assert autonomous.learner.candidate_interval_examples == 5_000_000
+    assert autonomous.learner.selfplay_snapshot_interval_examples == 3_000_000
+    assert autonomous.learner.selfplay_snapshot_warmup_examples == 20_000_000
+    assert autonomous.learner.selfplay_snapshot_warmup_interval_examples == 1_000_000
     assert autonomous.data.shards_per_batch == 4
     assert replace(autonomous.selfplay, rings=10).considered_actions() == 53
     validate_continuous_config(autonomous)

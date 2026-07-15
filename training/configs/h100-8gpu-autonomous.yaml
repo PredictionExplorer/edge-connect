@@ -84,7 +84,10 @@ learner:
   max_replay_lag_steps: 120000
   steps_per_window: 1000
   candidate_interval: 40000
-  candidate_interval_examples: 20000000
+  candidate_interval_examples: 5000000
+  selfplay_snapshot_interval_examples: 3000000
+  selfplay_snapshot_warmup_examples: 20000000
+  selfplay_snapshot_warmup_interval_examples: 1000000
   recovery_interval_steps: 1000
   target_updates_per_new_sample: 1.0
   metrics_interval: 10

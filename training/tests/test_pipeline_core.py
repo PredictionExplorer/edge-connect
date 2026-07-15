@@ -12,7 +12,11 @@ import pytest
 import torch
 from torch import nn
 
-from startrain.checkpoint import ExponentialMovingAverage, save_checkpoint
+from startrain.checkpoint import (
+    ExponentialMovingAverage,
+    load_model_manifest,
+    save_checkpoint,
+)
 from startrain.config import (
     CurriculumStage,
     DataConfig,
@@ -365,6 +369,14 @@ def test_curriculum_and_selfplay_reject_noncanonical_rings() -> None:
         LearnerConfig(unlimited="yes")  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="recovery_interval_steps"):
         LearnerConfig(candidate_interval=10, recovery_interval_steps=11)
+    with pytest.raises(ValueError, match="warmup requires"):
+        LearnerConfig(selfplay_snapshot_warmup_examples=10)
+    with pytest.raises(ValueError, match="cannot be slower"):
+        LearnerConfig(
+            selfplay_snapshot_interval_examples=10,
+            selfplay_snapshot_warmup_examples=100,
+            selfplay_snapshot_warmup_interval_examples=20,
+        )
     with pytest.raises(ValueError, match="match configured rings"):
         RingMixtureConfig(step_weights=(RingWeightStage(10, (0.3, 0.7)),))
 
@@ -884,7 +896,13 @@ def test_learner_runs_batch_publishes_metrics_and_resumes_example_cadence(
         assert history[-1]["model_identity"] == published.model_identity
         assert history[-1]["model_step"] == 1
         assert not (tmp_path / "learner" / "champion.json").exists()
-        metric_lines = (tmp_path / "learner" / "metrics.jsonl").read_text().splitlines()
+        metric_lines = [
+            line
+            for line in (tmp_path / "learner" / "metrics.jsonl")
+            .read_text()
+            .splitlines()
+            if "losses" in json.loads(line)
+        ]
         assert len(metric_lines) == 1
         metric = json.loads(metric_lines[0])
         assert metric["metrics_interval_steps"] == 1
@@ -905,6 +923,7 @@ def test_learner_runs_batch_publishes_metrics_and_resumes_example_cadence(
             target_updates_per_new_sample=2.0,
             candidate_interval_examples=4,
         )
+        learner._last_candidate_examples = 0
         learner.examples_consumed = 0
         assert learner._utd_step_budget() == 2
         learner.examples_consumed = 2
@@ -1055,6 +1074,103 @@ def test_learner_publishes_initial_ema_then_times_out_on_short_batch(
         )
         assert manifest["model_step"] == 0
         assert manifest["role"] == "candidate"
+
+
+def test_decoupled_model_cadence_migrates_existing_run_without_reset(
+    tmp_path,
+) -> None:
+    identity = run_identity(tmp_path)
+    with ReplayStore(tmp_path / "cadence-replay") as store:
+        model = tiny_model()
+        optimizer = build_optimizer(model, OptimizerConfig(kind="adamw"))
+        scheduler = build_scheduler(
+            optimizer,
+            SchedulerConfig(warmup_steps=0, total_steps=100),
+        )
+        learner = LearnerLoop(
+            store=store,
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            ema=ExponentialMovingAverage(model, decay=0.9),
+            output_directory=tmp_path / "cadence-learner",
+            learner_config=LearnerConfig(
+                candidate_interval=10,
+                candidate_interval_examples=5,
+                selfplay_snapshot_interval_examples=3,
+                selfplay_snapshot_warmup_examples=20,
+                selfplay_snapshot_warmup_interval_examples=1,
+                device="cpu",
+            ),
+            train_config=TrainConfig(
+                per_rank_batch_size=1,
+                scheduler=SchedulerConfig(warmup_steps=0, total_steps=100),
+            ),
+            data_config=DataConfig(workers=0),
+            loss_weights=LossWeights(),
+            seed=5,
+            serialized_config={"schema_version": 3},
+            run_identity=identity,
+        )
+        initial = learner._publish()
+        assert initial.model_step == 0
+        learner.step = 18
+        learner.examples_consumed = 18
+
+        learner._load_cadence_state()
+
+        assert learner._last_candidate_examples == 0
+        assert learner._last_selfplay_examples == 0
+        assert (
+            load_model_manifest(
+                tmp_path / "cadence-learner" / "selfplay" / "candidate.json"
+            ).model_step
+            == 0
+        )
+
+        candidate, selfplay = learner._publish_due_models()
+        assert candidate is not None and candidate.model_step == 18
+        assert selfplay is not None and selfplay.model_step == 18
+
+        learner.step = 19
+        learner.examples_consumed = 19
+        candidate, selfplay = learner._publish_due_models()
+        assert candidate is None
+        assert selfplay is not None and selfplay.model_step == 19
+
+        learner.step = 22
+        learner.examples_consumed = 22
+        candidate, selfplay = learner._publish_due_models()
+        assert candidate is None
+        assert selfplay is not None and selfplay.model_step == 22
+
+        learner.step = 23
+        learner.examples_consumed = 23
+        candidate, selfplay = learner._publish_due_models()
+        assert candidate is not None and candidate.model_step == 23
+        assert selfplay is None
+        cadence = json.loads(
+            (tmp_path / "cadence-learner" / "cadence.json").read_text(encoding="utf-8")
+        )
+        assert cadence["candidate_examples"] == 23
+        assert cadence["selfplay_examples"] == 22
+        assert (
+            load_model_manifest(
+                tmp_path / "cadence-learner" / "candidate.json"
+            ).model_step
+            == 23
+        )
+        assert (
+            load_model_manifest(
+                tmp_path / "cadence-learner" / "selfplay" / "candidate.json"
+            ).model_step
+            == 22
+        )
+        learner._last_candidate_examples = None
+        learner._last_selfplay_examples = None
+        learner._load_cadence_state()
+        assert learner._last_candidate_examples == 23
+        assert learner._last_selfplay_examples == 22
 
 
 def test_lazy_replay_sampler_is_unique_deterministic_and_homogeneous(
