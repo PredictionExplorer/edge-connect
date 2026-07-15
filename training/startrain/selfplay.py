@@ -65,6 +65,8 @@ class SelfPlayConfig:
     max_considered_cap: int = 64
     record_fast_policy_targets: bool = False
     fast_policy_weight: float = 0.25
+    policy_surprise_weight: float = 0.0
+    policy_surprise_max_weight: float = 4.0
     c_visit: float = 50.0
     c_scale: float = 1.0
     score_utility_weight: float = 0.0
@@ -101,6 +103,12 @@ class SelfPlayConfig:
             raise ValueError("record_fast_policy_targets must be boolean")
         if not 0 <= self.fast_policy_weight <= 1:
             raise ValueError("fast_policy_weight must be in [0, 1]")
+        if (
+            not 0 <= self.policy_surprise_weight <= 1
+            or not math.isfinite(self.policy_surprise_max_weight)
+            or self.policy_surprise_max_weight < 1
+        ):
+            raise ValueError("policy-surprise weighting settings are invalid")
         if not 0 <= self.score_utility_weight <= 1:
             raise ValueError("score utility weight must be in [0, 1]")
 
@@ -169,6 +177,9 @@ class SelfPlayMetrics:
     policy_entropy_count: int = 0
     policy_entropy_sum: float = 0.0
     policy_weight_sum: float = 0.0
+    policy_surprise_count: int = 0
+    policy_surprise_sum: float = 0.0
+    sample_weight_sum: float = 0.0
     interrupted_cohorts: int = 0
     dropped_games: int = 0
     dropped_decisions: int = 0
@@ -215,6 +226,7 @@ class _Decision:
     search_seed: int
     ply: int
     policy_weight: float
+    policy_surprise: float
 
 
 class SelfPlayActor:
@@ -246,6 +258,9 @@ class SelfPlayActor:
         self.policy_entropy_count = 0
         self.policy_entropy_sum = 0.0
         self.policy_weight_sum = 0.0
+        self.policy_surprise_count = 0
+        self.policy_surprise_sum = 0.0
+        self.sample_weight_sum = 0.0
         self.interrupted_cohorts = 0
         self.dropped_games = 0
         self.dropped_decisions = 0
@@ -261,6 +276,9 @@ class SelfPlayActor:
             policy_entropy_count=self.policy_entropy_count,
             policy_entropy_sum=self.policy_entropy_sum,
             policy_weight_sum=self.policy_weight_sum,
+            policy_surprise_count=self.policy_surprise_count,
+            policy_surprise_sum=self.policy_surprise_sum,
+            sample_weight_sum=self.sample_weight_sum,
             interrupted_cohorts=self.interrupted_cohorts,
             dropped_games=self.dropped_games,
             dropped_decisions=self.dropped_decisions,
@@ -442,6 +460,12 @@ class SelfPlayActor:
         offsets = [int(value) for value in results.action_offsets]
         actions = [int(value) for value in results.actions]
         probabilities = np.asarray(results.policy_target, dtype=np.float32)
+        raw_priors = getattr(results, "priors", None)
+        priors = (
+            np.asarray(raw_priors, dtype=np.float32)
+            if raw_priors is not None
+            else np.empty(0, dtype=np.float32)
+        )
         selected_actions = [int(value) for value in results.selected_actions]
         if len(offsets) != len(positions) + 1 or offsets[-1] != len(actions):
             raise RuntimeError("native search result CSR is invalid")
@@ -454,6 +478,7 @@ class SelfPlayActor:
                 continue
             policy = None
             policy_entropy = None
+            policy_surprise = 0.0
             if full_search or self.config.record_fast_policy_targets:
                 start, end = offsets[row], offsets[row + 1]
                 if end <= start or end > probabilities.size:
@@ -481,6 +506,38 @@ class SelfPlayActor:
                 )
                 if not math.isfinite(policy_entropy):
                     raise RuntimeError("completed-Q policy entropy is not finite")
+                if priors.size:
+                    if priors.size != probabilities.size:
+                        raise RuntimeError(
+                            "root priors and policy target sizes disagree"
+                        )
+                    prior = np.zeros(position.stones.numel(), dtype=np.float32)
+                    for action, probability in zip(
+                        actions[start:end], priors[start:end], strict=True
+                    ):
+                        prior[action] = probability
+                    prior_mass = float(prior.sum())
+                    if prior_mass <= 0:
+                        raise RuntimeError("root policy prior has no mass")
+                    prior /= prior_mass
+                    positive = policy > 0
+                    policy_surprise = float(
+                        np.sum(
+                            policy[positive]
+                            * (
+                                np.log(policy[positive])
+                                - np.log(np.maximum(prior[positive], 1e-12))
+                            ),
+                            dtype=np.float64,
+                        )
+                    )
+                    if not math.isfinite(policy_surprise) or policy_surprise < -1e-6:
+                        raise RuntimeError("policy surprise is invalid")
+                    policy_surprise = max(0.0, policy_surprise)
+                elif self.config.policy_surprise_weight:
+                    raise RuntimeError(
+                        "policy-surprise weighting requires native root priors"
+                    )
             trajectories[row].append(
                 _Decision(
                     position=position,
@@ -493,6 +550,7 @@ class SelfPlayActor:
                     policy_weight=(
                         1.0 if full_search else self.config.fast_policy_weight
                     ),
+                    policy_surprise=policy_surprise,
                 )
             )
             if full_search:
@@ -505,6 +563,8 @@ class SelfPlayActor:
                 self.policy_weight_sum += (
                     1.0 if full_search else self.config.fast_policy_weight
                 )
+                self.policy_surprise_count += 1
+                self.policy_surprise_sum += policy_surprise
 
     def _finalize_rows(
         self,
@@ -553,7 +613,8 @@ class SelfPlayActor:
                 raise RuntimeError("terminal game has no recorded decisions")
             version, model_step, model_identity = pinned_versions[row]
             game_id = game_ids[row]
-            for decision in decisions:
+            sample_weights = self._policy_surprise_sample_weights(decisions)
+            for decision, sample_weight in zip(decisions, sample_weights, strict=True):
                 mode = "full" if decision.full_search else "fast"
                 self.pending_samples.append(
                     ReplaySample.from_position(
@@ -582,9 +643,11 @@ class SelfPlayActor:
                         game_id=game_id,
                         ply=decision.ply,
                         model_identity=model_identity,
+                        weight=sample_weight,
                         policy_weight=decision.policy_weight,
                     )
                 )
+                self.sample_weight_sum += sample_weight
                 self.pending_phases.append(decision.phase)
                 self.completed_decisions += 1
             metadata = trajectory_rows[row]
@@ -612,6 +675,39 @@ class SelfPlayActor:
             if len(self.pending_samples) >= self.config.shard_size:
                 self._flush(model_version=version, model_step=model_step)
         return summaries
+
+    def _policy_surprise_sample_weights(
+        self,
+        decisions: Sequence[_Decision],
+    ) -> list[float]:
+        mix = self.config.policy_surprise_weight
+        if not mix:
+            return [1.0] * len(decisions)
+        surprises = np.asarray(
+            [
+                decision.policy_surprise if decision.policy is not None else 0.0
+                for decision in decisions
+            ],
+            dtype=np.float64,
+        )
+        eligible = surprises > 0
+        if not bool(eligible.any()):
+            return [1.0] * len(decisions)
+        normalized = np.zeros_like(surprises)
+        normalized[eligible] = (
+            int(eligible.sum()) * surprises[eligible] / surprises[eligible].sum()
+        )
+        weights = np.ones_like(surprises)
+        weights[eligible] = (1.0 - mix) + mix * normalized[eligible]
+        maximum = self.config.policy_surprise_max_weight
+        weights = np.minimum(weights, maximum)
+        deficit = len(weights) - float(weights.sum())
+        if deficit > 1e-12:
+            available = weights < maximum
+            headroom = maximum - weights[available]
+            if headroom.size and float(headroom.sum()) >= deficit:
+                weights[available] += deficit * headroom / headroom.sum()
+        return [float(value) for value in weights]
 
     def _flush(
         self,

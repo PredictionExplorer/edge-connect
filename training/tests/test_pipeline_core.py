@@ -17,6 +17,7 @@ from startrain.config import (
     CurriculumStage,
     DataConfig,
     LearnerConfig,
+    PlateauConfig,
     RingMixtureConfig,
     RingWeightStage,
     SchedulerConfig,
@@ -40,6 +41,7 @@ from startrain.learner import (
     LazyShardReplayDataset,
     LearnerLoop,
     UniqueReplayBatchSampler,
+    _maximum_cross_shard_groups,
     _weighted_ring_quotas,
     plateau_policy_decision,
 )
@@ -873,6 +875,14 @@ def test_learner_runs_batch_publishes_metrics_and_resumes_example_cadence(
         )
         checkpoint = published.checkpoint
         assert checkpoint.exists()
+        history = [
+            json.loads(line)
+            for line in (tmp_path / "learner" / "model-history.jsonl")
+            .read_text(encoding="utf-8")
+            .splitlines()
+        ]
+        assert history[-1]["model_identity"] == published.model_identity
+        assert history[-1]["model_step"] == 1
         assert not (tmp_path / "learner" / "champion.json").exists()
         metric_lines = (tmp_path / "learner" / "metrics.jsonl").read_text().splitlines()
         assert len(metric_lines) == 1
@@ -1106,6 +1116,70 @@ def test_lazy_replay_sampler_is_unique_deterministic_and_homogeneous(
         assert len({dataset[index].rings for index in batch}) == 1
 
 
+def test_lazy_replay_sampler_mixes_distinct_shards_without_replacement(
+    tmp_path,
+) -> None:
+    spans = []
+    for shard_id in range(4):
+        path = write_replay_shard(
+            tmp_path / f"mixed-{shard_id}.npz",
+            [
+                make_replay_sample(game_id=f"mixed-{shard_id}-{index}")
+                for index in range(8)
+            ],
+        )
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        spans.append(
+            ReplaySpan(
+                ShardRecord(
+                    shard_id=shard_id + 1,
+                    path=path,
+                    created_ns=shard_id + 1,
+                    sample_count=8,
+                    ring=4,
+                    phase_min=0,
+                    phase_max=0,
+                    model_version="sha256-" + "1" * 64,
+                    model_step=0,
+                    model_identity="sha256-" + "1" * 64,
+                    run_id="run-test",
+                    generation_family="family-test",
+                    actor_id="actor-test",
+                    generation=0,
+                    game_count=8,
+                    checksum_sha256=digest,
+                    state="ready",
+                    quarantine_reason=None,
+                ),
+                0,
+                8,
+            )
+        )
+    dataset = LazyShardReplayDataset(
+        ReplaySelection(tuple(spans), {4: 32}, 4),
+        seed=11,
+        epoch=0,
+        augmentation_enabled=False,
+        shard_cache_size=4,
+    )
+    sampler = UniqueReplayBatchSampler(
+        dataset,
+        batch_size=4,
+        batches=4,
+        seed=11,
+        epoch=0,
+        ring_stratified=True,
+        shards_per_batch=2,
+    )
+
+    batches = list(sampler)
+
+    assert len({index for batch in batches for index in batch}) == 16
+    assert all(len({index // 8 for index in batch}) == 2 for batch in batches)
+    assert _maximum_cross_shard_groups([2, 2, 2, 2], shards_per_batch=2) == 4
+    assert _maximum_cross_shard_groups([10, 1], shards_per_batch=2) == 1
+
+
 def test_lazy_replay_sampler_applies_weighted_ring_quotas(tmp_path) -> None:
     spans = []
     samples_by_ring = {}
@@ -1256,6 +1330,37 @@ def test_plateau_policy_keeps_replay_live_and_resets_after_rejections() -> None:
         )
         == "pause"
     )
+    autonomous = {
+        **common,
+        "action": "reduce_lr_keep_weights",
+    }
+    assert (
+        plateau_policy_decision(
+            lag_steps=20,
+            terminal_rejection=True,
+            rejection_streak=3,
+            **autonomous,
+        )
+        == "recover"
+    )
+    assert (
+        plateau_policy_decision(
+            lag_steps=50,
+            terminal_rejection=True,
+            rejection_streak=1,
+            **autonomous,
+        )
+        == "recover"
+    )
+    assert (
+        plateau_policy_decision(
+            lag_steps=50,
+            terminal_rejection=False,
+            rejection_streak=0,
+            **{**autonomous, "reset_already_applied": True},
+        )
+        == "proceed"
+    )
     assert (
         plateau_policy_decision(
             lag_steps=20,
@@ -1314,6 +1419,88 @@ def test_plateau_learning_rate_scale_updates_optimizer_and_scheduler() -> None:
     optimizer.step()
     scheduler.step()
     assert optimizer.param_groups[0]["lr"] < 0.5
+
+    adam = torch.optim.AdamW([parameter], lr=0.1)
+    parameter.grad = torch.ones_like(parameter)
+    adam.step()
+    assert adam.state
+    learner.optimizer = adam
+    learner._clear_optimizer_state()
+    assert not adam.state
+
+
+def test_plateau_recovery_preserves_weights_and_creates_durable_cutover(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    parameter = torch.nn.Parameter(torch.tensor(2.0))
+    optimizer = torch.optim.AdamW([parameter], lr=0.1)
+    scheduler = build_scheduler(
+        optimizer,
+        SchedulerConfig(warmup_steps=0, total_steps=100),
+    )
+    parameter.grad = torch.ones_like(parameter)
+    optimizer.step()
+    before = parameter.detach().clone()
+    events = []
+    cutovers = []
+    learner = object.__new__(LearnerLoop)
+    learner.rank = 0
+    learner.world_size = 1
+    learner.step = 100
+    learner.optimizer = optimizer
+    learner.scheduler = scheduler
+    learner._last_recovery_step = 90
+    learner._last_plateau_reset = None
+    learner.publisher = SimpleNamespace(root=tmp_path / "learner")
+    learner.promotion_status_path = tmp_path / "arena" / "promotion-status.json"
+    learner.run_identity = SimpleNamespace(
+        run_id="run-autonomous",
+        generation_family="family-autonomous",
+    )
+    learner.metrics = SimpleNamespace(append=events.append)
+    configured = PlateauConfig(
+        enabled=True,
+        action="reduce_lr_keep_weights",
+        reset_learning_rate_scale=0.5,
+        clear_optimizer_state_on_recovery=True,
+    )
+    action = {
+        "kind": "recover",
+        "reset_reason": "terminal_rejection_streak",
+        "candidate_identity": "candidate",
+        "candidate_step": 100,
+        "champion_identity": "champion",
+        "champion_step": 50,
+    }
+    learner._plateau_config = lambda: configured
+    learner._rank_zero_plateau_action = lambda _configured: action
+    learner._broadcast_object = lambda value: value
+    learner._distributed_barrier = lambda: None
+    learner._maybe_write_recovery_checkpoint = lambda **_kwargs: SimpleNamespace(
+        checkpoint_sha256="a" * 64
+    )
+    monkeypatch.setattr(
+        "startrain.learner.write_resume_cutover",
+        lambda *args, **kwargs: cutovers.append((args, kwargs)),
+    )
+
+    assert learner._plateau_control(
+        stop_requested=lambda: False,
+        progress=None,
+    )
+
+    torch.testing.assert_close(parameter, before)
+    assert not optimizer.state
+    assert optimizer.param_groups[0]["lr"] == pytest.approx(0.05)
+    assert learner.step == 100
+    assert learner._last_plateau_reset == ("champion", "candidate")
+    assert len(cutovers) == 1
+    status = json.loads(learner.promotion_status_path.read_text(encoding="utf-8"))
+    assert status["decision"] == "plateau_recover"
+    assert status["candidate_step"] == 100
+    assert events[-1]["event"] == "plateau_recovery"
+    assert events[-1]["optimizer_state_cleared"] is True
 
 
 def test_ddp_replay_selection_metadata_is_broadcast_from_rank_zero(
@@ -1439,6 +1626,7 @@ class OneMoveSearchBatch:
             actions=[action],
             visits=[1],
             q_values=[1.0],
+            priors=[1.0],
             policy_target=[1.0],
         )
 
@@ -1554,6 +1742,25 @@ def test_selfplay_randomization_is_seeded_and_board_scaled() -> None:
     assert runs[0][0] == runs[1][0]
     np.testing.assert_array_equal(runs[0][1], runs[1][1])
     assert runs[0][2] == runs[1][2]
+
+
+def test_policy_surprise_weighting_preserves_total_mass_and_prioritizes() -> None:
+    actor = object.__new__(SelfPlayActor)
+    actor.config = SelfPlayConfig(
+        policy_surprise_weight=0.5,
+        policy_surprise_max_weight=4.0,
+    )
+    decisions = [
+        SimpleNamespace(policy=np.ones(1), policy_surprise=0.1),
+        SimpleNamespace(policy=np.ones(1), policy_surprise=0.9),
+        SimpleNamespace(policy=None, policy_surprise=0.0),
+    ]
+
+    weights = actor._policy_surprise_sample_weights(decisions)
+
+    assert sum(weights) == pytest.approx(3.0)
+    assert weights[1] > weights[0]
+    assert weights[2] == pytest.approx(1.0)
 
 
 def test_selfplay_measures_replay_append_bytes_and_metric_monotonicity(

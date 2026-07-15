@@ -8,7 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from startrain.actor import ActorSupervisor, ManifestModelProvider
+from startrain.actor import ActorSupervisor, HistoricalModelPool, ManifestModelProvider
 from startrain.config import (
     ConfigError,
     GPUWorkerConfig,
@@ -352,7 +352,7 @@ def test_manifest_provider_compiles_inference_model_when_profile_enables_it(
 
 def test_selfplay_model_source_selects_candidate_or_controlled_mix(tmp_path) -> None:
     experiment = load_config(Path(__file__).parents[1] / "configs" / "small.yaml")
-    champion = SimpleNamespace(name="champion")
+    champion = SimpleNamespace(name="champion", manifest=None)
     candidate = SimpleNamespace(name="candidate")
     supervisor = object.__new__(ActorSupervisor)
     supervisor.provider = champion
@@ -387,5 +387,48 @@ def test_selfplay_model_source_selects_candidate_or_controlled_mix(tmp_path) -> 
         )
         assert supervisor._select_model_provider()[1] is expected
 
+    historical = SimpleNamespace(name="history")
+    observed_exclusions: list[set[str]] = []
+
+    class FakeHistoryPool:
+        def select(self, *, random_source, exclude):
+            assert random_source is supervisor.model_random
+            observed_exclusions.append(exclude)
+            return historical
+
+    supervisor.history_pool = FakeHistoryPool()
+    supervisor._read_candidate = lambda: SimpleNamespace(model_identity="candidate-id")
+    history_mix = replace(
+        candidate_refresh,
+        selfplay_source="candidate_champion_history_mix",
+        candidate_probability=0.0,
+        history_probability=1.0,
+    )
+    supervisor.experiment = replace(
+        experiment,
+        orchestration=replace(
+            experiment.orchestration,
+            model_refresh=history_mix,
+        ),
+    )
+    assert supervisor._select_model_provider() == ("history", historical)
+    assert observed_exclusions == [{"candidate-id"}]
+
     with pytest.raises(ConfigError, match="candidate_probability"):
         ModelRefreshConfig(candidate_probability=1.1)
+    with pytest.raises(ConfigError, match="history mixture"):
+        ModelRefreshConfig(
+            selfplay_source="candidate_champion_history_mix",
+            candidate_probability=0.5,
+        )
+
+
+def test_historical_pool_selects_log_spaced_checkpoints() -> None:
+    pool = object.__new__(HistoricalModelPool)
+    pool.pool_size = 3
+    manifests = [
+        SimpleNamespace(model_step=step, model_identity=f"model-{step}")
+        for step in range(10)
+    ]
+    selected = pool._spaced_candidates(manifests)
+    assert [item.model_step for item in selected] == [0, 4, 9]

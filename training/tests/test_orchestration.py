@@ -41,7 +41,9 @@ from startrain.orchestration import (
     Coordinator,
     RunDirectories,
     build_worker_specs,
+    ensure_autonomous_provenance,
     gpu_pause_ack_path,
+    validate_autonomous_run_root,
 )
 from startrain.runtime import (
     RunIdentity,
@@ -66,6 +68,14 @@ def test_finite_and_continuous_systemd_restart_policies_are_distinct() -> None:
     assert "validate_continuous_profile.py" in continuous
     assert "WatchdogSignal=SIGTERM" in finite
     assert "WatchdogSignal=SIGTERM" in continuous
+    report_service = (
+        DEPLOY / "edgeconnect-startrain-report.service.example"
+    ).read_text()
+    report_timer = (DEPLOY / "edgeconnect-startrain-report.timer.example").read_text()
+    assert "strength_efficiency_report.py" in report_service
+    assert "@PROVISIONED_GPUS@" in report_service
+    assert "OnUnitActiveSec=15min" in report_timer
+    assert "edgeconnect-startrain-@RUN_ID@-report.service" in report_timer
 
 
 def test_graceful_stop_signals_only_worker_leader_before_group_kill(
@@ -199,6 +209,46 @@ def test_h100_layouts_assign_one_learner_and_every_actor_gpu() -> None:
     assert arena.role == "arena"
     assert arena.environment["CUDA_VISIBLE_DEVICES"] == "7"
     assert "--gpu-pause" in arena.command
+
+
+def test_autonomous_run_provenance_rejects_imports_and_profile_drift(
+    tmp_path,
+) -> None:
+    configured = load_config(CONFIGS / "h100-8gpu-autonomous.yaml")
+    configured = replace(
+        configured,
+        orchestration=replace(
+            configured.orchestration,
+            run_id="autonomous-test",
+            directories=replace(
+                configured.orchestration.directories,
+                root=str(tmp_path / "autonomous"),
+            ),
+        ),
+    )
+    directories = RunDirectories.from_experiment(configured)
+    directories.create()
+    (directories.learner / "candidate.json").write_text("{}", encoding="utf-8")
+    with pytest.raises(ValueError, match="imported artifacts"):
+        validate_autonomous_run_root(configured, directories)
+    (directories.learner / "candidate.json").unlink()
+
+    validate_autonomous_run_root(configured, directories)
+    identity = load_or_create_run_identity(
+        directories.run_identity,
+        requested_run_id="autonomous-test",
+    )
+    ensure_autonomous_provenance(configured, directories, identity)
+    payload = json.loads(directories.autonomous_provenance.read_text(encoding="utf-8"))
+    assert payload["mode"] == "random-init-selfplay-only"
+    assert payload["external_weights"] is False
+    assert payload["external_replay"] is False
+    assert payload["external_positions"] is False
+    ensure_autonomous_provenance(configured, directories, identity)
+
+    drifted = replace(configured, train=replace(configured.train, seed=99))
+    with pytest.raises(ValueError, match="frozen run profile"):
+        ensure_autonomous_provenance(drifted, directories, identity)
 
 
 def test_actor_lanes_expand_worker_specs_with_distinct_identity_and_affinity(

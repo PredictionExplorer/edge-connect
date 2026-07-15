@@ -1,0 +1,12 @@
+[Unit]
+Description=Periodic EdgeConnect StarTrain autonomous Elo report
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=15min
+RandomizedDelaySec=1min
+Persistent=true
+Unit=edgeconnect-startrain-@RUN_ID@-report.service
+
+[Install]
+WantedBy=timers.target

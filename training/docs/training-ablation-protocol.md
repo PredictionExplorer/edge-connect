@@ -19,14 +19,20 @@ The committed 4-H100 and 8-H100 profiles use:
 
 The following switches are deliberately first-class and recorded in metrics:
 
-- `orchestration.model_refresh.selfplay_source`: `champion`, `candidate`, or
-  `candidate_champion_mix`;
+- `orchestration.model_refresh.selfplay_source`: `champion`, `candidate`,
+  `candidate_champion_mix`, or the self-generated
+  `candidate_champion_history_mix`;
 - `orchestration.model_refresh.candidate_probability`: candidate share for the
   seeded mixture;
+- `orchestration.model_refresh.history_probability` and `history_pool_size`:
+  share and bounded log-spaced pool of immutable checkpoints from the same run;
 - `selfplay.record_fast_policy_targets`: retain completed-Q policy targets from
   reduced searches;
 - `selfplay.fast_policy_weight`: confidence weight applied only to policy and
   soft-policy losses for retained fast-search targets;
+- `selfplay.policy_surprise_weight` and `policy_surprise_max_weight`: bounded
+  replay weighting from the KL divergence between the network root prior and
+  completed-Q target;
 - `selfplay.max_considered_ring_exponent`: scale the candidate set with board
   radius; and
 - `selfplay.max_considered_cap`: bound the scaled candidate set;
@@ -39,10 +45,19 @@ The following switches are deliberately first-class and recorded in metrics:
 - `learner.target_updates_per_new_sample` and
   `learner.candidate_interval_examples`, which make replay ratio and candidate
   cadence explicit instead of accidental consequences of throughput.
+- `data.shards_per_batch`, which mixes positions from several same-ring shards
+  while retaining homogeneous tensor shapes.
+- `orchestration.plateau.action: reduce_lr_keep_weights`, which clears stale
+  optimizer moments and lowers rates without discarding the learner branch.
 
-Candidate/champion mixing keeps pointer roles and run identities strict. Models
-are refreshed only between complete game batches, so no game contains weights
-from two checkpoints.
+Candidate/champion/history mixing keeps pointer roles and run identities strict.
+Models are refreshed only between complete game batches, so no game contains
+weights from two checkpoints.
+
+The autonomous profile adds a stronger provenance contract: every treatment
+starts with random weights, empty replay, a new run identity, and no external
+positions. Its fixed Elo ladder may evaluate historical checkpoints, but those
+games never enter replay.
 
 ## Experiment design
 
@@ -57,6 +72,8 @@ from two checkpoints.
 5. Evaluate every ring independently in addition to the aggregate result.
 6. Keep negative and inconclusive results. Do not repeatedly tune on one arena
    seed.
+7. Use successive halving for expensive scratch treatments: equal-leaf pilots
+   first, then at least three seeds for any treatment promoted to a long run.
 
 ## Required metrics
 
@@ -68,6 +85,8 @@ Each report must retain:
 - candidate/champion role share and model lag;
 - game length, search entropy, and ring distribution;
 - paired aggregate and per-ring Elo intervals;
+- autonomous checkpoint-ladder Elo slope per billion leaf evaluations and
+  provisioned GPU-hour;
 - peak memory, replay I/O, restarts, and failed/quarantined shards; and
 - final strength divided by GPU-hours and leaf evaluations.
 
@@ -81,8 +100,8 @@ improves throughput without a detectable strength regression.
 
 ## Later research
 
-Regret-guided restarts, replay prioritization, calibrated resignation, FP8, and
-multi-leaf search remain experimental. Introduce each behind a versioned config
-field, add deterministic CPU parity tests first, and do not enable it in the
-shipped profiles before an H100 ablation passes this protocol.
+Regret-guided restarts, calibrated resignation, FP8, and multi-leaf search
+remain experimental. Policy-surprise weighting is implemented, but self-play
+forks and regret buffers still require a versioned contract and deterministic
+CPU parity tests before an H100 ablation.
 

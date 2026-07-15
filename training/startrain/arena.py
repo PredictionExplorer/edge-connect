@@ -383,58 +383,82 @@ def promotion_assessment(
         sequential_state = "continue"
 
     ring_floors: dict[str, object] = {}
-    floors_pass = True
-    floors_ready = True
+    floor_statuses: list[Literal["pass", "regress", "continue"]] = []
     floor_error_probability = (1.0 - config.confidence) / 2.0
+    floor_e_value_threshold = 1.0 / floor_error_probability
+    floor_log_e_value_threshold = math.log(floor_e_value_threshold)
     for ring in config.rings:
         result = per_ring[ring]
         floor = config.per_ring_regression_floor_elo.get(
             ring, config.regression_floor_elo
         )
+        floor_score_rate = _expected_score(floor)
         if len(result) < config.minimum_pairs_per_ring:
-            floors_ready = False
-            floors_pass = False
+            floor_statuses.append("continue")
             ring_floors[str(ring)] = {
                 "floor_elo": floor,
+                "floor_score_rate": floor_score_rate,
                 "paired_bootstrap_lower_elo": None,
+                "paired_bootstrap_upper_elo": None,
                 "anytime_lower_elo": None,
+                "anytime_upper_elo": None,
                 "error_probability": floor_error_probability,
+                "threshold": floor_e_value_threshold,
+                "log_threshold": floor_log_e_value_threshold,
+                "pass_e_value": None,
+                "pass_log_e_value": None,
+                "regression_e_value": None,
+                "regression_log_e_value": None,
+                "evidence_test": "pair-level-mixture-betting-e-process-v1",
                 "pairs": len(result),
                 "passed": None,
+                "status": "continue",
             }
             continue
-        bootstrap_lower_score, _ = _paired_bootstrap_interval(
+        bootstrap_lower_score, bootstrap_upper_score = _paired_bootstrap_interval(
             result,
             confidence=config.confidence,
             samples=config.bootstrap_samples,
             seed=config.seed + ring * 1_000_003,
         )
-        anytime_lower_score, _ = pair_confidence_sequence(
+        anytime_lower_score, anytime_upper_score = pair_confidence_sequence(
             result,
             error_probability=floor_error_probability,
         )
-        floor_score_rate = _expected_score(floor)
-        passed = _pair_mean_exceeds(
+        status, pass_log_e_value, regression_log_e_value = _pair_floor_state(
             _pair_score_counts(result),
-            null_score_rate=floor_score_rate,
+            floor_score_rate=floor_score_rate,
             error_probability=floor_error_probability,
         )
-        floors_pass = floors_pass and passed
+        floor_statuses.append(status)
         ring_floors[str(ring)] = {
             "floor_elo": floor,
+            "floor_score_rate": floor_score_rate,
             "paired_bootstrap_lower_elo": elo_from_probability(bootstrap_lower_score),
+            "paired_bootstrap_upper_elo": elo_from_probability(bootstrap_upper_score),
             "anytime_lower_elo": elo_from_probability(anytime_lower_score),
+            "anytime_upper_elo": elo_from_probability(anytime_upper_score),
             "error_probability": floor_error_probability,
+            "threshold": floor_e_value_threshold,
+            "log_threshold": floor_log_e_value_threshold,
+            "pass_e_value": _reported_e_value(pass_log_e_value),
+            "pass_log_e_value": pass_log_e_value,
+            "regression_e_value": _reported_e_value(regression_log_e_value),
+            "regression_log_e_value": regression_log_e_value,
+            "evidence_test": "pair-level-mixture-betting-e-process-v1",
             "test": "pair-level-mixture-betting-confidence-sequence-v1",
             "pairs": len(result),
-            "passed": passed,
+            "passed": status == "pass",
+            "status": status,
         }
 
-    if sequential_state == "accept_alternative" and floors_ready and floors_pass:
+    if sequential_state == "accept_alternative" and all(
+        status == "pass" for status in floor_statuses
+    ):
         decision = "promote"
     elif sequential_state == "accept_null":
         decision = "reject"
-    elif floors_ready and not floors_pass:
+    elif any(status == "regress" for status in floor_statuses):
         decision = "reject_ring_regression"
     else:
         decision = "continue"
@@ -570,19 +594,40 @@ def _pair_sequential_state(
     return state, promotion_log_e_value, rejection_log_e_value
 
 
-def _pair_mean_exceeds(
+def _pair_floor_state(
     counts: Sequence[int],
     *,
-    null_score_rate: float,
+    floor_score_rate: float,
     error_probability: float,
-) -> bool:
+) -> tuple[Literal["pass", "regress", "continue"], float, float]:
+    """Assess both sides of a ring floor with one-sided paired e-processes.
+
+    Pass evidence tests the null that the pair-score mean is at most the floor.
+    Regression evidence applies the same construction to ``1 - X`` and tests
+    the null that the mean is at least the floor. Each side is anytime-valid
+    because its observation unit remains one complete role-reversed pair.
+    """
+
     if not 0 < error_probability < 1:
-        raise ValueError("pair mean test error probability is invalid")
-    return _pair_log_e_value_from_counts(
+        raise ValueError("pair floor test error probability is invalid")
+    pass_log_e_value = _pair_log_e_value_from_counts(
         counts,
-        null_score_rate=null_score_rate,
+        null_score_rate=floor_score_rate,
         direction="greater",
-    ) >= math.log(1.0 / error_probability)
+    )
+    regression_log_e_value = _pair_log_e_value_from_counts(
+        counts,
+        null_score_rate=floor_score_rate,
+        direction="less",
+    )
+    log_threshold = math.log(1.0 / error_probability)
+    if pass_log_e_value >= log_threshold:
+        status: Literal["pass", "regress", "continue"] = "pass"
+    elif regression_log_e_value >= log_threshold:
+        status = "regress"
+    else:
+        status = "continue"
+    return status, pass_log_e_value, regression_log_e_value
 
 
 def _pair_log_e_value_from_counts(

@@ -458,11 +458,29 @@ def collect_snapshot(
     stale_threshold = _number(shutdown.get("stale_heartbeat_seconds")) or 180.0
     stall_threshold = _number(shutdown.get("stall_timeout_seconds")) or 1_800.0
     learner_config = _mapping(profile.get("learner"))
+    autonomous_config = _mapping(orchestration.get("autonomous"))
+    autonomous_enabled = autonomous_config.get("enabled") is True
     target_steps = (
         "unlimited"
         if learner_config.get("unlimited") is True
         else learner_config.get("steps")
     )
+    provenance = _read_json(root / "autonomous-provenance.json") or {}
+    run_identity = _read_json(root / "run.json") or {}
+    if autonomous_enabled and (
+        provenance.get("mode") != "random-init-selfplay-only"
+        or provenance.get("run_id") != run_identity.get("run_id")
+        or provenance.get("generation_family") != run_identity.get("generation_family")
+        or provenance.get("external_weights") is not False
+        or provenance.get("external_replay") is not False
+        or provenance.get("external_positions") is not False
+    ):
+        _add_warning(
+            warnings,
+            "ERROR",
+            "autonomous_provenance_invalid",
+            "autonomous run provenance is missing or incompatible",
+        )
 
     service = _systemd_status(unit)
     if service.get("query_error"):
@@ -585,6 +603,19 @@ def collect_snapshot(
             "learner_data_wait",
             f"learner data wait is {data_wait_fraction:.1%} of wall step time",
         )
+    updates_per_new_sample = _number(learner_metric.get("updates_per_new_sample"))
+    target_updates = _number(learner_config.get("target_updates_per_new_sample"))
+    if (
+        target_updates is not None
+        and updates_per_new_sample is not None
+        and updates_per_new_sample > target_updates * 1.05
+    ):
+        _add_warning(
+            warnings,
+            "WARN",
+            "update_to_data_high",
+            f"UTD={updates_per_new_sample:.3f} target={target_updates:.3f}",
+        )
     learner = {
         "step": learner_heartbeat.get("step", learner_metric.get("step")),
         "target_steps": target_steps,
@@ -597,7 +628,8 @@ def collect_snapshot(
         "data_wait_seconds": learner_metric.get("data_wait_seconds"),
         "data_wait_fraction": data_wait_fraction,
         "h2d_seconds": learner_metric.get("h2d_seconds"),
-        "updates_per_new_sample": learner_metric.get("updates_per_new_sample"),
+        "updates_per_new_sample": updates_per_new_sample,
+        "target_updates_per_new_sample": target_updates,
         "learning_rates": learner_metric.get("learning_rates"),
         "replay_samples_by_ring": learner_metric.get("replay_samples_by_ring"),
         "ring_batch_weights": learner_metric.get("ring_batch_weights"),
@@ -694,6 +726,10 @@ def collect_snapshot(
         "ring_weight_variants": [list(weights) for weights in sorted(weight_variants)],
         "noncompliant_weight_workers": noncompliant_weight_workers,
         "low_policy_workers": low_policy_workers,
+        "model_role_counts": {
+            role: sum(row.get("model_role") == role for row in actors)
+            for role in ("champion", "candidate", "history")
+        },
         "latest_batch_rate_sum": {
             "games_per_second": sum(
                 _number(row.get("games_per_second")) or 0.0 for row in actors
@@ -984,6 +1020,10 @@ def collect_snapshot(
         "timestamp": _utc_now(),
         "status": status,
         "run_root": str(root),
+        "autonomous": {
+            "enabled": autonomous_enabled,
+            "provenance": provenance if autonomous_enabled else None,
+        },
         "service": service,
         "coordinator": {
             "state": coordinator.get("state"),

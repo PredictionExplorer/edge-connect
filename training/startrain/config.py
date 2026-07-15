@@ -114,11 +114,19 @@ class DataConfig:
     prefetch_factor: int = 2
     pin_memory: bool = False
     shard_cache_size: int = 2
+    shards_per_batch: int = 1
 
     def __post_init__(self) -> None:
         if self.schema_version != 4:
             raise ConfigError("data schema_version must be 4")
-        if self.workers < 0 or self.prefetch_factor <= 0 or self.shard_cache_size <= 0:
+        if (
+            self.workers < 0
+            or self.prefetch_factor <= 0
+            or self.shard_cache_size <= 0
+            or isinstance(self.shards_per_batch, bool)
+            or not isinstance(self.shards_per_batch, int)
+            or self.shards_per_batch <= 0
+        ):
             raise ConfigError("invalid data-loader worker settings")
 
 
@@ -370,10 +378,15 @@ class ModelRefreshConfig:
     manifest_poll_seconds: float = 2.0
     startup_timeout_seconds: float = 600.0
     refresh_only_between_batches: bool = True
-    selfplay_source: Literal["champion", "candidate", "candidate_champion_mix"] = (
-        "champion"
-    )
+    selfplay_source: Literal[
+        "champion",
+        "candidate",
+        "candidate_champion_mix",
+        "candidate_champion_history_mix",
+    ] = "champion"
     candidate_probability: float = 0.8
+    history_probability: float = 0.0
+    history_pool_size: int = 8
 
     def __post_init__(self) -> None:
         if type(self.refresh_only_between_batches) is not bool:
@@ -384,10 +397,36 @@ class ModelRefreshConfig:
             "champion",
             "candidate",
             "candidate_champion_mix",
+            "candidate_champion_history_mix",
         ):
             raise ConfigError("selfplay_source is invalid")
-        if not 0.0 <= self.candidate_probability <= 1.0:
-            raise ConfigError("candidate_probability must be in [0, 1]")
+        if (
+            not 0.0 <= self.candidate_probability <= 1.0
+            or not 0.0 <= self.history_probability <= 1.0
+            or self.candidate_probability + self.history_probability > 1.0
+        ):
+            raise ConfigError(
+                "candidate_probability/history_probability must be in [0, 1] "
+                "and sum to at most 1"
+            )
+        if (
+            isinstance(self.history_pool_size, bool)
+            or not isinstance(self.history_pool_size, int)
+            or self.history_pool_size <= 0
+        ):
+            raise ConfigError("history_pool_size must be positive")
+        if (
+            self.selfplay_source == "candidate_champion_history_mix"
+            and self.history_probability <= 0
+        ):
+            raise ConfigError("history mixture requires a positive history_probability")
+        if (
+            self.selfplay_source != "candidate_champion_history_mix"
+            and self.history_probability != 0
+        ):
+            raise ConfigError(
+                "history_probability is valid only for candidate/champion/history mix"
+            )
         if not self.refresh_only_between_batches:
             raise ConfigError(
                 "actors may refresh models only between complete game batches"
@@ -528,21 +567,61 @@ class PlateauConfig:
     enabled: bool = False
     max_learner_champion_lag_steps: int = 20_000
     consecutive_terminal_rejections: int = 3
-    action: Literal["pause", "reset_from_champion"] = "pause"
+    action: Literal["pause", "reset_from_champion", "reduce_lr_keep_weights"] = "pause"
     reset_learning_rate_scale: float = 1.0
+    clear_optimizer_state_on_recovery: bool = True
     poll_seconds: float = 10.0
 
     def __post_init__(self) -> None:
-        if type(self.enabled) is not bool:
-            raise ConfigError("plateau.enabled must be boolean")
+        if (
+            type(self.enabled) is not bool
+            or type(self.clear_optimizer_state_on_recovery) is not bool
+        ):
+            raise ConfigError("plateau booleans must be boolean")
         if (
             self.max_learner_champion_lag_steps < 0
             or self.consecutive_terminal_rejections <= 0
             or not 0 < self.reset_learning_rate_scale <= 1
             or self.poll_seconds <= 0
-            or self.action not in ("pause", "reset_from_champion")
+            or self.action
+            not in ("pause", "reset_from_champion", "reduce_lr_keep_weights")
         ):
             raise ConfigError("plateau policy settings are invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class AutonomousConfig:
+    enabled: bool = False
+    require_random_initialization: bool = True
+    reject_external_replay: bool = True
+    reject_external_positions: bool = True
+    elo_anchor_step: int = 0
+
+    def __post_init__(self) -> None:
+        booleans = (
+            self.enabled,
+            self.require_random_initialization,
+            self.reject_external_replay,
+            self.reject_external_positions,
+        )
+        if any(type(value) is not bool for value in booleans):
+            raise ConfigError("autonomous settings must use booleans")
+        if (
+            isinstance(self.elo_anchor_step, bool)
+            or not isinstance(self.elo_anchor_step, int)
+            or self.elo_anchor_step < 0
+        ):
+            raise ConfigError("autonomous elo_anchor_step must be non-negative")
+        if self.enabled and (
+            not self.require_random_initialization
+            or not self.reject_external_replay
+            or not self.reject_external_positions
+            or self.elo_anchor_step != 0
+        ):
+            raise ConfigError(
+                "autonomous scratch runs require random step-zero initialization "
+                "with no external replay or positions"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -588,6 +667,7 @@ class OrchestrationConfig:
     distributed: DistributedConfig = DistributedConfig()
     promotion: PromotionConfig = PromotionConfig()
     plateau: PlateauConfig = PlateauConfig()
+    autonomous: AutonomousConfig = AutonomousConfig()
     retention: RetentionConfig = RetentionConfig()
 
     def __post_init__(self) -> None:
@@ -888,6 +968,7 @@ def load_config(path: str | Path) -> ExperimentConfig:
         ("distributed", DistributedConfig),
         ("promotion", PromotionConfig),
         ("plateau", PlateauConfig),
+        ("autonomous", AutonomousConfig),
         ("retention", RetentionConfig),
     ):
         orchestration_values[key] = _construct(cls, orchestration_values.get(key, {}))

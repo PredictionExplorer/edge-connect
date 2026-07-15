@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import heapq
 import os
 import random
 import time
@@ -52,7 +53,7 @@ from .replay import (
     decode_replay_shard,
 )
 from .replay_store import ReplaySelection, ReplaySpan, ReplayStore
-from .runtime import RunIdentity, atomic_json
+from .runtime import RunIdentity, append_jsonl, atomic_json
 from .symmetry import deterministic_transform
 from .training import (
     DeviceBatchPrefetcher,
@@ -244,6 +245,7 @@ class UniqueReplayBatchSampler(Sampler[list[int]]):
         epoch: int,
         ring_stratified: bool,
         ring_weights: Mapping[int, float] | None = None,
+        shards_per_batch: int = 1,
         rank: int = 0,
         world_size: int = 1,
     ) -> None:
@@ -251,6 +253,14 @@ class UniqueReplayBatchSampler(Sampler[list[int]]):
             raise ValueError("dataset, batch_size, and batches must be positive")
         if world_size <= 0 or rank < 0 or rank >= world_size:
             raise ValueError("invalid distributed sampler rank")
+        if (
+            isinstance(shards_per_batch, bool)
+            or not isinstance(shards_per_batch, int)
+            or shards_per_batch <= 0
+        ):
+            raise ValueError("shards_per_batch must be positive")
+        if shards_per_batch > 1 and not ring_stratified:
+            raise ValueError("cross-shard batches require ring-stratified replay")
         required = batches * world_size * batch_size
         if required > len(dataset):
             raise ValueError("replay window lacks enough unique samples")
@@ -265,10 +275,11 @@ class UniqueReplayBatchSampler(Sampler[list[int]]):
             if ring_weights is not None
             else None
         )
+        self.shards_per_batch = shards_per_batch
         self.rank = rank
         self.world_size = world_size
         self.chunks = dataset.shard_batch_chunks(batch_size)
-        if len(self.chunks) < batches * world_size:
+        if len(self.chunks) < batches * world_size * shards_per_batch:
             raise ValueError("replay spans lack enough full shard-local unique batches")
         if ring_stratified:
             if len(self.chunks) < batches * world_size:
@@ -286,18 +297,28 @@ class UniqueReplayBatchSampler(Sampler[list[int]]):
 
     def __iter__(self) -> Iterator[list[int]]:
         rng = random.Random(self.seed + self.epoch * 1_000_003)
-        total_chunks = self.batches * self.world_size
+        total_batches = self.batches * self.world_size
         if not self.ring_stratified:
-            chosen = rng.sample(self.chunks, total_chunks)
+            chosen_groups = [
+                [chunk] for chunk in rng.sample(self.chunks, total_batches)
+            ]
         else:
             by_ring: dict[int, list[ShardBatchChunk]] = defaultdict(list)
             for chunk in self.chunks:
                 by_ring[chunk.ring].append(chunk)
-            capacities = {ring: len(chunks) for ring, chunks in by_ring.items()}
+            groups_by_ring = {
+                ring: _cross_shard_chunk_groups(
+                    chunks,
+                    shards_per_batch=self.shards_per_batch,
+                    rng=rng,
+                )
+                for ring, chunks in by_ring.items()
+            }
+            capacities = {ring: len(groups) for ring, groups in groups_by_ring.items()}
             if self.ring_weights is None:
                 order = []
                 used = {ring: 0 for ring in capacities}
-                while len(order) < total_chunks:
+                while len(order) < total_batches:
                     available = [
                         ring for ring in capacities if used[ring] < capacities[ring]
                     ]
@@ -305,11 +326,11 @@ class UniqueReplayBatchSampler(Sampler[list[int]]):
                     for ring in available:
                         order.append(ring)
                         used[ring] += 1
-                        if len(order) == total_chunks:
+                        if len(order) == total_batches:
                             break
             else:
                 used = _weighted_ring_quotas(
-                    total_chunks,
+                    total_batches,
                     capacities=capacities,
                     weights={
                         ring: self.ring_weights.get(ring, 0.0) for ring in capacities
@@ -319,19 +340,77 @@ class UniqueReplayBatchSampler(Sampler[list[int]]):
                     ring for ring, count in sorted(used.items()) for _ in range(count)
                 ]
                 rng.shuffle(order)
-            ring_chunks: dict[int, Iterator[ShardBatchChunk]] = {}
+            ring_groups: dict[int, Iterator[list[ShardBatchChunk]]] = {}
             for ring, count in used.items():
-                ring_chunks[ring] = iter(rng.sample(by_ring[ring], count))
-            chosen = [next(ring_chunks[ring]) for ring in order]
-        local_chunks = chosen[self.rank :: self.world_size]
+                ring_groups[ring] = iter(rng.sample(groups_by_ring[ring], count))
+            chosen_groups = [next(ring_groups[ring]) for ring in order]
+        local_groups = chosen_groups[self.rank :: self.world_size]
         local = []
-        for chunk in local_chunks:
-            indices = self.dataset.indices_for_chunk(chunk)
-            rng.shuffle(indices)
-            local.append(indices)
+        for group in local_groups:
+            batch_indices: list[int] = []
+            base = self.batch_size // len(group)
+            remainder = self.batch_size % len(group)
+            for offset, chunk in enumerate(group):
+                indices = self.dataset.indices_for_chunk(chunk)
+                rng.shuffle(indices)
+                count = base + int(offset < remainder)
+                batch_indices.extend(indices[:count])
+            rng.shuffle(batch_indices)
+            if len(batch_indices) != self.batch_size:
+                raise RuntimeError("cross-shard sampler emitted an incomplete batch")
+            local.append(batch_indices)
         if len(local) != self.batches:
             raise RuntimeError("distributed sampler emitted uneven batches")
         yield from local
+
+
+def _cross_shard_chunk_groups(
+    chunks: Sequence[ShardBatchChunk],
+    *,
+    shards_per_batch: int,
+    rng: random.Random,
+) -> list[list[ShardBatchChunk]]:
+    by_span: dict[int, list[ShardBatchChunk]] = defaultdict(list)
+    for chunk in chunks:
+        by_span[chunk.span_index].append(chunk)
+    heap: list[tuple[int, float, int]] = []
+    for span_index, span_chunks in by_span.items():
+        rng.shuffle(span_chunks)
+        heap.append((-len(span_chunks), rng.random(), span_index))
+    heapq.heapify(heap)
+    output: list[list[ShardBatchChunk]] = []
+    while len(heap) >= shards_per_batch:
+        selected = [heapq.heappop(heap) for _ in range(shards_per_batch)]
+        group = []
+        for negative_count, _tie, span_index in selected:
+            group.append(by_span[span_index].pop())
+            remaining = -negative_count - 1
+            if remaining:
+                heapq.heappush(
+                    heap,
+                    (-remaining, rng.random(), span_index),
+                )
+        output.append(group)
+    return output
+
+
+def _maximum_cross_shard_groups(
+    chunk_counts: Sequence[int],
+    *,
+    shards_per_batch: int,
+) -> int:
+    if not chunk_counts:
+        return 0
+    upper = sum(chunk_counts) // shards_per_batch
+    low = 0
+    while low < upper:
+        middle = (low + upper + 1) // 2
+        available = sum(min(count, middle) for count in chunk_counts)
+        if available >= middle * shards_per_batch:
+            low = middle
+        else:
+            upper = middle - 1
+    return low
 
 
 def _weighted_ring_quotas(
@@ -394,6 +473,22 @@ def plateau_policy_decision(
 ) -> str:
     if lag_steps < soft_lag_steps:
         return "proceed"
+    if action == "reduce_lr_keep_weights" and reset_already_applied:
+        return "proceed"
+    recovery_due = (
+        status_matches_candidate
+        and terminal_rejection
+        and (
+            lag_steps >= hard_replay_lag_steps
+            or rejection_streak >= reset_after_rejections
+        )
+    )
+    if (
+        recovery_due
+        and action == "reduce_lr_keep_weights"
+        and not reset_already_applied
+    ):
+        return "recover"
     if (
         status_matches_candidate
         and terminal_rejection
@@ -455,6 +550,7 @@ class ImmutableModelPublisher:
                     and current.run_id == self.run_identity.run_id
                     and current.generation_family == self.run_identity.generation_family
                 ):
+                    self._record_model_history(current)
                     return current
         staged = self.checkpoint_directory / f".candidate-{step:012d}.staging.pt"
         save_checkpoint(
@@ -529,7 +625,27 @@ class ImmutableModelPublisher:
             atomic_json(manifest_path, manifest_payload)
         manifest = load_model_manifest(manifest_path)
         write_model_pointer(self.candidate_path, manifest, role="candidate")
-        return load_model_manifest(self.candidate_path)
+        published = load_model_manifest(self.candidate_path)
+        self._record_model_history(published)
+        return published
+
+    def _record_model_history(self, manifest: ModelManifest) -> None:
+        append_jsonl(
+            self.root / "model-history.jsonl",
+            {
+                "schema_version": 1,
+                "run_id": manifest.run_id,
+                "generation_family": manifest.generation_family,
+                "model_identity": manifest.model_identity,
+                "model_step": manifest.model_step,
+                "published_ns": manifest.published_ns,
+                "manifest": os.path.relpath(
+                    manifest.artifact_manifest or manifest.path,
+                    self.root,
+                ),
+            },
+            durable=True,
+        )
 
 
 AtomicModelPublisher = ImmutableModelPublisher
@@ -1007,6 +1123,7 @@ class LearnerLoop:
             epoch=self.epoch,
             ring_stratified=self.data_config.ring_stratified,
             ring_weights=self._active_ring_weights(),
+            shards_per_batch=self.data_config.shards_per_batch,
             rank=self.rank,
             world_size=self.world_size,
         )
@@ -1058,6 +1175,9 @@ class LearnerLoop:
             self.scheduler._last_lr = [
                 float(group["lr"]) for group in self.optimizer.param_groups
             ]
+
+    def _clear_optimizer_state(self) -> None:
+        self.optimizer.state.clear()
 
     def _active_ring_weights(self) -> dict[int, float] | None:
         weights = self.ring_mixture_config.weights_for_step(self.step)
@@ -1155,9 +1275,16 @@ class LearnerLoop:
 
     def _maximum_unique_batches(self, selection: ReplaySelection) -> int:
         batch = self.train_config.per_rank_batch_size
-        capacities: dict[int, int] = defaultdict(int)
+        chunk_counts: dict[int, list[int]] = defaultdict(list)
         for span in selection.spans:
-            capacities[span.record.ring] += span.sample_count // batch
+            chunk_counts[span.record.ring].append(span.sample_count // batch)
+        capacities = {
+            ring: _maximum_cross_shard_groups(
+                counts,
+                shards_per_batch=self.data_config.shards_per_batch,
+            )
+            for ring, counts in chunk_counts.items()
+        }
         capacity = sum(capacities.values()) // self.world_size
         weights = self._active_ring_weights()
         if not self.data_config.ring_stratified or weights is None:
@@ -1288,12 +1415,26 @@ class LearnerLoop:
             and self.publisher.champion_path.is_file()
         ):
             champion = load_model_manifest(self.publisher.champion_path)
-            budget = max(
-                0,
-                champion.model_step
-                + self.learner_config.max_replay_lag_steps
-                - self.step,
+            candidate = (
+                load_model_manifest(self.publisher.candidate_path)
+                if self.publisher.candidate_path.is_file()
+                else None
             )
+            recovery_token = (
+                champion.model_identity,
+                candidate.model_identity if candidate is not None else "",
+            )
+            recovered_in_place = (
+                configured.action == "reduce_lr_keep_weights"
+                and self._last_plateau_reset == recovery_token
+            )
+            if not recovered_in_place:
+                budget = max(
+                    0,
+                    champion.model_step
+                    + self.learner_config.max_replay_lag_steps
+                    - self.step,
+                )
         value = self._broadcast_object(budget if self.rank == 0 else None)
         if not isinstance(value, int):
             raise RuntimeError("distributed plateau step budget is invalid")
@@ -1399,6 +1540,79 @@ class LearnerLoop:
                         phase="plateau_reset",
                         step=self.step,
                         champion_identity=action["champion_identity"],
+                        reason=action.get("reset_reason"),
+                    )
+                return True
+            if kind == "recover":
+                previous_step = self.step
+                self._scale_learning_rates(configured.reset_learning_rate_scale)
+                if configured.clear_optimizer_state_on_recovery:
+                    self._clear_optimizer_state()
+                if self.rank == 0:
+                    self._last_recovery_step = max(0, self.step - 1)
+                    recovery = self._maybe_write_recovery_checkpoint(force=True)
+                    if recovery is None:
+                        raise RuntimeError(
+                            "plateau recovery did not create a recovery checkpoint"
+                        )
+                    cutover_created_ns = time.time_ns()
+                    write_resume_cutover(
+                        self.publisher.root,
+                        manifest=recovery,
+                        run_id=self.run_identity.run_id,
+                        generation_family=self.run_identity.generation_family,
+                        created_ns=cutover_created_ns,
+                    )
+                    if self.promotion_status_path is not None:
+                        atomic_json(
+                            self.promotion_status_path,
+                            {
+                                "schema_version": 1,
+                                "candidate_identity": action["candidate_identity"],
+                                "candidate_step": action["candidate_step"],
+                                "champion_identity": action["champion_identity"],
+                                "champion_step": action["champion_step"],
+                                "decision": "plateau_recover",
+                                "terminal": True,
+                                "consecutive_terminal_rejections": 0,
+                                "cutover_created_ns": cutover_created_ns,
+                                "updated_ns": time.time_ns(),
+                            },
+                        )
+                    self.metrics.append(
+                        {
+                            "schema_version": 1,
+                            "timestamp_ns": time.time_ns(),
+                            "worker": "learner",
+                            "event": "plateau_recovery",
+                            "reason": action.get("reset_reason"),
+                            "from_step": previous_step,
+                            "to_step": self.step,
+                            "candidate_identity": action["candidate_identity"],
+                            "champion_identity": action["champion_identity"],
+                            "learning_rate_scale": (
+                                configured.reset_learning_rate_scale
+                            ),
+                            "optimizer_state_cleared": (
+                                configured.clear_optimizer_state_on_recovery
+                            ),
+                            "learning_rates": [
+                                float(group["lr"])
+                                for group in self.optimizer.param_groups
+                            ],
+                        }
+                    )
+                self._distributed_barrier()
+                self._last_plateau_reset = (
+                    str(action["champion_identity"]),
+                    str(action["candidate_identity"]),
+                )
+                if progress is not None and self.rank == 0:
+                    progress(
+                        phase="plateau_recovery",
+                        step=self.step,
+                        champion_identity=action["champion_identity"],
+                        candidate_identity=action["candidate_identity"],
                         reason=action.get("reset_reason"),
                     )
                 return True
@@ -1552,20 +1766,35 @@ class LearnerLoop:
             action=configured.action,
             reset_already_applied=self._last_plateau_reset == reset_token,
         )
-        if decision == "reset":
+        if decision in ("reset", "recover"):
+            if candidate is None:
+                return {
+                    "kind": "pause",
+                    "reason": "awaiting_candidate",
+                    "champion_step": champion.model_step,
+                }
+            recovery_kind = "reset" if decision == "reset" else "recover"
             return {
-                "kind": "reset",
+                "kind": recovery_kind,
                 "reset_reason": (
                     "hard_replay_lag"
                     if lag >= self.learner_config.max_replay_lag_steps
                     and streak < configured.consecutive_terminal_rejections
                     else "terminal_rejection_streak"
                 ),
-                "checkpoint": str(champion.checkpoint),
-                "sha256": champion.checkpoint_sha256,
-                "bytes": champion.checkpoint_bytes,
                 "champion_identity": champion.model_identity,
-                "candidate_identity": reset_token[1],
+                "champion_step": champion.model_step,
+                "candidate_identity": candidate.model_identity,
+                "candidate_step": candidate.model_step,
+                **(
+                    {
+                        "checkpoint": str(champion.checkpoint),
+                        "sha256": champion.checkpoint_sha256,
+                        "bytes": champion.checkpoint_bytes,
+                    }
+                    if decision == "reset"
+                    else {}
+                ),
             }
         if decision == "proceed":
             return {"kind": "proceed"}

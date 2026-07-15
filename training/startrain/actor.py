@@ -6,6 +6,7 @@ import json
 import random
 import statistics
 import time
+from collections import OrderedDict
 from collections.abc import Callable, Mapping
 from dataclasses import asdict, replace
 from pathlib import Path
@@ -63,7 +64,7 @@ class ManifestModelProvider:
         *,
         device: str,
         run_identity: RunIdentity,
-        expected_role: Literal["champion", "candidate"] = "champion",
+        expected_role: Literal["champion", "candidate", "direct"] = "champion",
     ) -> None:
         self.config = config
         self.manifest_path = Path(manifest_path)
@@ -152,6 +153,84 @@ class ManifestModelProvider:
         return self.evaluator
 
 
+class HistoricalModelPool:
+    """Selects only immutable checkpoints produced by the active self-play run."""
+
+    def __init__(
+        self,
+        config: ExperimentConfig,
+        manifest_directory: str | Path,
+        *,
+        device: str,
+        run_identity: RunIdentity,
+        pool_size: int,
+        evaluator_cache_size: int = 2,
+    ) -> None:
+        if pool_size <= 0 or evaluator_cache_size <= 0:
+            raise ValueError("historical model pool sizes must be positive")
+        self.config = config
+        self.manifest_directory = Path(manifest_directory)
+        self.device = device
+        self.run_identity = run_identity
+        self.pool_size = pool_size
+        self.evaluator_cache_size = min(pool_size, evaluator_cache_size)
+        self.providers: OrderedDict[str, ManifestModelProvider] = OrderedDict()
+
+    def select(
+        self,
+        *,
+        random_source: random.Random,
+        exclude: set[str],
+    ) -> ManifestModelProvider | None:
+        manifests = []
+        for path in sorted(self.manifest_directory.glob("manifest-*.json")):
+            try:
+                manifest = load_model_manifest(path)
+            except (OSError, ValueError):
+                continue
+            if (
+                manifest.role == "direct"
+                and manifest.run_id == self.run_identity.run_id
+                and manifest.generation_family == self.run_identity.generation_family
+                and manifest.model_identity not in exclude
+            ):
+                manifests.append(manifest)
+        manifests.sort(key=lambda item: (item.model_step, item.model_identity))
+        if not manifests:
+            return None
+        candidates = self._spaced_candidates(manifests)
+        selected = random_source.choice(candidates)
+        provider = self.providers.pop(selected.model_identity, None)
+        if provider is None:
+            source = selected.artifact_manifest or selected.path
+            provider = ManifestModelProvider(
+                self.config,
+                source,
+                device=self.device,
+                run_identity=self.run_identity,
+                expected_role="direct",
+            )
+        self.providers[selected.model_identity] = provider
+        while len(self.providers) > self.evaluator_cache_size:
+            self.providers.popitem(last=False)
+        return provider
+
+    def _spaced_candidates(
+        self,
+        manifests: list[ModelManifest],
+    ) -> list[ModelManifest]:
+        if len(manifests) <= self.pool_size:
+            return manifests
+        if self.pool_size == 1:
+            return [manifests[0]]
+        last = len(manifests) - 1
+        indices = {
+            round(offset * last / (self.pool_size - 1))
+            for offset in range(self.pool_size)
+        }
+        return [manifests[index] for index in sorted(indices)]
+
+
 class ActorSupervisor:
     def __init__(
         self,
@@ -210,6 +289,17 @@ class ActorSupervisor:
                 expected_role="candidate",
             )
             if source != "champion"
+            else None
+        )
+        self.history_pool = (
+            HistoricalModelPool(
+                experiment,
+                self.candidate_manifest_path.parent / "manifests",
+                device=device,
+                run_identity=run_identity,
+                pool_size=experiment.orchestration.model_refresh.history_pool_size,
+            )
+            if source == "candidate_champion_history_mix"
             else None
         )
         self.model_random = random.Random(
@@ -405,6 +495,18 @@ class ActorSupervisor:
                         if selfplay_metrics.policy_entropy_count
                         else None
                     )
+                    policy_surprise_mean = (
+                        selfplay_metrics.policy_surprise_sum
+                        / selfplay_metrics.policy_surprise_count
+                        if selfplay_metrics.policy_surprise_count
+                        else None
+                    )
+                    sample_weight_mean = (
+                        selfplay_metrics.sample_weight_sum
+                        / selfplay_metrics.completed_decisions
+                        if selfplay_metrics.completed_decisions
+                        else None
+                    )
                     attempted_decisions = (
                         selfplay_metrics.full_decisions
                         + selfplay_metrics.fast_decisions
@@ -469,6 +571,15 @@ class ActorSupervisor:
                                 selfplay_metrics.policy_entropy_count
                             ),
                             "policy_weight_mean": policy_weight_mean,
+                            "policy_surprise_count": (
+                                selfplay_metrics.policy_surprise_count
+                            ),
+                            "policy_surprise_sum": (
+                                selfplay_metrics.policy_surprise_sum
+                            ),
+                            "policy_surprise_mean": policy_surprise_mean,
+                            "sample_weight_sum": (selfplay_metrics.sample_weight_sum),
+                            "sample_weight_mean": sample_weight_mean,
                             "interrupted_cohorts": (
                                 selfplay_metrics.interrupted_cohorts
                             ),
@@ -553,15 +664,36 @@ class ActorSupervisor:
 
     def _select_model_provider(
         self,
-    ) -> tuple[Literal["champion", "candidate"], ManifestModelProvider]:
+    ) -> tuple[Literal["champion", "candidate", "history"], ManifestModelProvider]:
         refresh = self.experiment.orchestration.model_refresh
         if refresh.selfplay_source == "champion":
             return "champion", self.provider
         assert self.candidate_provider is not None
         if refresh.selfplay_source == "candidate":
             return "candidate", self.candidate_provider
-        if self.model_random.random() < refresh.candidate_probability:
+        draw = self.model_random.random()
+        if draw < refresh.candidate_probability:
             return "candidate", self.candidate_provider
+        if (
+            refresh.selfplay_source == "candidate_champion_history_mix"
+            and draw < refresh.candidate_probability + refresh.history_probability
+        ):
+            assert self.history_pool is not None
+            candidate = self._read_candidate()
+            champion_identity = (
+                self.provider.manifest.model_identity
+                if self.provider.manifest is not None
+                else None
+            )
+            historical = self.history_pool.select(
+                random_source=self.model_random,
+                exclude={
+                    candidate.model_identity,
+                    *({champion_identity} if champion_identity is not None else set()),
+                },
+            )
+            if historical is not None:
+                return "history", historical
         return "champion", self.provider
 
     def _read_candidate(self) -> ModelManifest:

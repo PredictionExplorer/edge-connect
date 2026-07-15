@@ -10,8 +10,13 @@ from collections import defaultdict
 from collections.abc import Iterable, Mapping
 from pathlib import Path
 
+from startrain.autonomous_elo import DecisiveMatch, fit_bradley_terry_elo
+
 SCHEMA_VERSION = 1
 REPORT_NAME = "startrain-strength-efficiency"
+AUTONOMOUS_ELO_SCHEMA_VERSION = 1
+AUTONOMOUS_ELO_CONFIDENCE = 0.95
+PRIMARY_ELO_RING = 10
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -314,8 +319,8 @@ def _arena_results(
             continue
         if (
             isinstance(payload, dict)
-            and isinstance(payload.get("aggregate"), dict)
-            and isinstance(payload.get("evaluation_metrics"), dict)
+            and "candidate" in payload
+            and "baseline" in payload
         ):
             results.append({**payload, "_path": str(path)})
     return results
@@ -330,8 +335,9 @@ def _arena_summary(
     by_baseline: dict[str, list[dict[str, object]]] = defaultdict(list)
     serialized = []
     for result in results:
-        aggregate = result["aggregate"]
-        assert isinstance(aggregate, dict)
+        aggregate = result.get("aggregate")
+        if not isinstance(aggregate, dict):
+            continue
         baseline = str(result.get("baseline") or "unknown")
         completed_ns = _timestamp(result)
         elo = _number(aggregate.get("elo_difference"))
@@ -404,6 +410,661 @@ def _arena_summary(
     }
 
 
+def _nonnegative_integer(value: object) -> int | None:
+    if type(value) is int and value >= 0:
+        return value
+    return None
+
+
+def _checkpoint_identity(value: object) -> str | None:
+    return (
+        value
+        if isinstance(value, str) and bool(value) and value.strip() == value
+        else None
+    )
+
+
+def _content_addressed_identity(identity: str) -> bool:
+    digest = identity.removeprefix("sha256-")
+    return (
+        identity.startswith("sha256-")
+        and len(digest) == 64
+        and all(character in "0123456789abcdef" for character in digest)
+    )
+
+
+def _record_step_evidence(
+    evidence: dict[str, set[int]],
+    *,
+    identity: object,
+    step: object,
+) -> None:
+    parsed_identity = _checkpoint_identity(identity)
+    parsed_step = _nonnegative_integer(step)
+    if parsed_identity is not None and parsed_step is not None:
+        evidence.setdefault(parsed_identity, set()).add(parsed_step)
+
+
+def _checkpoint_step_evidence(
+    root: Path,
+    *,
+    actor_records: list[dict[str, object]],
+    arena_results: list[dict[str, object]],
+) -> tuple[dict[str, int], list[dict[str, object]]]:
+    evidence: dict[str, set[int]] = {}
+    metadata_failures: list[dict[str, object]] = []
+    for record in actor_records:
+        _record_step_evidence(
+            evidence,
+            identity=record.get("model_identity", record.get("model_version")),
+            step=record.get("model_step"),
+        )
+    for result in arena_results:
+        _record_step_evidence(
+            evidence,
+            identity=result.get("candidate"),
+            step=result.get("candidate_step"),
+        )
+        _record_step_evidence(
+            evidence,
+            identity=result.get("baseline"),
+            step=result.get("baseline_step", result.get("champion_step")),
+        )
+        for participant, metadata_name in (
+            (result.get("candidate"), "candidate_metadata"),
+            (result.get("baseline"), "baseline_metadata"),
+        ):
+            metadata = result.get(metadata_name)
+            if isinstance(metadata, Mapping):
+                _record_step_evidence(
+                    evidence,
+                    identity=metadata.get("identity", participant),
+                    step=metadata.get("model_step", metadata.get("step")),
+                )
+    history_records = _read_jsonl(
+        root / "learner" / "model-history.jsonl",
+        failures=metadata_failures,
+    )
+    for record in history_records:
+        _record_step_evidence(
+            evidence,
+            identity=record.get("model_identity"),
+            step=record.get("model_step"),
+        )
+
+    metadata_paths = [
+        *(root / "learner" / "manifests").glob("manifest-*.json"),
+        *(root / "learner").glob("candidate.json"),
+        *(root / "learner").glob("champion.json"),
+        *(root / "arena").glob("promotion-status.json"),
+    ]
+    for path in sorted(set(metadata_paths)):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            metadata_failures.append(
+                {
+                    "path": str(path),
+                    "reason": f"{type(error).__name__}: {error}",
+                }
+            )
+            continue
+        if not isinstance(payload, dict):
+            metadata_failures.append(
+                {"path": str(path), "reason": "checkpoint metadata is not an object"}
+            )
+            continue
+        _record_step_evidence(
+            evidence,
+            identity=payload.get(
+                "model_identity",
+                payload.get("candidate_identity"),
+            ),
+            step=payload.get("model_step", payload.get("candidate_step")),
+        )
+        _record_step_evidence(
+            evidence,
+            identity=payload.get("champion_identity"),
+            step=payload.get("champion_step"),
+        )
+
+    conflicts = [
+        {
+            "identity": identity,
+            "steps": sorted(steps),
+            "reason": "conflicting model_step evidence",
+        }
+        for identity, steps in sorted(evidence.items())
+        if len(steps) > 1
+    ]
+    resolved = {
+        identity: next(iter(steps))
+        for identity, steps in evidence.items()
+        if len(steps) == 1
+    }
+    return resolved, [*metadata_failures, *conflicts]
+
+
+def _baseline_kind(
+    result: Mapping[str, object],
+    *,
+    checkpoint_steps: Mapping[str, int],
+) -> tuple[str, str]:
+    metadata = result.get("baseline_metadata")
+    baseline = _checkpoint_identity(result.get("baseline"))
+    if isinstance(metadata, Mapping):
+        kind = metadata.get("kind")
+        if isinstance(kind, str) and kind:
+            metadata_identity = metadata.get("identity")
+            if (
+                kind == "checkpoint"
+                and metadata_identity is not None
+                and metadata_identity != baseline
+            ):
+                return "unknown", "checkpoint baseline metadata identity disagrees"
+            return (
+                ("checkpoint", "baseline_metadata")
+                if kind == "checkpoint"
+                else ("frozen", kind)
+            )
+        if "kind" in metadata:
+            return "unknown", "baseline metadata kind is invalid"
+    elif metadata is not None:
+        return "unknown", "baseline metadata must be an object"
+    candidate = _checkpoint_identity(result.get("candidate"))
+    if (
+        candidate is not None
+        and baseline is not None
+        and (
+            (candidate in checkpoint_steps and baseline in checkpoint_steps)
+            or (
+                _content_addressed_identity(candidate)
+                and _content_addressed_identity(baseline)
+            )
+        )
+    ):
+        return "checkpoint", "identity_evidence"
+    return "unknown", "checkpoint baseline was not established"
+
+
+def _decisive_match(
+    result: Mapping[str, object],
+    *,
+    scope: str,
+) -> tuple[DecisiveMatch | None, str | None]:
+    candidate = _checkpoint_identity(result.get("candidate"))
+    baseline = _checkpoint_identity(result.get("baseline"))
+    if candidate is None or baseline is None:
+        return None, "candidate and baseline identities must be non-empty strings"
+    if scope == "aggregate":
+        summary = result.get("aggregate")
+    else:
+        per_ring = result.get("per_ring")
+        summary = (
+            per_ring.get(str(PRIMARY_ELO_RING))
+            if isinstance(per_ring, Mapping)
+            else None
+        )
+    if not isinstance(summary, Mapping):
+        return None, f"{scope} decisive summary is missing"
+    wins = _nonnegative_integer(summary.get("wins"))
+    losses = _nonnegative_integer(summary.get("losses"))
+    if wins is None or losses is None:
+        return None, f"{scope} wins/losses must be non-negative integers"
+    games = summary.get("games")
+    if games is not None and _nonnegative_integer(games) != wins + losses:
+        return None, f"{scope} games disagrees with wins plus losses"
+    try:
+        return DecisiveMatch(candidate, baseline, wins, losses), None
+    except ValueError as error:
+        return None, str(error)
+
+
+def _scope_inputs(
+    arena_results: list[dict[str, object]],
+    *,
+    scope: str,
+    checkpoint_steps: Mapping[str, int],
+) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+    included = []
+    exclusions = []
+    for result in arena_results:
+        kind, kind_evidence = _baseline_kind(
+            result,
+            checkpoint_steps=checkpoint_steps,
+        )
+        if kind != "checkpoint":
+            if kind == "unknown":
+                exclusions.append(
+                    {
+                        "path": result.get("_path"),
+                        "scope": scope,
+                        "candidate": result.get("candidate"),
+                        "baseline": result.get("baseline"),
+                        "reason": kind_evidence,
+                    }
+                )
+            continue
+        match, reason = _decisive_match(result, scope=scope)
+        if match is None:
+            exclusions.append(
+                {
+                    "path": result.get("_path"),
+                    "scope": scope,
+                    "candidate": result.get("candidate"),
+                    "baseline": result.get("baseline"),
+                    "reason": reason,
+                }
+            )
+            continue
+        included.append(
+            {
+                "match": match,
+                "path": result.get("_path"),
+                "completed_ns": _timestamp(result),
+                "classification": kind_evidence,
+            }
+        )
+    return included, exclusions
+
+
+def _select_anchor(
+    scoped_inputs: list[dict[str, object]],
+    *,
+    checkpoint_steps: Mapping[str, int],
+) -> tuple[str | None, str]:
+    identities = {
+        identity
+        for item in scoped_inputs
+        if isinstance((match := item.get("match")), DecisiveMatch)
+        for identity in (match.candidate, match.baseline)
+    }
+    if not identities:
+        return None, "unavailable"
+    step_zero = sorted(
+        identity for identity in identities if checkpoint_steps.get(identity) == 0
+    )
+    if step_zero:
+        return step_zero[0], "step_zero_snapshot"
+    stepped = sorted(
+        (step, identity)
+        for identity in identities
+        if (step := checkpoint_steps.get(identity)) is not None
+    )
+    if stepped:
+        return stepped[0][1], "earliest_step_snapshot"
+    return min(identities), "lexical_fallback_step_unavailable"
+
+
+def _graph_components(matches: list[DecisiveMatch]) -> list[list[str]]:
+    adjacency: dict[str, set[str]] = {}
+    for match in matches:
+        adjacency.setdefault(match.candidate, set()).add(match.baseline)
+        adjacency.setdefault(match.baseline, set()).add(match.candidate)
+    remaining = set(adjacency)
+    components = []
+    while remaining:
+        pending = [min(remaining)]
+        component: set[str] = set()
+        while pending:
+            identity = pending.pop()
+            if identity in component:
+                continue
+            component.add(identity)
+            pending.extend(sorted(adjacency[identity] - component, reverse=True))
+        remaining.difference_update(component)
+        components.append(sorted(component))
+    return sorted(components)
+
+
+def _unavailable_ladder(
+    *,
+    scope: str,
+    anchor_identity: str | None,
+    inputs: list[dict[str, object]],
+    exclusions: list[dict[str, object]],
+    reason: str,
+) -> dict[str, object]:
+    matches = [
+        match
+        for item in inputs
+        if isinstance((match := item.get("match")), DecisiveMatch)
+    ]
+    components = _graph_components(matches)
+    identities = sorted(
+        {identity for component in components for identity in component}
+    )
+    return {
+        "status": "unavailable",
+        "scope": scope,
+        "ring": PRIMARY_ELO_RING if scope == "ring_10" else None,
+        "reason": reason,
+        "anchor_identity": anchor_identity,
+        "ladder": [],
+        "latest": None,
+        "input": {
+            "result_count": len(inputs),
+            "identity_count": len(identities),
+            "decisive_games": sum(match.wins + match.losses for match in matches),
+        },
+        "connectedness": {
+            "connected": len(components) == 1 and bool(components),
+            "component_count": len(components),
+            "components": components,
+            "excluded_identities": identities
+            if anchor_identity is not None and anchor_identity not in identities
+            else [],
+        },
+        "exclusions": exclusions,
+    }
+
+
+def _build_ladder(
+    *,
+    scope: str,
+    inputs: list[dict[str, object]],
+    exclusions: list[dict[str, object]],
+    anchor_identity: str | None,
+    checkpoint_steps: Mapping[str, int],
+) -> dict[str, object]:
+    if anchor_identity is None:
+        return _unavailable_ladder(
+            scope=scope,
+            anchor_identity=None,
+            inputs=inputs,
+            exclusions=exclusions,
+            reason="no valid checkpoint-vs-checkpoint decisive results",
+        )
+    matches = [
+        match
+        for item in inputs
+        if isinstance((match := item.get("match")), DecisiveMatch)
+    ]
+    if not matches:
+        return _unavailable_ladder(
+            scope=scope,
+            anchor_identity=anchor_identity,
+            inputs=inputs,
+            exclusions=exclusions,
+            reason=f"no valid {scope} checkpoint-vs-checkpoint decisive results",
+        )
+    identities = {
+        identity for match in matches for identity in (match.candidate, match.baseline)
+    }
+    if anchor_identity not in identities:
+        return _unavailable_ladder(
+            scope=scope,
+            anchor_identity=anchor_identity,
+            inputs=inputs,
+            exclusions=exclusions,
+            reason="the fixed anchor is absent from this comparison graph",
+        )
+    try:
+        fit = fit_bradley_terry_elo(
+            matches,
+            anchor_identity=anchor_identity,
+            confidence=AUTONOMOUS_ELO_CONFIDENCE,
+        )
+    except (ArithmeticError, TypeError, ValueError) as error:
+        return _unavailable_ladder(
+            scope=scope,
+            anchor_identity=anchor_identity,
+            inputs=inputs,
+            exclusions=exclusions,
+            reason=f"{type(error).__name__}: {error}",
+        )
+
+    last_seen: dict[str, int] = {}
+    for order, item in enumerate(inputs):
+        match = item["match"]
+        assert isinstance(match, DecisiveMatch)
+        completed_ns = item.get("completed_ns")
+        observed = completed_ns if isinstance(completed_ns, int) else order
+        for identity in (match.candidate, match.baseline):
+            last_seen[identity] = max(last_seen.get(identity, 0), observed)
+    ladder = [
+        {
+            "rank": rank,
+            "identity": estimate.identity,
+            "step": checkpoint_steps.get(estimate.identity),
+            "rating": estimate.rating,
+            "standard_error": estimate.standard_error,
+            "confidence_interval": list(estimate.confidence_interval),
+            "decisive_games": estimate.decisive_games,
+        }
+        for rank, estimate in enumerate(fit.estimates, start=1)
+    ]
+    stepped = [item for item in ladder if item["step"] is not None]
+    if stepped:
+        latest = max(
+            stepped,
+            key=lambda item: (
+                int(item["step"]),
+                last_seen.get(str(item["identity"]), 0),
+                str(item["identity"]),
+            ),
+        )
+        latest_basis = "maximum_step"
+    else:
+        latest = max(
+            ladder,
+            key=lambda item: (
+                last_seen.get(str(item["identity"]), 0),
+                str(item["identity"]),
+            ),
+        )
+        latest_basis = "last_observed_step_unavailable"
+    latest = {**latest, "selection": latest_basis}
+    disconnected_results = [
+        item.get("path")
+        for item in inputs
+        if isinstance((match := item.get("match")), DecisiveMatch)
+        and (
+            match.candidate in fit.excluded_identities
+            or match.baseline in fit.excluded_identities
+        )
+    ]
+    return {
+        "status": "available",
+        "scope": scope,
+        "ring": PRIMARY_ELO_RING if scope == "ring_10" else None,
+        "anchor_identity": anchor_identity,
+        "ladder": ladder,
+        "latest": latest,
+        "input": {
+            "result_count": len(inputs),
+            "fitted_result_count": fit.observation_count,
+            "unique_pairing_count": fit.unique_pairing_count,
+            "decisive_games": fit.decisive_games,
+            "continuity_corrected_pairings": (fit.continuity_corrected_pairings),
+        },
+        "fit": {
+            "converged": fit.converged,
+            "iterations": fit.iterations,
+            "log_likelihood": fit.log_likelihood,
+        },
+        "connectedness": {
+            "connected": fit.connected,
+            "component_count": len(fit.components),
+            "anchor_component_size": len(fit.estimates),
+            "identity_count": sum(len(component) for component in fit.components),
+            "components": [list(component) for component in fit.components],
+            "excluded_identities": list(fit.excluded_identities),
+            "excluded_result_paths": sorted(
+                path for path in disconnected_results if isinstance(path, str)
+            ),
+        },
+        "exclusions": exclusions,
+    }
+
+
+def _frozen_baseline_results(
+    arena_results: list[dict[str, object]],
+    *,
+    checkpoint_steps: Mapping[str, int],
+) -> dict[str, object]:
+    serialized = []
+    for result in arena_results:
+        kind, evidence = _baseline_kind(
+            result,
+            checkpoint_steps=checkpoint_steps,
+        )
+        if kind != "frozen":
+            continue
+        aggregate = result.get("aggregate")
+        per_ring = result.get("per_ring")
+        ring_10 = (
+            per_ring.get(str(PRIMARY_ELO_RING))
+            if isinstance(per_ring, Mapping)
+            else None
+        )
+
+        def summary(value: object) -> dict[str, object] | None:
+            if not isinstance(value, Mapping):
+                return None
+            return {
+                "wins": value.get("wins"),
+                "losses": value.get("losses"),
+                "games": value.get("games"),
+                "elo_difference": value.get("elo_difference"),
+                "anytime_elo_interval": value.get("anytime_elo_interval"),
+            }
+
+        serialized.append(
+            {
+                "path": result.get("_path"),
+                "candidate": result.get("candidate"),
+                "baseline": result.get("baseline"),
+                "kind": evidence,
+                "completed_ns": _timestamp(result),
+                "aggregate": summary(aggregate),
+                "ring_10": summary(ring_10),
+            }
+        )
+    serialized.sort(
+        key=lambda item: (
+            _number(item.get("completed_ns")) or 0,
+            str(item.get("path")),
+        )
+    )
+    return {
+        "connected_to_primary": False,
+        "result_count": len(serialized),
+        "results": serialized,
+    }
+
+
+def _autonomous_elo_summary(
+    root: Path,
+    *,
+    arena_results: list[dict[str, object]],
+    actor_records: list[dict[str, object]],
+    actor_summary: Mapping[str, object],
+    provisioned_gpu_hours: float,
+) -> dict[str, object]:
+    checkpoint_steps, metadata_exclusions = _checkpoint_step_evidence(
+        root,
+        actor_records=actor_records,
+        arena_results=arena_results,
+    )
+    aggregate_inputs, aggregate_exclusions = _scope_inputs(
+        arena_results,
+        scope="aggregate",
+        checkpoint_steps=checkpoint_steps,
+    )
+    ring_inputs, ring_exclusions = _scope_inputs(
+        arena_results,
+        scope="ring_10",
+        checkpoint_steps=checkpoint_steps,
+    )
+    anchor_inputs = aggregate_inputs or ring_inputs
+    anchor_identity, anchor_selection = _select_anchor(
+        anchor_inputs,
+        checkpoint_steps=checkpoint_steps,
+    )
+    primary = _build_ladder(
+        scope="ring_10",
+        inputs=ring_inputs,
+        exclusions=ring_exclusions,
+        anchor_identity=anchor_identity,
+        checkpoint_steps=checkpoint_steps,
+    )
+    aggregate = _build_ladder(
+        scope="aggregate",
+        inputs=aggregate_inputs,
+        exclusions=aggregate_exclusions,
+        anchor_identity=anchor_identity,
+        checkpoint_steps=checkpoint_steps,
+    )
+    latest_source = None
+    latest = None
+    if primary.get("status") == "available":
+        latest_source = "ring_10"
+        latest = primary.get("latest")
+    elif aggregate.get("status") == "available":
+        latest_source = "aggregate"
+        latest = aggregate.get("latest")
+    latest_elo = _number(latest.get("rating")) if isinstance(latest, Mapping) else None
+    leaf_evaluations = (
+        _nonnegative_integer(actor_summary.get("evaluator_rows"))
+        if actor_records
+        else None
+    )
+    billion_leaf_evaluations = (
+        leaf_evaluations / 1_000_000_000 if leaf_evaluations is not None else None
+    )
+    return {
+        "schema_version": AUTONOMOUS_ELO_SCHEMA_VERSION,
+        "method": "connected-bradley-terry-elo-v1",
+        "fit_estimator": (
+            "maximum-likelihood with 0.5 symmetric continuity correction "
+            "for one-sided pairings"
+        ),
+        "uncertainty_method": (
+            "marginal normal interval from raw observed-information Hessian"
+        ),
+        "confidence_level": AUTONOMOUS_ELO_CONFIDENCE,
+        "primary_ring": PRIMARY_ELO_RING,
+        "anchor": {
+            "identity": anchor_identity,
+            "step": checkpoint_steps.get(anchor_identity)
+            if anchor_identity is not None
+            else None,
+            "rating": 0.0 if anchor_identity is not None else None,
+            "selection": anchor_selection,
+        },
+        "primary_ring_10": primary,
+        "aggregate": aggregate,
+        "latest": (
+            {"source": latest_source, **latest} if isinstance(latest, dict) else None
+        ),
+        "latest_elo": latest_elo,
+        "efficiency": {
+            "leaf_evaluations": leaf_evaluations,
+            "leaf_evaluation_source": "actors.evaluator_rows"
+            if leaf_evaluations is not None
+            else None,
+            "billion_leaf_evaluations": billion_leaf_evaluations,
+            "provisioned_gpu_hours": provisioned_gpu_hours or None,
+            "elo_per_billion_leaf_evaluations": (
+                latest_elo / billion_leaf_evaluations
+                if latest_elo is not None and billion_leaf_evaluations
+                else None
+            ),
+            "elo_per_provisioned_gpu_hour": (
+                latest_elo / provisioned_gpu_hours
+                if latest_elo is not None and provisioned_gpu_hours
+                else None
+            ),
+        },
+        "frozen_baselines": _frozen_baseline_results(
+            arena_results,
+            checkpoint_steps=checkpoint_steps,
+        ),
+        "step_metadata_exclusions": metadata_exclusions,
+    }
+
+
 def build_strength_efficiency_report(
     run_root: str | Path,
     *,
@@ -444,6 +1105,9 @@ def build_strength_efficiency_report(
     ]
     observed_until_ns = max(observed_timestamps, default=started_ns)
     wall_seconds = max(0.0, (observed_until_ns - started_ns) / 1_000_000_000)
+    provisioned_gpu_hours = provisioned_gpus * wall_seconds / 3_600.0
+    learner_summary = _learner_summary(learner_records)
+    actor_summary = _actor_summary(actor_records)
     return {
         "schema_version": SCHEMA_VERSION,
         "report": REPORT_NAME,
@@ -455,13 +1119,20 @@ def build_strength_efficiency_report(
         "observed_until_ns": observed_until_ns,
         "wall_seconds": wall_seconds,
         "provisioned_gpus": provisioned_gpus,
-        "provisioned_gpu_hours": provisioned_gpus * wall_seconds / 3_600.0,
-        "learner": _learner_summary(learner_records),
-        "actors": _actor_summary(actor_records),
+        "provisioned_gpu_hours": provisioned_gpu_hours,
+        "learner": learner_summary,
+        "actors": actor_summary,
         "arena": _arena_summary(
             arenas,
             run_started_ns=started_ns,
             provisioned_gpus=provisioned_gpus,
+        ),
+        "autonomous_elo": _autonomous_elo_summary(
+            root,
+            arena_results=arenas,
+            actor_records=actor_records,
+            actor_summary=actor_summary,
+            provisioned_gpu_hours=provisioned_gpu_hours,
         ),
         "parse_failure_count": len(failures),
         "parse_failures": failures,

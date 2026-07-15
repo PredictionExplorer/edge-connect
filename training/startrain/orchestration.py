@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shutil
@@ -17,6 +18,7 @@ from typing import Protocol, TextIO
 
 from .config import ExperimentConfig, load_config, parse_cpu_affinity
 from .runtime import (
+    RunIdentity,
     SignalLatch,
     SystemdNotifier,
     append_jsonl,
@@ -85,6 +87,94 @@ class RunDirectories:
             self.arena,
         ):
             path.mkdir(parents=True, exist_ok=True)
+
+    @property
+    def autonomous_provenance(self) -> Path:
+        return self.root / "autonomous-provenance.json"
+
+
+def _autonomous_config_sha256(experiment: ExperimentConfig) -> str:
+    encoded = json.dumps(
+        experiment.as_dict(),
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _autonomous_artifacts(directories: RunDirectories) -> tuple[Path, ...]:
+    candidates = (
+        directories.replay / "manifest.sqlite3",
+        directories.learner / "candidate.json",
+        directories.learner / "champion.json",
+        directories.learner / "recovery.json",
+        directories.learner / "resume-cutover.json",
+    )
+    discovered = []
+    for root, patterns in (
+        (directories.replay / "shards", ("*.npz",)),
+        (directories.learner / "checkpoints", ("*.pt",)),
+        (directories.learner / "manifests", ("*.json",)),
+        (directories.arena, ("*.json",)),
+    ):
+        for pattern in patterns:
+            discovered.extend(root.glob(pattern))
+    return (*candidates, *discovered)
+
+
+def validate_autonomous_run_root(
+    experiment: ExperimentConfig,
+    directories: RunDirectories,
+) -> None:
+    """Reject imported artifacts before creating a scratch run identity."""
+
+    if not experiment.orchestration.autonomous.enabled:
+        return
+    if directories.run_identity.exists():
+        return
+    if directories.autonomous_provenance.exists():
+        raise ValueError("autonomous provenance exists without a durable run identity")
+    imported = [path for path in _autonomous_artifacts(directories) if path.exists()]
+    if imported:
+        rendered = ", ".join(str(path) for path in sorted(imported))
+        raise ValueError(
+            f"autonomous scratch run contains imported artifacts: {rendered}"
+        )
+
+
+def ensure_autonomous_provenance(
+    experiment: ExperimentConfig,
+    directories: RunDirectories,
+    identity: RunIdentity,
+) -> None:
+    if not experiment.orchestration.autonomous.enabled:
+        return
+    expected = {
+        "schema_version": 1,
+        "mode": "random-init-selfplay-only",
+        "run_id": identity.run_id,
+        "generation_family": identity.generation_family,
+        "train_seed": experiment.train.seed,
+        "elo_anchor_step": experiment.orchestration.autonomous.elo_anchor_step,
+        "external_weights": False,
+        "external_replay": False,
+        "external_positions": False,
+        "config_sha256": _autonomous_config_sha256(experiment),
+    }
+    path = directories.autonomous_provenance
+    if path.exists():
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError(f"cannot read autonomous provenance: {exc}") from exc
+        if payload != expected:
+            raise ValueError(
+                "autonomous provenance disagrees with the frozen run profile"
+            )
+        return
+    if any(path.exists() for path in _autonomous_artifacts(directories)):
+        raise ValueError("autonomous provenance is missing for an initialized run")
+    atomic_json(path, expected)
 
 
 @dataclass(frozen=True, slots=True)
@@ -487,13 +577,19 @@ class Coordinator:
     ) -> int:
         notifier = SystemdNotifier()
         self.directories.create()
+        validate_autonomous_run_root(self.experiment, self.directories)
         self.lock.acquire()
         exit_code = 0
         cycles = 0
         try:
-            load_or_create_run_identity(
+            identity = load_or_create_run_identity(
                 self.directories.run_identity,
                 requested_run_id=self.experiment.orchestration.run_id,
+            )
+            ensure_autonomous_provenance(
+                self.experiment,
+                self.directories,
+                identity,
             )
             if stop_requested():
                 return 0

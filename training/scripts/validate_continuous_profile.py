@@ -5,18 +5,71 @@ from __future__ import annotations
 
 import argparse
 
-from startrain.config import load_config
+from startrain.config import ExperimentConfig, load_config
 
 
-def validate_continuous_config(config) -> None:
-    if not config.learner.unlimited:
-        raise ValueError("continuous service requires learner.unlimited: true")
-    if config.learner.recovery_interval_steps is None:
-        raise ValueError("continuous service requires recovery_interval_steps")
-    if config.learner.steps != 1_000_000:
-        raise ValueError("continuous service requires learner.steps: 1000000")
-    if config.train.scheduler.total_steps != 1_000_000:
-        raise ValueError("continuous service requires scheduler.total_steps: 1000000")
+def _validate_autonomous_config(config: ExperimentConfig) -> None:
+    autonomous = config.orchestration.autonomous
+    if not autonomous.enabled:
+        raise ValueError(
+            "autonomous validator requires orchestration.autonomous.enabled"
+        )
+    if config.data.shards_per_batch < 2:
+        raise ValueError("autonomous service requires cross-shard replay batches")
+    selfplay = config.selfplay
+    if (
+        selfplay.max_considered_ring_exponent <= 0
+        or selfplay.max_considered_cap < 48
+        or selfplay.full_probability < 0.35
+        or not selfplay.record_fast_policy_targets
+        or not 0 < selfplay.fast_policy_weight <= 0.25
+        or selfplay.policy_surprise_weight <= 0
+    ):
+        raise ValueError(
+            "autonomous service requires large-board search and weighted fast targets"
+        )
+    learner = config.learner
+    if (
+        learner.target_updates_per_new_sample is None
+        or learner.target_updates_per_new_sample > 1.25
+        or learner.candidate_interval_examples is None
+    ):
+        raise ValueError(
+            "autonomous service requires bounded update-to-data and example cadence"
+        )
+    refresh = config.orchestration.model_refresh
+    if (
+        refresh.selfplay_source != "candidate_champion_history_mix"
+        or refresh.history_probability <= 0
+        or refresh.candidate_probability <= 0
+    ):
+        raise ValueError(
+            "autonomous service requires candidate/champion/history self-play"
+        )
+    plateau = config.orchestration.plateau
+    if (
+        not plateau.enabled
+        or plateau.action != "reduce_lr_keep_weights"
+        or plateau.reset_learning_rate_scale > 0.5
+        or not plateau.clear_optimizer_state_on_recovery
+    ):
+        raise ValueError("autonomous service requires non-destructive plateau recovery")
+    mixture = config.orchestration.ring_mixture
+    final_weights = mixture.weights_for_step(10**18)
+    if (
+        final_weights is None
+        or final_weights[mixture.rings.index(10)] < 0.5
+        or abs(sum(final_weights) - 1.0) > 1e-9
+    ):
+        raise ValueError("autonomous service requires a ring-10-weighted final mixture")
+    retention = config.orchestration.retention
+    if retention.candidate_manifests < 2 * refresh.history_pool_size:
+        raise ValueError("autonomous retention cannot protect the history pool")
+    if config.arena.max_considered < 48:
+        raise ValueError("autonomous arena must evaluate a broad action set")
+
+
+def _validate_throughput_config(config: ExperimentConfig) -> None:
     mixture = config.orchestration.ring_mixture
     weights = mixture.weights_for_step(1_000_000)
     tail_weights = mixture.weights_for_step(10**18)
@@ -64,9 +117,44 @@ def validate_continuous_config(config) -> None:
         or plateau.reset_learning_rate_scale > 0.5
     ):
         raise ValueError("continuous service requires bounded lower-LR champion resets")
+
+
+def validate_continuous_config(config: ExperimentConfig) -> None:
+    if config.profile != "continuous" or not config.orchestration.enabled:
+        raise ValueError("continuous service requires an enabled continuous profile")
+    if not config.learner.unlimited:
+        raise ValueError("continuous service requires learner.unlimited: true")
+    if config.learner.recovery_interval_steps is None:
+        raise ValueError("continuous service requires recovery_interval_steps")
+    if config.learner.steps != 1_000_000:
+        raise ValueError("continuous service requires learner.steps: 1000000")
+    if config.train.scheduler.total_steps != 1_000_000:
+        raise ValueError("continuous service requires scheduler.total_steps: 1000000")
+    promotion = config.orchestration.promotion
+    if (
+        not promotion.enabled
+        or config.arena.minimum_pairs_per_ring < config.arena.pairs_per_ring
+        or config.arena.max_pairs_per_ring < config.arena.minimum_pairs_per_ring
+    ):
+        raise ValueError("continuous service requires bounded promotion supervision")
+    plateau = config.orchestration.plateau
+    if (
+        not plateau.enabled
+        or plateau.max_learner_champion_lag_steps > config.learner.max_replay_lag_steps
+    ):
+        raise ValueError("continuous service plateau lag exceeds replay eligibility")
     retention = config.orchestration.retention
-    if not retention.enabled or retention.dry_run or retention.recovery_dry_run:
+    if (
+        not retention.enabled
+        or retention.dry_run
+        or retention.recovery_dry_run
+        or retention.recovery_checkpoints <= 0
+    ):
         raise ValueError("continuous service requires bounded active retention")
+    if config.orchestration.autonomous.enabled:
+        _validate_autonomous_config(config)
+    else:
+        _validate_throughput_config(config)
 
 
 def main() -> None:

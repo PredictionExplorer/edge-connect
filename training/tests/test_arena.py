@@ -202,17 +202,85 @@ def test_binary_summary_and_pair_validation() -> None:
         balanced.record(0)
 
 
-def test_pair_promotion_and_per_ring_regression_are_binary() -> None:
+def test_ring_floor_pass_requires_anytime_valid_evidence() -> None:
+    config = arena_config(
+        regression_floor_elo=-100.0,
+        minimum_pairs_per_ring=20,
+        max_pairs_per_ring=40,
+    )
+    pairs = [ArenaPair(4, pair, pair, 0, True, (1, -1)) for pair in range(20)]
+
+    assessment = promotion_assessment(pairs, {4: pairs}, config)
+    ring = assessment["ring_floors"]["4"]
+
+    assert assessment["decision"] == "continue"
+    assert ring["status"] == "pass"
+    assert ring["passed"] is True
+    assert ring["pass_e_value"] >= ring["threshold"]
+    assert ring["regression_e_value"] < ring["threshold"]
+
+
+def test_ring_floor_regression_requires_opposite_one_sided_e_process() -> None:
+    config = arena_config(
+        beta=0.001,
+        regression_floor_elo=0.0,
+        minimum_pairs_per_ring=10,
+        max_pairs_per_ring=20,
+    )
+    pairs = [ArenaPair(4, pair, pair, 0, True, (-1, -1)) for pair in range(10)]
+
+    assessment = promotion_assessment(pairs, {4: pairs}, config)
+    ring = assessment["ring_floors"]["4"]
+
+    assert assessment["sequential_state"] == "continue"
+    assert assessment["decision"] == "reject_ring_regression"
+    assert ring["status"] == "regress"
+    assert ring["passed"] is False
+    assert ring["pass_e_value"] < ring["threshold"]
+    assert ring["regression_e_value"] >= ring["threshold"]
+
+
+def test_ring_floor_uncertainty_at_minimum_continues() -> None:
+    config = arena_config(
+        regression_floor_elo=-100.0,
+        minimum_pairs_per_ring=10,
+        max_pairs_per_ring=20,
+    )
+    pairs = [ArenaPair(4, pair, pair, 0, True, (1, -1)) for pair in range(10)]
+
+    assessment = promotion_assessment(pairs, {4: pairs}, config)
+    ring = assessment["ring_floors"]["4"]
+
+    assert assessment["decision"] == "continue"
+    assert ring["status"] == "continue"
+    assert ring["passed"] is False
+    assert ring["pass_e_value"] < ring["threshold"]
+    assert ring["regression_e_value"] < ring["threshold"]
+
+
+def test_promotion_requires_aggregate_alternative_and_every_ring_pass() -> None:
     config = ArenaConfig(
-        rings=(4, 6, 8, 10),
+        rings=(4, 6),
         pairs_per_ring=5,
         simulations=1,
         max_considered=2,
         minimum_pairs_per_ring=10,
         max_pairs_per_ring=20,
         bootstrap_samples=200,
-        regression_floor_elo=-2_500.0,
+        regression_floor_elo=-100.0,
     )
+    one_unresolved = {
+        4: [ArenaPair(4, pair, pair, 0, True, (1, 1)) for pair in range(10)],
+        6: [ArenaPair(6, pair, pair, 0, True, (1, -1)) for pair in range(10)],
+    }
+    aggregate = [pair for pairs in one_unresolved.values() for pair in pairs]
+    unresolved = promotion_assessment(aggregate, one_unresolved, config)
+
+    assert unresolved["sequential_state"] == "accept_alternative"
+    assert unresolved["ring_floors"]["4"]["status"] == "pass"
+    assert unresolved["ring_floors"]["6"]["status"] == "continue"
+    assert unresolved["decision"] == "continue"
+
     per_ring = {
         ring: [ArenaPair(ring, pair, pair, 0, True, (1, 1)) for pair in range(10)]
         for ring in config.rings
@@ -225,27 +293,29 @@ def test_pair_promotion_and_per_ring_regression_are_binary() -> None:
         seed=1,
     )
     assert summary["pair_win_counts"]["2"] == len(aggregate)
-    assert promotion_assessment(aggregate, per_ring, config)["decision"] == "promote"
+    promoted = promotion_assessment(aggregate, per_ring, config)
+    assert promoted["decision"] == "promote"
+    assert all(ring["status"] == "pass" for ring in promoted["ring_floors"].values())
 
-    regressed = dict(per_ring)
-    regressed[10] = [ArenaPair(10, pair, pair, 0, True, (-1, -1)) for pair in range(10)]
-    strict = ArenaConfig(
-        rings=(4, 6, 8, 10),
+
+def test_unresolved_ring_at_max_pairs_remains_continue_for_supervisor() -> None:
+    config = ArenaConfig(
+        rings=(4,),
         pairs_per_ring=5,
         simulations=1,
         max_considered=2,
         minimum_pairs_per_ring=10,
-        max_pairs_per_ring=20,
+        max_pairs_per_ring=10,
         bootstrap_samples=200,
-        regression_floor_elo=-100.0,
+        regression_floor_elo=0.0,
     )
-    assessment = promotion_assessment(
-        [pair for pairs in regressed.values() for pair in pairs],
-        regressed,
-        strict,
-    )
-    assert assessment["decision"] == "reject_ring_regression"
-    assert assessment["ring_floors"]["10"]["passed"] is False
+    pairs = [ArenaPair(4, pair, pair, 0, True, (1, -1)) for pair in range(10)]
+
+    assessment = promotion_assessment(pairs, {4: pairs}, config)
+
+    assert len(pairs) == config.max_pairs_per_ring
+    assert assessment["ring_floors"]["4"]["status"] == "continue"
+    assert assessment["decision"] == "continue"
 
 
 def test_batched_arena_parallelizes_search_but_serializes_inference() -> None:

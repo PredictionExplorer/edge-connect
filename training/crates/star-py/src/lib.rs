@@ -609,6 +609,7 @@ struct PackedSearchRow {
     actions: Vec<i32>,
     visits: Vec<u32>,
     q_values: Vec<f32>,
+    priors: Vec<f32>,
     policy_target: Vec<f32>,
 }
 
@@ -622,6 +623,7 @@ struct PySearchResults {
     actions: Vec<i32>,
     visits: Vec<u32>,
     q_values: Vec<f32>,
+    priors: Vec<f32>,
     policy_target: Vec<f32>,
 }
 
@@ -661,6 +663,11 @@ impl PySearchResults {
     #[getter]
     fn q_values(&self) -> Vec<f32> {
         self.q_values.clone()
+    }
+
+    #[getter]
+    fn priors(&self) -> Vec<f32> {
+        self.priors.clone()
     }
 
     #[getter]
@@ -973,6 +980,7 @@ fn pack_search_results(
                     actions: Vec::new(),
                     visits: Vec::new(),
                     q_values: Vec::new(),
+                    priors: Vec::new(),
                     policy_target: Vec::new(),
                 });
             };
@@ -987,6 +995,7 @@ fn pack_search_results(
                 actions: stats.iter().map(|row| row.action.code()).collect(),
                 visits: stats.iter().map(|row| row.visits).collect(),
                 q_values: stats.iter().map(|row| row.q).collect(),
+                priors: stats.iter().map(|row| row.prior).collect(),
                 policy_target: tree
                     .completed_q_target(parameters)
                     .into_iter()
@@ -1004,6 +1013,7 @@ fn pack_search_results(
     let mut actions = Vec::with_capacity(action_count);
     let mut visits = Vec::with_capacity(action_count);
     let mut q_values = Vec::with_capacity(action_count);
+    let mut priors = Vec::with_capacity(action_count);
     let mut policy_target = Vec::with_capacity(action_count);
     action_offsets.push(0);
     for row in rows {
@@ -1013,6 +1023,7 @@ fn pack_search_results(
         actions.extend(row.actions);
         visits.extend(row.visits);
         q_values.extend(row.q_values);
+        priors.extend(row.priors);
         policy_target.extend(row.policy_target);
         action_offsets.push(actions.len());
     }
@@ -1024,6 +1035,7 @@ fn pack_search_results(
         actions,
         visits,
         q_values,
+        priors,
         policy_target,
     })
 }

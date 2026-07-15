@@ -1,0 +1,11 @@
+[Unit]
+Description=EdgeConnect StarTrain autonomous Elo report
+
+[Service]
+Type=oneshot
+User=@USER@
+WorkingDirectory=@TRAINING_DIR@
+Environment=PYTHONPATH=@TRAINING_DIR@
+ExecStart=@TRAINING_DIR@/.venv/bin/python @TRAINING_DIR@/scripts/strength_efficiency_report.py --run-root @RUN_ROOT@ --provisioned-gpus @PROVISIONED_GPUS@ --output @RUN_ROOT@/strength-efficiency.json
+NoNewPrivileges=true
+UMask=0027

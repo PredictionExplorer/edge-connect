@@ -151,6 +151,36 @@ def test_yaml_configs_load_strictly() -> None:
     assert throughput.orchestration.plateau.consecutive_terminal_rejections == 2
     assert throughput.orchestration.plateau.reset_learning_rate_scale == 0.5
     validate_continuous_config(throughput)
+    autonomous = load_config(CONFIGS / "h100-8gpu-autonomous.yaml")
+    assert autonomous.orchestration.autonomous.enabled is True
+    assert autonomous.orchestration.model_refresh.selfplay_source == (
+        "candidate_champion_history_mix"
+    )
+    assert autonomous.orchestration.model_refresh.history_probability == 0.25
+    assert autonomous.orchestration.plateau.action == "reduce_lr_keep_weights"
+    assert autonomous.learner.target_updates_per_new_sample == 1.0
+    assert autonomous.learner.candidate_interval_examples == 20_000_000
+    assert autonomous.data.shards_per_batch == 4
+    assert replace(autonomous.selfplay, rings=10).considered_actions() == 53
+    validate_continuous_config(autonomous)
+
+    with pytest.raises(ValueError, match="cross-shard"):
+        validate_continuous_config(
+            replace(
+                autonomous,
+                data=replace(autonomous.data, shards_per_batch=1),
+            )
+        )
+    with pytest.raises(ValueError, match="update-to-data"):
+        validate_continuous_config(
+            replace(
+                autonomous,
+                learner=replace(
+                    autonomous.learner,
+                    target_updates_per_new_sample=None,
+                ),
+            )
+        )
 
 
 def test_yaml_parses_opt_in_learner_ring_mixture_curriculum(tmp_path) -> None:

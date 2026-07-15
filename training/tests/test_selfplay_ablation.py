@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from types import SimpleNamespace
 
 import pytest
@@ -37,6 +38,8 @@ def test_candidate_limit_scaling_is_explicit_and_capped() -> None:
         SelfPlayConfig(max_considered=16, max_considered_cap=8)
     with pytest.raises(ValueError, match="fast_policy_weight"):
         SelfPlayConfig(fast_policy_weight=1.1)
+    with pytest.raises(ValueError, match="policy-surprise"):
+        SelfPlayConfig(policy_surprise_weight=1.1)
 
 
 @pytest.mark.native
@@ -77,6 +80,7 @@ def test_fast_policy_target_ablation_records_completed_q_when_enabled() -> None:
         max_considered=2,
         record_fast_policy_targets=True,
         fast_policy_weight=0.3,
+        policy_surprise_weight=0.5,
         shard_size=128,
         seed=91,
     )
@@ -88,3 +92,9 @@ def test_fast_policy_target_ablation_records_completed_q_when_enabled() -> None:
         sample.policy_provenance == "completed-q-fast" for sample in sink.samples
     )
     assert all(sample.policy_weight == pytest.approx(0.3) for sample in sink.samples)
+    assert all(
+        math.isfinite(sample.weight) and sample.weight > 0 for sample in sink.samples
+    )
+    assert sum(sample.weight for sample in sink.samples) == pytest.approx(
+        len(sink.samples)
+    )
