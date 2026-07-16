@@ -72,9 +72,9 @@ def _validate_autonomous_config(config: ExperimentConfig) -> None:
         raise ValueError("autonomous retention cannot protect the history pool")
     historical = config.orchestration.historical_evaluation
     if historical.enabled and (
-        historical.every_promotions < 2
+        historical.every_promotions < 4
         or historical.anchors_per_evaluation > 1
-        or historical.pairs_per_ring > 5
+        or historical.pairs_per_ring > 10
         or historical.max_pairs_per_ring > 10
     ):
         raise ValueError("autonomous historical evaluation exceeds its compute budget")

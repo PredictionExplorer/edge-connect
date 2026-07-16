@@ -173,9 +173,11 @@ def test_yaml_configs_load_strictly() -> None:
     assert autonomous.learner.selfplay_snapshot_warmup_examples == 20_000_000
     assert autonomous.learner.selfplay_snapshot_warmup_interval_examples == 1_000_000
     assert autonomous.data.shards_per_batch == 4
-    assert autonomous.arena.pairs_per_ring == 5
+    assert autonomous.arena.pairs_per_ring == 15
     assert autonomous.arena.minimum_pairs_per_ring == 15
     assert autonomous.orchestration.historical_evaluation.enabled is True
+    assert autonomous.orchestration.historical_evaluation.every_promotions == 4
+    assert autonomous.orchestration.historical_evaluation.pairs_per_ring == 10
     assert replace(autonomous.selfplay, rings=10).considered_actions() == 53
     validate_continuous_config(autonomous)
 

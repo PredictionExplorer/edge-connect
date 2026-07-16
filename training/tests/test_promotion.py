@@ -743,6 +743,34 @@ def test_promotion_runs_waves_in_one_lease_and_pins_result_manifests(
     assert case.candidate.checkpoint.is_file()
 
 
+def test_promotion_wave_fills_minimum_without_overshooting() -> None:
+    experiment = load_config(Path(__file__).parents[1] / "configs" / "small.yaml")
+    supervisor = object.__new__(PromotionSupervisor)
+    supervisor.experiment = replace(
+        experiment,
+        arena=ArenaConfig(
+            rings=(4,),
+            pairs_per_ring=15,
+            minimum_pairs_per_ring=15,
+            max_pairs_per_ring=200,
+        ),
+    )
+    accumulated = [
+        ArenaPair(4, pair, pair, 0, True, (1, -1)) for pair in range(10)
+    ]
+
+    starts, counts = supervisor._wave_plan(accumulated)
+
+    assert starts == {4: 10}
+    assert counts == {4: 5}
+    accumulated.extend(
+        ArenaPair(4, pair, pair, 0, True, (1, -1)) for pair in range(10, 15)
+    )
+    starts, counts = supervisor._wave_plan(accumulated)
+    assert starts == {4: 15}
+    assert counts == {4: 15}
+
+
 def test_historical_crossplay_persists_bounded_waves_without_promoting(
     tmp_path,
     monkeypatch,

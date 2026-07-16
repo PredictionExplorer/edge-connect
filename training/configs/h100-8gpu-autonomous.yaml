@@ -206,9 +206,9 @@ orchestration:
     final_drain_timeout_seconds: 57600.0
   historical_evaluation:
     enabled: true
-    every_promotions: 2
+    every_promotions: 4
     anchors_per_evaluation: 1
-    pairs_per_ring: 5
+    pairs_per_ring: 10
     max_pairs_per_ring: 10
   plateau:
     enabled: true
@@ -234,7 +234,7 @@ orchestration:
     gc_interval_windows: 10
 arena:
   rings: [4, 6, 8, 10]
-  pairs_per_ring: 5
+  pairs_per_ring: 15
   simulations: 1024
   max_considered: 64
   c_visit: 50.0

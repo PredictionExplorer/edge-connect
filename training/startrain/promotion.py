@@ -1021,6 +1021,10 @@ class PromotionSupervisor:
         self,
         accumulated: list[ArenaPair],
     ) -> tuple[dict[int, int], dict[int, int]]:
+        existing_counts = {
+            ring: sum(pair.ring == ring for pair in accumulated)
+            for ring in self.experiment.arena.rings
+        }
         starts = {
             ring: (
                 max(
@@ -1031,14 +1035,19 @@ class PromotionSupervisor:
             )
             for ring in self.experiment.arena.rings
         }
-        counts = {
-            ring: min(
-                self.experiment.arena.pairs_per_ring,
-                self.experiment.arena.max_pairs_per_ring
-                - sum(pair.ring == ring for pair in accumulated),
+        counts = {}
+        for ring, existing in existing_counts.items():
+            remaining = self.experiment.arena.max_pairs_per_ring - existing
+            required_for_minimum = max(
+                0,
+                self.experiment.arena.minimum_pairs_per_ring - existing,
             )
-            for ring in self.experiment.arena.rings
-        }
+            wave = (
+                min(self.experiment.arena.pairs_per_ring, required_for_minimum)
+                if required_for_minimum
+                else self.experiment.arena.pairs_per_ring
+            )
+            counts[ring] = min(wave, remaining)
         return starts, counts
 
     def _reject_max_pairs(
