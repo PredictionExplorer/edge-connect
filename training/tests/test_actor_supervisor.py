@@ -7,6 +7,8 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import torch
+from torch import nn
 
 from startrain.actor import ActorSupervisor, HistoricalModelPool, ManifestModelProvider
 from startrain.config import (
@@ -15,6 +17,8 @@ from startrain.config import (
     ModelRefreshConfig,
     load_config,
 )
+from startrain.features import EncodedBatch
+from startrain.model import StarModelOutput
 from startrain.runtime import RunIdentity
 from startrain.selfplay import SelfPlayMetrics
 
@@ -294,7 +298,7 @@ def test_actor_supervisor_records_interrupted_cohort_metrics(
     assert metric["dropped_decisions"] == 7
 
 
-def test_manifest_provider_compiles_inference_model_when_profile_enables_it(
+def test_manifest_provider_reuses_compiled_evaluator_and_refreshes_weights(
     tmp_path, monkeypatch
 ) -> None:
     experiment = load_config(Path(__file__).parents[1] / "configs" / "small.yaml")
@@ -306,39 +310,164 @@ def test_manifest_provider_compiles_inference_model_when_profile_enables_it(
         1,
     )
     pointer = tmp_path / "champion.json"
-    pointer.write_text("{}")
-    manifest = SimpleNamespace(
+    pointer.write_text("first", encoding="utf-8")
+    first_manifest = SimpleNamespace(
         role="champion",
         model_version="sha256-" + "d" * 64,
         model_identity="sha256-" + "d" * 64,
         model_step=12,
-        checkpoint=tmp_path / "checkpoint.pt",
+        checkpoint=tmp_path / "checkpoint-first.pt",
         checkpoint_sha256="d" * 64,
-        checkpoint_bytes=1,
+        checkpoint_bytes=11,
         run_id=identity.run_id,
         generation_family=identity.generation_family,
     )
-    monkeypatch.setattr("startrain.actor.load_model_manifest", lambda _path: manifest)
-    monkeypatch.setattr(
-        "startrain.actor.load_ema_checkpoint",
-        lambda *_args, **_kwargs: {"step": 12},
+    second_manifest = SimpleNamespace(
+        role="champion",
+        model_version="sha256-" + "e" * 64,
+        model_identity="sha256-" + "e" * 64,
+        model_step=24,
+        checkpoint=tmp_path / "checkpoint-second.pt",
+        checkpoint_sha256="e" * 64,
+        checkpoint_bytes=22,
+        run_id=identity.run_id,
+        generation_family=identity.generation_family,
     )
-    compile_calls = []
+    manifests = {"first": first_manifest, "second-manifest": second_manifest}
+    monkeypatch.setattr(
+        "startrain.actor.load_model_manifest",
+        lambda path: manifests[Path(path).read_text(encoding="utf-8")],
+    )
+
+    class TinyGraphModel(nn.Module):
+        def __init__(self, _config) -> None:
+            super().__init__()
+            self.weight = nn.Parameter(torch.zeros(()))
+
+        def forward(self, *arguments: torch.Tensor) -> StarModelOutput:
+            node_features = arguments[0]
+            legal_actions = arguments[-1]
+            batch, nodes = node_features.shape[:2]
+            value = self.weight.expand(batch)
+            policy = self.weight.expand(batch, nodes).masked_fill(
+                ~legal_actions, torch.finfo(node_features.dtype).min
+            )
+            return StarModelOutput(
+                policy_logits=policy,
+                outcome_logits=torch.stack((torch.zeros_like(value), value), dim=-1),
+                score_margin_logits=torch.zeros(batch, 303, dtype=node_features.dtype),
+                ownership_logits=torch.zeros(
+                    batch, nodes, 3, dtype=node_features.dtype
+                ),
+                alive_logits=torch.zeros(batch, nodes, dtype=node_features.dtype),
+                soft_policy_logits=policy,
+            )
+
+    class CompiledGraphModel(nn.Module):
+        def __init__(self, raw_model: nn.Module) -> None:
+            super().__init__()
+            self.raw_model = raw_model
+            self.train(raw_model.training)
+
+        def forward(self, *arguments: torch.Tensor) -> StarModelOutput:
+            return self.raw_model(*arguments)
+
+    checkpoint_weights = {
+        first_manifest.checkpoint: -2.0,
+        second_manifest.checkpoint: 2.0,
+    }
+    checkpoint_steps = {
+        first_manifest.checkpoint: first_manifest.model_step,
+        second_manifest.checkpoint: second_manifest.model_step,
+    }
+    load_models: list[nn.Module] = []
+
+    def load_checkpoint(source, *, model, **options):
+        source = Path(source)
+        load_models.append(model)
+        assert options["expected_run_id"] == identity.run_id
+        assert options["expected_generation_family"] == identity.generation_family
+        assert options["expected_sha256"] in {"d" * 64, "e" * 64}
+        assert options["expected_bytes"] in {11, 22}
+        with torch.no_grad():
+            model.weight.fill_(checkpoint_weights[source])
+        return {"step": checkpoint_steps[source]}
+
+    compile_calls: list[tuple[nn.Module, dict[str, object]]] = []
 
     def compile_model(model, **options):
-        compile_calls.append(options)
-        return model
+        compile_calls.append((model, options))
+        return CompiledGraphModel(model)
 
+    monkeypatch.setattr("startrain.actor.GraphResTNet", TinyGraphModel)
+    monkeypatch.setattr("startrain.actor.load_ema_checkpoint", load_checkpoint)
     monkeypatch.setattr("startrain.actor.maybe_compile_model", compile_model)
+    encoded = EncodedBatch(
+        node_features=torch.zeros(1, 1, 1),
+        global_features=torch.zeros(1, 1),
+        neighbor_index=torch.zeros(1, 1, 1, dtype=torch.int64),
+        neighbor_mask=torch.ones(1, 1, 1, dtype=torch.bool),
+        neighbor_edge_type=torch.zeros(1, 1, 1, dtype=torch.int64),
+        node_mask=torch.ones(1, 1, dtype=torch.bool),
+        legal_action_mask=torch.ones(1, 1, dtype=torch.bool),
+        rings=torch.tensor([4], dtype=torch.int64),
+    )
+    monkeypatch.setattr(
+        "startrain.inference.encode_native_state_data",
+        lambda _states: encoded,
+    )
+
+    class Requests:
+        tokens = [7]
+        states = object()
+        legal_offsets = [0, 1]
+        legal_actions = [0]
+
+        def __len__(self) -> int:
+            return 1
+
     provider = ManifestModelProvider(
         experiment,
         pointer,
         device="cpu",
         run_identity=identity,
     )
-    evaluator = provider.refresh()
-    assert evaluator.model_identity == manifest.model_identity
-    assert compile_calls == [{"enabled": True, "dynamic": True, "fullgraph": True}]
+    first_evaluator = provider.refresh()
+    compiled_model = first_evaluator.model
+    topology_cache = first_evaluator._topology_cache
+    topology_cache[(4, 1, 1, 1)] = (torch.zeros(1),) * 4
+    first_output = first_evaluator.evaluate(Requests())
+
+    pointer.write_text("second-manifest", encoding="utf-8")
+    second_evaluator = provider.refresh()
+    second_output = second_evaluator.evaluate(Requests())
+
+    assert second_evaluator is first_evaluator
+    assert second_evaluator.model is compiled_model
+    assert second_evaluator._topology_cache is topology_cache
+    assert (4, 1, 1, 1) in second_evaluator._topology_cache
+    assert load_models == [compile_calls[0][0], compile_calls[0][0]]
+    assert compile_calls == [
+        (
+            load_models[0],
+                {
+                    "enabled": True,
+                    "dynamic": True,
+                    "fullgraph": True,
+                    "mode": "default",
+                    "recompile_limit": None,
+                    "isolate_recompiles": False,
+                },
+        )
+    ]
+    assert first_output.values[0] < 0
+    assert second_output.values[0] > 0
+    assert second_evaluator.model_version == second_manifest.model_version
+    assert second_evaluator.model_identity == second_manifest.model_identity
+    assert second_evaluator.model_step == second_manifest.model_step
+    assert second_evaluator.evaluator_calls == 2
+    assert provider.manifest is second_manifest
+
     candidate_provider = ManifestModelProvider(
         experiment,
         pointer,
@@ -348,6 +477,97 @@ def test_manifest_provider_compiles_inference_model_when_profile_enables_it(
     )
     with pytest.raises(ValueError, match="expected a candidate"):
         candidate_provider.refresh()
+
+
+def test_manifest_provider_fails_closed_after_in_place_reload_error(
+    tmp_path, monkeypatch
+) -> None:
+    experiment = load_config(Path(__file__).parents[1] / "configs" / "small.yaml")
+    identity = RunIdentity(
+        tmp_path / "run.json",
+        "run-provider-failure",
+        "family-provider-failure",
+        1,
+    )
+    pointer = tmp_path / "champion.json"
+    pointer.write_text("first", encoding="utf-8")
+    first_manifest = SimpleNamespace(
+        role="champion",
+        model_version="sha256-" + "1" * 64,
+        model_identity="sha256-" + "1" * 64,
+        model_step=1,
+        checkpoint=tmp_path / "checkpoint-first.pt",
+        checkpoint_sha256="1" * 64,
+        checkpoint_bytes=1,
+        run_id=identity.run_id,
+        generation_family=identity.generation_family,
+    )
+    broken_manifest = SimpleNamespace(
+        role="champion",
+        model_version="sha256-" + "2" * 64,
+        model_identity="sha256-" + "2" * 64,
+        model_step=2,
+        checkpoint=tmp_path / "checkpoint-broken.pt",
+        checkpoint_sha256="2" * 64,
+        checkpoint_bytes=2,
+        run_id=identity.run_id,
+        generation_family=identity.generation_family,
+    )
+    manifests = {"first": first_manifest, "broken": broken_manifest}
+    monkeypatch.setattr(
+        "startrain.actor.load_model_manifest",
+        lambda path: manifests[Path(path).read_text(encoding="utf-8")],
+    )
+
+    class TinyGraphModel(nn.Module):
+        def __init__(self, _config) -> None:
+            super().__init__()
+            self.weight = nn.Parameter(torch.zeros(()))
+
+    load_calls = 0
+
+    def load_checkpoint(source, *, model, **_options):
+        nonlocal load_calls
+        load_calls += 1
+        with torch.no_grad():
+            model.weight.fill_(float(load_calls))
+        if Path(source) == broken_manifest.checkpoint:
+            raise ValueError("broken checkpoint")
+        return {"step": first_manifest.model_step}
+
+    compile_calls = 0
+
+    def compile_model(model, **_options):
+        nonlocal compile_calls
+        compile_calls += 1
+        return model
+
+    monkeypatch.setattr("startrain.actor.GraphResTNet", TinyGraphModel)
+    monkeypatch.setattr("startrain.actor.load_ema_checkpoint", load_checkpoint)
+    monkeypatch.setattr("startrain.actor.maybe_compile_model", compile_model)
+    provider = ManifestModelProvider(
+        experiment,
+        pointer,
+        device="cpu",
+        run_identity=identity,
+    )
+    evaluator = provider.refresh()
+
+    pointer.write_text("broken", encoding="utf-8")
+    with pytest.raises(ValueError, match="broken checkpoint"):
+        provider.refresh()
+
+    assert provider.manifest is first_manifest
+    assert provider.evaluator is evaluator
+    assert evaluator.model_version == first_manifest.model_version
+    assert evaluator.model_step == first_manifest.model_step
+    assert load_calls == 2
+    assert compile_calls == 1
+
+    pointer.write_text("first", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="unusable after a failed"):
+        provider.refresh()
+    assert load_calls == 2
 
 
 def test_selfplay_model_source_selects_candidate_or_controlled_mix(tmp_path) -> None:

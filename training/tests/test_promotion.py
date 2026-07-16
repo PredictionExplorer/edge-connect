@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from contextlib import contextmanager
 from dataclasses import asdict, replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -18,6 +19,7 @@ from startrain.checkpoint import (
 from startrain.arena import ARENA_RESULT_SCHEMA_VERSION, ArenaPair
 from startrain.config import (
     ArenaConfig,
+    HistoricalEvaluationConfig,
     PromotionConfig,
     SchedulerConfig,
     load_config,
@@ -69,7 +71,16 @@ def test_arena_manifest_evaluator_uses_compiled_inference_model(
     evaluator = load_manifest_evaluator(experiment, manifest, device="cpu")
 
     assert evaluator.model is model
-    assert compile_calls == [{"enabled": True, "dynamic": True, "fullgraph": True}]
+    assert compile_calls == [
+        {
+            "enabled": True,
+            "dynamic": True,
+            "fullgraph": True,
+            "mode": "default",
+            "recompile_limit": None,
+            "isolate_recompiles": False,
+        }
+    ]
 
 
 def test_promotion_candidates_respect_durable_resume_cutover(tmp_path) -> None:
@@ -366,7 +377,7 @@ def test_promotion_supervisor_bootstraps_and_only_promotes_arena_pass(
         dry_run=True,
         referenced_result_directory=tmp_path / "arena",
     )
-    assert dry_gc["candidate_manifests"] >= 1
+    assert dry_gc["candidate_manifests"] == 0
     assert dry_gc["deleted_manifests"] == 0
 
 
@@ -509,6 +520,367 @@ def test_old_arena_schema_is_rejected_before_new_candidate_evaluation(
     newer_progress = json.loads(newer_path.read_text())
     assert newer_progress["terminal"] is False
     assert len(newer_progress["pairs"]) == 2
+
+
+def _promotion_wave_case(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> SimpleNamespace:
+    experiment = load_config(Path(__file__).parents[1] / "configs" / "small.yaml")
+    experiment = replace(
+        experiment,
+        orchestration=replace(
+            experiment.orchestration,
+            promotion=PromotionConfig(
+                enabled=True,
+                gpu_id=0,
+                cpu_threads=1,
+                poll_seconds=0.01,
+                bootstrap_initial_champion=True,
+                device="cpu",
+            ),
+        ),
+        arena=ArenaConfig(
+            rings=(4,),
+            pairs_per_ring=2,
+            minimum_pairs_per_ring=4,
+            max_pairs_per_ring=6,
+            simulations=1,
+            max_considered=2,
+            regression_floor_elo=-2_500.0,
+            bootstrap_samples=200,
+        ),
+    )
+    identity = RunIdentity(tmp_path / "run.json", "run-waves", "family-waves", 1)
+    model = GraphResTNet(experiment.model)
+    optimizer = build_optimizer(model, OptimizerConfig(kind="adamw"))
+    scheduler = build_scheduler(
+        optimizer, SchedulerConfig(warmup_steps=0, total_steps=10)
+    )
+    ema = ExponentialMovingAverage(model, decay=0.9)
+    publisher = ImmutableModelPublisher(tmp_path / "learner", identity)
+    champion = publisher.publish(
+        model=model,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        ema=ema,
+        step=0,
+        epoch=0,
+        config=experiment.as_dict(),
+    )
+    with torch.no_grad():
+        next(model.parameters()).add_(0.01)
+    ema.update(model)
+    candidate = publisher.publish(
+        model=model,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        ema=ema,
+        step=1,
+        epoch=1,
+        config=experiment.as_dict(),
+    )
+    supervisor = PromotionSupervisor(
+        experiment=experiment,
+        run_identity=identity,
+        candidate_path=publisher.candidate_path,
+        champion_path=publisher.champion_path,
+        results_directory=tmp_path / "arena",
+        native_module=object(),
+        device="cpu",
+    )
+    result_path = supervisor._result_path(candidate, champion)
+    state = SimpleNamespace(
+        lease_entries=0,
+        evaluator_loads=[],
+        runner_instances=0,
+        wave_starts=[],
+        persisted_pairs=[],
+        wave_calls=0,
+        stop=False,
+        stop_after_wave=None,
+        after_wave=None,
+    )
+
+    @contextmanager
+    def single_lease(**_options):
+        state.lease_entries += 1
+        yield
+
+    def load_evaluator(_experiment, manifest, *, device):
+        assert device == "cpu"
+        state.evaluator_loads.append(manifest.model_identity)
+        return SimpleNamespace(
+            model_version=manifest.model_version,
+            model_identity=manifest.model_identity,
+        )
+
+    class WaveArena:
+        def __init__(self, **options):
+            state.runner_instances += 1
+            self.candidate = options["candidate"]
+            self.baseline = options["baseline"]
+
+        def run(self, *, pair_starts, pair_counts, **_options):
+            if result_path.is_file():
+                persisted = json.loads(result_path.read_text(encoding="utf-8"))
+                state.persisted_pairs.append(
+                    [int(pair["pair"]) for pair in persisted["pairs"]]
+                )
+            else:
+                state.persisted_pairs.append([])
+            state.wave_starts.append(dict(pair_starts))
+            pairs = [
+                ArenaPair(
+                    ring,
+                    pair,
+                    pair,
+                    0,
+                    True,
+                    (1, -1),
+                )
+                for ring, count in pair_counts.items()
+                for pair in range(pair_starts[ring], pair_starts[ring] + count)
+            ]
+            state.wave_calls += 1
+            if state.stop_after_wave == state.wave_calls:
+                state.stop = True
+            if state.after_wave is not None:
+                state.after_wave(state.wave_calls)
+            return {
+                "schema_version": ARENA_RESULT_SCHEMA_VERSION,
+                "candidate": self.candidate.model_version,
+                "baseline": self.baseline.model_version,
+                "pairs": [asdict(pair) for pair in pairs],
+                "games": [],
+                "promotion": {"decision": "continue"},
+            }
+
+    monkeypatch.setattr(supervisor, "_gpu_pause", single_lease)
+    monkeypatch.setattr(promotion_module, "load_manifest_evaluator", load_evaluator)
+    monkeypatch.setattr(promotion_module, "ArenaRunner", WaveArena)
+    return SimpleNamespace(
+        experiment=experiment,
+        identity=identity,
+        model=model,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        ema=ema,
+        publisher=publisher,
+        champion=champion,
+        candidate=candidate,
+        supervisor=supervisor,
+        result_path=result_path,
+        state=state,
+    )
+
+
+def test_promotion_runs_waves_in_one_lease_and_pins_result_manifests(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    case = _promotion_wave_case(tmp_path, monkeypatch)
+
+    def progress(**details) -> None:
+        if details.get("phase") == "arena_terminal":
+            case.state.stop = True
+
+    assert (
+        case.supervisor.run(
+            stop_requested=lambda: case.state.stop,
+            progress=progress,
+        )
+        == 3
+    )
+
+    assert case.state.lease_entries == 1
+    assert case.state.runner_instances == 1
+    assert case.state.evaluator_loads == [
+        case.candidate.model_identity,
+        case.champion.model_identity,
+    ]
+    assert case.state.wave_starts == [{4: 0}, {4: 2}, {4: 4}]
+    assert case.state.persisted_pairs == [
+        [],
+        [0, 1],
+        [0, 1, 2, 3],
+    ]
+    result = json.loads(case.result_path.read_text(encoding="utf-8"))
+    pair_indices = [int(pair["pair"]) for pair in result["pairs"]]
+    assert pair_indices == list(range(6))
+    assert len(pair_indices) == len(set(pair_indices))
+    assert result["terminal"] is True
+    assert result["promotion"]["decision"] == "reject_max_pairs"
+    assert result["result_kind"] == "promotion"
+    assert (
+        Path(result["candidate_manifest"])
+        == (case.candidate.artifact_manifest or case.candidate.path).resolve()
+    )
+    assert (
+        Path(result["champion_manifest"])
+        == (case.champion.artifact_manifest or case.champion.path).resolve()
+    )
+
+    with torch.no_grad():
+        next(case.model.parameters()).add_(0.01)
+    case.ema.update(case.model)
+    case.publisher.publish(
+        model=case.model,
+        optimizer=case.optimizer,
+        scheduler=case.scheduler,
+        ema=case.ema,
+        step=2,
+        epoch=2,
+        config=case.experiment.as_dict(),
+    )
+    collect_model_garbage(
+        case.publisher.root,
+        retain_candidate_manifests=1,
+        dry_run=False,
+        referenced_result_directory=case.result_path.parent,
+    )
+    assert Path(result["candidate_manifest"]).is_file()
+    assert case.candidate.checkpoint.is_file()
+
+
+def test_historical_crossplay_persists_bounded_waves_without_promoting(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    case = _promotion_wave_case(tmp_path, monkeypatch)
+    case.supervisor.experiment = replace(
+        case.experiment,
+        orchestration=replace(
+            case.experiment.orchestration,
+            historical_evaluation=HistoricalEvaluationConfig(
+                enabled=True,
+                every_promotions=2,
+                anchors_per_evaluation=1,
+                pairs_per_ring=5,
+                max_pairs_per_ring=10,
+            ),
+        ),
+    )
+    crossplay_path = tmp_path / "arena" / "crossplay.json"
+    assert not case.publisher.champion_path.exists()
+
+    waves = case.supervisor._evaluate_historical_waves(
+        candidate=case.candidate,
+        baseline=case.champion,
+        result_path=crossplay_path,
+        previous=None,
+        stop_requested=lambda: False,
+        progress=None,
+        once=False,
+    )
+
+    assert waves == 2
+    result = json.loads(crossplay_path.read_text(encoding="utf-8"))
+    assert result["result_kind"] == "historical_crossplay"
+    assert result["promotion"]["decision"] == "evaluation"
+    assert result["terminal"] is True
+    assert [pair["pair"] for pair in result["pairs"]] == list(range(10))
+    assert Path(result["candidate_manifest"]).is_file()
+    assert Path(result["baseline_manifest"]).is_file()
+    assert not case.publisher.champion_path.exists()
+
+
+def test_promotion_stop_persists_wave_and_once_resumes_next_pair_indices(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    case = _promotion_wave_case(tmp_path, monkeypatch)
+    case.state.stop_after_wave = 1
+
+    assert case.supervisor.run(stop_requested=lambda: case.state.stop) == 1
+    first = json.loads(case.result_path.read_text(encoding="utf-8"))
+    assert first["terminal"] is False
+    assert [pair["pair"] for pair in first["pairs"]] == [0, 1]
+    assert case.state.lease_entries == 1
+    assert case.state.evaluator_loads == [
+        case.candidate.model_identity,
+        case.champion.model_identity,
+    ]
+
+    case.state.stop = False
+    case.state.stop_after_wave = None
+    assert (
+        case.supervisor.run(
+            stop_requested=lambda: case.state.stop,
+            once=True,
+        )
+        == 1
+    )
+    resumed = json.loads(case.result_path.read_text(encoding="utf-8"))
+    pair_indices = [int(pair["pair"]) for pair in resumed["pairs"]]
+    assert pair_indices == [0, 1, 2, 3]
+    assert len(pair_indices) == len(set(pair_indices))
+    assert resumed["terminal"] is False
+    assert case.state.wave_starts == [{4: 0}, {4: 2}]
+    assert case.state.persisted_pairs == [[], [0, 1]]
+    assert case.state.lease_entries == 2
+    assert case.state.runner_instances == 2
+    assert case.state.evaluator_loads == [
+        case.candidate.model_identity,
+        case.champion.model_identity,
+        case.candidate.model_identity,
+        case.champion.model_identity,
+    ]
+
+
+def test_newer_candidate_supersedes_between_session_waves(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    case = _promotion_wave_case(tmp_path, monkeypatch)
+    published = []
+
+    def publish_newer(wave: int) -> None:
+        if wave != 1:
+            return
+        with torch.no_grad():
+            next(case.model.parameters()).add_(0.01)
+        case.ema.update(case.model)
+        published.append(
+            case.publisher.publish(
+                model=case.model,
+                optimizer=case.optimizer,
+                scheduler=case.scheduler,
+                ema=case.ema,
+                step=2,
+                epoch=2,
+                config=case.experiment.as_dict(),
+            )
+        )
+
+    def progress(**details) -> None:
+        if details.get("phase") == "candidate_superseded":
+            case.state.stop = True
+
+    case.state.after_wave = publish_newer
+    assert (
+        case.supervisor.run(
+            stop_requested=lambda: case.state.stop,
+            progress=progress,
+        )
+        == 1
+    )
+
+    result = json.loads(case.result_path.read_text(encoding="utf-8"))
+    assert len(published) == 1
+    assert case.state.wave_starts == [{4: 0}]
+    assert case.state.lease_entries == 1
+    assert case.state.evaluator_loads == [
+        case.candidate.model_identity,
+        case.champion.model_identity,
+    ]
+    assert [pair["pair"] for pair in result["pairs"]] == [0, 1]
+    assert result["terminal"] is True
+    assert result["promotion"] == {
+        "decision": "superseded",
+        "superseded_by": published[0].model_identity,
+    }
+    assert result["result_kind"] == "promotion"
 
 
 class LeaseClock:

@@ -44,6 +44,8 @@ from startrain.inference import (
 from startrain.learner import (
     LazyShardReplayDataset,
     LearnerLoop,
+    ReplayWindowSession,
+    UTDSegmentState,
     UniqueReplayBatchSampler,
     _maximum_cross_shard_groups,
     _weighted_ring_quotas,
@@ -725,6 +727,53 @@ def tiny_model() -> GraphResTNet:
     )
 
 
+def make_test_learner(
+    store: ReplayStore,
+    identity: RunIdentity,
+    output_directory,
+    *,
+    learner_config: LearnerConfig,
+    train_config: TrainConfig | None = None,
+    data_config: DataConfig | None = None,
+    ring_mixture_config: RingMixtureConfig = RingMixtureConfig(),
+) -> LearnerLoop:
+    train = train_config or TrainConfig(
+        per_rank_batch_size=1,
+        scheduler=SchedulerConfig(warmup_steps=0, total_steps=100),
+    )
+    model = tiny_model()
+    optimizer = build_optimizer(model, OptimizerConfig(kind="adamw"))
+    scheduler = build_scheduler(optimizer, train.scheduler)
+    return LearnerLoop(
+        store=store,
+        model=model,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        ema=ExponentialMovingAverage(model, decay=0.9),
+        output_directory=output_directory,
+        learner_config=learner_config,
+        train_config=train,
+        data_config=data_config
+        or DataConfig(
+            workers=0,
+            ring_stratified=False,
+            d5_augmentation=False,
+        ),
+        loss_weights=LossWeights(),
+        seed=5,
+        serialized_config={
+            "schema_version": 3,
+            "learner": {
+                "target_updates_per_new_sample": (
+                    learner_config.target_updates_per_new_sample
+                )
+            },
+        },
+        run_identity=identity,
+        ring_mixture_config=ring_mixture_config,
+    )
+
+
 def curriculum_learner_stub(*, enabled: bool = True) -> LearnerLoop:
     learner = object.__new__(LearnerLoop)
     learner.learner_config = LearnerConfig(
@@ -923,6 +972,20 @@ def test_learner_runs_batch_publishes_metrics_and_resumes_example_cadence(
             target_updates_per_new_sample=2.0,
             candidate_interval_examples=4,
         )
+        (tmp_path / "learner" / "utd-segment.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "run_id": identity.run_id,
+                    "generation_family": identity.generation_family,
+                    "target_updates_per_new_sample": 2.0,
+                    "baseline_examples_consumed": 0,
+                    "baseline_committed_replay_samples": 0,
+                }
+            ),
+            encoding="utf-8",
+        )
+        learner._utd_segment_state = None
         learner._last_candidate_examples = 0
         learner.examples_consumed = 0
         assert learner._utd_step_budget() == 2
@@ -1012,6 +1075,470 @@ def test_learner_runs_batch_publishes_metrics_and_resumes_example_cadence(
             (tmp_path / "restored" / "recovery.json").read_text(encoding="utf-8")
         )
         assert recovery["step"] == 2
+
+
+def test_persistent_replay_window_reuses_loader_across_utd_waits(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    identity = run_identity(tmp_path)
+    with ReplayStore(tmp_path / "persistent-replay") as store:
+        generation = store.lease_generation(identity, "actor-test")
+        append_replay(
+            store,
+            [
+                make_replay_sample(
+                    identity=identity,
+                    generation=generation,
+                    game_id=f"persistent-{index}",
+                )
+                for index in range(8)
+            ],
+            identity,
+            model_step=0,
+            generation=generation,
+        )
+        learner = make_test_learner(
+            store,
+            identity,
+            tmp_path / "persistent-learner",
+            learner_config=LearnerConfig(
+                steps=4,
+                minimum_replay_samples=1,
+                recent_samples_per_ring=16,
+                max_replay_lag_steps=10,
+                steps_per_window=4,
+                candidate_interval=100,
+                target_updates_per_new_sample=1.0,
+                metrics_interval=1,
+                replay_poll_seconds=0.001,
+                device="cpu",
+            ),
+        )
+        loader_batches: list[int] = []
+        original_loader = learner._loader
+
+        def capture_loader(selection, *, batches):
+            loader_batches.append(batches)
+            return original_loader(selection, batches=batches)
+
+        budgets = iter((1, 0, 1, 2))
+
+        def utd_budget() -> int:
+            learner._latest_total_replay_samples = 8
+            return next(budgets)
+
+        selected_indices: list[int] = []
+        original_sampler_iter = UniqueReplayBatchSampler.__iter__
+
+        def capture_sampler(sampler):
+            for indices in original_sampler_iter(sampler):
+                selected_indices.extend(indices)
+                yield indices
+
+        watermark_during_wait: list[int] = []
+
+        def progress(**payload) -> None:
+            if payload.get("phase") == "update_to_data_wait":
+                watermark_during_wait.append(
+                    store.connection.execute(
+                        "SELECT COUNT(*) FROM gc_watermarks"
+                    ).fetchone()[0]
+                )
+
+        monkeypatch.setattr(learner, "_loader", capture_loader)
+        monkeypatch.setattr(learner, "_utd_step_budget", utd_budget)
+        monkeypatch.setattr(UniqueReplayBatchSampler, "__iter__", capture_sampler)
+        monkeypatch.setattr("startrain.learner.time.sleep", lambda _seconds: None)
+
+        assert learner.run(steps=4, progress=progress) == 4
+
+        assert loader_batches == [4]
+        assert watermark_during_wait == [1]
+        assert len(selected_indices) == len(set(selected_indices)) == 4
+        assert (
+            store.connection.execute(
+                "SELECT COUNT(*) FROM gc_watermarks"
+            ).fetchone()[0]
+            == 0
+        )
+        events = [
+            json.loads(line)
+            for line in (tmp_path / "persistent-learner" / "metrics.jsonl")
+            .read_text(encoding="utf-8")
+            .splitlines()
+        ]
+        allocations = [
+            event
+            for event in events
+            if event.get("event") == "replay_window_allocated"
+        ]
+        consumptions = [
+            event
+            for event in events
+            if event.get("event") == "replay_window_consumed"
+        ]
+        assert len(allocations) == 1
+        assert allocations[0]["window_batches_allocated"] == 4
+        assert allocations[0]["loader_workers_effective"] == 0
+        assert [event["window_reuse"] for event in consumptions] == [
+            False,
+            True,
+            True,
+        ]
+        assert consumptions[-1]["window_batches_consumed"] == 4
+
+
+def test_replay_window_refreshes_at_ring_weight_boundary(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    identity = run_identity(tmp_path)
+    with ReplayStore(tmp_path / "boundary-replay") as store:
+        generation = store.lease_generation(identity, "actor-test")
+        append_replay(
+            store,
+            [
+                make_replay_sample(
+                    identity=identity,
+                    generation=generation,
+                    game_id=f"boundary-{index}",
+                )
+                for index in range(8)
+            ],
+            identity,
+            model_step=0,
+            generation=generation,
+        )
+        learner = make_test_learner(
+            store,
+            identity,
+            tmp_path / "boundary-learner",
+            learner_config=LearnerConfig(
+                steps=4,
+                minimum_replay_samples=1,
+                recent_samples_per_ring=16,
+                max_replay_lag_steps=10,
+                steps_per_window=4,
+                candidate_interval=100,
+                metrics_interval=10,
+                device="cpu",
+            ),
+            ring_mixture_config=RingMixtureConfig(
+                step_weights=(RingWeightStage(2, (1.0, 0.0, 0.0, 0.0)),)
+            ),
+        )
+        allocations: list[int] = []
+        original_loader = learner._loader
+
+        def capture_loader(selection, *, batches):
+            allocations.append(batches)
+            return original_loader(selection, batches=batches)
+
+        monkeypatch.setattr(learner, "_loader", capture_loader)
+
+        assert learner.run(steps=4) == 4
+
+        assert allocations == [2, 2]
+        events = [
+            json.loads(line)
+            for line in (tmp_path / "boundary-learner" / "metrics.jsonl")
+            .read_text(encoding="utf-8")
+            .splitlines()
+            if '"event":"replay_window_refreshed"' in line
+        ]
+        assert [event["window_refresh_reason"] for event in events] == [
+            "ring_weight_change",
+            "target",
+        ]
+
+
+def test_short_replay_windows_disable_configured_workers() -> None:
+    learner = object.__new__(LearnerLoop)
+    learner.data_config = DataConfig(
+        workers=8,
+        min_batches_for_workers=32,
+    )
+
+    assert learner._effective_loader_workers(31) == 0
+    assert learner._effective_loader_workers(32) == 8
+
+
+def test_replay_window_shutdown_closes_workers_and_stop_clears_watermark(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    class WorkerIterator:
+        shutdowns = 0
+
+        def _shutdown_workers(self) -> None:
+            self.shutdowns += 1
+
+    worker_iterator = WorkerIterator()
+    standalone = ReplayWindowSession(
+        selection=ReplaySelection((), {}, 0),
+        loader=SimpleNamespace(_iterator=worker_iterator),
+        prefetcher=SimpleNamespace(_stream=None),
+        batches_allocated=1,
+        effective_workers=1,
+        setup_seconds=0.0,
+        refresh_reason="test",
+        opened_step=0,
+        opened_epoch=0,
+        active_rings=(),
+        ring_weights=None,
+        recovery_boundary=None,
+        ring_weight_boundary=None,
+    )
+    standalone.shutdown()
+    standalone.shutdown()
+    assert worker_iterator.shutdowns == 1
+
+    class FailingStream:
+        def synchronize(self) -> None:
+            raise RuntimeError("stream failed")
+
+    failed_iterator = WorkerIterator()
+    failing = ReplayWindowSession(
+        selection=ReplaySelection((), {}, 0),
+        loader=SimpleNamespace(_iterator=failed_iterator),
+        prefetcher=SimpleNamespace(_stream=FailingStream()),
+        batches_allocated=1,
+        effective_workers=1,
+        setup_seconds=0.0,
+        refresh_reason="test",
+        opened_step=0,
+        opened_epoch=0,
+        active_rings=(),
+        ring_weights=None,
+        recovery_boundary=None,
+        ring_weight_boundary=None,
+    )
+    with pytest.raises(RuntimeError, match="stream failed"):
+        failing.shutdown()
+    assert failed_iterator.shutdowns == 1
+    assert failing.closed is True
+    assert failing.loader is None
+    assert failing.prefetcher is None
+
+    identity = run_identity(tmp_path)
+    with ReplayStore(tmp_path / "shutdown-replay") as store:
+        generation = store.lease_generation(identity, "actor-test")
+        append_replay(
+            store,
+            [
+                make_replay_sample(
+                    identity=identity,
+                    generation=generation,
+                    game_id=f"shutdown-{index}",
+                )
+                for index in range(4)
+            ],
+            identity,
+            model_step=0,
+            generation=generation,
+        )
+        learner = make_test_learner(
+            store,
+            identity,
+            tmp_path / "shutdown-learner",
+            learner_config=LearnerConfig(
+                steps=4,
+                minimum_replay_samples=1,
+                recent_samples_per_ring=8,
+                max_replay_lag_steps=10,
+                steps_per_window=4,
+                candidate_interval=100,
+                device="cpu",
+            ),
+        )
+        shutdown_reasons: list[str] = []
+        original_close = learner._close_replay_window
+
+        def capture_close(window, *, reason):
+            shutdown_reasons.append(reason)
+            return original_close(window, reason=reason)
+
+        monkeypatch.setattr(learner, "_close_replay_window", capture_close)
+
+        assert learner.run(
+            steps=4,
+            stop_requested=lambda: learner.step >= 1,
+        ) == 1
+        assert shutdown_reasons == ["stop"]
+        assert (
+            store.connection.execute(
+                "SELECT COUNT(*) FROM gc_watermarks"
+            ).fetchone()[0]
+            == 0
+        )
+
+
+def test_prospective_fractional_utd_state_and_target_mismatch_fail_closed(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    identity = run_identity(tmp_path)
+    with ReplayStore(tmp_path / "utd-replay") as store:
+        monkeypatch.setattr(
+            store,
+            "total_committed_sample_count",
+            lambda **_metadata: 4,
+        )
+        origin = make_test_learner(
+            store,
+            identity,
+            tmp_path / "utd-origin",
+            learner_config=LearnerConfig(
+                target_updates_per_new_sample=1.25,
+                device="cpu",
+            ),
+            train_config=TrainConfig(
+                per_rank_batch_size=2,
+                scheduler=SchedulerConfig(warmup_steps=0, total_steps=100),
+            ),
+        )
+
+        assert origin._utd_step_budget() == 2
+        origin_state = json.loads(
+            (tmp_path / "utd-origin" / "utd-segment.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        assert origin_state["baseline_examples_consumed"] == 0
+        assert origin_state["baseline_committed_replay_samples"] == 0
+        published = origin._publish()
+        checkpoint_payload = torch.load(
+            published.checkpoint,
+            map_location="cpu",
+            weights_only=False,
+        )
+        assert checkpoint_payload["extra"]["utd_segment"] == origin_state
+
+        restored_output = tmp_path / "utd-restored"
+        restored = make_test_learner(
+            store,
+            identity,
+            restored_output,
+            learner_config=LearnerConfig(
+                target_updates_per_new_sample=1.25,
+                device="cpu",
+            ),
+            train_config=TrainConfig(
+                per_rank_batch_size=2,
+                scheduler=SchedulerConfig(warmup_steps=0, total_steps=100),
+            ),
+        )
+        restored.resume(
+            published.checkpoint,
+            expected_sha256=published.checkpoint_sha256,
+            expected_bytes=published.checkpoint_bytes,
+        )
+        assert not (restored_output / "utd-segment.json").exists()
+        assert restored._utd_step_budget() == 2
+        assert json.loads(
+            (restored_output / "utd-segment.json").read_text(encoding="utf-8")
+        ) == origin_state
+
+        migrated_output = tmp_path / "utd-migrated"
+        migrated = make_test_learner(
+            store,
+            identity,
+            migrated_output,
+            learner_config=LearnerConfig(
+                target_updates_per_new_sample=1.25,
+                device="cpu",
+            ),
+            train_config=TrainConfig(
+                per_rank_batch_size=2,
+                scheduler=SchedulerConfig(warmup_steps=0, total_steps=100),
+            ),
+        )
+        (migrated_output / "utd-segment.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "run_id": identity.run_id,
+                    "generation_family": identity.generation_family,
+                    "target_updates_per_new_sample": 1.25,
+                    "baseline_examples_consumed": 100,
+                    "baseline_committed_replay_samples": 80,
+                }
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(
+            store,
+            "total_committed_sample_count",
+            lambda **_metadata: 84,
+        )
+        migrated.step = 50
+        migrated.examples_consumed = 100
+
+        assert migrated._utd_step_budget() == 2
+        migrated.examples_consumed = 104
+        assert migrated._utd_step_budget() == 0
+        metrics = migrated._utd_metric_values()
+        assert metrics["lifetime_updates_per_new_sample"] == pytest.approx(104 / 84)
+        assert metrics["segment_updates_per_new_sample"] == pytest.approx(1.0)
+
+        mismatched = make_test_learner(
+            store,
+            identity,
+            tmp_path / "utd-mismatch",
+            learner_config=LearnerConfig(
+                target_updates_per_new_sample=1.25,
+                device="cpu",
+            ),
+            train_config=TrainConfig(
+                per_rank_batch_size=2,
+                scheduler=SchedulerConfig(warmup_steps=0, total_steps=100),
+            ),
+        )
+        mismatched.step = 50
+        mismatched.examples_consumed = 100
+        mismatched._resume_utd_target = 1.0
+        with pytest.raises(ValueError, match="changed its update-to-data target"):
+            mismatched._utd_step_budget()
+
+        override_output = tmp_path / "utd-migration-override"
+        override = make_test_learner(
+            store,
+            identity,
+            override_output,
+            learner_config=LearnerConfig(
+                target_updates_per_new_sample=1.25,
+                device="cpu",
+            ),
+            train_config=TrainConfig(
+                per_rank_batch_size=2,
+                scheduler=SchedulerConfig(warmup_steps=0, total_steps=100),
+            ),
+        )
+        (override_output / "utd-segment.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "run_id": identity.run_id,
+                    "generation_family": identity.generation_family,
+                    "target_updates_per_new_sample": 1.25,
+                    "baseline_examples_consumed": 100,
+                    "baseline_committed_replay_samples": 80,
+                }
+            ),
+            encoding="utf-8",
+        )
+        override.step = 50
+        override.examples_consumed = 100
+        override._resume_utd_target = 1.0
+        override._resume_utd_segment_state = UTDSegmentState(
+            run_id=identity.run_id,
+            generation_family=identity.generation_family,
+            target_updates_per_new_sample=1.0,
+            baseline_examples_consumed=0,
+            baseline_committed_replay_samples=0,
+        )
+        assert override._utd_step_budget() == 2
 
 
 def test_learner_publishes_initial_ema_then_times_out_on_short_batch(

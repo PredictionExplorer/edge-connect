@@ -55,7 +55,7 @@ class RingMixtureScheduler:
 
 
 class ManifestModelProvider:
-    """Owns one immutable evaluator and swaps it only on explicit refresh calls."""
+    """Owns one evaluator whose weights refresh only at explicit boundaries."""
 
     def __init__(
         self,
@@ -73,7 +73,9 @@ class ManifestModelProvider:
         self.expected_role = expected_role
         self.manifest: ModelManifest | None = None
         self.evaluator: GraphInferenceAdapter | None = None
+        self._raw_model: GraphResTNet | None = None
         self._pointer_signature: tuple[int, int, int] | None = None
+        self._reload_failed = False
 
     def wait_for_initial(
         self,
@@ -96,6 +98,10 @@ class ManifestModelProvider:
         return None
 
     def refresh(self) -> GraphInferenceAdapter:
+        if self._reload_failed:
+            raise RuntimeError(
+                "model provider is unusable after a failed in-place refresh"
+            )
         stat = self.manifest_path.stat()
         signature = (stat.st_mtime_ns, stat.st_size, stat.st_ino)
         if self._pointer_signature == signature and self.evaluator is not None:
@@ -104,15 +110,77 @@ class ManifestModelProvider:
         if manifest.role != self.expected_role:
             raise ValueError(f"self-play expected a {self.expected_role} model pointer")
         if (
+            manifest.run_id != self.run_identity.run_id
+            or manifest.generation_family != self.run_identity.generation_family
+        ):
+            raise ValueError("model manifest and checkpoint identity disagree")
+        if (
             self.manifest is not None
             and manifest.model_version == self.manifest.model_version
+            and manifest.model_identity == self.manifest.model_identity
             and manifest.model_step == self.manifest.model_step
             and manifest.checkpoint == self.manifest.checkpoint
+            and manifest.checkpoint_sha256 == self.manifest.checkpoint_sha256
+            and manifest.checkpoint_bytes == self.manifest.checkpoint_bytes
         ):
             assert self.evaluator is not None
             self._pointer_signature = signature
             return self.evaluator
-        model = GraphResTNet(self.config.model).to(self.device)
+
+        if self._raw_model is None:
+            model = GraphResTNet(self.config.model).to(self.device)
+            self._load_weights(model, manifest)
+            model.eval()
+            refresh = self.config.orchestration.model_refresh
+            inference_model = maybe_compile_model(
+                model,
+                enabled=self.config.train.compile,
+                dynamic=refresh.inference_compile_dynamic,
+                fullgraph=True,
+                mode=refresh.inference_compile_mode,
+                recompile_limit=(
+                    None
+                    if refresh.inference_compile_dynamic
+                    else len(self.config.game.rings)
+                ),
+                isolate_recompiles=not refresh.inference_compile_dynamic,
+            )
+            evaluator = GraphInferenceAdapter(
+                inference_model,
+                device=self.device,
+                config=InferenceConfig(
+                    precision=self.config.train.precision,
+                    score_utility_weight=self.config.selfplay.score_utility_weight,
+                ),
+                model_version=manifest.model_version,
+                model_step=manifest.model_step,
+                model_identity=manifest.model_identity,
+            )
+            self._raw_model = model
+            self.evaluator = evaluator
+        else:
+            assert self.evaluator is not None
+            try:
+                self._load_weights(self._raw_model, manifest)
+                self._raw_model.eval()
+                self.evaluator.model_version = manifest.model_version
+                self.evaluator.model_step = manifest.model_step
+                self.evaluator.model_identity = manifest.model_identity
+            except Exception:
+                # A checkpoint loader may have copied only part of a state dict
+                # before rejecting it. Never expose that evaluator again.
+                self._reload_failed = True
+                raise
+
+        self.manifest = manifest
+        self._pointer_signature = signature
+        return self.evaluator
+
+    def _load_weights(
+        self,
+        model: GraphResTNet,
+        manifest: ModelManifest,
+    ) -> None:
         metadata = load_ema_checkpoint(
             manifest.checkpoint,
             model=model,
@@ -124,33 +192,8 @@ class ManifestModelProvider:
             expected_sha256=manifest.checkpoint_sha256,
             expected_bytes=manifest.checkpoint_bytes,
         )
-        if (
-            int(metadata["step"]) != manifest.model_step
-            or manifest.run_id != self.run_identity.run_id
-            or manifest.generation_family != self.run_identity.generation_family
-        ):
+        if int(metadata["step"]) != manifest.model_step:
             raise ValueError("model manifest and checkpoint identity disagree")
-        model.eval()
-        inference_model = maybe_compile_model(
-            model,
-            enabled=self.config.train.compile,
-            dynamic=True,
-            fullgraph=True,
-        )
-        self.evaluator = GraphInferenceAdapter(
-            inference_model,
-            device=self.device,
-            config=InferenceConfig(
-                precision=self.config.train.precision,
-                score_utility_weight=self.config.selfplay.score_utility_weight,
-            ),
-            model_version=manifest.model_version,
-            model_step=manifest.model_step,
-            model_identity=manifest.model_identity,
-        )
-        self.manifest = manifest
-        self._pointer_signature = signature
-        return self.evaluator
 
 
 class HistoricalModelPool:

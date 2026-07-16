@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
-from typing import cast
+from typing import Any, cast
 
 import torch
 from torch import nn
@@ -221,6 +221,7 @@ def maybe_compile_model(
     dynamic: bool = True,
     fullgraph: bool = True,
     backend: str | None = None,
+    mode: str | None = None,
     recompile_limit: int | None = None,
     isolate_recompiles: bool = False,
 ) -> nn.Module:
@@ -228,7 +229,9 @@ def maybe_compile_model(
         return model
     if recompile_limit is not None and recompile_limit <= 0:
         raise ValueError("compile recompile_limit must be positive")
-    options = {
+    if mode not in (None, "default", "reduce-overhead", "max-autotune"):
+        raise ValueError("compile mode is invalid")
+    options: dict[str, Any] = {
         "dynamic": dynamic,
         "fullgraph": fullgraph,
         "recompile_limit": recompile_limit,
@@ -236,6 +239,8 @@ def maybe_compile_model(
     }
     if backend is not None:
         options["backend"] = backend
+    if mode not in (None, "default"):
+        options["mode"] = mode
     return cast(
         nn.Module,
         torch.compile(model, **options),

@@ -186,7 +186,7 @@ def test_report_surfaces_jsonl_parse_failures_and_cli_exit_status(
     )
     metrics = root / "learner" / "metrics.jsonl"
     metrics.parent.mkdir()
-    metrics.write_text("{bad json}\n", encoding="utf-8")
+    metrics.write_text("\n{bad json}\n\n", encoding="utf-8")
 
     report = build_strength_efficiency_report(root)
 
@@ -441,7 +441,13 @@ def test_report_builds_autonomous_checkpoint_ladders_and_efficiency(
         "at least one game" in str(exclusion["reason"])
         for exclusion in primary["exclusions"]
     )
+    assert autonomous["latest"]["source"] == "ring_10"
     assert autonomous["latest_elo"] == primary["latest"]["rating"]
+    assert autonomous["headline"]["source"] == "aggregate"
+    assert autonomous["headline"]["confidence_interval"] == aggregate["latest"][
+        "confidence_interval"
+    ]
+    assert autonomous["headline_elo"] == aggregate["latest"]["rating"]
     efficiency = autonomous["efficiency"]
     assert efficiency["leaf_evaluations"] == 2_000_000_000
     assert efficiency["elo_per_billion_leaf_evaluations"] == pytest.approx(
@@ -453,3 +459,297 @@ def test_report_builds_autonomous_checkpoint_ladders_and_efficiency(
     assert frozen["result_count"] == 1
     assert frozen["results"][0]["baseline"] == "frozen-shallow-v2"
     assert all(item["identity"] != "frozen-shallow-v2" for item in primary["ladder"])
+
+
+def test_learner_summary_exposes_segment_utd_and_persistent_window_metrics() -> None:
+    summary = _learner_summary(
+        [
+            {
+                "timestamp_ns": 1,
+                "event": "replay_window_allocated",
+                "step": 10,
+                "window_batches_allocated": 100,
+                "window_batches_consumed": 0,
+                "loader_workers_effective": 8,
+                "window_setup_seconds": 4.0,
+                "window_setup_amortized_seconds": 0.04,
+            },
+            {
+                "timestamp_ns": 2,
+                "step": 12,
+                "step_seconds": 1.0,
+                "metrics_interval_steps": 2,
+                "global_batch_size": 64,
+                "lifetime_updates_per_new_sample": 1.04,
+                "updates_per_new_sample": 1.04,
+                "segment_updates_per_new_sample": 1.2,
+                "utd_segment_target_updates_per_new_sample": 1.25,
+                "utd_segment_baseline_examples_consumed": 1_000,
+                "utd_segment_baseline_committed_replay_samples": 800,
+                "loader_workers_effective": 8,
+                "window_batches_allocated": 100,
+                "window_batches_consumed": 2,
+                "window_reuse": False,
+                "window_reuse_spins": 0,
+                "window_setup_amortized_seconds": 0.04,
+            },
+            {
+                "timestamp_ns": 3,
+                "event": "replay_window_consumed",
+                "step": 15,
+                "window_batches_allocated": 100,
+                "window_batches_consumed": 5,
+                "window_batches_consumed_this_spin": 3,
+                "window_batches_remaining": 95,
+                "window_reuse": True,
+                "window_reuse_spins": 1,
+                "loader_workers_effective": 8,
+            },
+        ]
+    )
+
+    assert summary["updates_per_new_sample"] == 1.04
+    assert summary["lifetime_updates_per_new_sample"] == 1.04
+    assert summary["segment_updates_per_new_sample"] == 1.2
+    assert summary["utd_segment_target_updates_per_new_sample"] == 1.25
+    assert summary["loader_workers_effective"] == 8
+    assert summary["window_reuse"] is True
+    assert summary["window_reuse_spins"] == 1
+    persistent = summary["persistent_window"]
+    assert persistent["allocation_records"] == 1
+    assert persistent["consumption_records"] == 1
+    assert persistent["reused_consumption_records"] == 1
+    assert persistent["reuse_fraction"] == 1.0
+    assert persistent["consumed_batches"] == 3
+    assert persistent["setup_seconds"] == 4.0
+
+
+def test_report_classifies_crossplay_and_legacy_arena_results(tmp_path) -> None:
+    root = tmp_path / "run"
+    root.mkdir()
+    (root / "run.json").write_text(
+        json.dumps(
+            {
+                "run_id": "run-result-kinds",
+                "generation_family": "family-result-kinds",
+                "created_ns": 1_000_000_000,
+            }
+        ),
+        encoding="utf-8",
+    )
+    arena = root / "arena"
+    arena.mkdir()
+    legacy = _arena_result(completed_ns=2_000_000_000, elo=10, lower=-10)
+    crossplay = {
+        **_arena_result(completed_ns=3_000_000_000, elo=20, lower=0),
+        "result_kind": "historical_crossplay",
+    }
+    (arena / "legacy.json").write_text(json.dumps(legacy), encoding="utf-8")
+    (arena / "crossplay.json").write_text(json.dumps(crossplay), encoding="utf-8")
+
+    report = build_strength_efficiency_report(root)
+
+    assert report["arena"]["result_kind_counts"] == {
+        "promotion": 1,
+        "crossplay": 0,
+        "historical_crossplay": 1,
+        "unknown": 0,
+    }
+    assert report["arena"]["result_category_counts"] == {
+        "promotion": 1,
+        "crossplay": 1,
+        "unknown": 0,
+    }
+    assert [item["result_kind"] for item in report["arena"]["results"]] == [
+        "promotion",
+        "historical_crossplay",
+    ]
+
+
+def test_report_identifies_saturated_one_sided_pairings(tmp_path) -> None:
+    root = tmp_path / "run"
+    root.mkdir()
+    (root / "run.json").write_text(
+        json.dumps(
+            {
+                "run_id": "run-saturated",
+                "generation_family": "family-saturated",
+                "created_ns": 1_000_000_000,
+            }
+        ),
+        encoding="utf-8",
+    )
+    manifests = root / "learner" / "manifests"
+    manifests.mkdir(parents=True)
+    for step, identity in enumerate(("checkpoint-anchor", "checkpoint-latest")):
+        (manifests / f"manifest-{step}.json").write_text(
+            json.dumps({"model_identity": identity, "model_step": step}),
+            encoding="utf-8",
+        )
+    arena = root / "arena"
+    arena.mkdir()
+    (arena / "saturated.json").write_text(
+        json.dumps(
+            _checkpoint_arena_result(
+                candidate="checkpoint-latest",
+                baseline="checkpoint-anchor",
+                completed_ns=2_000_000_000,
+                wins=100,
+                losses=0,
+                ring_wins=60,
+                ring_losses=40,
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    report = build_strength_efficiency_report(root)
+    aggregate = report["autonomous_elo"]["aggregate"]
+
+    assert aggregate["input"]["continuity_corrected_pairings"] == 1
+    assert aggregate["input"]["saturated_one_sided_pairing_count"] == 1
+    pairing = aggregate["input"]["saturated_one_sided_pairings"][0]
+    assert pairing["decisive_games"] == 100
+    assert {pairing["first_wins"], pairing["second_wins"]} == {0, 100}
+    assert report["autonomous_elo"]["saturation"]["aggregate"][
+        "saturated_one_sided_pairing_count"
+    ] == 1
+
+
+def test_report_exposes_validated_migration_boundaries_and_segments(
+    tmp_path,
+) -> None:
+    root = tmp_path / "run"
+    root.mkdir()
+    (root / "run.json").write_text(
+        json.dumps(
+            {
+                "run_id": "run-migrated",
+                "generation_family": "family-migrated",
+                "created_ns": 1_000_000_000,
+            }
+        ),
+        encoding="utf-8",
+    )
+    before = "a" * 64
+    middle = "b" * 64
+    after = "c" * 64
+    _write_jsonl(
+        root / "autonomous-migrations.jsonl",
+        [
+            {
+                "schema_version": 1,
+                "timestamp_ns": 2_000_000_000,
+                "run_id": "run-migrated",
+                "generation_family": "family-migrated",
+                "from_config_sha256": before,
+                "to_config_sha256": middle,
+                "from_profile": "profile.yaml",
+                "to_profile": "profile-cadence-v2.yaml",
+                "learner_step": 80,
+                "examples_consumed": 8_000,
+                "reason": "legacy-cadence",
+            },
+            {
+                "schema_version": 1,
+                "timestamp_ns": 3_000_000_000,
+                "run_id": "run-migrated",
+                "generation_family": "family-migrated",
+                "from_config_sha256": middle,
+                "to_config_sha256": after,
+                "from_profile": "profile-cadence-v2.yaml",
+                "to_profile": "profile-elo-v3.yaml",
+                "learner_step": 100,
+                "examples_consumed": 10_000,
+                "committed_replay_samples": 8_000,
+                "target_updates_per_new_sample": 1.25,
+                "reason": "prospective-utd",
+            },
+        ],
+    )
+
+    report = build_strength_efficiency_report(root)
+    migrations = report["migrations"]
+
+    assert migrations["record_count"] == 2
+    assert migrations["boundary_count"] == 2
+    assert migrations["boundaries"] == [
+        {
+            "migration_id": "migration-2000000000",
+            "timestamp_ns": 2_000_000_000,
+            "from_sha256": before,
+            "to_sha256": middle,
+            "step": 80,
+            "examples_consumed": 8_000,
+            "committed_replay_samples": None,
+            "target_updates_per_new_sample": None,
+        },
+        {
+            "migration_id": "migration-3000000000",
+            "timestamp_ns": 3_000_000_000,
+            "from_sha256": middle,
+            "to_sha256": after,
+            "step": 100,
+            "examples_consumed": 10_000,
+            "committed_replay_samples": 8_000,
+            "target_updates_per_new_sample": 1.25,
+        }
+    ]
+    assert len(migrations["segments"]) == 3
+    assert migrations["segments"][-1]["config_sha256"] == after
+    assert report["migration_boundaries"] == migrations["boundaries"]
+    assert report["migration_segments"] == migrations["segments"]
+
+
+def test_report_rejects_malformed_active_migration_record(tmp_path) -> None:
+    root = tmp_path / "run"
+    root.mkdir()
+    (root / "run.json").write_text(
+        json.dumps(
+            {
+                "run_id": "run-malformed-migration",
+                "generation_family": "family-malformed-migration",
+                "created_ns": 1,
+            }
+        ),
+        encoding="utf-8",
+    )
+    _write_jsonl(
+        root / "autonomous-migrations.jsonl",
+        [
+            {
+                "schema_version": 1,
+                "timestamp_ns": 2,
+                "run_id": "run-malformed-migration",
+                "generation_family": "family-malformed-migration",
+                "from_sha256": "a" * 64,
+            }
+        ],
+    )
+
+    with pytest.raises(ValueError, match="source/target config hashes"):
+        build_strength_efficiency_report(root)
+
+
+def test_report_ignores_migration_records_for_another_run(tmp_path) -> None:
+    root = tmp_path / "run"
+    root.mkdir()
+    (root / "run.json").write_text(
+        json.dumps(
+            {
+                "run_id": "active-run",
+                "generation_family": "active-family",
+                "created_ns": 1,
+            }
+        ),
+        encoding="utf-8",
+    )
+    _write_jsonl(
+        root / "autonomous-migrations.jsonl",
+        [{"run_id": "different-run", "malformed": True}],
+    )
+
+    report = build_strength_efficiency_report(root)
+
+    assert report["migrations"]["record_count"] == 0
+    assert report["migrations"]["ignored_record_count"] == 1

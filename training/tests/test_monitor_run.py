@@ -401,3 +401,136 @@ def test_run_monitor_once_emits_one_json_record(tmp_path, monkeypatch, capsys) -
     lines = capsys.readouterr().out.splitlines()
     assert len(lines) == 1
     assert json.loads(lines[0])["status"] == "OK"
+
+
+def test_monitor_shows_headline_segment_loader_and_result_kind_counts(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    now_ns = 10_000_000_000
+    root = _fixture(tmp_path, now_ns=now_ns)
+    learner_metric_path = root / "learner" / "metrics.jsonl"
+    learner_metric = json.loads(learner_metric_path.read_text(encoding="utf-8"))
+    learner_metric.update(
+        {
+            "updates_per_new_sample": 1.05,
+            "lifetime_updates_per_new_sample": 1.05,
+            "segment_updates_per_new_sample": 1.2,
+            "utd_segment_target_updates_per_new_sample": 1.25,
+            "loader_workers_effective": 8,
+            "window_reuse": True,
+            "window_reuse_spins": 3,
+            "window_setup_seconds": 0.02,
+            "window_setup_amortized_seconds": 0.004,
+        }
+    )
+    learner_metric_path.write_text(
+        json.dumps(learner_metric) + "\n",
+        encoding="utf-8",
+    )
+    _write_json(
+        root / "strength-efficiency.json",
+        {
+            "status": "complete",
+            "autonomous_elo": {
+                "headline": {
+                    "source": "aggregate",
+                    "rating": 321.5,
+                    "confidence_interval": [300.0, 343.0],
+                },
+                "headline_elo": 321.5,
+            },
+        },
+    )
+    common = {
+        "schema_version": 3,
+        "candidate": "candidate",
+        "baseline": "baseline",
+        "aggregate": {
+            "elo_difference": 10.0,
+            "wins": 6,
+            "losses": 4,
+            "games": 10,
+        },
+        "per_ring": {},
+    }
+    _write_json(
+        root / "arena" / "legacy-promotion.json",
+        {
+            **common,
+            "completed_ns": now_ns - 1,
+            "promotion": {"decision": "reject"},
+        },
+    )
+    _write_json(
+        root / "arena" / "crossplay.json",
+        {
+            **common,
+            "candidate": "candidate-new",
+            "completed_ns": now_ns,
+            "result_kind": "historical_crossplay",
+        },
+    )
+    _healthy_dependencies(monkeypatch)
+
+    snapshot: Any = monitor.collect_snapshot(root, now_ns=now_ns)
+    text = monitor.format_text(snapshot)
+
+    assert snapshot["strength_efficiency"]["headline_elo"] == 321.5
+    assert snapshot["strength_efficiency"]["headline_source"] == "aggregate"
+    assert snapshot["arena_history"]["promotion_evaluations"] == 1
+    assert snapshot["arena_history"]["crossplay_evaluations"] == 1
+    assert snapshot["arena_history"]["result_kind_counts"][
+        "historical_crossplay"
+    ] == 1
+    assert snapshot["learner"]["segment_updates_per_new_sample"] == 1.2
+    assert snapshot["learner"]["loader_workers_effective"] == 8
+    assert "utd_segment=1.20/1.25" in text
+    assert "loader_workers=8" in text
+    assert "window_reuse=yes" in text
+    assert "window_setup=0.0040s" in text
+    assert "promotion_evals=1" in text
+    assert "crossplay_evals=1" in text
+    assert "elo=321.50" in text
+    assert "elo_source=aggregate" in text
+
+
+def test_monitor_softly_ignores_malformed_strength_report(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    now_ns = 10_000_000_000
+    root = _fixture(tmp_path, now_ns=now_ns)
+    (root / "strength-efficiency.json").write_text("{partial", encoding="utf-8")
+    _healthy_dependencies(monkeypatch)
+
+    snapshot: Any = monitor.collect_snapshot(root, now_ns=now_ns)
+
+    assert snapshot["strength_efficiency"] == {"available": False}
+    assert "elo=n/a" in monitor.format_text(snapshot)
+
+
+def test_monitor_derives_aggregate_headline_from_legacy_report(tmp_path) -> None:
+    _write_json(
+        tmp_path / "strength-efficiency.json",
+        {
+            "status": "complete",
+            "autonomous_elo": {
+                "latest": {"source": "ring_10", "rating": 500.0},
+                "latest_elo": 500.0,
+                "aggregate": {
+                    "status": "available",
+                    "latest": {
+                        "rating": 300.0,
+                        "confidence_interval": [250.0, 350.0],
+                    },
+                },
+            },
+        },
+    )
+
+    status = monitor._strength_efficiency_status(tmp_path)
+
+    assert status["headline_elo"] == 300.0
+    assert status["headline_source"] == "aggregate"
+    assert status["headline_confidence_interval"] == [250.0, 350.0]

@@ -111,6 +111,7 @@ class DataConfig:
     ring_stratified: bool = True
     d5_augmentation: bool = True
     workers: int = 0
+    min_batches_for_workers: int = 32
     prefetch_factor: int = 2
     pin_memory: bool = False
     shard_cache_size: int = 2
@@ -121,6 +122,9 @@ class DataConfig:
             raise ConfigError("data schema_version must be 4")
         if (
             self.workers < 0
+            or isinstance(self.min_batches_for_workers, bool)
+            or not isinstance(self.min_batches_for_workers, int)
+            or self.min_batches_for_workers <= 0
             or self.prefetch_factor <= 0
             or self.shard_cache_size <= 0
             or isinstance(self.shards_per_batch, bool)
@@ -425,6 +429,10 @@ class ModelRefreshConfig:
     manifest_poll_seconds: float = 2.0
     startup_timeout_seconds: float = 600.0
     refresh_only_between_batches: bool = True
+    inference_compile_dynamic: bool = True
+    inference_compile_mode: Literal[
+        "default", "reduce-overhead", "max-autotune"
+    ] = "default"
     selfplay_source: Literal[
         "champion",
         "candidate",
@@ -436,10 +444,19 @@ class ModelRefreshConfig:
     history_pool_size: int = 8
 
     def __post_init__(self) -> None:
-        if type(self.refresh_only_between_batches) is not bool:
-            raise ConfigError("refresh_only_between_batches must be boolean")
+        if (
+            type(self.refresh_only_between_batches) is not bool
+            or type(self.inference_compile_dynamic) is not bool
+        ):
+            raise ConfigError("model refresh compile settings must use booleans")
         if self.manifest_poll_seconds <= 0 or self.startup_timeout_seconds <= 0:
             raise ConfigError("model refresh intervals must be positive")
+        if self.inference_compile_mode not in (
+            "default",
+            "reduce-overhead",
+            "max-autotune",
+        ):
+            raise ConfigError("inference_compile_mode is invalid")
         if self.selfplay_source not in (
             "champion",
             "candidate",
@@ -610,6 +627,34 @@ class PromotionConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class HistoricalEvaluationConfig:
+    enabled: bool = False
+    every_promotions: int = 2
+    anchors_per_evaluation: int = 1
+    pairs_per_ring: int = 5
+    max_pairs_per_ring: int = 10
+
+    def __post_init__(self) -> None:
+        if type(self.enabled) is not bool:
+            raise ConfigError("historical evaluation enabled must be boolean")
+        values = (
+            self.every_promotions,
+            self.anchors_per_evaluation,
+            self.pairs_per_ring,
+            self.max_pairs_per_ring,
+        )
+        if any(
+            isinstance(value, bool) or not isinstance(value, int) or value <= 0
+            for value in values
+        ):
+            raise ConfigError("historical evaluation counts must be positive integers")
+        if self.max_pairs_per_ring < self.pairs_per_ring:
+            raise ConfigError(
+                "historical evaluation maximum must cover one evaluation wave"
+            )
+
+
+@dataclass(frozen=True, slots=True)
 class PlateauConfig:
     enabled: bool = False
     max_learner_champion_lag_steps: int = 20_000
@@ -713,6 +758,7 @@ class OrchestrationConfig:
     shutdown: ShutdownConfig = ShutdownConfig()
     distributed: DistributedConfig = DistributedConfig()
     promotion: PromotionConfig = PromotionConfig()
+    historical_evaluation: HistoricalEvaluationConfig = HistoricalEvaluationConfig()
     plateau: PlateauConfig = PlateauConfig()
     autonomous: AutonomousConfig = AutonomousConfig()
     retention: RetentionConfig = RetentionConfig()
@@ -1014,6 +1060,7 @@ def load_config(path: str | Path) -> ExperimentConfig:
         ("shutdown", ShutdownConfig),
         ("distributed", DistributedConfig),
         ("promotion", PromotionConfig),
+        ("historical_evaluation", HistoricalEvaluationConfig),
         ("plateau", PlateauConfig),
         ("autonomous", AutonomousConfig),
         ("retention", RetentionConfig),

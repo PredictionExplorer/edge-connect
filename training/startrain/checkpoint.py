@@ -440,6 +440,7 @@ def write_recovery_checkpoint(
     generation_family: str,
     examples_consumed: int,
     global_batch_size: int,
+    utd_segment: Mapping[str, object] | None = None,
 ) -> ResumeCheckpoint:
     directory = Path(root)
     recovery_directory = directory / "recovery"
@@ -462,6 +463,7 @@ def write_recovery_checkpoint(
             "generation_family": family,
             "examples_consumed": examples_consumed,
             "global_batch_size": global_batch_size,
+            **({"utd_segment": dict(utd_segment)} if utd_segment else {}),
         },
     )
     checkpoint_sha256 = sha256_file(staged)
@@ -1174,7 +1176,11 @@ def collect_model_garbage(
                 payload = _read_json(result_path, "arena result")
             except ValueError:
                 continue
-            for key in ("candidate_manifest", "champion_manifest"):
+            for key in (
+                "candidate_manifest",
+                "champion_manifest",
+                "baseline_manifest",
+            ):
                 value = payload.get(key)
                 if isinstance(value, str) and value:
                     path = Path(value)

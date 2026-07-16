@@ -70,6 +70,14 @@ def _validate_autonomous_config(config: ExperimentConfig) -> None:
     retention = config.orchestration.retention
     if retention.candidate_manifests < 2 * refresh.history_pool_size:
         raise ValueError("autonomous retention cannot protect the history pool")
+    historical = config.orchestration.historical_evaluation
+    if historical.enabled and (
+        historical.every_promotions < 2
+        or historical.anchors_per_evaluation > 1
+        or historical.pairs_per_ring > 5
+        or historical.max_pairs_per_ring > 10
+    ):
+        raise ValueError("autonomous historical evaluation exceeds its compute budget")
     if config.arena.max_considered < 48:
         raise ValueError("autonomous arena must evaluate a broad action set")
 

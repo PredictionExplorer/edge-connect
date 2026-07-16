@@ -33,6 +33,18 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iterations", type=int, default=50)
     parser.add_argument(
+        "--compile-dynamic",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="override the profile's actor inference shape specialization",
+    )
+    parser.add_argument(
+        "--compile-mode",
+        choices=("default", "reduce-overhead", "max-autotune"),
+        default=None,
+        help="override the profile's actor torch.compile mode",
+    )
+    parser.add_argument(
         "--minimum-leaves-per-second",
         type=float,
         default=5_000.0,
@@ -54,14 +66,24 @@ def main(argv: list[str] | None = None) -> int:
     torch.cuda.set_device(device)
 
     experiment = load_config(arguments.config)
+    refresh = experiment.orchestration.model_refresh
+    compile_dynamic = (
+        refresh.inference_compile_dynamic
+        if arguments.compile_dynamic is None
+        else arguments.compile_dynamic
+    )
+    compile_mode = arguments.compile_mode or refresh.inference_compile_mode
     native = load_star_native(required=True)
     assert native is not None
     model = GraphResTNet(experiment.model).to(device).eval()
     inference_model = maybe_compile_model(
         model,
         enabled=experiment.train.compile,
-        dynamic=True,
+        dynamic=compile_dynamic,
         fullgraph=True,
+        mode=compile_mode,
+        recompile_limit=(None if compile_dynamic else len(experiment.game.rings)),
+        isolate_recompiles=not compile_dynamic,
     )
     evaluator = GraphInferenceAdapter(
         inference_model,
@@ -110,6 +132,8 @@ def main(argv: list[str] | None = None) -> int:
         "rings": arguments.rings,
         "batch_size": arguments.batch_size,
         "iterations": arguments.iterations,
+        "compile_dynamic": compile_dynamic,
+        "compile_mode": compile_mode,
         "model_parameters": model.parameter_count(),
         "feature_path": evaluator.last_feature_path,
         "feature_path_counts": evaluator.feature_path_counts,

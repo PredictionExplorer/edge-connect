@@ -997,7 +997,51 @@ The shipped single-learner production profile can still run without NCCL, but
 do not enable custom DDP. Check driver versions, GPU topology, NCCL environment,
 shared memory, and firewall/network interfaces first.
 
-## 20. Actions that are forbidden during an active run
+## 20. Controlled migration of an initialized autonomous run
+
+Prefer a new run root for treatment changes. If an initialized autonomous run
+must continue across a code/profile migration, preserve an explicit treatment
+boundary instead of editing provenance by hand:
+
+1. Build and test a new immutable release directory while the old unit remains
+   active.
+2. Wait for any arena promotion wave to persist, create a verified online replay
+   backup, and archive the profile, provenance, cadence, recovery pointer, and
+   systemd units.
+3. Stop the coordinator through systemd and allow the configured graceful
+   timeout. Confirm the coordinator lock owner is no longer live.
+4. Run `scripts/migrate_autonomous_profile.py` in dry-run mode, inspect the
+   allowed diff and computed hashes, then repeat with `--apply`.
+5. Repoint the training, report, and backup units to the new immutable release
+   and newly named frozen profile. Never modify the previous profile in place.
+6. Start the coordinator and verify recovery step, examples consumed, cadence,
+   replay counts, worker heartbeats, and the migration-segment UTD ratio.
+
+An update-to-data change must be prospective. The migration utility writes
+`learner/utd-segment.json` with the current committed replay and consumed-example
+baselines, preventing a new ratio from retroactively authorizing updates over
+the full historical ledger.
+
+For the Elo-per-wall-clock profile, keep candidate and self-play publication
+cadence constant per newly generated replay sample when changing UTD. At UTD
+1.25, scale the 5M candidate and 3M steady self-play intervals to 6.25M and
+3.75M learner examples respectively.
+
+Promotion may use five-pair waves with a fifteen-pair minimum only while the
+existing anytime-valid pair e-process, error levels, search budget, deterministic
+opening schedule, and 200-pair maximum remain unchanged. Persist every wave so
+the arena can resume after a stop.
+
+Benchmark actor compile modes on the target H100 before selecting one. Compare
+the current dynamic full-graph path with static `reduce-overhead` and
+`max-autotune`; require fixed-position output parity and a material throughput
+win. Keep the current path when the gate is inconclusive.
+
+Rollback means stopping the new unit, restoring the archived profile/provenance
+bundle and old immutable release paths, then resuming from the still-valid
+recovery pointer. Do not delete post-migration artifacts during rollback.
+
+## 21. Actions that are forbidden during an active run
 
 Do not:
 
@@ -1012,7 +1056,7 @@ Do not:
 - infer H100 readiness from CPU tests;
 - infer superhuman strength from training loss or promotion alone.
 
-## 21. Run artifacts to preserve
+## 22. Run artifacts to preserve
 
 Archive:
 
@@ -1032,7 +1076,7 @@ Archive:
 Keep `run.json`, manifests, pointers, and checkpoints together so relative
 artifact references remain valid.
 
-## 22. After training
+## 23. After training
 
 The output is not automatically a browser model:
 
