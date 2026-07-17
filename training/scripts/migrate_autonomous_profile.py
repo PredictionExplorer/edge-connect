@@ -137,6 +137,9 @@ class MigrationPlan:
                 "examples_consumed": self.examples_consumed,
                 "committed_replay_samples": self.committed_replay_samples,
                 "champion_model_identity": self.champion_model_identity,
+                "discarded_uncheckpointed_steps": self.migration_record.get(
+                    "discarded_uncheckpointed_steps", 0
+                ),
                 "target_updates_per_new_sample": self.utd_segment_payload[
                     "target_updates_per_new_sample"
                 ],
@@ -955,10 +958,20 @@ def plan_migration(request: MigrationRequest) -> MigrationPlan:
         run_id=run_id,
         generation_family=generation_family,
     )
-    if heartbeat_step != learner_step:
-        raise MigrationError("learner heartbeat and recovery steps disagree")
-    if heartbeat_examples is not None and heartbeat_examples > examples_consumed:
-        raise MigrationError("learner heartbeat is ahead of the recovery boundary")
+    recovery_interval = old_config.learner.recovery_interval_steps
+    discarded_uncheckpointed_steps = heartbeat_step - learner_step
+    if discarded_uncheckpointed_steps < 0:
+        raise MigrationError("learner heartbeat is behind the recovery boundary")
+    if (
+        discarded_uncheckpointed_steps
+        and (
+            recovery_interval is None
+            or discarded_uncheckpointed_steps >= recovery_interval
+        )
+    ):
+        raise MigrationError(
+            "learner heartbeat is too far ahead of the recovery boundary"
+        )
     if candidate_examples > examples_consumed or (
         selfplay_examples is not None and selfplay_examples > examples_consumed
     ):
@@ -1055,6 +1068,8 @@ def plan_migration(request: MigrationRequest) -> MigrationPlan:
         "to_profile": target_name,
         "learner_step": learner_step,
         "examples_consumed": examples_consumed,
+        "discarded_uncheckpointed_steps": discarded_uncheckpointed_steps,
+        "heartbeat_examples_consumed": heartbeat_examples,
         "from_source_commit": from_source_commit,
         "to_source_commit": to_source_commit,
         "reason": reason,

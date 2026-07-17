@@ -282,6 +282,22 @@ def test_dry_run_does_not_mutate_run(tmp_path: Path) -> None:
     assert not (fixture.root / "migration-backups").exists()
 
 
+def test_dry_run_uses_recovery_when_stopped_heartbeat_is_slightly_ahead(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture(tmp_path)
+    heartbeat_path = fixture.root / "status" / "learner.heartbeat.json"
+    heartbeat = json.loads(heartbeat_path.read_text(encoding="utf-8"))
+    heartbeat["step"] += 50
+    heartbeat["examples_consumed"] += 25_600
+    _write_json(heartbeat_path, heartbeat)
+
+    result = migration.migrate_autonomous_profile(fixture.request)
+
+    assert result["boundary"]["learner_step"] == 100
+    assert result["boundary"]["discarded_uncheckpointed_steps"] == 50
+
+
 def test_cli_defaults_to_json_dry_run(tmp_path: Path, capsys) -> None:
     fixture = _fixture(tmp_path)
     before = _snapshot(fixture.root)
