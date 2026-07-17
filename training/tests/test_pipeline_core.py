@@ -1374,6 +1374,53 @@ def test_replay_window_shutdown_closes_workers_and_stop_clears_watermark(
         )
 
 
+def test_learner_gpu_pause_synchronizes_and_releases_cuda_cache(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    pause_path = tmp_path / "arena-gpu-pause.json"
+    pause_path.write_text(json.dumps({"pid": os.getpid()}), encoding="utf-8")
+    learner = object.__new__(LearnerLoop)
+    learner.gpu_pause_path = pause_path
+    learner.rank = 0
+    learner.step = 12
+    learner.serialized_config = {"orchestration": {"plateau": {"poll_seconds": 0.001}}}
+    learner.model = SimpleNamespace(
+        parameters=lambda: iter([SimpleNamespace(device=torch.device("cuda"))])
+    )
+    learner._broadcast_object = lambda value: value
+    learner._collective_stop = lambda value: value
+    barriers = []
+    learner._distributed_barrier = lambda: barriers.append(True)
+    synchronized = []
+    emptied = []
+    monkeypatch.setattr(torch.cuda, "synchronize", synchronized.append)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: emptied.append(True))
+    pauses = []
+    progress_events = []
+
+    def progress(**details) -> None:
+        progress_events.append(details)
+        pause_path.unlink()
+
+    assert learner._gpu_pause_control(
+        stop_requested=lambda: False,
+        progress=progress,
+        on_pause=lambda: pauses.append(True),
+    )
+    assert pauses == [True]
+    assert synchronized == [torch.device("cuda")]
+    assert emptied == [True]
+    assert barriers == [True]
+    assert progress_events == [
+        {
+            "phase": "arena_gpu_pause",
+            "step": 12,
+            "cuda_cache_released": True,
+        }
+    ]
+
+
 def test_prospective_fractional_utd_state_and_target_mismatch_fail_closed(
     tmp_path,
     monkeypatch,

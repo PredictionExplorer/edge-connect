@@ -743,6 +743,60 @@ def test_promotion_runs_waves_in_one_lease_and_pins_result_manifests(
     assert case.candidate.checkpoint.is_file()
 
 
+def test_learner_shared_promotion_yields_after_one_wave_and_cools_down(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    case = _promotion_wave_case(tmp_path, monkeypatch)
+    bounded = replace(
+        case.experiment.orchestration.promotion,
+        poll_seconds=10.0,
+        max_waves_per_lease=1,
+        inter_wave_cooldown_seconds=30.0,
+    )
+    case.supervisor.experiment = replace(
+        case.experiment,
+        orchestration=replace(case.experiment.orchestration, promotion=bounded),
+    )
+    now_ns = [1_000_000_000]
+    case.supervisor.wall_clock_ns = lambda: now_ns[0]
+
+    evaluated, state = case.supervisor._evaluate_candidate_session(
+        candidate=case.candidate,
+        champion=case.champion,
+        previous=None,
+        stop_requested=lambda: False,
+        progress=None,
+        once=False,
+    )
+
+    assert evaluated == 1
+    assert state == "lease_yield"
+    assert case.state.lease_entries == 1
+    assert len(json.loads(case.result_path.read_text())["pairs"]) == 2
+    assert case.supervisor.cooldown_path.is_file()
+    sleeps = []
+
+    def sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        now_ns[0] += int(seconds * 1_000_000_000)
+
+    case.supervisor.sleep = sleep
+    monkeypatch.setattr(
+        case.supervisor,
+        "_newer_candidate",
+        lambda *_args: SimpleNamespace(model_step=99),
+    )
+    assert case.supervisor._wait_between_leases(
+        candidate=case.candidate,
+        champion=case.champion,
+        stop_requested=lambda: False,
+        progress=None,
+    )
+    assert sleeps == [10.0, 10.0, 10.0]
+    assert not case.supervisor.cooldown_path.exists()
+
+
 def test_promotion_wave_fills_minimum_without_overshooting() -> None:
     experiment = load_config(Path(__file__).parents[1] / "configs" / "small.yaml")
     supervisor = object.__new__(PromotionSupervisor)

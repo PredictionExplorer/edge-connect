@@ -354,6 +354,7 @@ class PromotionSupervisor:
         device: str,
         gpu_pause_path: str | Path | None = None,
         clock: Callable[[], float] = time.monotonic,
+        wall_clock_ns: Callable[[], int] = time.time_ns,
         sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         self.experiment = experiment
@@ -369,7 +370,13 @@ class PromotionSupervisor:
             Path(gpu_pause_path) if gpu_pause_path is not None else None
         )
         self.pause_events_path = self.results_directory / "pause-lease-events.jsonl"
+        self.cooldown_path = (
+            self.gpu_pause_path.parent / "arena-inter-wave-cooldown.json"
+            if self.gpu_pause_path is not None
+            else self.results_directory / ".inter-wave-cooldown.json"
+        )
         self.clock = clock
+        self.wall_clock_ns = wall_clock_ns
         self.sleep = sleep
         self._manifest_cache: dict[Path, ModelManifest] = {}
 
@@ -539,9 +546,79 @@ class PromotionSupervisor:
                 return evaluated
             if stop_requested():
                 return evaluated
+            if session_state == "lease_yield":
+                if not self._wait_between_leases(
+                    candidate=candidate,
+                    champion=champion,
+                    stop_requested=stop_requested,
+                    progress=progress,
+                ):
+                    return evaluated
             if once and session_state != "superseded":
                 return evaluated
         return evaluated
+
+    def _wait_between_leases(
+        self,
+        *,
+        candidate: ModelManifest,
+        champion: ModelManifest,
+        stop_requested: Callable[[], bool],
+        progress: Callable[..., None] | None,
+    ) -> bool:
+        promotion = self.experiment.orchestration.promotion
+        if not self.cooldown_path.is_file():
+            return True
+        try:
+            payload = json.loads(self.cooldown_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError(f"cannot read arena inter-wave cooldown: {exc}") from exc
+        if (
+            not isinstance(payload, dict)
+            or payload.get("schema_version") != 1
+            or payload.get("run_id") != self.run_identity.run_id
+            or payload.get("generation_family")
+            != self.run_identity.generation_family
+            or isinstance(payload.get("not_before_ns"), bool)
+            or not isinstance(payload.get("not_before_ns"), int)
+        ):
+            raise ValueError("arena inter-wave cooldown is incompatible")
+        not_before_ns = int(payload["not_before_ns"])
+        while self.wall_clock_ns() < not_before_ns:
+            if stop_requested():
+                return False
+            remaining = max(0.0, (not_before_ns - self.wall_clock_ns()) / 1e9)
+            if progress is not None:
+                progress(
+                    phase="arena_inter_wave_cooldown",
+                    candidate_step=candidate.model_step,
+                    champion_step=champion.model_step,
+                    remaining_seconds=remaining,
+                )
+            interval = min(promotion.poll_seconds, remaining)
+            self.sleep(interval)
+        self.cooldown_path.unlink(missing_ok=True)
+        return True
+
+    def _record_inter_wave_cooldown(self, candidate: ModelManifest) -> None:
+        seconds = (
+            self.experiment.orchestration.promotion.inter_wave_cooldown_seconds
+        )
+        if seconds <= 0:
+            return
+        created_ns = self.wall_clock_ns()
+        atomic_json(
+            self.cooldown_path,
+            {
+                "schema_version": 1,
+                "run_id": self.run_identity.run_id,
+                "generation_family": self.run_identity.generation_family,
+                "candidate_identity": candidate.model_identity,
+                "candidate_step": candidate.model_step,
+                "created_ns": created_ns,
+                "not_before_ns": created_ns + int(seconds * 1_000_000_000),
+            },
+        )
 
     def _evaluate_historical_if_due(
         self,
@@ -733,6 +810,13 @@ class PromotionSupervisor:
         progress: Callable[..., None] | None,
         once: bool,
     ) -> tuple[int, str]:
+        if not self._wait_between_leases(
+            candidate=candidate,
+            champion=champion,
+            stop_requested=stop_requested,
+            progress=progress,
+        ):
+            return 0, "stopped"
         newer = self._newer_candidate(candidate, champion)
         if newer is not None:
             marked = self._mark_superseded(
@@ -893,6 +977,12 @@ class PromotionSupervisor:
                         return waves, "terminal"
                     if once:
                         return waves, "once"
+                    max_waves = (
+                        self.experiment.orchestration.promotion.max_waves_per_lease
+                    )
+                    if max_waves is not None and waves >= max_waves:
+                        self._record_inter_wave_cooldown(candidate)
+                        return waves, "lease_yield"
             finally:
                 del runner
                 del champion_evaluator

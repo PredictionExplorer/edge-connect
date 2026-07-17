@@ -2608,6 +2608,7 @@ class LearnerLoop:
         if self.gpu_pause_path is None:
             return True
         pause_applied = False
+        cuda_cache_released = False
         while True:
             active = self._rank_zero_gpu_pause_active() if self.rank == 0 else None
             active = self._broadcast_object(active)
@@ -2615,13 +2616,24 @@ class LearnerLoop:
                 return True
             if active is not True:
                 raise RuntimeError("distributed GPU pause state is invalid")
-            if not pause_applied and on_pause is not None:
-                on_pause()
+            if not pause_applied:
+                if on_pause is not None:
+                    on_pause()
+                device = next(self.model.parameters()).device
+                if device.type == "cuda":
+                    torch.cuda.synchronize(device)
+                    torch.cuda.empty_cache()
+                    cuda_cache_released = True
+                self._distributed_barrier()
                 pause_applied = True
             if self._collective_stop(stop_requested()):
                 return False
             if progress is not None and self.rank == 0:
-                progress(phase="arena_gpu_pause", step=self.step)
+                progress(
+                    phase="arena_gpu_pause",
+                    step=self.step,
+                    cuda_cache_released=cuda_cache_released,
+                )
             time.sleep(self._plateau_config().poll_seconds)
 
     def _rank_zero_gpu_pause_active(self) -> bool:

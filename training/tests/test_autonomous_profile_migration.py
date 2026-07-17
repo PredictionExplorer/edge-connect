@@ -42,6 +42,10 @@ def _fixture(tmp_path: Path) -> _Fixture:
     old_raw = yaml.safe_load(base_path.read_text(encoding="utf-8"))
     old_raw["orchestration"]["run_id"] = "autonomous-test-run"
     old_raw["orchestration"]["directories"]["root"] = str(root)
+    old_raw["orchestration"]["gpus"][7]["actor_lanes"] = 1
+    old_raw["orchestration"]["promotion"]["gpu_id"] = 7
+    old_raw["orchestration"]["promotion"].pop("max_waves_per_lease")
+    old_raw["orchestration"]["promotion"].pop("inter_wave_cooldown_seconds")
     old_raw["orchestration"].pop("historical_evaluation", None)
     old_raw["data"].pop("min_batches_for_workers", None)
 
@@ -454,3 +458,90 @@ def test_chained_migration_preserves_unchanged_utd_segment(tmp_path: Path) -> No
     migration.migrate_autonomous_profile(request, apply=True)
 
     assert (fixture.root / "learner" / "utd-segment.json").read_bytes() == first_segment
+
+
+def test_gpu_topology_migration_is_narrowly_allowlisted(tmp_path: Path) -> None:
+    run_root = tmp_path / "run"
+    run_root.mkdir()
+    profile = Path(__file__).parents[1] / "configs" / "h100-8gpu-autonomous.yaml"
+    target_raw = yaml.safe_load(profile.read_text(encoding="utf-8"))
+    target_raw["orchestration"]["run_id"] = "topology-migration"
+    target_raw["orchestration"]["directories"]["root"] = str(run_root)
+    source_raw = deepcopy(target_raw)
+    source_raw["orchestration"]["gpus"][7]["actor_lanes"] = 1
+    source_raw["orchestration"]["promotion"]["gpu_id"] = 7
+    source_raw["orchestration"]["promotion"].pop("max_waves_per_lease")
+    source_raw["orchestration"]["promotion"].pop("inter_wave_cooldown_seconds")
+    source_raw["orchestration"]["historical_evaluation"]["enabled"] = True
+    source = tmp_path / "source.yaml"
+    target = tmp_path / "target.yaml"
+    source.write_text(yaml.safe_dump(source_raw, sort_keys=False), encoding="utf-8")
+    target.write_text(yaml.safe_dump(target_raw, sort_keys=False), encoding="utf-8")
+
+    changes = migration._validate_profile_pair(
+        load_config(source),
+        load_config(target),
+        run_root=run_root,
+    )
+
+    paths = {path for path, _, _ in changes}
+    assert {
+        "orchestration.gpus.7.actor_lanes",
+        "orchestration.promotion.gpu_id",
+        "orchestration.promotion.max_waves_per_lease",
+        "orchestration.promotion.inter_wave_cooldown_seconds",
+        "orchestration.historical_evaluation.enabled",
+    } <= paths
+
+    invalid_raw = deepcopy(target_raw)
+    invalid_raw["orchestration"]["gpus"][7]["actor_lanes"] = 3
+    invalid = tmp_path / "invalid.yaml"
+    invalid.write_text(yaml.safe_dump(invalid_raw, sort_keys=False), encoding="utf-8")
+    with pytest.raises(migration.MigrationError, match="one lane to two"):
+        migration._validate_profile_pair(
+            load_config(source),
+            load_config(invalid),
+            run_root=run_root,
+        )
+
+    unsafe_raw = deepcopy(target_raw)
+    unsafe_raw["orchestration"]["promotion"]["max_waves_per_lease"] = 2
+    unsafe = tmp_path / "unsafe.yaml"
+    unsafe.write_text(yaml.safe_dump(unsafe_raw, sort_keys=False), encoding="utf-8")
+    with pytest.raises(migration.MigrationError, match="learner-shared promotion"):
+        migration._validate_profile_pair(
+            load_config(source),
+            load_config(unsafe),
+            run_root=run_root,
+        )
+
+    measured_raw = deepcopy(target_raw)
+    measured_raw["orchestration"]["historical_evaluation"]["enabled"] = True
+    measured = tmp_path / "measured.yaml"
+    measured.write_text(
+        yaml.safe_dump(measured_raw, sort_keys=False),
+        encoding="utf-8",
+    )
+    with pytest.raises(migration.MigrationError, match="learner-shared promotion"):
+        migration._validate_profile_pair(
+            load_config(source),
+            load_config(measured),
+            run_root=run_root,
+        )
+    with pytest.raises(migration.MigrationError, match="learner-shared promotion"):
+        migration._validate_profile_pair(
+            load_config(target),
+            load_config(measured),
+            run_root=run_root,
+        )
+
+    drift_raw = deepcopy(target_raw)
+    drift_raw["orchestration"]["gpus"][7]["cpu_threads"] = 9
+    drift = tmp_path / "drift.yaml"
+    drift.write_text(yaml.safe_dump(drift_raw, sort_keys=False), encoding="utf-8")
+    with pytest.raises(migration.MigrationError, match="immutable fields"):
+        migration._validate_profile_pair(
+            load_config(source),
+            load_config(drift),
+            run_root=run_root,
+        )

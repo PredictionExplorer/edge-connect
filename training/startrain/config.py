@@ -601,6 +601,8 @@ class PromotionConfig:
     pause_ready_timeout_seconds: float = 1_200.0
     pause_release_timeout_seconds: float = 120.0
     final_drain_timeout_seconds: float = 7_200.0
+    max_waves_per_lease: int | None = None
+    inter_wave_cooldown_seconds: float = 0.0
 
     def __post_init__(self) -> None:
         if (
@@ -618,12 +620,31 @@ class PromotionConfig:
             or self.pause_ready_timeout_seconds <= 0
             or self.pause_release_timeout_seconds <= 0
             or self.final_drain_timeout_seconds <= 0
+            or (
+                self.max_waves_per_lease is not None
+                and (
+                    isinstance(self.max_waves_per_lease, bool)
+                    or not isinstance(self.max_waves_per_lease, int)
+                    or self.max_waves_per_lease <= 0
+                )
+            )
+            or isinstance(self.inter_wave_cooldown_seconds, bool)
+            or not isinstance(self.inter_wave_cooldown_seconds, int | float)
+            or not math.isfinite(float(self.inter_wave_cooldown_seconds))
+            or self.inter_wave_cooldown_seconds < 0
         ):
             raise ConfigError(
                 "promotion GPU, CPU, poll, and pause timeout settings are invalid"
             )
         if not isinstance(self.device, str) or not self.device:
             raise ConfigError("promotion device must be non-empty")
+        if (
+            self.inter_wave_cooldown_seconds
+            and self.max_waves_per_lease is None
+        ):
+            raise ConfigError(
+                "promotion inter-wave cooldown requires a bounded lease"
+            )
 
 
 @dataclass(frozen=True, slots=True)

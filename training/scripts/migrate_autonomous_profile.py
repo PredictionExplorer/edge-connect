@@ -41,6 +41,9 @@ _ALLOWED_PROFILE_PATHS = {
     ("learner", "selfplay_snapshot_warmup_interval_examples"),
     ("orchestration", "model_refresh", "inference_compile_dynamic"),
     ("orchestration", "model_refresh", "inference_compile_mode"),
+    ("orchestration", "promotion", "gpu_id"),
+    ("orchestration", "promotion", "max_waves_per_lease"),
+    ("orchestration", "promotion", "inter_wave_cooldown_seconds"),
     ("arena", "pairs_per_ring"),
     ("arena", "minimum_pairs_per_ring"),
 }
@@ -326,6 +329,13 @@ def _json_value(value: object) -> object:
 def _is_allowed_profile_path(path: tuple[str, ...]) -> bool:
     if path in _ALLOWED_PROFILE_PATHS:
         return True
+    if (
+        len(path) == 4
+        and path[:2] == ("orchestration", "gpus")
+        and path[2].isdigit()
+        and path[3] == "actor_lanes"
+    ):
+        return True
     # Evaluation configuration is intentionally isolated from training and replay.
     # Supporting this named subtree keeps future typed evaluation settings migratable
     # without opening arbitrary orchestration fields.
@@ -339,6 +349,69 @@ def _is_allowed_profile_path(path: tuple[str, ...]) -> bool:
             ("orchestration", "historical_evaluation"),
         }
     )
+
+
+def _validate_gpu_topology_pair(
+    old: ExperimentConfig,
+    new: ExperimentConfig,
+) -> None:
+    old_gpus = old.orchestration.gpus
+    new_gpus = new.orchestration.gpus
+    if len(old_gpus) != len(new_gpus):
+        raise MigrationError("GPU topology cannot add or remove physical GPUs")
+    changed_lanes = []
+    for index, (before, after) in enumerate(zip(old_gpus, new_gpus, strict=True)):
+        immutable = (
+            "gpu_id",
+            "role",
+            "cpu_threads",
+            "actor_batch_size",
+            "cpu_affinity",
+        )
+        if any(getattr(before, name) != getattr(after, name) for name in immutable):
+            raise MigrationError(
+                f"GPU topology changed immutable fields at orchestration.gpus.{index}"
+            )
+        if before.actor_lanes != after.actor_lanes:
+            changed_lanes.append(before.gpu_id)
+
+    old_promotion = old.orchestration.promotion
+    new_promotion = new.orchestration.promotion
+    old_by_id = {gpu.gpu_id: gpu for gpu in old_gpus}
+    new_by_id = {gpu.gpu_id: gpu for gpu in new_gpus}
+    new_shared = new_by_id.get(new_promotion.gpu_id)
+    if new_shared is not None and new_shared.role == "learner" and (
+        new_promotion.max_waves_per_lease != 1
+        or new_promotion.inter_wave_cooldown_seconds < 1_800
+        or new.orchestration.historical_evaluation.enabled
+    ):
+        raise MigrationError(
+            "learner-shared promotion requires one-wave leases, a 30-minute "
+            "cooldown, and disabled historical evaluation"
+        )
+    if old_promotion.gpu_id == new_promotion.gpu_id:
+        if changed_lanes:
+            raise MigrationError("actor lane changes require moving promotion off that GPU")
+        return
+    if (
+        not old_promotion.pause_sharing_mode
+        or not new_promotion.pause_sharing_mode
+    ):
+        raise MigrationError("GPU topology migration must retain pause sharing")
+    old_shared = old_by_id.get(old_promotion.gpu_id)
+    if old_shared is None or old_shared.role != "actor":
+        raise MigrationError("source promotion GPU must be an actor GPU")
+    if new_shared is None or new_shared.role != "learner":
+        raise MigrationError("target promotion GPU must be a learner GPU")
+    if (
+        changed_lanes != [old_shared.gpu_id]
+        or old_shared.actor_lanes != 1
+        or new_by_id[old_shared.gpu_id].actor_lanes != 2
+    ):
+        raise MigrationError(
+            "topology migration may only raise the former arena actor "
+            "from one lane to two"
+        )
 
 
 def _validate_profile_pair(
@@ -378,6 +451,7 @@ def _validate_profile_pair(
     for section in ("game", "model", "loss", "optimizer"):
         if getattr(old, section) != getattr(new, section):
             raise MigrationError(f"{section} configuration is immutable")
+    _validate_gpu_topology_pair(old, new)
 
     differences = tuple(_profile_diffs(old.as_dict(), new.as_dict()))
     disallowed = [

@@ -182,6 +182,12 @@ a fresh learner `arena_gpu_pause` progress acknowledgement before granting the
 same tokenized lease. Pause sharing must overlap exactly one configured learner
 or actor GPU; all uncoordinated overlap is rejected.
 
+The autonomous 8-GPU profile uses this learner-sharing mode on GPU 0 so both
+GPU-7 actor lanes remain productive during promotion. Learner-shared leases are
+limited to one arena wave; unresolved candidates release the lease for a
+30-minute learner catch-up interval. Automatic historical cross-play is disabled
+because it consumes learner wall time without producing replay.
+
 Model pointers use pointer-relative manifest paths, and immutable manifests use
 manifest-relative checkpoint paths. The whole learner artifact tree can be
 relocated or mounted at a different container path without invalidating digest

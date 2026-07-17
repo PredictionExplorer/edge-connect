@@ -238,9 +238,21 @@ def test_autonomous_run_provenance_rejects_imports_and_profile_drift(
     actor = next(spec for spec in specs if spec.role == "actor")
     actor_candidate = actor.command[actor.command.index("--candidate-manifest") + 1]
     assert actor_candidate.endswith("/learner/selfplay/candidate.json")
+    learner = next(spec for spec in specs if spec.role == "learner")
+    assert learner.gpu_ids == (0,)
+    assert "--gpu-pause" in learner.command
+    actor_specs = [spec for spec in specs if spec.role == "actor"]
+    assert len(actor_specs) == 14
+    gpu_seven = [spec for spec in actor_specs if spec.gpu_ids == (7,)]
+    assert [spec.name for spec in gpu_seven] == [
+        "actor-gpu-7-lane-0",
+        "actor-gpu-7-lane-1",
+    ]
     promotion = next(spec for spec in specs if spec.role == "arena")
     promotion_candidate = promotion.command[promotion.command.index("--candidate") + 1]
     assert promotion_candidate.endswith("/learner/candidate.json")
+    assert promotion.gpu_ids == (0,)
+    assert promotion.environment["CUDA_VISIBLE_DEVICES"] == "0"
     (directories.learner / "candidate.json").write_text("{}", encoding="utf-8")
     with pytest.raises(ValueError, match="imported artifacts"):
         validate_autonomous_run_root(configured, directories)

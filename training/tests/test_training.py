@@ -175,9 +175,15 @@ def test_yaml_configs_load_strictly() -> None:
     assert autonomous.data.shards_per_batch == 4
     assert autonomous.arena.pairs_per_ring == 15
     assert autonomous.arena.minimum_pairs_per_ring == 15
-    assert autonomous.orchestration.historical_evaluation.enabled is True
+    assert autonomous.orchestration.historical_evaluation.enabled is False
     assert autonomous.orchestration.historical_evaluation.every_promotions == 4
     assert autonomous.orchestration.historical_evaluation.pairs_per_ring == 10
+    assert autonomous.orchestration.promotion.gpu_id == 0
+    assert autonomous.orchestration.promotion.max_waves_per_lease == 1
+    assert (
+        autonomous.orchestration.promotion.inter_wave_cooldown_seconds == 1_800
+    )
+    assert sum(gpu.actor_lanes for gpu in autonomous.orchestration.actor_gpus) == 14
     assert replace(autonomous.selfplay, rings=10).considered_actions() == 53
     validate_continuous_config(autonomous)
 
@@ -206,7 +212,21 @@ def test_yaml_configs_load_strictly() -> None:
                     autonomous.orchestration,
                     historical_evaluation=replace(
                         autonomous.orchestration.historical_evaluation,
+                        enabled=True,
                         max_pairs_per_ring=15,
+                    ),
+                ),
+            )
+        )
+    with pytest.raises(ValueError, match="learner-shared promotion"):
+        validate_continuous_config(
+            replace(
+                autonomous,
+                orchestration=replace(
+                    autonomous.orchestration,
+                    promotion=replace(
+                        autonomous.orchestration.promotion,
+                        max_waves_per_lease=2,
                     ),
                 ),
             )
@@ -260,7 +280,7 @@ def test_inference_compile_and_historical_evaluation_settings_load_strictly(
         experiment.orchestration.model_refresh.inference_compile_mode
         == "reduce-overhead"
     )
-    assert experiment.orchestration.historical_evaluation.enabled is True
+    assert experiment.orchestration.historical_evaluation.enabled is False
     assert experiment.orchestration.historical_evaluation.max_pairs_per_ring == 10
     with pytest.raises(ConfigError, match="inference_compile_mode"):
         ModelRefreshConfig(inference_compile_mode="fastest")  # type: ignore[arg-type]

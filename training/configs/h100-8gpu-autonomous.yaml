@@ -144,7 +144,7 @@ orchestration:
     role: actor
     cpu_threads: 8
     actor_batch_size: 128
-    actor_lanes: 1
+    actor_lanes: 2
     cpu_affinity: 104-207
   actor_games_per_batch: 128
   ring_mixture:
@@ -195,7 +195,7 @@ orchestration:
     backend: nccl
   promotion:
     enabled: true
-    gpu_id: 7
+    gpu_id: 0
     cpu_threads: 8
     poll_seconds: 10.0
     bootstrap_initial_champion: true
@@ -204,8 +204,10 @@ orchestration:
     pause_ready_timeout_seconds: 930.0
     pause_release_timeout_seconds: 120.0
     final_drain_timeout_seconds: 57600.0
+    max_waves_per_lease: 1
+    inter_wave_cooldown_seconds: 1800.0
   historical_evaluation:
-    enabled: true
+    enabled: false
     every_promotions: 4
     anchors_per_evaluation: 1
     pairs_per_ring: 10
