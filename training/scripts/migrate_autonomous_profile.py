@@ -45,6 +45,7 @@ _ALLOWED_PROFILE_PATHS = {
     ("orchestration", "promotion", "max_waves_per_lease"),
     ("orchestration", "promotion", "inter_wave_cooldown_seconds"),
     ("arena", "pairs_per_ring"),
+    ("arena", "continuation_pairs_per_ring"),
     ("arena", "minimum_pairs_per_ring"),
 }
 

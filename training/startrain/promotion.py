@@ -9,7 +9,7 @@ import os
 import threading
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from contextlib import contextmanager
 from dataclasses import asdict, replace
 from pathlib import Path
@@ -577,8 +577,7 @@ class PromotionSupervisor:
             not isinstance(payload, dict)
             or payload.get("schema_version") != 1
             or payload.get("run_id") != self.run_identity.run_id
-            or payload.get("generation_family")
-            != self.run_identity.generation_family
+            or payload.get("generation_family") != self.run_identity.generation_family
             or isinstance(payload.get("not_before_ns"), bool)
             or not isinstance(payload.get("not_before_ns"), int)
         ):
@@ -601,9 +600,7 @@ class PromotionSupervisor:
         return True
 
     def _record_inter_wave_cooldown(self, candidate: ModelManifest) -> None:
-        seconds = (
-            self.experiment.orchestration.promotion.inter_wave_cooldown_seconds
-        )
+        seconds = self.experiment.orchestration.promotion.inter_wave_cooldown_seconds
         if seconds <= 0:
             return
         created_ns = self.wall_clock_ns()
@@ -970,6 +967,9 @@ class PromotionSupervisor:
                         metric_device=metric_device,
                         collect_cuda_metrics=collect_cuda_metrics,
                         progress=progress,
+                        wave_index=waves,
+                        pair_starts=starts,
+                        pair_counts=counts,
                     )
                     waves += 1
                     previous_result = result
@@ -1005,6 +1005,9 @@ class PromotionSupervisor:
         metric_device: torch.device,
         collect_cuda_metrics: bool,
         progress: Callable[..., None] | None,
+        wave_index: int,
+        pair_starts: Mapping[int, int],
+        pair_counts: Mapping[int, int],
     ) -> tuple[str, bool]:
         if collect_cuda_metrics:
             torch.cuda.synchronize(metric_device)
@@ -1025,6 +1028,53 @@ class PromotionSupervisor:
             if collect_cuda_metrics
             else None
         )
+        evaluation_metrics["requested_pairs"] = sum(pair_counts.values())
+        evaluation_metrics["completed_pairs"] = len(self._pairs_from_result(result))
+        previous_history = (
+            previous.get("wave_history", []) if previous is not None else []
+        )
+        if not isinstance(previous_history, list) or not all(
+            isinstance(item, dict) for item in previous_history
+        ):
+            raise ValueError("persisted arena wave history is invalid")
+        if previous is not None and not previous_history:
+            legacy_pairs = self._pairs_from_result(previous)
+            if legacy_pairs:
+                previous_history = [
+                    {
+                        "schema_version": 0,
+                        "wave_index": 0,
+                        "phase": "legacy",
+                        "pair_counts": {
+                            str(ring): sum(pair.ring == ring for pair in legacy_pairs)
+                            for ring in self.experiment.arena.rings
+                        },
+                    }
+                ]
+        wave_plan = {
+            "schema_version": 1,
+            "wave_index": len(previous_history),
+            "lease_wave_index": wave_index,
+            "phase": (
+                "initial"
+                if any(
+                    pair_starts.get(ring, 0)
+                    < self.experiment.arena.minimum_pairs_per_ring
+                    for ring in self.experiment.arena.rings
+                )
+                else "continuation"
+            ),
+            "pair_starts": {
+                str(ring): int(pair_starts.get(ring, 0))
+                for ring in self.experiment.arena.rings
+            },
+            "pair_counts": {
+                str(ring): int(pair_counts.get(ring, 0))
+                for ring in self.experiment.arena.rings
+            },
+        }
+        result["wave_plan"] = wave_plan
+        result["wave_history"] = [*previous_history, wave_plan]
         result["arena_seed_block"] = arena_config.seed
         unique = {(pair.ring, pair.pair): pair for pair in accumulated}
         for pair in self._pairs_from_result(result):
@@ -1135,7 +1185,10 @@ class PromotionSupervisor:
             wave = (
                 min(self.experiment.arena.pairs_per_ring, required_for_minimum)
                 if required_for_minimum
-                else self.experiment.arena.pairs_per_ring
+                else (
+                    self.experiment.arena.continuation_pairs_per_ring
+                    or self.experiment.arena.pairs_per_ring
+                )
             )
             counts[ring] = min(wave, remaining)
         return starts, counts

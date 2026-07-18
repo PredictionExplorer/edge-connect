@@ -52,6 +52,15 @@ class EloEstimate:
 
 
 @dataclass(frozen=True, slots=True)
+class EloContrast:
+    first_identity: str
+    second_identity: str
+    difference: float
+    standard_error: float
+    confidence_interval: tuple[float, float]
+
+
+@dataclass(frozen=True, slots=True)
 class BradleyTerryFit:
     """A fit for the graph component containing ``anchor_identity``."""
 
@@ -67,10 +76,43 @@ class BradleyTerryFit:
     converged: bool
     iterations: int
     log_likelihood: float
+    covariance_identities: tuple[str, ...]
+    rating_covariance: tuple[tuple[float, ...], ...]
 
     @property
     def connected(self) -> bool:
         return len(self.components) == 1
+
+    def contrast(self, first_identity: str, second_identity: str) -> EloContrast:
+        positions = {
+            identity: index for index, identity in enumerate(self.covariance_identities)
+        }
+        try:
+            first_index = positions[first_identity]
+            second_index = positions[second_identity]
+        except KeyError as exc:
+            raise ValueError(
+                f"identity is absent from the fitted component: {exc}"
+            ) from exc
+        ratings = {estimate.identity: estimate.rating for estimate in self.estimates}
+        difference = ratings[first_identity] - ratings[second_identity]
+        variance = (
+            self.rating_covariance[first_index][first_index]
+            + self.rating_covariance[second_index][second_index]
+            - 2.0 * self.rating_covariance[first_index][second_index]
+        )
+        standard_error = math.sqrt(max(0.0, variance))
+        z_value = NormalDist().inv_cdf(0.5 + self.confidence_level / 2.0)
+        return EloContrast(
+            first_identity=first_identity,
+            second_identity=second_identity,
+            difference=difference,
+            standard_error=standard_error,
+            confidence_interval=(
+                difference - z_value * standard_error,
+                difference + z_value * standard_error,
+            ),
+        )
 
 
 @dataclass(slots=True)
@@ -228,6 +270,19 @@ def fit_bradley_terry_elo(
             )
         )
     estimates.sort(key=lambda item: (-item.rating, item.identity))
+    covariance_identities = tuple(identities)
+    rating_covariance_rows = []
+    for first in identities:
+        row = []
+        for second in identities:
+            if first == anchor_identity or second == anchor_identity:
+                row.append(0.0)
+            else:
+                row.append(
+                    covariance[variable_index[first]][variable_index[second]]
+                    * _ELO_PER_LOGIT**2
+                )
+        rating_covariance_rows.append(tuple(row))
 
     return BradleyTerryFit(
         anchor_identity=anchor_identity,
@@ -244,6 +299,8 @@ def fit_bradley_terry_elo(
         converged=converged,
         iterations=iterations,
         log_likelihood=_log_likelihood(raw_pairs, logits),
+        covariance_identities=covariance_identities,
+        rating_covariance=tuple(rating_covariance_rows),
     )
 
 

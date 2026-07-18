@@ -38,6 +38,22 @@ def test_bradley_terry_fit_recovers_known_synthetic_ranking() -> None:
         < estimates["checkpoint-a"].rating
         < estimates["checkpoint-a"].confidence_interval[1]
     )
+    contrast = fit.contrast("checkpoint-a", "checkpoint-b")
+    assert contrast.difference == pytest.approx(one_step_elo)
+    assert (
+        0
+        < contrast.standard_error
+        < (
+            estimates["checkpoint-a"].standard_error ** 2
+            + estimates["checkpoint-b"].standard_error ** 2
+        )
+        ** 0.5
+    )
+    assert (
+        contrast.confidence_interval[0]
+        < contrast.difference
+        < contrast.confidence_interval[1]
+    )
 
 
 def test_reversed_and_repeated_directed_results_are_aggregated() -> None:

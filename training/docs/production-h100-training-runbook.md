@@ -99,6 +99,20 @@ free -h
 lsblk -o NAME,SIZE,FSTYPE,TYPE,MOUNTPOINTS
 ```
 
+Before every production start, run the fail-closed health gate against the
+frozen profile:
+
+```bash
+python scripts/hardware_health_preflight.py \
+  --config "$PROFILE" \
+  --output "$RUN_ROOT/status/hardware-health-startup.json"
+```
+
+The gate rejects missing or unexpected GPUs, non-H100 devices, MIG or ECC
+misconfiguration, volatile or aggregate uncorrectable ECC, SRAM threshold
+exceeded, pending channel/TPC repair, row-remap failure, and a requested GPU
+recovery action. Do not bypass it to resume a run.
+
 If 4–7 H100s are visible, use the 4-GPU profile and leave additional GPUs
 unassigned. If at least 8 are visible, use the 8-GPU profile; extra GPUs remain
 unassigned. Create and validate a custom topology only when the run should
@@ -610,7 +624,8 @@ sudo systemctl enable --now "edgeconnect-startrain-$RUN_ID.service"
 
 For an unlimited profile, generate the unit from
 `deploy/edgeconnect-startrain-continuous.service.example`. It validates the
-continuous settings, uses `Restart=always`, disables systemd's start-burst
+continuous settings, fails closed on configured GPU health before replay
+recovery, uses `Restart=always`, disables systemd's start-burst
 cutoff, and feeds a watchdog from the coordinator loop. A deliberate
 `systemctl stop` still suppresses restart. Finite profiles must use the regular
 `Restart=on-failure` template. Install the replay-ledger backup service/timer
@@ -620,6 +635,12 @@ For autonomous runs, also install
 `deploy/edgeconnect-startrain-report.{service,timer}.example`, replace
 `@PROVISIONED_GPUS@`, and enable the timer to refresh
 `strength-efficiency.json` every 15 minutes.
+
+The GPU gate is an `ExecCondition`: an unhealthy or unqueryable device leaves
+the unit inactive instead of entering a restart loop. Runtime health failure
+uses coordinator exit status 78, which both templates explicitly exclude from
+restart. An operator must re-run the health gate and start the unit after
+remediation.
 
 Keep the template's `KillMode=mixed`: systemd sends the graceful signal only to
 the coordinator, allowing it to unwind learner DataLoader children and actor
@@ -788,6 +809,9 @@ Useful metric expectations:
 - learner replay batches should report the native/Rust feature path;
 - actor metrics include games/s, samples/s, search simulations/s,
   policy-supervision rate, model role, and model identity;
+- the monitor headline actor rates use completed counter deltas over merged
+  physical-GPU wall intervals; `latest_batch_rate_sum` is legacy diagnostic
+  data and must not be used for capacity or Elo/hour decisions;
 - learner metrics include examples/s, step time, loss heads, gradient norm,
   replay counts, and model step;
 - shipped profiles report `model_role: champion`;
@@ -901,6 +925,26 @@ checkpoints remain protected. Whole-volume loss and persistent GPU/driver
 failure still require operator intervention.
 
 ## 19. Troubleshooting
+
+### Aggregate SRAM threshold or uncorrectable ECC
+
+Treat `SRAM Threshold Exceeded: Yes`, any volatile uncorrectable ECC, pending
+repair/remap, or a non-`None` recovery action as a blocking hardware incident.
+Capture `nvidia-smi -q -x`, kernel and service journals, current status,
+recovery pointers, and a verified replay-ledger backup. Disable the report and
+backup timers, then stop and disable the coordinator through systemd and allow
+the full graceful timeout. Do not resume on that GPU because volatile counters
+returned to zero.
+
+Before a provider node or GPU swap, copy the incident bundle, current recovery
+checkpoint, and verified replay-ledger backup off-host and verify their
+recorded SHA-256 digests. Confirm whether the run volume survives a full node
+replacement; a ledger without its replay shards is not a complete run backup.
+
+Request provider/NVIDIA Field Diagnostic or DCGM validation and replacement
+review. Resume only after eight full H100s pass the health gate, ring-6/ring-10
+CUDA preflight, topology checks, and NCCL smoke. A seven-GPU degraded resume is
+not supported for an initialized autonomous run.
 
 ### `torch.cuda.is_available()` is false
 
@@ -1035,6 +1079,8 @@ Promotion may use five-pair waves with a fifteen-pair minimum only while the
 existing anytime-valid pair e-process, error levels, search budget, deterministic
 opening schedule, and 200-pair maximum remain unchanged. Persist every wave so
 the arena can resume after a stop.
+`arena.continuation_pairs_per_ring` may increase only post-minimum continuation
+batches; it must not alter the initial minimum look or any statistical gate.
 
 Benchmark actor compile modes on the target H100 before selecting one. Compare
 the current dynamic full-graph path with static `reduce-overhead` and

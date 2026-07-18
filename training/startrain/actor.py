@@ -385,6 +385,11 @@ class ActorSupervisor:
 
     def run(self, *, stop_requested: Callable[[], bool]) -> int:
         batches = 0
+        process_started_ns = time.time_ns()
+        cumulative_games = 0
+        cumulative_samples = 0
+        cumulative_evaluator_rows = 0
+        cumulative_batch_wall_seconds = 0.0
         self.heartbeat.start()
         final_phase = "stopped"
         try:
@@ -573,6 +578,10 @@ class ActorSupervisor:
                         peak_cuda_reserved_memory_bytes,
                     ) = self._peak_cuda_memory()
                     batch_completed_ns = time.time_ns()
+                    cumulative_games += len(summaries)
+                    cumulative_samples += samples
+                    cumulative_evaluator_rows += evaluator_rows
+                    cumulative_batch_wall_seconds += elapsed
                     append_jsonl(
                         self.metrics_path,
                         {
@@ -587,6 +596,8 @@ class ActorSupervisor:
                             "generation_family": (self.run_identity.generation_family),
                             "generation": generation,
                             "batch": batches,
+                            "record_sequence": batches,
+                            "process_started_ns": process_started_ns,
                             "ring": ring,
                             "scheduling_step": scheduling_step,
                             "scheduling_step_source": scheduling_step_source,
@@ -603,6 +614,12 @@ class ActorSupervisor:
                             ),
                             "evaluator_calls": evaluator_calls,
                             "evaluator_rows": evaluator_rows,
+                            "cumulative_games": cumulative_games,
+                            "cumulative_samples": cumulative_samples,
+                            "cumulative_evaluator_rows": cumulative_evaluator_rows,
+                            "cumulative_batch_wall_seconds": (
+                                cumulative_batch_wall_seconds
+                            ),
                             "evaluator_rows_per_second": (
                                 evaluator_rows / elapsed if elapsed else 0.0
                             ),
@@ -697,6 +714,11 @@ class ActorSupervisor:
                         games=len(summaries),
                         samples=samples,
                         evaluator_rows=evaluator_rows,
+                        process_started_ns=process_started_ns,
+                        cumulative_games=cumulative_games,
+                        cumulative_samples=cumulative_samples,
+                        cumulative_evaluator_rows=cumulative_evaluator_rows,
+                        cumulative_batch_wall_seconds=cumulative_batch_wall_seconds,
                     )
             return batches
         except Exception:

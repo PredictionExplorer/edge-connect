@@ -868,6 +868,7 @@ class OrchestrationConfig:
 class ArenaConfig:
     rings: tuple[int, ...] = SUPPORTED_RINGS
     pairs_per_ring: int = 20
+    continuation_pairs_per_ring: int | None = None
     simulations: int = 1_024
     max_considered: int = 32
     c_visit: float = 50.0
@@ -897,9 +898,21 @@ class ArenaConfig:
             raise ConfigError(
                 "arena rings must be a sorted unique subset of (4, 6, 8, 10)"
             )
-        if self.pairs_per_ring < 2 or self.simulations <= 0:
+        if (
+            self.pairs_per_ring < 2
+            or (
+                self.continuation_pairs_per_ring is not None
+                and (
+                    isinstance(self.continuation_pairs_per_ring, bool)
+                    or not isinstance(self.continuation_pairs_per_ring, int)
+                    or self.continuation_pairs_per_ring < 2
+                )
+            )
+            or self.simulations <= 0
+        ):
             raise ConfigError(
-                "arena requires at least two pairs per ring and positive simulations"
+                "arena requires at least two initial/continuation pairs per ring "
+                "and positive simulations"
             )
         if self.max_considered <= 0 or self.c_visit <= 0 or self.c_scale <= 0:
             raise ConfigError("arena search settings must be positive")
@@ -917,6 +930,12 @@ class ArenaConfig:
             self.pairs_per_ring > 0
             and self.minimum_pairs_per_ring >= self.pairs_per_ring
             and self.max_pairs_per_ring >= self.minimum_pairs_per_ring
+            and self.max_pairs_per_ring
+            >= (
+                self.continuation_pairs_per_ring
+                if self.continuation_pairs_per_ring is not None
+                else self.pairs_per_ring
+            )
         ):
             raise ConfigError(
                 "arena pair round/minimum/maximum settings are inconsistent"

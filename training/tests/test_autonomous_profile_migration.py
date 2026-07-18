@@ -561,3 +561,32 @@ def test_gpu_topology_migration_is_narrowly_allowlisted(tmp_path: Path) -> None:
             load_config(drift),
             run_root=run_root,
         )
+
+
+def test_arena_continuation_batch_is_allowlisted_for_existing_profile(
+    tmp_path: Path,
+) -> None:
+    run_root = tmp_path / "run"
+    run_root.mkdir()
+    profile = Path(__file__).parents[1] / "configs" / "h100-8gpu-autonomous.yaml"
+    target_raw = yaml.safe_load(profile.read_text(encoding="utf-8"))
+    target_raw["orchestration"]["run_id"] = "continuation-migration"
+    target_raw["orchestration"]["directories"]["root"] = str(run_root)
+    source_raw = deepcopy(target_raw)
+    source_raw["arena"].pop("continuation_pairs_per_ring")
+    source = tmp_path / "source-continuation.yaml"
+    target = tmp_path / "target-continuation.yaml"
+    source.write_text(yaml.safe_dump(source_raw, sort_keys=False), encoding="utf-8")
+    target.write_text(yaml.safe_dump(target_raw, sort_keys=False), encoding="utf-8")
+
+    changes = migration._validate_profile_pair(
+        load_config(source),
+        load_config(target),
+        run_root=run_root,
+    )
+
+    assert (
+        "arena.continuation_pairs_per_ring",
+        None,
+        50,
+    ) in changes

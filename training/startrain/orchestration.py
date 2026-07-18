@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Protocol, TextIO
 
 from .config import ExperimentConfig, load_config, parse_cpu_affinity
+from .hardware_health import query_gpu_health, unhealthy_reasons
 from .runtime import (
     RunIdentity,
     SignalLatch,
@@ -39,6 +40,9 @@ class ProcessProtocol(Protocol):
 
 
 ProcessFactory = Callable[..., ProcessProtocol]
+HardwareHealthProbe = Callable[[], Mapping[str, object]]
+HARDWARE_HEALTH_EXIT_CODE = 78
+HARDWARE_HEALTH_INTERVAL_SECONDS = 60.0
 
 
 def gpu_pause_ack_path(request_path: str | Path) -> Path:
@@ -227,6 +231,9 @@ class PauseLease:
     owner_stop_requested: bool = False
     owner_reaped: bool = False
     failure_reason: str | None = None
+    target_pause_generation: int | None = None
+    target_checkpoint_step: int | None = None
+    ready_latency_seconds: float | None = None
 
 
 class CoordinatorLock:
@@ -530,6 +537,8 @@ class Coordinator:
         process_factory: ProcessFactory = subprocess.Popen,
         clock: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
+        hardware_health_probe: HardwareHealthProbe | None = None,
+        hardware_health_interval_seconds: float = HARDWARE_HEALTH_INTERVAL_SECONDS,
     ) -> None:
         if not specs or sum(spec.role == "learner" for spec in specs) != 1:
             raise ValueError("coordinator requires exactly one learner job")
@@ -541,6 +550,11 @@ class Coordinator:
         self.process_factory = process_factory
         self.clock = clock
         self.sleep = sleep
+        self.hardware_health_probe = hardware_health_probe
+        self.hardware_health_interval_seconds = hardware_health_interval_seconds
+        self.next_hardware_health_at = 0.0
+        self.hardware_health: dict[str, object] | None = None
+        self.hardware_failure_reason: str | None = None
         self.workers = {spec.name: ManagedWorker(spec) for spec in specs}
         self.lock = CoordinatorLock(directories.root / "coordinator.lock")
         self.metrics_path = directories.metrics / "coordinator.jsonl"
@@ -596,6 +610,8 @@ class Coordinator:
                 self.directories,
                 identity,
             )
+            if self._hardware_health_failed(self.clock(), force=True):
+                return HARDWARE_HEALTH_EXIT_CODE
             if stop_requested():
                 return 0
             for worker in self.workers.values():
@@ -603,6 +619,9 @@ class Coordinator:
             notifier.ready("StarTrain coordinator is running")
             while not stop_requested():
                 now = self.clock()
+                if self._hardware_health_failed(now):
+                    exit_code = HARDWARE_HEALTH_EXIT_CODE
+                    break
                 self._reconcile_pause_lease(now)
                 exhausted = self.pause_failed
                 for worker in self.workers.values():
@@ -637,6 +656,44 @@ class Coordinator:
             self._stop_all()
             self._write_status(final=True)
             self.lock.release()
+
+    def _hardware_health_failed(self, now: float, *, force: bool = False) -> bool:
+        probe = self.hardware_health_probe
+        if probe is None or (not force and now < self.next_hardware_health_at):
+            return False
+        self.next_hardware_health_at = now + self.hardware_health_interval_seconds
+        try:
+            report = dict(probe())
+        except Exception as exc:
+            report = {
+                "schema_version": 1,
+                "healthy": False,
+                "query_error": f"{type(exc).__name__}: {exc}",
+                "gpus": [],
+            }
+        report["observed_ns"] = time.time_ns()
+        self.hardware_health = report
+        atomic_json(self.directories.status / "hardware-health.json", report)
+        if report.get("healthy") is True:
+            self.hardware_failure_reason = None
+            return False
+        reasons = unhealthy_reasons(report)
+        reason = "; ".join(reasons) or str(
+            report.get("query_error", "GPU health report is unhealthy")
+        )
+        self.hardware_failure_reason = reason
+        append_jsonl(
+            self.metrics_path,
+            {
+                "schema_version": 1,
+                "timestamp_ns": time.time_ns(),
+                "event": "hardware_health_failure",
+                "reason": reason,
+                "report": report,
+            },
+            durable=True,
+        )
+        return True
 
     def _monitor_worker(self, worker: ManagedWorker, now: float) -> bool:
         pause_learner_ready = (
@@ -970,13 +1027,33 @@ class Coordinator:
         except (OSError, json.JSONDecodeError):
             return
         progress_ns = heartbeat.get("progress_ns") if isinstance(heartbeat, dict) else 0
+        pause_generation = (
+            heartbeat.get("pause_generation") if isinstance(heartbeat, dict) else None
+        )
+        pause_checkpoint_step = (
+            heartbeat.get("pause_checkpoint_step")
+            if isinstance(heartbeat, dict)
+            else None
+        )
         if (
             isinstance(heartbeat, dict)
             and heartbeat.get("phase") == "arena_gpu_pause"
             and isinstance(progress_ns, int)
             and not isinstance(progress_ns, bool)
             and progress_ns >= lease.requested_ns
+            and isinstance(pause_generation, int)
+            and not isinstance(pause_generation, bool)
+            and pause_generation > 0
+            and isinstance(pause_checkpoint_step, int)
+            and not isinstance(pause_checkpoint_step, bool)
+            and pause_checkpoint_step >= 0
+            and heartbeat.get("cuda_cache_released") is True
         ):
+            lease.target_pause_generation = pause_generation
+            lease.target_checkpoint_step = pause_checkpoint_step
+            lease.ready_latency_seconds = max(
+                0.0, (time.time_ns() - lease.requested_ns) / 1_000_000_000
+            )
             self._mark_pause_ready(lease)
 
     def _mark_pause_ready(self, lease: PauseLease) -> None:
@@ -1481,6 +1558,7 @@ class Coordinator:
                 "event": event,
                 "worker": worker.spec.name,
                 "role": worker.spec.role,
+                "gpu_ids": list(worker.spec.gpu_ids),
                 "pid": worker.process.pid if worker.process is not None else None,
                 "restart_count": worker.restart_count,
                 **details,
@@ -1497,6 +1575,8 @@ class Coordinator:
                 "coordinator_pid": os.getpid(),
                 "state": "stopped" if final else "running",
                 "draining": self.draining,
+                "hardware_health": self.hardware_health,
+                "hardware_failure_reason": self.hardware_failure_reason,
                 "pause_sharing": (
                     {
                         "token": self.pause_lease.token,
@@ -1508,6 +1588,15 @@ class Coordinator:
                         "heartbeat_ns": self.pause_lease.heartbeat_ns,
                         "release_requested": self.pause_lease.release_requested,
                         "failure_reason": self.pause_lease.failure_reason,
+                        "target_pause_generation": (
+                            self.pause_lease.target_pause_generation
+                        ),
+                        "target_checkpoint_step": (
+                            self.pause_lease.target_checkpoint_step
+                        ),
+                        "ready_latency_seconds": (
+                            self.pause_lease.ready_latency_seconds
+                        ),
                     }
                     if self.pause_lease is not None
                     else None
@@ -1571,10 +1660,19 @@ def orchestrate_main(argv: list[str] | None = None) -> None:
     )
     stop = SignalLatch()
     stop.install()
+    expected_gpu_indices = sorted({gpu_id for spec in specs for gpu_id in spec.gpu_ids})
+    requires_cuda_health = experiment.learner.device.startswith(
+        "cuda"
+    ) or experiment.orchestration.promotion.device.startswith("cuda")
     exit_code = Coordinator(
         experiment=experiment,
         specs=specs,
         directories=directories,
+        hardware_health_probe=(
+            (lambda: query_gpu_health(expected_indices=expected_gpu_indices))
+            if requires_cuda_health
+            else None
+        ),
     ).run(stop_requested=stop.is_set)
     if exit_code:
         raise SystemExit(exit_code)

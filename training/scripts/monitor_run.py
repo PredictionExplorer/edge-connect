@@ -82,6 +82,221 @@ def _latest_jsonl(
     return None
 
 
+def _recent_jsonl(path: Path, *, maximum_bytes: int = 2 * 1024 * 1024):
+    try:
+        with path.open("rb") as stream:
+            size = stream.seek(0, 2)
+            start = max(0, size - maximum_bytes)
+            stream.seek(start)
+            data = stream.read(size - start)
+    except OSError:
+        return []
+    if start and b"\n" in data:
+        data = data.split(b"\n", 1)[1]
+    lines = data.splitlines()
+    if data and not data.endswith(b"\n") and lines:
+        lines.pop()
+    output = []
+    for line in lines:
+        try:
+            payload = json.loads(line)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        if isinstance(payload, dict):
+            output.append(payload)
+    return output
+
+
+def _merge_interval_seconds(intervals: list[tuple[int, int]]) -> float:
+    merged = 0
+    end = 0
+    for started, completed in sorted(intervals):
+        if completed <= started:
+            continue
+        if started >= end:
+            merged += completed - started
+        elif completed > end:
+            merged += completed - end
+        end = max(end, completed)
+    return merged / 1_000_000_000
+
+
+def _actor_throughput_window(
+    metrics_root: Path,
+    *,
+    now_ns: int,
+    window_seconds: float = 3_600.0,
+) -> dict[str, object]:
+    cutoff_ns = now_ns - int(window_seconds * 1_000_000_000)
+    all_records = []
+
+    def required_int(row: Mapping[str, object], name: str) -> int:
+        value = row.get(name)
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(f"actor metric {name} is not an integer")
+        return value
+
+    def counter_int(row: Mapping[str, object], name: str) -> int:
+        value = row.get(name, 0)
+        return value if isinstance(value, int) and not isinstance(value, bool) else 0
+
+    for path in sorted(metrics_root.glob("actor-gpu-*.jsonl")):
+        for row in _recent_jsonl(path):
+            started = row.get("batch_started_ns")
+            completed = row.get("batch_completed_ns")
+            if (
+                isinstance(started, int)
+                and not isinstance(started, bool)
+                and isinstance(completed, int)
+                and not isinstance(completed, bool)
+                and completed <= now_ns
+                and completed > started
+            ):
+                all_records.append(row)
+
+    counter_names = ("games", "samples", "evaluator_rows")
+    cumulative_names = tuple(f"cumulative_{name}" for name in counter_names)
+    groups: dict[tuple[str, int], list[dict[str, object]]] = {}
+    legacy_records = []
+    for row in all_records:
+        process_started = row.get("process_started_ns")
+        if (
+            isinstance(process_started, int)
+            and not isinstance(process_started, bool)
+            and all(
+                isinstance(row.get(name), int) and not isinstance(row.get(name), bool)
+                for name in cumulative_names
+            )
+        ):
+            groups.setdefault(
+                (str(row.get("worker")), process_started),
+                [],
+            ).append(row)
+        elif required_int(row, "batch_completed_ns") >= cutoff_ns:
+            legacy_records.append(row)
+
+    totals = {name: 0 for name in counter_names}
+    totals_by_gpu: dict[int, dict[str, int]] = {}
+    workers_by_gpu: dict[int, set[str]] = {}
+    partial_processes = []
+    contributing_starts = []
+    contributing_records = []
+
+    def add_values(row: Mapping[str, object], values: Mapping[str, int]) -> None:
+        gpu_id = row.get("gpu_id")
+        for name, value in values.items():
+            totals[name] += value
+        if isinstance(gpu_id, int) and not isinstance(gpu_id, bool):
+            gpu_totals = totals_by_gpu.setdefault(
+                gpu_id, {name: 0 for name in counter_names}
+            )
+            for name, value in values.items():
+                gpu_totals[name] += value
+            workers_by_gpu.setdefault(gpu_id, set()).add(str(row.get("worker")))
+
+    for (worker, process_started), rows in sorted(groups.items()):
+        ordered = sorted(rows, key=lambda row: required_int(row, "batch_completed_ns"))
+        end = ordered[-1]
+        if required_int(end, "batch_completed_ns") < cutoff_ns:
+            continue
+        baselines = [
+            row
+            for row in ordered
+            if required_int(row, "batch_completed_ns") <= cutoff_ns
+        ]
+        if baselines:
+            baseline = baselines[-1]
+            values = {
+                name: required_int(end, f"cumulative_{name}")
+                - required_int(baseline, f"cumulative_{name}")
+                for name in counter_names
+            }
+            start_ns = cutoff_ns
+        elif process_started >= cutoff_ns:
+            values = {
+                name: required_int(end, f"cumulative_{name}") for name in counter_names
+            }
+            start_ns = process_started
+        else:
+            selected = [
+                row
+                for row in ordered
+                if required_int(row, "batch_completed_ns") >= cutoff_ns
+            ]
+            values = {
+                name: sum(counter_int(row, name) for row in selected)
+                for name in counter_names
+            }
+            start_ns = max(
+                cutoff_ns,
+                min(required_int(row, "batch_started_ns") for row in selected),
+            )
+            partial_processes.append(worker)
+        if any(value < 0 for value in values.values()):
+            partial_processes.append(worker)
+            continue
+        add_values(end, values)
+        contributing_starts.append(start_ns)
+        contributing_records.extend(
+            row
+            for row in ordered
+            if required_int(row, "batch_completed_ns") >= cutoff_ns
+        )
+
+    for row in legacy_records:
+        values = {name: counter_int(row, name) for name in counter_names}
+        add_values(row, values)
+        contributing_starts.append(
+            max(cutoff_ns, required_int(row, "batch_started_ns"))
+        )
+        contributing_records.append(row)
+        partial_processes.append(str(row.get("worker")))
+
+    observation_start_ns = (
+        max(cutoff_ns, min(contributing_starts)) if contributing_starts else cutoff_ns
+    )
+    fleet_seconds = max(0.0, (now_ns - observation_start_ns) / 1_000_000_000)
+    active_seconds = _merge_interval_seconds(
+        [
+            (
+                max(cutoff_ns, required_int(row, "batch_started_ns")),
+                min(now_ns, required_int(row, "batch_completed_ns")),
+            )
+            for row in contributing_records
+        ]
+    )
+    by_gpu = {}
+    for gpu_id, gpu_totals in sorted(totals_by_gpu.items()):
+        by_gpu[str(gpu_id)] = {
+            "wall_seconds": fleet_seconds,
+            **gpu_totals,
+            **{
+                f"{name}_per_second": value / fleet_seconds if fleet_seconds else None
+                for name, value in gpu_totals.items()
+            },
+            "workers": sorted(workers_by_gpu.get(gpu_id, set())),
+        }
+    return {
+        "schema_version": 1,
+        "method": "cumulative_counter_wall_window_v1",
+        "requested_window_seconds": window_seconds,
+        "observation_start_ns": observation_start_ns,
+        "observation_end_ns": now_ns,
+        "record_count": len(contributing_records),
+        "partial_processes": sorted(set(partial_processes)),
+        "active_interval_seconds": active_seconds,
+        "fleet": {
+            "wall_seconds": fleet_seconds,
+            **totals,
+            **{
+                f"{key}_per_second": value / fleet_seconds if fleet_seconds else None
+                for key, value in totals.items()
+            },
+        },
+        "by_gpu": by_gpu,
+    }
+
+
 def _run_command(command: Sequence[str], *, timeout: float = 10.0):
     try:
         return subprocess.run(
@@ -234,6 +449,8 @@ def _gpu_status() -> tuple[list[dict[str, object]], str | None]:
         "temperature.gpu",
         "power.draw",
         "ecc.errors.uncorrected.volatile.total",
+        "ecc.errors.uncorrected.aggregate.sram",
+        "ecc.errors.uncorrected.aggregate.dram",
     )
     completed = _run_command(
         [
@@ -673,9 +890,7 @@ def collect_snapshot(
             f"learner data wait is {data_wait_fraction:.1%} of wall step time",
         )
     updates_per_new_sample = _number(learner_metric.get("updates_per_new_sample"))
-    lifetime_updates = _number(
-        learner_metric.get("lifetime_updates_per_new_sample")
-    )
+    lifetime_updates = _number(learner_metric.get("lifetime_updates_per_new_sample"))
     if lifetime_updates is None:
         lifetime_updates = updates_per_new_sample
     segment_updates = _number(learner_metric.get("segment_updates_per_new_sample"))
@@ -727,16 +942,12 @@ def collect_snapshot(
         "utd_segment_baseline_committed_replay_samples": learner_metric.get(
             "utd_segment_baseline_committed_replay_samples"
         ),
-        "loader_workers_effective": learner_metric.get(
-            "loader_workers_effective"
-        ),
+        "loader_workers_effective": learner_metric.get("loader_workers_effective"),
         "window_setup_seconds": learner_metric.get("window_setup_seconds"),
         "window_setup_amortized_seconds": learner_metric.get(
             "window_setup_amortized_seconds"
         ),
-        "window_batches_allocated": learner_metric.get(
-            "window_batches_allocated"
-        ),
+        "window_batches_allocated": learner_metric.get("window_batches_allocated"),
         "window_batches_consumed": learner_metric.get("window_batches_consumed"),
         "window_batches_consumed_this_spin": learner_metric.get(
             "window_batches_consumed_this_spin"
@@ -832,8 +1043,24 @@ def collect_snapshot(
             "policy_supervision_low",
             "low actor policy supervision: " + ",".join(low_policy_workers),
         )
+    actor_throughput = _actor_throughput_window(
+        root / "metrics",
+        now_ns=now,
+    )
+    if (
+        active_actor_rows
+        and any(isinstance(row.get("batch_completed_ns"), int) for row in actors)
+        and actor_throughput.get("record_count") == 0
+    ):
+        _add_warning(
+            warnings,
+            "WARN",
+            "actor_throughput_stale",
+            "no completed actor batches are available in the throughput window",
+        )
     actor_fleet = {
         "workers": len(actors),
+        "throughput": actor_throughput,
         "policy_supervision_rate": policy_supervision_rate,
         "active_ring_weights": (
             list(next(iter(weight_variants))) if len(weight_variants) == 1 else None
@@ -856,6 +1083,7 @@ def collect_snapshot(
                 _number(row.get("evaluator_rows_per_second")) or 0.0 for row in actors
             ),
         },
+        "latest_batch_rate_sum_deprecated": True,
         "latest": [
             {
                 "worker": row.get("worker"),
@@ -1177,11 +1405,31 @@ def collect_snapshot(
         _add_warning(warnings, "WARN", "disk_high", "disk or inode use >=85%")
 
     gpus, gpu_error = _gpu_status()
+    hardware_health = (
+        _read_json(root / "status" / "hardware-health.json")
+        or _read_json(root / "status" / "hardware-health-startup.json")
+        or {}
+    )
     if gpu_error:
         _add_warning(warnings, "WARN", gpu_error, "GPU telemetry is unavailable")
+    if hardware_health and hardware_health.get("healthy") is not True:
+        reasons = []
+        hardware_rows = hardware_health.get("gpus")
+        for row in hardware_rows if isinstance(hardware_rows, list) else []:
+            if isinstance(row, dict):
+                reasons.extend(
+                    f"GPU {row.get('index')}: {reason}"
+                    for reason in row.get("reasons", [])
+                )
+        detail = "; ".join(reasons) or str(
+            hardware_health.get("query_error", "hardware health gate failed")
+        )
+        _add_warning(warnings, "ERROR", "gpu_health_gate", detail)
     for gpu in gpus:
         temperature = _number(gpu.get("temperature.gpu"))
         ecc = _number(gpu.get("ecc.errors.uncorrected.volatile.total"))
+        aggregate_sram = _number(gpu.get("ecc.errors.uncorrected.aggregate.sram"))
+        aggregate_dram = _number(gpu.get("ecc.errors.uncorrected.aggregate.dram"))
         if temperature is not None and temperature >= 90:
             _add_warning(
                 warnings,
@@ -1202,6 +1450,14 @@ def collect_snapshot(
                 "ERROR",
                 "gpu_ecc",
                 f"GPU {gpu['index']} volatile uncorrected ECC={ecc:g}",
+            )
+        if (aggregate_sram or 0.0) > 0 or (aggregate_dram or 0.0) > 0:
+            _add_warning(
+                warnings,
+                "ERROR",
+                "gpu_ecc_aggregate",
+                f"GPU {gpu['index']} aggregate uncorrected "
+                f"SRAM={aggregate_sram or 0:g} DRAM={aggregate_dram or 0:g}",
             )
 
     status = max(
@@ -1235,6 +1491,7 @@ def collect_snapshot(
         "pause": pause,
         "disk": disk,
         "gpus": gpus,
+        "gpu_health": hardware_health,
         "warnings": warnings,
     }
 
@@ -1244,7 +1501,9 @@ def format_text(snapshot: Mapping[str, object]) -> str:
     learner = learner if isinstance(learner, Mapping) else {}
     actors = snapshot.get("actors")
     actors = actors if isinstance(actors, Mapping) else {}
-    rates = actors.get("latest_batch_rate_sum")
+    throughput = actors.get("throughput")
+    throughput = throughput if isinstance(throughput, Mapping) else {}
+    rates = throughput.get("fleet")
     rates = rates if isinstance(rates, Mapping) else {}
     replay = snapshot.get("replay")
     replay = replay if isinstance(replay, Mapping) else {}

@@ -72,6 +72,8 @@ encoding, host transfer, model execution, and legal-logit return boundary:
 
 ```bash
 cd training
+uv run python scripts/hardware_health_preflight.py \
+  --config configs/h100-8gpu.yaml
 uv run pytest --require-native -m "cuda and not multi_gpu and not soak"
 uv run python scripts/hardware_preflight.py \
   --config configs/h100-8gpu.yaml \
@@ -80,6 +82,9 @@ uv run python scripts/hardware_preflight.py \
   --config configs/h100-8gpu.yaml \
   --rings 10
 ```
+
+The hardware-health gate is fail-closed. It must report every configured GPU
+healthy before CUDA correctness or throughput results are accepted.
 
 Both representative board sizes must sustain at least 5,000 realistic leaf
 evaluations per second per H100. Keep the emitted JSON with the run artifacts;

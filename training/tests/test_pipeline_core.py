@@ -72,7 +72,7 @@ from startrain.selfplay import (
     SelfPlayMetrics,
 )
 from startrain.topology import SUPPORTED_RINGS, get_topology
-from startrain.training import build_scheduler
+from startrain.training import DeviceBatchPrefetcher, build_scheduler
 
 
 def pack_mask(mask: torch.Tensor) -> list[int]:
@@ -1157,9 +1157,7 @@ def test_persistent_replay_window_reuses_loader_across_utd_waits(
         assert watermark_during_wait == [1]
         assert len(selected_indices) == len(set(selected_indices)) == 4
         assert (
-            store.connection.execute(
-                "SELECT COUNT(*) FROM gc_watermarks"
-            ).fetchone()[0]
+            store.connection.execute("SELECT COUNT(*) FROM gc_watermarks").fetchone()[0]
             == 0
         )
         events = [
@@ -1169,14 +1167,10 @@ def test_persistent_replay_window_reuses_loader_across_utd_waits(
             .splitlines()
         ]
         allocations = [
-            event
-            for event in events
-            if event.get("event") == "replay_window_allocated"
+            event for event in events if event.get("event") == "replay_window_allocated"
         ]
         consumptions = [
-            event
-            for event in events
-            if event.get("event") == "replay_window_consumed"
+            event for event in events if event.get("event") == "replay_window_consumed"
         ]
         assert len(allocations) == 1
         assert allocations[0]["window_batches_allocated"] == 4
@@ -1262,6 +1256,69 @@ def test_short_replay_windows_disable_configured_workers() -> None:
 
     assert learner._effective_loader_workers(31) == 0
     assert learner._effective_loader_workers(32) == 8
+
+
+def test_device_prefetcher_suspend_preserves_iterator_position() -> None:
+    class Source:
+        def __init__(self, value: int) -> None:
+            self.value = value
+
+        def to(self, _device):
+            return self
+
+    first = Source(1)
+    second = Source(2)
+    prefetcher = DeviceBatchPrefetcher(
+        [first, second],
+        device="cpu",
+        enabled=False,
+    )
+
+    prefetcher.suspend_device()
+    with pytest.raises(RuntimeError, match="suspended"):
+        next(prefetcher)
+    prefetcher.resume_device()
+
+    assert next(prefetcher) is first
+    assert next(prefetcher) is second
+
+
+def test_replay_window_gpu_pause_does_not_shutdown_loader_workers() -> None:
+    class WorkerIterator:
+        shutdowns = 0
+
+        def _shutdown_workers(self) -> None:
+            self.shutdowns += 1
+
+    worker_iterator = WorkerIterator()
+    calls: list[str] = []
+    window = ReplayWindowSession(
+        selection=ReplaySelection((), {}, 0),
+        loader=SimpleNamespace(_iterator=worker_iterator),
+        prefetcher=SimpleNamespace(
+            suspend_device=lambda: calls.append("suspend"),
+            resume_device=lambda: calls.append("resume"),
+            _stream=None,
+        ),
+        batches_allocated=4,
+        effective_workers=2,
+        setup_seconds=0.0,
+        refresh_reason="test",
+        opened_step=0,
+        opened_epoch=7,
+        active_rings=(),
+        ring_weights=None,
+        recovery_boundary=None,
+        ring_weight_boundary=None,
+    )
+
+    assert window.suspend_for_gpu_pause() == 1
+    assert window.suspended is True
+    assert worker_iterator.shutdowns == 0
+    assert window.resume_after_gpu_pause() == 1
+    assert window.suspended is False
+    assert window.opened_epoch == 7
+    assert calls == ["suspend", "resume"]
 
 
 def test_replay_window_shutdown_closes_workers_and_stop_clears_watermark(
@@ -1361,15 +1418,16 @@ def test_replay_window_shutdown_closes_workers_and_stop_clears_watermark(
 
         monkeypatch.setattr(learner, "_close_replay_window", capture_close)
 
-        assert learner.run(
-            steps=4,
-            stop_requested=lambda: learner.step >= 1,
-        ) == 1
+        assert (
+            learner.run(
+                steps=4,
+                stop_requested=lambda: learner.step >= 1,
+            )
+            == 1
+        )
         assert shutdown_reasons == ["stop"]
         assert (
-            store.connection.execute(
-                "SELECT COUNT(*) FROM gc_watermarks"
-            ).fetchone()[0]
+            store.connection.execute("SELECT COUNT(*) FROM gc_watermarks").fetchone()[0]
             == 0
         )
 
@@ -1383,6 +1441,7 @@ def test_learner_gpu_pause_synchronizes_and_releases_cuda_cache(
     learner = object.__new__(LearnerLoop)
     learner.gpu_pause_path = pause_path
     learner.rank = 0
+    learner.world_size = 1
     learner.step = 12
     learner.serialized_config = {"orchestration": {"plateau": {"poll_seconds": 0.001}}}
     learner.model = SimpleNamespace(
@@ -1390,12 +1449,17 @@ def test_learner_gpu_pause_synchronizes_and_releases_cuda_cache(
     )
     learner._broadcast_object = lambda value: value
     learner._collective_stop = lambda value: value
+    learner._gpu_pause_generation = 0
+    learner._maybe_write_recovery_checkpoint = lambda *, force: SimpleNamespace(step=12)
+    learner.metrics = SimpleNamespace(append=lambda _record: None)
     barriers = []
     learner._distributed_barrier = lambda: barriers.append(True)
     synchronized = []
     emptied = []
     monkeypatch.setattr(torch.cuda, "synchronize", synchronized.append)
     monkeypatch.setattr(torch.cuda, "empty_cache", lambda: emptied.append(True))
+    monkeypatch.setattr(torch.cuda, "memory_allocated", lambda _device: 0)
+    monkeypatch.setattr(torch.cuda, "memory_reserved", lambda _device: 0)
     pauses = []
     progress_events = []
 
@@ -1411,12 +1475,16 @@ def test_learner_gpu_pause_synchronizes_and_releases_cuda_cache(
     assert pauses == [True]
     assert synchronized == [torch.device("cuda")]
     assert emptied == [True]
-    assert barriers == [True]
+    assert barriers == [True, True]
     assert progress_events == [
         {
             "phase": "arena_gpu_pause",
             "step": 12,
             "cuda_cache_released": True,
+            "pause_generation": 1,
+            "pause_checkpoint_step": 12,
+            "cuda_memory_allocated_bytes": 0,
+            "cuda_memory_reserved_bytes": 0,
         }
     ]
 
@@ -1448,9 +1516,7 @@ def test_prospective_fractional_utd_state_and_target_mismatch_fail_closed(
 
         assert origin._utd_step_budget() == 2
         origin_state = json.loads(
-            (tmp_path / "utd-origin" / "utd-segment.json").read_text(
-                encoding="utf-8"
-            )
+            (tmp_path / "utd-origin" / "utd-segment.json").read_text(encoding="utf-8")
         )
         assert origin_state["baseline_examples_consumed"] == 0
         assert origin_state["baseline_committed_replay_samples"] == 0
@@ -1483,9 +1549,12 @@ def test_prospective_fractional_utd_state_and_target_mismatch_fail_closed(
         )
         assert not (restored_output / "utd-segment.json").exists()
         assert restored._utd_step_budget() == 2
-        assert json.loads(
-            (restored_output / "utd-segment.json").read_text(encoding="utf-8")
-        ) == origin_state
+        assert (
+            json.loads(
+                (restored_output / "utd-segment.json").read_text(encoding="utf-8")
+            )
+            == origin_state
+        )
 
         migrated_output = tmp_path / "utd-migrated"
         migrated = make_test_learner(

@@ -39,6 +39,7 @@ from startrain.model import GraphResTNet, ModelConfig
 from startrain.optim import OptimizerConfig, build_optimizer
 from startrain.orchestration import (
     Coordinator,
+    HARDWARE_HEALTH_EXIT_CODE,
     RunDirectories,
     build_worker_specs,
     ensure_autonomous_provenance,
@@ -66,6 +67,12 @@ def test_finite_and_continuous_systemd_restart_policies_are_distinct() -> None:
     assert "Restart=always" not in finite
     assert "Restart=always" in continuous
     assert "validate_continuous_profile.py" in continuous
+    assert "hardware_health_preflight.py" in continuous
+    assert "ExecCondition=" in continuous
+    assert "RestartPreventExitStatus=78" in continuous
+    assert "hardware_health_preflight.py" in finite
+    assert "ExecCondition=" in finite
+    assert "RestartPreventExitStatus=78" in finite
     assert "WatchdogSignal=SIGTERM" in finite
     assert "WatchdogSignal=SIGTERM" in continuous
     report_service = (
@@ -76,6 +83,55 @@ def test_finite_and_continuous_systemd_restart_policies_are_distinct() -> None:
     assert "@PROVISIONED_GPUS@" in report_service
     assert "OnUnitActiveSec=15min" in report_timer
     assert "edgeconnect-startrain-@RUN_ID@-report.service" in report_timer
+
+
+def test_coordinator_fails_closed_before_starting_workers_on_bad_hardware(
+    tmp_path,
+) -> None:
+    experiment = load_config(CONFIGS / "h100-4gpu.yaml")
+    experiment = replace(
+        experiment,
+        orchestration=replace(
+            experiment.orchestration,
+            directories=RunDirectoryConfig(root=str(tmp_path / "hardware-failure")),
+        ),
+    )
+    directories = RunDirectories.from_experiment(experiment)
+    specs = build_worker_specs(
+        experiment,
+        config_path=CONFIGS / "h100-4gpu.yaml",
+        directories=directories,
+        base_environment={},
+    )
+    launches = 0
+
+    def process_factory(*_args, **_kwargs):
+        nonlocal launches
+        launches += 1
+        return FakeProcess(exit_immediately=False)
+
+    coordinator = Coordinator(
+        experiment=experiment,
+        specs=specs,
+        directories=directories,
+        process_factory=process_factory,
+        hardware_health_probe=lambda: {
+            "schema_version": 1,
+            "healthy": False,
+            "gpus": [
+                {
+                    "index": 0,
+                    "reasons": ["sram_threshold_exceeded"],
+                }
+            ],
+        },
+    )
+
+    assert coordinator.run(stop_requested=lambda: False) == HARDWARE_HEALTH_EXIT_CODE
+    assert launches == 0
+    status = json.loads(coordinator.status_path.read_text(encoding="utf-8"))
+    assert status["state"] == "stopped"
+    assert "sram_threshold_exceeded" in status["hardware_failure_reason"]
 
 
 def test_graceful_stop_signals_only_worker_leader_before_group_kill(
@@ -1169,6 +1225,9 @@ def test_learner_pause_sharing_waits_for_fresh_progress_ack(tmp_path) -> None:
                     "phase": "arena_gpu_pause",
                     "progress": 1,
                     "progress_ns": max(time.time_ns(), request["requested_ns"]),
+                    "pause_generation": 1,
+                    "pause_checkpoint_step": 0,
+                    "cuda_cache_released": True,
                 },
             )
             phase = "ready"

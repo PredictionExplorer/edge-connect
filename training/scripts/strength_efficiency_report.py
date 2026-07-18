@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import time
 from collections import defaultdict
 from collections.abc import Iterable, Mapping
 from pathlib import Path
@@ -195,19 +196,13 @@ def _learner_summary(records: list[dict[str, object]]) -> dict[str, object]:
         )
     }
     allocation_records = [
-        record
-        for record in records
-        if record.get("event") == "replay_window_allocated"
+        record for record in records if record.get("event") == "replay_window_allocated"
     ]
     consumption_records = [
-        record
-        for record in records
-        if record.get("event") == "replay_window_consumed"
+        record for record in records if record.get("event") == "replay_window_consumed"
     ]
     refresh_records = [
-        record
-        for record in records
-        if record.get("event") == "replay_window_refreshed"
+        record for record in records if record.get("event") == "replay_window_refreshed"
     ]
     has_persistent_window_metrics = any(
         record.get("event")
@@ -244,8 +239,7 @@ def _learner_summary(records: list[dict[str, object]]) -> dict[str, object]:
             "consumed_batches": int(
                 _sum(consumption_records, "window_batches_consumed_this_spin")
             ),
-            "setup_seconds": _sum(allocation_records, "window_setup_seconds")
-            or None,
+            "setup_seconds": _sum(allocation_records, "window_setup_seconds") or None,
             "latest": {
                 name: latest_fields[name]
                 for name in (
@@ -385,12 +379,7 @@ def _migration_boundary(
     values: dict[str, object | None] = {}
     for normalized, names in aliases.items():
         values[normalized] = next(
-            (
-                source[name]
-                for source in sources
-                for name in names
-                if name in source
-            ),
+            (source[name] for source in sources for name in names if name in source),
             None,
         )
     if all(value is None for value in values.values()):
@@ -564,9 +553,7 @@ def _migration_summary(
                 )
             reason = payload.get("reason")
             if reason is not None and (
-                not isinstance(reason, str)
-                or not reason.strip()
-                or "\n" in reason
+                not isinstance(reason, str) or not reason.strip() or "\n" in reason
             ):
                 raise ValueError(
                     f"autonomous migration line {line_number} has an invalid reason"
@@ -618,9 +605,7 @@ def _migration_summary(
                     )
             boundary = record.get("boundary")
             previous_boundary = previous.get("boundary")
-            if isinstance(boundary, Mapping) and isinstance(
-                previous_boundary, Mapping
-            ):
+            if isinstance(boundary, Mapping) and isinstance(previous_boundary, Mapping):
                 for name in (
                     "step",
                     "examples_consumed",
@@ -683,43 +668,29 @@ def _migration_summary(
         prior = records[index - 1] if index else None
         following = records[index] if index < len(records) else None
         started_ns = (
-            cast(int, prior["timestamp_ns"])
-            if prior is not None
-            else run_started_ns
+            cast(int, prior["timestamp_ns"]) if prior is not None else run_started_ns
         )
         ended_ns = (
             cast(int, following["timestamp_ns"])
             if following is not None
             else segment_observed_until_ns
         )
-        start_boundary = (
-            prior.get("boundary") if prior is not None else None
-        )
-        start_boundary = (
-            start_boundary if isinstance(start_boundary, Mapping) else {}
-        )
+        start_boundary = prior.get("boundary") if prior is not None else None
+        start_boundary = start_boundary if isinstance(start_boundary, Mapping) else {}
         segments.append(
             {
                 "index": index,
                 "started_ns": started_ns,
                 "ended_ns": ended_ns,
-                "migration_id": (
-                    prior["migration_id"] if prior is not None else None
-                ),
+                "migration_id": (prior["migration_id"] if prior is not None else None),
                 "config_sha256": (
                     prior["to_sha256"]
                     if prior is not None
-                    else (
-                        records[0]["from_sha256"] if records else None
-                    )
+                    else (records[0]["from_sha256"] if records else None)
                 ),
-                "start_boundary": (
-                    prior["boundary"] if prior is not None else None
-                ),
+                "start_boundary": (prior["boundary"] if prior is not None else None),
                 "started_step": start_boundary.get("step"),
-                "started_examples_consumed": start_boundary.get(
-                    "examples_consumed"
-                ),
+                "started_examples_consumed": start_boundary.get("examples_consumed"),
                 "started_committed_replay_samples": start_boundary.get(
                     "committed_replay_samples"
                 ),
@@ -732,9 +703,7 @@ def _migration_summary(
                 ),
                 "provisioned_gpu_hours": max(
                     0.0,
-                    provisioned_gpus
-                    * (ended_ns - started_ns)
-                    / 3_600_000_000_000,
+                    provisioned_gpus * (ended_ns - started_ns) / 3_600_000_000_000,
                 ),
             }
         )
@@ -1052,9 +1021,17 @@ def _checkpoint_step_evidence(
     *,
     actor_records: list[dict[str, object]],
     arena_results: list[dict[str, object]],
-) -> tuple[dict[str, int], list[dict[str, object]]]:
+) -> tuple[dict[str, int], dict[str, int], list[dict[str, object]]]:
     evidence: dict[str, set[int]] = {}
+    publication_evidence: dict[str, set[int]] = {}
     metadata_failures: list[dict[str, object]] = []
+
+    def record_publication(identity: object, published_ns: object) -> None:
+        parsed_identity = _checkpoint_identity(identity)
+        parsed_ns = _nonnegative_integer(published_ns)
+        if parsed_identity is not None and parsed_ns is not None and parsed_ns > 0:
+            publication_evidence.setdefault(parsed_identity, set()).add(parsed_ns)
+
     for record in actor_records:
         _record_step_evidence(
             evidence,
@@ -1093,6 +1070,10 @@ def _checkpoint_step_evidence(
             identity=record.get("model_identity"),
             step=record.get("model_step"),
         )
+        record_publication(
+            record.get("model_identity"),
+            record.get("published_ns"),
+        )
 
     metadata_paths = [
         *(root / "learner" / "manifests").glob("manifest-*.json"),
@@ -1124,6 +1105,13 @@ def _checkpoint_step_evidence(
             ),
             step=payload.get("model_step", payload.get("candidate_step")),
         )
+        record_publication(
+            payload.get(
+                "model_identity",
+                payload.get("candidate_identity"),
+            ),
+            payload.get("published_ns"),
+        )
         _record_step_evidence(
             evidence,
             identity=payload.get("champion_identity"),
@@ -1144,7 +1132,25 @@ def _checkpoint_step_evidence(
         for identity, steps in evidence.items()
         if len(steps) == 1
     }
-    return resolved, [*metadata_failures, *conflicts]
+    publication_conflicts = [
+        {
+            "identity": identity,
+            "published_ns": sorted(values),
+            "reason": "conflicting checkpoint publication evidence",
+        }
+        for identity, values in sorted(publication_evidence.items())
+        if len(values) > 1
+    ]
+    publications = {
+        identity: next(iter(values))
+        for identity, values in publication_evidence.items()
+        if len(values) == 1
+    }
+    return (
+        resolved,
+        publications,
+        [*metadata_failures, *conflicts, *publication_conflicts],
+    )
 
 
 def _baseline_kind(
@@ -1364,9 +1370,7 @@ def _saturated_one_sided_pairings(
             {
                 **total,
                 "decisive_games": first_wins + second_wins,
-                "result_paths": sorted(
-                    set(cast(list[str], total["result_paths"]))
-                ),
+                "result_paths": sorted(set(cast(list[str], total["result_paths"]))),
             }
         )
     return sorted(
@@ -1430,6 +1434,7 @@ def _build_ladder(
     exclusions: list[dict[str, object]],
     anchor_identity: str | None,
     checkpoint_steps: Mapping[str, int],
+    checkpoint_publications: Mapping[str, int],
 ) -> dict[str, object]:
     if anchor_identity is None:
         return _unavailable_ladder(
@@ -1495,6 +1500,8 @@ def _build_ladder(
             "standard_error": estimate.standard_error,
             "confidence_interval": list(estimate.confidence_interval),
             "decisive_games": estimate.decisive_games,
+            "last_observed_ns": last_seen.get(estimate.identity),
+            "published_ns": checkpoint_publications.get(estimate.identity),
         }
         for rank, estimate in enumerate(fit.estimates, start=1)
     ]
@@ -1533,6 +1540,53 @@ def _build_ladder(
         inputs,
         included_identities=fitted_identities,
     )
+    ordered_steps = sorted(
+        stepped,
+        key=lambda item: (int(item["step"]), str(item["identity"])),
+    )
+    marginal_contrasts = []
+    for previous_step, current_step in zip(
+        ordered_steps,
+        ordered_steps[1:],
+        strict=False,
+    ):
+        contrast = fit.contrast(
+            str(current_step["identity"]),
+            str(previous_step["identity"]),
+        )
+        previous_ns = previous_step.get("published_ns")
+        current_ns = current_step.get("published_ns")
+        elapsed_hours = (
+            (current_ns - previous_ns) / 3_600_000_000_000
+            if isinstance(previous_ns, int)
+            and isinstance(current_ns, int)
+            and current_ns > previous_ns
+            else None
+        )
+        marginal_contrasts.append(
+            {
+                "from_identity": previous_step["identity"],
+                "from_step": previous_step["step"],
+                "to_identity": current_step["identity"],
+                "to_step": current_step["step"],
+                "delta_elo": contrast.difference,
+                "standard_error": contrast.standard_error,
+                "confidence_interval": list(contrast.confidence_interval),
+                "elapsed_wall_hours": elapsed_hours,
+                "elo_per_wall_hour": (
+                    contrast.difference / elapsed_hours if elapsed_hours else None
+                ),
+                "elo_per_wall_hour_confidence_interval": (
+                    [
+                        contrast.confidence_interval[0] / elapsed_hours,
+                        contrast.confidence_interval[1] / elapsed_hours,
+                    ]
+                    if elapsed_hours
+                    else None
+                ),
+                "time_basis": "checkpoint_publication",
+            }
+        )
     return {
         "status": "available",
         "scope": scope,
@@ -1540,6 +1594,7 @@ def _build_ladder(
         "anchor_identity": anchor_identity,
         "ladder": ladder,
         "latest": latest,
+        "marginal_contrasts": marginal_contrasts,
         "input": {
             "result_count": len(inputs),
             "fitted_result_count": fit.observation_count,
@@ -1635,7 +1690,11 @@ def _autonomous_elo_summary(
     actor_summary: Mapping[str, object],
     provisioned_gpu_hours: float,
 ) -> dict[str, object]:
-    checkpoint_steps, metadata_exclusions = _checkpoint_step_evidence(
+    (
+        checkpoint_steps,
+        checkpoint_publications,
+        metadata_exclusions,
+    ) = _checkpoint_step_evidence(
         root,
         actor_records=actor_records,
         arena_results=arena_results,
@@ -1661,6 +1720,7 @@ def _autonomous_elo_summary(
         exclusions=ring_exclusions,
         anchor_identity=anchor_identity,
         checkpoint_steps=checkpoint_steps,
+        checkpoint_publications=checkpoint_publications,
     )
     aggregate = _build_ladder(
         scope="aggregate",
@@ -1668,6 +1728,7 @@ def _autonomous_elo_summary(
         exclusions=aggregate_exclusions,
         anchor_identity=anchor_identity,
         checkpoint_steps=checkpoint_steps,
+        checkpoint_publications=checkpoint_publications,
     )
     latest_source = None
     latest = None
@@ -1679,9 +1740,7 @@ def _autonomous_elo_summary(
         latest = aggregate.get("latest")
     latest_elo = _number(latest.get("rating")) if isinstance(latest, Mapping) else None
     aggregate_latest = (
-        aggregate.get("latest")
-        if aggregate.get("status") == "available"
-        else None
+        aggregate.get("latest") if aggregate.get("status") == "available" else None
     )
     headline = (
         {
@@ -1711,7 +1770,8 @@ def _autonomous_elo_summary(
             "for one-sided pairings"
         ),
         "uncertainty_method": (
-            "marginal normal interval from raw observed-information Hessian"
+            "marginal and correlated-contrast normal intervals from the raw "
+            "observed-information Hessian"
         ),
         "confidence_level": AUTONOMOUS_ELO_CONFIDENCE,
         "primary_ring": PRIMARY_ELO_RING,
@@ -1766,9 +1826,9 @@ def _autonomous_elo_summary(
                         "saturated_one_sided_pairing_count"
                     )
                 ),
-                "saturated_one_sided_pairings": _mapping(
-                    aggregate.get("input")
-                ).get("saturated_one_sided_pairings", []),
+                "saturated_one_sided_pairings": _mapping(aggregate.get("input")).get(
+                    "saturated_one_sided_pairings", []
+                ),
             },
             "primary_ring_10": {
                 "saturated_one_sided_pairing_count": _nonnegative_integer(
@@ -1786,6 +1846,46 @@ def _autonomous_elo_summary(
             checkpoint_steps=checkpoint_steps,
         ),
         "step_metadata_exclusions": metadata_exclusions,
+    }
+
+
+def _coordinator_summary(records: list[dict[str, object]]) -> dict[str, object]:
+    ready_by_token: dict[str, int] = {}
+    pause_seconds = 0.0
+    completed_leases = 0
+    learner_pause_restarts = 0
+    hardware_failures = 0
+    for record in records:
+        event = record.get("event")
+        token = record.get("token")
+        timestamp = _timestamp(record)
+        if event == "pause_lease_ready" and isinstance(token, str) and timestamp:
+            ready_by_token[token] = timestamp
+        elif (
+            event in ("pause_lease_release_requested", "pause_lease_released")
+            and isinstance(token, str)
+            and timestamp
+            and token in ready_by_token
+        ):
+            pause_seconds += max(
+                0.0, (timestamp - ready_by_token.pop(token)) / 1_000_000_000
+            )
+            completed_leases += 1
+        if event == "pause_target_restarted" and record.get("target") == "learner":
+            learner_pause_restarts += 1
+        if event == "hardware_health_failure":
+            hardware_failures += 1
+    return {
+        "records": len(records),
+        "completed_pause_leases": completed_leases,
+        "pause_lease_seconds": pause_seconds,
+        "learner_pause_restarts": learner_pause_restarts,
+        "hardware_health_failures": hardware_failures,
+        "open_pause_lease_count": len(ready_by_token),
+        "efficiency_denominator_policy": (
+            "pause, cooldown, restart, and idle time remain included in total "
+            "wall time and provisioned GPU-hours"
+        ),
     }
 
 
@@ -1816,6 +1916,10 @@ def build_strength_efficiency_report(
         root / "learner" / "metrics.jsonl",
         failures=failures,
     )
+    coordinator_records = _read_jsonl(
+        root / "metrics" / "coordinator.jsonl",
+        failures=failures,
+    )
     actor_records: list[dict[str, object]] = []
     metrics_directory = root / "metrics"
     if metrics_directory.is_dir():
@@ -1824,10 +1928,37 @@ def build_strength_efficiency_report(
     arenas = _arena_results(root, failures=failures)
     observed_timestamps = [
         timestamp
-        for record in [*learner_records, *actor_records, *arenas]
+        for record in [*learner_records, *actor_records, *coordinator_records, *arenas]
         if (timestamp := _timestamp(record)) is not None
     ]
-    observed_until_ns = max(observed_timestamps, default=started_ns)
+    latest_metric_ns = max(observed_timestamps, default=started_ns)
+    coordinator_status_path = root / "status" / "coordinator.json"
+    coordinator_status = {}
+    if coordinator_status_path.is_file():
+        try:
+            loaded_status = json.loads(
+                coordinator_status_path.read_text(encoding="utf-8")
+            )
+            coordinator_status = (
+                loaded_status if isinstance(loaded_status, dict) else {}
+            )
+        except (OSError, json.JSONDecodeError):
+            coordinator_status = {}
+    coordinator_timestamp = coordinator_status.get("timestamp_ns")
+    if coordinator_status.get("state") == "running":
+        observed_until_ns = max(latest_metric_ns, time.time_ns())
+        observation_end_source = "report_capture_while_running"
+    elif (
+        coordinator_status.get("state") == "stopped"
+        and isinstance(coordinator_timestamp, int)
+        and not isinstance(coordinator_timestamp, bool)
+        and coordinator_timestamp > 0
+    ):
+        observed_until_ns = max(latest_metric_ns, coordinator_timestamp)
+        observation_end_source = "coordinator_terminal_timestamp"
+    else:
+        observed_until_ns = latest_metric_ns
+        observation_end_source = "latest_metric"
     wall_seconds = max(0.0, (observed_until_ns - started_ns) / 1_000_000_000)
     provisioned_gpu_hours = provisioned_gpus * wall_seconds / 3_600.0
     learner_summary = _learner_summary(learner_records)
@@ -1848,12 +1979,14 @@ def build_strength_efficiency_report(
         "generation_family": run.get("generation_family"),
         "started_ns": started_ns,
         "observed_until_ns": observed_until_ns,
+        "observation_end_source": observation_end_source,
         "wall_seconds": wall_seconds,
         "provisioned_gpus": provisioned_gpus,
         "provisioned_gpu_hours": provisioned_gpu_hours,
         "migrations": migration_summary,
         "migration_boundaries": migration_summary["boundaries"],
         "migration_segments": migration_summary["segments"],
+        "coordinator": _coordinator_summary(coordinator_records),
         "learner": learner_summary,
         "actors": actor_summary,
         "arena": _arena_summary(

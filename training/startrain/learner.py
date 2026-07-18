@@ -506,6 +506,8 @@ class ReplayWindowSession:
     batches_consumed: int = 0
     reuse_spins: int = 0
     utd_wait_spins: int = 0
+    pause_generation: int = 0
+    suspended: bool = False
     closed: bool = False
 
     @property
@@ -515,6 +517,8 @@ class ReplayWindowSession:
     def next_batch(self) -> ReplayBatch:
         if self.closed or self.prefetcher is None:
             raise RuntimeError("replay window is closed")
+        if self.suspended:
+            raise RuntimeError("replay window is suspended")
         return next(self.prefetcher)
 
     def pop_copy_events(self) -> list[tuple[torch.cuda.Event, torch.cuda.Event]]:
@@ -528,28 +532,66 @@ class ReplayWindowSession:
         loader = self.loader
         prefetcher = self.prefetcher
         failure: BaseException | None = None
+        prefetcher_closed_iterator = False
         try:
-            stream = getattr(prefetcher, "_stream", None)
-            if stream is not None:
-                stream.synchronize()
-        except BaseException as exc:
-            failure = exc
-        try:
-            iterator = getattr(loader, "_iterator", None)
-            if iterator is None:
-                iterator = getattr(prefetcher, "_batches", None)
-            shutdown_workers = getattr(iterator, "_shutdown_workers", None)
-            if callable(shutdown_workers):
-                shutdown_workers()
-        except BaseException as exc:
-            if failure is None:
+            try:
+                if prefetcher is not None:
+                    close = getattr(prefetcher, "close", None)
+                    if callable(close):
+                        close_result = close(strict=False)
+                        if close_result is not None and not isinstance(
+                            close_result, BaseException
+                        ):
+                            raise TypeError(
+                                "device prefetcher close returned an invalid result"
+                            )
+                        failure = close_result
+                        prefetcher_closed_iterator = True
+                    else:
+                        stream = getattr(prefetcher, "_stream", None)
+                        if stream is not None:
+                            stream.synchronize()
+            except BaseException as exc:
                 failure = exc
+            if not prefetcher_closed_iterator:
+                try:
+                    iterator = getattr(loader, "_iterator", None)
+                    if iterator is None:
+                        iterator = getattr(prefetcher, "_batches", None)
+                    shutdown_workers = getattr(iterator, "_shutdown_workers", None)
+                    if callable(shutdown_workers):
+                        shutdown_workers()
+                except BaseException as exc:
+                    if failure is None:
+                        failure = exc
         finally:
             self.prefetcher = None
             self.loader = None
+            self.suspended = False
             self.closed = True
         if failure is not None:
             raise failure
+
+    def suspend_for_gpu_pause(self) -> int:
+        if self.closed:
+            raise RuntimeError("cannot suspend a closed replay window")
+        if self.suspended:
+            return self.pause_generation
+        if self.prefetcher is not None:
+            self.prefetcher.suspend_device()
+        self.pause_generation += 1
+        self.suspended = True
+        return self.pause_generation
+
+    def resume_after_gpu_pause(self) -> int:
+        if self.closed:
+            raise RuntimeError("cannot resume a closed replay window")
+        if not self.suspended:
+            return self.pause_generation
+        if self.prefetcher is not None:
+            self.prefetcher.resume_device()
+        self.suspended = False
+        return self.pause_generation
 
 
 def plateau_policy_decision(
@@ -824,6 +866,7 @@ class LearnerLoop:
         self.examples_consumed = 0
         self._last_recovery_step = 0
         self._latest_total_replay_samples = 0
+        self._gpu_pause_generation = 0
         # Replay batches are fixed-size and ring-homogeneous. Static compilation
         # avoids Inductor's dynamic backward reductions (which fail on variable
         # graph lengths) while allowing one cached graph per encountered ring.
@@ -1033,6 +1076,50 @@ class LearnerLoop:
                 window = None
             next_refresh_reason = reason
 
+        def suspend_active_window() -> int | None:
+            if window is None:
+                return None
+            started = time.perf_counter()
+            generation = window.suspend_for_gpu_pause()
+            if self.rank == 0:
+                self.metrics.append(
+                    {
+                        "schema_version": 1,
+                        "timestamp_ns": time.time_ns(),
+                        "worker": "learner",
+                        "event": "replay_window_suspended",
+                        "step": self.step,
+                        "epoch": self.epoch,
+                        "pause_generation": generation,
+                        "window_batches_allocated": window.batches_allocated,
+                        "window_batches_consumed": window.batches_consumed,
+                        "suspend_seconds": time.perf_counter() - started,
+                    }
+                )
+            return generation
+
+        def resume_active_window() -> int | None:
+            if window is None:
+                return None
+            started = time.perf_counter()
+            generation = window.resume_after_gpu_pause()
+            if self.rank == 0:
+                self.metrics.append(
+                    {
+                        "schema_version": 1,
+                        "timestamp_ns": time.time_ns(),
+                        "worker": "learner",
+                        "event": "replay_window_resumed",
+                        "step": self.step,
+                        "epoch": self.epoch,
+                        "pause_generation": generation,
+                        "window_batches_allocated": window.batches_allocated,
+                        "window_batches_consumed": window.batches_consumed,
+                        "resume_seconds": time.perf_counter() - started,
+                    }
+                )
+            return generation
+
         try:
             while target is None or self.step < target:
                 if self._collective_stop(stop_requested()):
@@ -1041,7 +1128,8 @@ class LearnerLoop:
                 if not self._gpu_pause_control(
                     stop_requested=stop_requested,
                     progress=progress,
-                    on_pause=lambda: close_active_window("gpu_pause"),
+                    on_pause=suspend_active_window,
+                    on_resume=resume_active_window,
                 ):
                     exit_reason = "stop"
                     break
@@ -1137,12 +1225,8 @@ class LearnerLoop:
                             target_updates_per_new_sample=(
                                 self.learner_config.target_updates_per_new_sample
                             ),
-                            window_batches_allocated=(
-                                spin_window.batches_allocated
-                            ),
-                            window_batches_consumed=(
-                                spin_window.batches_consumed
-                            ),
+                            window_batches_allocated=(spin_window.batches_allocated),
+                            window_batches_consumed=(spin_window.batches_consumed),
                             window_reuse=True,
                         )
                     time.sleep(self.learner_config.replay_poll_seconds)
@@ -1159,7 +1243,8 @@ class LearnerLoop:
                     if not self._gpu_pause_control(
                         stop_requested=stop_requested,
                         progress=progress,
-                        on_pause=lambda: close_active_window("gpu_pause"),
+                        on_pause=suspend_active_window,
+                        on_resume=resume_active_window,
                     ):
                         exit_reason = "stop"
                         stop_training = True
@@ -1179,13 +1264,11 @@ class LearnerLoop:
                         interval_data_wait_seconds += (
                             time.perf_counter() - data_wait_started
                         )
-                        interval_copy_events.extend(
-                            spin_window.pop_copy_events()
-                        )
+                        interval_copy_events.extend(spin_window.pop_copy_events())
                     step_started = time.perf_counter()
-                    device_events: (
-                        tuple[torch.cuda.Event, torch.cuda.Event] | None
-                    ) = None
+                    device_events: tuple[torch.cuda.Event, torch.cuda.Event] | None = (
+                        None
+                    )
                     if self.rank == 0 and device.type == "cuda":
                         device_events = (
                             torch.cuda.Event(enable_timing=True),
@@ -1257,17 +1340,13 @@ class LearnerLoop:
                                 "learning_rates": host_metrics.learning_rates,
                                 "step_seconds": wall_seconds / measured_steps,
                                 "examples_per_second": (
-                                    global_batch_size
-                                    * measured_steps
-                                    / wall_seconds
+                                    global_batch_size * measured_steps / wall_seconds
                                 ),
                                 "device_step_seconds": (
                                     device_seconds / measured_steps
                                 ),
                                 "device_examples_per_second": (
-                                    global_batch_size
-                                    * measured_steps
-                                    / device_seconds
+                                    global_batch_size * measured_steps / device_seconds
                                     if device_seconds
                                     else None
                                 ),
@@ -1276,8 +1355,7 @@ class LearnerLoop:
                                 ),
                                 "h2d_seconds": h2d_seconds / measured_steps,
                                 "window_setup_seconds": (
-                                    interval_window_setup_seconds
-                                    / measured_steps
+                                    interval_window_setup_seconds / measured_steps
                                 ),
                                 "window_setup_amortized_seconds": (
                                     spin_window.setup_seconds
@@ -1294,9 +1372,7 @@ class LearnerLoop:
                                 ),
                                 "window_reuse": window_reused,
                                 "window_reuse_spins": spin_window.reuse_spins,
-                                "window_refresh_reason": (
-                                    spin_window.refresh_reason
-                                ),
+                                "window_refresh_reason": (spin_window.refresh_reason),
                                 "loader_workers_effective": (
                                     spin_window.effective_workers
                                 ),
@@ -1309,21 +1385,16 @@ class LearnerLoop:
                                 ),
                                 **self._utd_metric_values(),
                                 "feature_path": batch.feature_path,
-                                "replay_samples": (
-                                    spin_window.selection.sample_count
-                                ),
+                                "replay_samples": (spin_window.selection.sample_count),
                                 "replay_samples_by_ring": (
                                     spin_window.selection.samples_by_ring
                                 ),
-                                "ring_batch_weights": (
-                                    self._active_ring_weights()
-                                ),
+                                "ring_batch_weights": (self._active_ring_weights()),
                                 "replay_max_shard_id": (
                                     spin_window.selection.max_shard_id
                                 ),
                                 "effective_unique_samples": (
-                                    spin_window.batches_allocated
-                                    * global_batch_size
+                                    spin_window.batches_allocated * global_batch_size
                                 ),
                                 "per_rank_batch_size": (
                                     self.train_config.per_rank_batch_size
@@ -1405,9 +1476,7 @@ class LearnerLoop:
         target_budget = limit if target is None else max(0, target - self.step)
         next_weight_step = self.ring_mixture_config.next_weight_step(self.step)
         weight_budget = (
-            limit
-            if next_weight_step is None
-            else max(0, next_weight_step - self.step)
+            limit if next_weight_step is None else max(0, next_weight_step - self.step)
         )
         recovery_boundary = self._next_recovery_boundary()
         recovery_budget = (
@@ -2122,9 +2191,8 @@ class LearnerLoop:
         if configured_target is None:
             return None
         if self._utd_segment_state is not None:
-            if (
-                self._utd_segment_state.target_updates_per_new_sample
-                != float(configured_target)
+            if self._utd_segment_state.target_updates_per_new_sample != float(
+                configured_target
             ):
                 raise ValueError(
                     "configured update-to-data target does not match "
@@ -2175,9 +2243,7 @@ class LearnerLoop:
     ) -> UTDSegmentState:
         if self.utd_segment_path.is_file():
             try:
-                payload = json.loads(
-                    self.utd_segment_path.read_text(encoding="utf-8")
-                )
+                payload = json.loads(self.utd_segment_path.read_text(encoding="utf-8"))
             except OSError as exc:
                 raise ValueError(f"cannot read UTD segment state: {exc}") from exc
             return self._parse_utd_segment_state(payload)
@@ -2232,9 +2298,7 @@ class LearnerLoop:
         ):
             return True
         checkpoint_directory = root / "checkpoints"
-        return checkpoint_directory.is_dir() and any(
-            checkpoint_directory.glob("*.pt")
-        )
+        return checkpoint_directory.is_dir() and any(checkpoint_directory.glob("*.pt"))
 
     @staticmethod
     def _parse_utd_segment_state(payload: object) -> UTDSegmentState:
@@ -2273,11 +2337,7 @@ class LearnerLoop:
             ("baseline examples", baseline_examples),
             ("baseline committed replay samples", baseline_samples),
         ):
-            if (
-                isinstance(value, bool)
-                or not isinstance(value, int)
-                or value < 0
-            ):
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                 raise ValueError(f"UTD segment {name} is invalid")
         created_ns = payload.get("created_ns")
         if created_ns is not None and (
@@ -2314,23 +2374,17 @@ class LearnerLoop:
         state = self._ensure_utd_segment_state()
         if state is None:
             raise RuntimeError("update-to-data segment state was not initialized")
-        if (
-            self._latest_total_replay_samples
-            < state.baseline_committed_replay_samples
-        ):
+        if self._latest_total_replay_samples < state.baseline_committed_replay_samples:
             raise ValueError(
                 "committed replay samples precede the UTD segment baseline"
             )
         if self.examples_consumed < state.baseline_examples_consumed:
             raise ValueError("learner examples precede the UTD segment baseline")
         segment_samples = (
-            self._latest_total_replay_samples
-            - state.baseline_committed_replay_samples
+            self._latest_total_replay_samples - state.baseline_committed_replay_samples
         )
         ratio = Fraction(str(state.target_updates_per_new_sample))
-        segment_allowance = (
-            ratio.numerator * segment_samples // ratio.denominator
-        )
+        segment_allowance = ratio.numerator * segment_samples // ratio.denominator
         allowed_examples = state.baseline_examples_consumed + segment_allowance
         remaining = max(0, allowed_examples - self.examples_consumed)
         return remaining // self.train_config.global_batch_size(self.world_size)
@@ -2348,9 +2402,7 @@ class LearnerLoop:
                 self._latest_total_replay_samples
                 - state.baseline_committed_replay_samples
             )
-            segment_examples = (
-                self.examples_consumed - state.baseline_examples_consumed
-            )
+            segment_examples = self.examples_consumed - state.baseline_examples_consumed
             if segment_samples > 0 and segment_examples >= 0:
                 segment = segment_examples / segment_samples
         return {
@@ -2364,9 +2416,7 @@ class LearnerLoop:
                 state.baseline_examples_consumed if state is not None else None
             ),
             "utd_segment_baseline_committed_replay_samples": (
-                state.baseline_committed_replay_samples
-                if state is not None
-                else None
+                state.baseline_committed_replay_samples if state is not None else None
             ),
         }
 
@@ -2603,36 +2653,135 @@ class LearnerLoop:
         *,
         stop_requested: Callable[[], bool],
         progress: Callable[..., None] | None,
-        on_pause: Callable[[], None] | None = None,
+        on_pause: Callable[[], object] | None = None,
+        on_resume: Callable[[], object] | None = None,
     ) -> bool:
         if self.gpu_pause_path is None:
             return True
         pause_applied = False
         cuda_cache_released = False
+        pause_checkpoint_step: int | None = None
+        pause_started = 0.0
         while True:
             active = self._rank_zero_gpu_pause_active() if self.rank == 0 else None
             active = self._broadcast_object(active)
             if active is False:
+                if pause_applied:
+                    resume_error = None
+                    try:
+                        if on_resume is not None:
+                            on_resume()
+                    except BaseException as exc:
+                        resume_error = f"{type(exc).__name__}: {exc}"
+                    resume_errors = self._collective_error_messages(resume_error)
+                    if resume_errors:
+                        raise RuntimeError(
+                            "distributed GPU pause resume failed: "
+                            + "; ".join(resume_errors)
+                        )
+                    self._distributed_barrier()
+                    if self.rank == 0:
+                        self.metrics.append(
+                            {
+                                "schema_version": 1,
+                                "timestamp_ns": time.time_ns(),
+                                "worker": "learner",
+                                "event": "gpu_pause_resumed",
+                                "step": self.step,
+                                "pause_generation": self._gpu_pause_generation,
+                                "pause_seconds": time.perf_counter() - pause_started,
+                            }
+                        )
                 return True
             if active is not True:
                 raise RuntimeError("distributed GPU pause state is invalid")
             if not pause_applied:
-                if on_pause is not None:
-                    on_pause()
+                pause_started = time.perf_counter()
+                checkpoint_outcome = None
+                if self.rank == 0:
+                    try:
+                        recovery = self._maybe_write_recovery_checkpoint(force=True)
+                        checkpoint_outcome = {
+                            "ok": True,
+                            "step": recovery.step
+                            if recovery is not None
+                            else self.step,
+                        }
+                    except BaseException as exc:
+                        checkpoint_outcome = {
+                            "ok": False,
+                            "error": f"{type(exc).__name__}: {exc}",
+                        }
+                checkpoint_payload = self._broadcast_object(checkpoint_outcome)
+                if (
+                    not isinstance(checkpoint_payload, dict)
+                    or checkpoint_payload.get("ok") is not True
+                    or isinstance(checkpoint_payload.get("step"), bool)
+                    or not isinstance(checkpoint_payload.get("step"), int)
+                ):
+                    detail = (
+                        checkpoint_payload.get("error")
+                        if isinstance(checkpoint_payload, dict)
+                        else "invalid checkpoint outcome"
+                    )
+                    raise RuntimeError(
+                        f"GPU pause recovery checkpoint failed: {detail}"
+                    )
+                pause_checkpoint_step = int(checkpoint_payload["step"])
                 device = next(self.model.parameters()).device
-                if device.type == "cuda":
-                    torch.cuda.synchronize(device)
-                    torch.cuda.empty_cache()
-                    cuda_cache_released = True
+                pause_error = None
+                try:
+                    if device.type == "cuda":
+                        torch.cuda.synchronize(device)
+                    if on_pause is not None:
+                        on_pause()
+                    if device.type == "cuda":
+                        torch.cuda.empty_cache()
+                        cuda_cache_released = True
+                except BaseException as exc:
+                    pause_error = f"{type(exc).__name__}: {exc}"
+                pause_errors = self._collective_error_messages(pause_error)
+                if pause_errors:
+                    raise RuntimeError(
+                        "distributed GPU pause preparation failed: "
+                        + "; ".join(pause_errors)
+                    )
                 self._distributed_barrier()
+                self._gpu_pause_generation += 1
                 pause_applied = True
+                if self.rank == 0:
+                    self.metrics.append(
+                        {
+                            "schema_version": 1,
+                            "timestamp_ns": time.time_ns(),
+                            "worker": "learner",
+                            "event": "gpu_pause_ready",
+                            "step": self.step,
+                            "pause_generation": self._gpu_pause_generation,
+                            "pause_checkpoint_step": pause_checkpoint_step,
+                            "cuda_cache_released": cuda_cache_released,
+                        }
+                    )
             if self._collective_stop(stop_requested()):
                 return False
             if progress is not None and self.rank == 0:
+                device = next(self.model.parameters()).device
                 progress(
                     phase="arena_gpu_pause",
                     step=self.step,
                     cuda_cache_released=cuda_cache_released,
+                    pause_generation=self._gpu_pause_generation,
+                    pause_checkpoint_step=pause_checkpoint_step,
+                    cuda_memory_allocated_bytes=(
+                        torch.cuda.memory_allocated(device)
+                        if device.type == "cuda"
+                        else 0
+                    ),
+                    cuda_memory_reserved_bytes=(
+                        torch.cuda.memory_reserved(device)
+                        if device.type == "cuda"
+                        else 0
+                    ),
                 )
             time.sleep(self._plateau_config().poll_seconds)
 
@@ -2828,6 +2977,15 @@ class LearnerLoop:
         tensor = torch.tensor(value, device=device, dtype=torch.int64)
         torch.distributed.all_reduce(tensor, op=torch.distributed.ReduceOp.MIN)
         return int(tensor.item())
+
+    def _collective_error_messages(self, local_error: str | None) -> tuple[str, ...]:
+        if self.world_size == 1:
+            return (local_error,) if local_error is not None else ()
+        if not torch.distributed.is_initialized():
+            raise RuntimeError("distributed learner process group is not initialized")
+        gathered: list[object] = [None] * self.world_size
+        torch.distributed.all_gather_object(gathered, local_error)
+        return tuple(str(error) for error in gathered if error is not None)
 
     def _broadcast_object(self, value: object) -> object:
         if self.world_size == 1:

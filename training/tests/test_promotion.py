@@ -805,13 +805,12 @@ def test_promotion_wave_fills_minimum_without_overshooting() -> None:
         arena=ArenaConfig(
             rings=(4,),
             pairs_per_ring=15,
+            continuation_pairs_per_ring=50,
             minimum_pairs_per_ring=15,
             max_pairs_per_ring=200,
         ),
     )
-    accumulated = [
-        ArenaPair(4, pair, pair, 0, True, (1, -1)) for pair in range(10)
-    ]
+    accumulated = [ArenaPair(4, pair, pair, 0, True, (1, -1)) for pair in range(10)]
 
     starts, counts = supervisor._wave_plan(accumulated)
 
@@ -822,7 +821,7 @@ def test_promotion_wave_fills_minimum_without_overshooting() -> None:
     )
     starts, counts = supervisor._wave_plan(accumulated)
     assert starts == {4: 15}
-    assert counts == {4: 15}
+    assert counts == {4: 50}
 
 
 def test_historical_crossplay_persists_bounded_waves_without_promoting(
@@ -898,6 +897,15 @@ def test_promotion_stop_persists_wave_and_once_resumes_next_pair_indices(
     assert pair_indices == [0, 1, 2, 3]
     assert len(pair_indices) == len(set(pair_indices))
     assert resumed["terminal"] is False
+    assert resumed["wave_plan"] == {
+        "schema_version": 1,
+        "wave_index": 1,
+        "lease_wave_index": 0,
+        "phase": "initial",
+        "pair_starts": {"4": 2},
+        "pair_counts": {"4": 2},
+    }
+    assert [item["wave_index"] for item in resumed["wave_history"]] == [0, 1]
     assert case.state.wave_starts == [{4: 0}, {4: 2}]
     assert case.state.persisted_pairs == [[], [0, 1]]
     assert case.state.lease_entries == 2

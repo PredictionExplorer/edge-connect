@@ -136,6 +136,26 @@ def test_report_joins_wall_throughput_policy_weight_and_arena_strength(
             }
         ],
     )
+    _write_jsonl(
+        root / "metrics" / "coordinator.jsonl",
+        [
+            {
+                "timestamp_ns": 2_000_000_000,
+                "event": "pause_lease_ready",
+                "token": "lease-one",
+            },
+            {
+                "timestamp_ns": 4_000_000_000,
+                "event": "pause_lease_released",
+                "token": "lease-one",
+            },
+            {
+                "timestamp_ns": 4_100_000_000,
+                "event": "pause_target_restarted",
+                "target": "learner",
+            },
+        ],
+    )
     arena = root / "arena"
     arena.mkdir()
     (arena / "first.json").write_text(
@@ -163,6 +183,9 @@ def test_report_joins_wall_throughput_policy_weight_and_arena_strength(
     assert actors["worker_count"] == 1
     assert actors["aggregate_samples_per_second"] == 20
     assert actors["mean_policy_weight"] == 0.25
+    assert report["coordinator"]["pause_lease_seconds"] == 2
+    assert report["coordinator"]["learner_pause_restarts"] == 1
+    assert "remain included" in report["coordinator"]["efficiency_denominator_policy"]
     trend = report["arena"]["by_baseline"]["frozen-shallow-v2"]
     assert trend["evaluations"] == 2
     assert trend["delta_elo"] == 20
@@ -195,6 +218,46 @@ def test_report_surfaces_jsonl_parse_failures_and_cli_exit_status(
     assert main(["--run-root", str(root)]) == 3
     output = json.loads(capsys.readouterr().out)
     assert output["status"] == "incomplete"
+
+
+def test_report_uses_coordinator_terminal_timestamp_for_idle_wall_time(
+    tmp_path,
+) -> None:
+    root = tmp_path / "run-terminal"
+    root.mkdir()
+    (root / "run.json").write_text(
+        json.dumps(
+            {
+                "run_id": "run-terminal",
+                "generation_family": "family-terminal",
+                "created_ns": 1_000_000_000,
+            }
+        ),
+        encoding="utf-8",
+    )
+    _write_jsonl(
+        root / "learner" / "metrics.jsonl",
+        [{"timestamp_ns": 2_000_000_000, "step": 1}],
+    )
+    status = root / "status"
+    status.mkdir()
+    (status / "coordinator.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "state": "stopped",
+                "timestamp_ns": 4_000_000_000,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    report = build_strength_efficiency_report(root, provisioned_gpus=8)
+
+    assert report["observed_until_ns"] == 4_000_000_000
+    assert report["observation_end_source"] == "coordinator_terminal_timestamp"
+    assert report["wall_seconds"] == 3
+    assert report["provisioned_gpu_hours"] == pytest.approx(24 / 3600)
 
 
 def test_actor_rates_merge_overlapping_lanes_on_one_physical_gpu() -> None:
@@ -325,7 +388,13 @@ def test_report_builds_autonomous_checkpoint_ladders_and_efficiency(
     manifests.mkdir(parents=True)
     for step, identity in enumerate(identities.values()):
         (manifests / f"manifest-{step}.json").write_text(
-            json.dumps({"model_identity": identity, "model_step": step}),
+            json.dumps(
+                {
+                    "model_identity": identity,
+                    "model_step": step,
+                    "published_ns": (step + 1) * 1_000_000_000,
+                }
+            ),
             encoding="utf-8",
         )
     (manifests / "manifest-0.json").unlink()
@@ -336,6 +405,7 @@ def test_report_builds_autonomous_checkpoint_ladders_and_efficiency(
                 "schema_version": 1,
                 "model_identity": identities["anchor"],
                 "model_step": 0,
+                "published_ns": 1_000_000_000,
             }
         ],
     )
@@ -432,6 +502,17 @@ def test_report_builds_autonomous_checkpoint_ladders_and_efficiency(
     assert primary["latest"]["identity"] == identities["latest"]
     assert primary["latest"]["step"] == 2
     assert primary["latest"]["rating"] > 0
+    assert len(primary["marginal_contrasts"]) == 2
+    assert primary["marginal_contrasts"][-1]["to_step"] == 2
+    assert primary["marginal_contrasts"][-1]["time_basis"] == "checkpoint_publication"
+    assert primary["marginal_contrasts"][-1]["elapsed_wall_hours"] == pytest.approx(
+        1 / 3600
+    )
+    assert (
+        primary["marginal_contrasts"][-1]["confidence_interval"][0]
+        < primary["marginal_contrasts"][-1]["delta_elo"]
+        < primary["marginal_contrasts"][-1]["confidence_interval"][1]
+    )
     assert primary["connectedness"]["connected"] is False
     assert primary["connectedness"]["excluded_identities"] == [
         identities["x"],
@@ -444,9 +525,10 @@ def test_report_builds_autonomous_checkpoint_ladders_and_efficiency(
     assert autonomous["latest"]["source"] == "ring_10"
     assert autonomous["latest_elo"] == primary["latest"]["rating"]
     assert autonomous["headline"]["source"] == "aggregate"
-    assert autonomous["headline"]["confidence_interval"] == aggregate["latest"][
-        "confidence_interval"
-    ]
+    assert (
+        autonomous["headline"]["confidence_interval"]
+        == aggregate["latest"]["confidence_interval"]
+    )
     assert autonomous["headline_elo"] == aggregate["latest"]["rating"]
     efficiency = autonomous["efficiency"]
     assert efficiency["leaf_evaluations"] == 2_000_000_000
@@ -611,9 +693,12 @@ def test_report_identifies_saturated_one_sided_pairings(tmp_path) -> None:
     pairing = aggregate["input"]["saturated_one_sided_pairings"][0]
     assert pairing["decisive_games"] == 100
     assert {pairing["first_wins"], pairing["second_wins"]} == {0, 100}
-    assert report["autonomous_elo"]["saturation"]["aggregate"][
-        "saturated_one_sided_pairing_count"
-    ] == 1
+    assert (
+        report["autonomous_elo"]["saturation"]["aggregate"][
+            "saturated_one_sided_pairing_count"
+        ]
+        == 1
+    )
 
 
 def test_report_exposes_validated_migration_boundaries_and_segments(
@@ -693,7 +778,7 @@ def test_report_exposes_validated_migration_boundaries_and_segments(
             "examples_consumed": 10_000,
             "committed_replay_samples": 8_000,
             "target_updates_per_new_sample": 1.25,
-        }
+        },
     ]
     assert len(migrations["segments"]) == 3
     assert migrations["segments"][-1]["config_sha256"] == after

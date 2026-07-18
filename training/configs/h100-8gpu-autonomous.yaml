@@ -237,6 +237,7 @@ orchestration:
 arena:
   rings: [4, 6, 8, 10]
   pairs_per_ring: 15
+  continuation_pairs_per_ring: 50
   simulations: 1024
   max_considered: 64
   c_visit: 50.0

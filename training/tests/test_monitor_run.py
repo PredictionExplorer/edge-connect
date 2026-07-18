@@ -6,6 +6,7 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
+import pytest
 import yaml
 
 from scripts import monitor_run as monitor
@@ -360,6 +361,130 @@ def test_snapshot_surfaces_stale_restart_quarantine_and_hardware(
     } <= codes
 
 
+def test_snapshot_surfaces_persistent_sram_threshold_with_zero_volatile(
+    tmp_path, monkeypatch
+) -> None:
+    now_ns = 300_000_000_000
+    root = _fixture(tmp_path, now_ns=now_ns)
+    _healthy_dependencies(monkeypatch)
+    _write_json(
+        root / "status" / "hardware-health.json",
+        {
+            "schema_version": 1,
+            "healthy": False,
+            "gpus": [
+                {
+                    "index": 0,
+                    "volatile_sram_uncorrectable_parity": 0,
+                    "aggregate_sram_uncorrectable_parity": 65_535,
+                    "sram_threshold_exceeded": True,
+                    "reasons": [
+                        "aggregate_uncorrectable_ecc",
+                        "sram_threshold_exceeded",
+                    ],
+                }
+            ],
+        },
+    )
+
+    snapshot: Any = monitor.collect_snapshot(root, now_ns=now_ns)
+
+    assert snapshot["status"] == "ERROR"
+    assert "gpu_health_gate" in {warning["code"] for warning in snapshot["warnings"]}
+
+
+def test_actor_throughput_uses_completed_counters_and_merged_wall_intervals(
+    tmp_path,
+) -> None:
+    metrics = tmp_path / "metrics"
+    metrics.mkdir()
+    for lane in range(2):
+        (metrics / f"actor-gpu-1-lane-{lane}.jsonl").write_text(
+            json.dumps(
+                {
+                    "worker": f"actor-gpu-1-lane-{lane}",
+                    "gpu_id": 1,
+                    "batch_started_ns": 10_000_000_000,
+                    "batch_completed_ns": 20_000_000_000,
+                    "games": 10,
+                    "samples": 100,
+                    "evaluator_rows": 1_000,
+                    "samples_per_second": 999_999,
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+    throughput = monitor._actor_throughput_window(
+        metrics,
+        now_ns=20_000_000_000,
+        window_seconds=60,
+    )
+
+    assert throughput["fleet"]["wall_seconds"] == 10
+    assert throughput["fleet"]["samples"] == 200
+    assert throughput["fleet"]["samples_per_second"] == 20
+    assert throughput["by_gpu"]["1"]["wall_seconds"] == 10
+
+
+def test_actor_throughput_handles_window_baseline_and_process_restart(
+    tmp_path,
+) -> None:
+    metrics = tmp_path / "metrics"
+    metrics.mkdir()
+    (metrics / "actor-gpu-1-lane-0.jsonl").write_text(
+        "\n".join(
+            json.dumps(row)
+            for row in [
+                {
+                    "worker": "actor-gpu-1-lane-0",
+                    "gpu_id": 1,
+                    "process_started_ns": 1,
+                    "batch_started_ns": 50_000_000_000,
+                    "batch_completed_ns": 60_000_000_000,
+                    "cumulative_games": 10,
+                    "cumulative_samples": 100,
+                    "cumulative_evaluator_rows": 1_000,
+                },
+                {
+                    "worker": "actor-gpu-1-lane-0",
+                    "gpu_id": 1,
+                    "process_started_ns": 1,
+                    "batch_started_ns": 110_000_000_000,
+                    "batch_completed_ns": 120_000_000_000,
+                    "cumulative_games": 30,
+                    "cumulative_samples": 300,
+                    "cumulative_evaluator_rows": 3_000,
+                },
+                {
+                    "worker": "actor-gpu-1-lane-0",
+                    "gpu_id": 1,
+                    "process_started_ns": 90_000_000_000,
+                    "batch_started_ns": 100_000_000_000,
+                    "batch_completed_ns": 115_000_000_000,
+                    "cumulative_games": 5,
+                    "cumulative_samples": 50,
+                    "cumulative_evaluator_rows": 500,
+                },
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    throughput = monitor._actor_throughput_window(
+        metrics,
+        now_ns=120_000_000_000,
+        window_seconds=60,
+    )
+
+    assert throughput["fleet"]["wall_seconds"] == 60
+    assert throughput["fleet"]["samples"] == 250
+    assert throughput["fleet"]["samples_per_second"] == pytest.approx(250 / 60)
+    assert throughput["partial_processes"] == []
+
+
 def test_latest_jsonl_ignores_partial_tail(tmp_path) -> None:
     path = tmp_path / "metrics.jsonl"
     path.write_bytes(b'{"step":1}\n{"step":2')
@@ -480,9 +605,7 @@ def test_monitor_shows_headline_segment_loader_and_result_kind_counts(
     assert snapshot["strength_efficiency"]["headline_source"] == "aggregate"
     assert snapshot["arena_history"]["promotion_evaluations"] == 1
     assert snapshot["arena_history"]["crossplay_evaluations"] == 1
-    assert snapshot["arena_history"]["result_kind_counts"][
-        "historical_crossplay"
-    ] == 1
+    assert snapshot["arena_history"]["result_kind_counts"]["historical_crossplay"] == 1
     assert snapshot["learner"]["segment_updates_per_new_sample"] == 1.2
     assert snapshot["learner"]["loader_workers_effective"] == 8
     assert "utd_segment=1.20/1.25" in text
