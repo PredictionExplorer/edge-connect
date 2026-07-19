@@ -1456,6 +1456,7 @@ def test_learner_gpu_pause_synchronizes_and_releases_cuda_cache(
     learner._distributed_barrier = lambda: barriers.append(True)
     synchronized = []
     emptied = []
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "synchronize", synchronized.append)
     monkeypatch.setattr(torch.cuda, "empty_cache", lambda: emptied.append(True))
     monkeypatch.setattr(torch.cuda, "memory_allocated", lambda _device: 0)

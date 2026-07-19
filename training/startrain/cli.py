@@ -23,6 +23,7 @@ from .checkpoint import (
     write_model_pointer,
 )
 from .config import load_config
+from .device import resolve_device_string
 from .distill import distill_main
 from .inference import GraphInferenceAdapter, InferenceConfig
 from .learner import LearnerLoop
@@ -45,13 +46,14 @@ def selfplay_main(argv: list[str] | None = None) -> None:
     parser.add_argument("--config", required=True)
     parser.add_argument("--replay-store", required=True)
     parser.add_argument("--checkpoint")
-    parser.add_argument("--device", default="cpu")
+    parser.add_argument("--device", default="cpu", help="cpu, cuda, mps, or auto")
     parser.add_argument("--games", type=int)
     parser.add_argument("--rings", type=int)
     parser.add_argument("--cpu-smoke", action="store_true")
     parser.add_argument("--run-identity", required=True)
     parser.add_argument("--actor-id", default="standalone-selfplay")
     arguments = parser.parse_args(argv)
+    arguments.device = resolve_device_string(arguments.device)
 
     experiment = load_config(arguments.config)
     selfplay_config = experiment.selfplay
@@ -176,7 +178,9 @@ def train_main(argv: list[str] | None = None) -> None:
             raise RuntimeError(
                 "configured DDP learner must be launched through torchrun"
             )
-        device = arguments.device or experiment.learner.device
+        device = resolve_device_string(
+            arguments.device or experiment.learner.device
+        )
     if device:
         experiment = replace(
             experiment,
@@ -360,8 +364,9 @@ def actor_main(argv: list[str] | None = None) -> None:
     parser.add_argument("--heartbeat", required=True)
     parser.add_argument("--learner-heartbeat")
     parser.add_argument("--metrics", required=True)
-    parser.add_argument("--device", default="cuda")
+    parser.add_argument("--device", default="auto", help="cuda, mps, cpu, or auto")
     arguments = parser.parse_args(argv)
+    arguments.device = resolve_device_string(arguments.device)
 
     experiment = load_config(arguments.config)
     matches = [
@@ -412,7 +417,7 @@ def arena_main(argv: list[str] | None = None) -> None:
         help="checkpoint (default) or a versioned frozen non-human opponent",
     )
     parser.add_argument("--output", required=True)
-    parser.add_argument("--device", default="cuda")
+    parser.add_argument("--device", default="auto", help="cuda, mps, cpu, or auto")
     parser.add_argument(
         "--target-elo-lcb",
         type=float,
@@ -431,6 +436,7 @@ def arena_main(argv: list[str] | None = None) -> None:
         parser.error("--baseline cannot be combined with a frozen --baseline-kind")
     if arguments.target_rings and arguments.target_elo_lcb is None:
         parser.error("--target-rings requires --target-elo-lcb")
+    arguments.device = resolve_device_string(arguments.device)
 
     experiment = load_config(arguments.config)
     candidate_manifest = load_model_manifest(arguments.candidate)

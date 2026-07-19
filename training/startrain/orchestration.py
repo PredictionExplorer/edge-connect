@@ -16,7 +16,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol, TextIO
 
+import yaml
+
 from .config import ExperimentConfig, load_config, parse_cpu_affinity
+from .device import normalize_device_string
 from .hardware_health import query_gpu_health, unhealthy_reasons
 from .runtime import (
     RunIdentity,
@@ -300,6 +303,8 @@ def build_worker_specs(
     orchestration = experiment.orchestration
     if not orchestration.enabled:
         raise ValueError("orchestration is disabled in this configuration")
+    worker_device = normalize_device_string(orchestration.device)
+    promotion_device = normalize_device_string(orchestration.promotion.device)
     environment = dict(os.environ if base_environment is None else base_environment)
     config = str(Path(config_path).resolve())
     candidate_manifest = directories.learner / "candidate.json"
@@ -324,6 +329,7 @@ def build_worker_specs(
         gpu_ids=tuple(gpu.gpu_id for gpu in learner_gpus),
         cpu_threads=learner_threads,
         cpu_affinity=learner_affinity,
+        device=worker_device,
     )
     train_arguments = (
         "--config",
@@ -333,7 +339,7 @@ def build_worker_specs(
         "--output",
         str(directories.learner),
         "--device",
-        "cuda",
+        worker_device,
         "--heartbeat",
         str(directories.status / "learner.heartbeat.json"),
         "--run-identity",
@@ -431,13 +437,14 @@ def build_worker_specs(
                         "--metrics",
                         str(directories.metrics / f"{name}.jsonl"),
                         "--device",
-                        "cuda",
+                        worker_device,
                     ),
                     environment=_worker_environment(
                         environment,
                         gpu_ids=(gpu.gpu_id,),
                         cpu_threads=gpu.cpu_threads,
                         cpu_affinity=affinity,
+                        device=worker_device,
                     ),
                     heartbeat_path=directories.status / f"{name}.heartbeat.json",
                     metrics_path=directories.metrics / f"{name}.jsonl",
@@ -481,7 +488,7 @@ def build_worker_specs(
                     "--heartbeat",
                     str(directories.status / f"{name}.heartbeat.json"),
                     "--device",
-                    promotion.device,
+                    promotion_device,
                     *(
                         ("--gpu-pause", str(directories.gpu_pause))
                         if promotion.pause_sharing_mode
@@ -493,6 +500,7 @@ def build_worker_specs(
                     gpu_ids=(promotion.gpu_id,),
                     cpu_threads=promotion.cpu_threads,
                     cpu_affinity=promotion_affinity,
+                    device=promotion_device,
                 ),
                 heartbeat_path=directories.status / f"{name}.heartbeat.json",
                 metrics_path=directories.metrics / f"{name}.jsonl",
@@ -509,12 +517,11 @@ def _worker_environment(
     gpu_ids: Sequence[int],
     cpu_threads: int,
     cpu_affinity: Sequence[int] | None = None,
+    device: str = "cuda",
 ) -> dict[str, str]:
     output = dict(base)
     output.update(
         {
-            "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
-            "CUDA_VISIBLE_DEVICES": ",".join(str(gpu_id) for gpu_id in gpu_ids),
             "RAYON_NUM_THREADS": str(cpu_threads),
             "OMP_NUM_THREADS": str(cpu_threads),
             "MKL_NUM_THREADS": str(cpu_threads),
@@ -522,6 +529,15 @@ def _worker_environment(
             "PYTHONUNBUFFERED": "1",
         }
     )
+    device_type = device.split(":", 1)[0]
+    if device_type == "cuda":
+        # gpu_id entries pin physical CUDA devices. On MPS/CPU hosts they are
+        # logical worker slots and no CUDA masking applies.
+        output["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+        output["CUDA_VISIBLE_DEVICES"] = ",".join(str(gpu_id) for gpu_id in gpu_ids)
+    elif device_type == "mps":
+        # Unsupported MPS operators fall back to CPU instead of aborting.
+        output.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
     if cpu_affinity:
         output["STARTRAIN_CPU_AFFINITY"] = ",".join(str(cpu) for cpu in cpu_affinity)
     return output
@@ -576,6 +592,14 @@ class Coordinator:
                 if worker.spec.role in ("learner", "actor")
                 and shared_gpu in worker.spec.gpu_ids
             ]
+            if len(targets) > 1:
+                # With colocated learner+actor on the shared GPU, pausing the
+                # actor frees its memory while the learner keeps training.
+                actor_targets = [
+                    worker for worker in targets if worker.spec.role == "actor"
+                ]
+                if len(actor_targets) == 1:
+                    targets = actor_targets
             owners = [
                 worker
                 for worker in self.workers.values()
@@ -1642,6 +1666,76 @@ def _signal_process(process: ProcessProtocol, signal_number: int) -> None:
         process.kill()
 
 
+def _config_uses_auto(raw: object) -> bool:
+    """Detect ``auto`` hardware markers in an unparsed configuration."""
+
+    if not isinstance(raw, dict):
+        return False
+    markers = []
+    orchestration = raw.get("orchestration")
+    if isinstance(orchestration, dict):
+        markers.append(orchestration.get("gpus") == "auto")
+        markers.append(orchestration.get("device") == "auto")
+        promotion = orchestration.get("promotion")
+        if isinstance(promotion, dict):
+            markers.append(promotion.get("device") == "auto")
+    learner = raw.get("learner")
+    if isinstance(learner, dict):
+        markers.append(learner.get("device") == "auto")
+    return any(markers)
+
+
+def _to_plain(value: object) -> object:
+    if isinstance(value, dict):
+        return {key: _to_plain(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_to_plain(item) for item in value]
+    return value
+
+
+def materialize_worker_config(
+    config_path: str | Path,
+    experiment: ExperimentConfig,
+    directories: RunDirectories,
+) -> Path:
+    """Freeze auto-resolved hardware decisions into the run root.
+
+    Child workers run with ``CUDA_VISIBLE_DEVICES`` masking, so re-detecting
+    hardware inside a child would resolve a different topology than the
+    coordinator saw. Children therefore receive a fully materialized config
+    with every ``auto`` marker replaced by this host's resolution.
+    """
+
+    source = Path(config_path)
+    with source.open("r", encoding="utf-8") as stream:
+        raw = yaml.safe_load(stream)
+    if not _config_uses_auto(raw):
+        return source
+    directories.root.mkdir(parents=True, exist_ok=True)
+    resolved_path = directories.root / "resolved-config.yaml"
+    temporary = resolved_path.with_name(f".{resolved_path.name}.{os.getpid()}.tmp")
+    try:
+        with temporary.open("w", encoding="utf-8") as stream:
+            stream.write(
+                "# Materialized by startrain-orchestrate from "
+                f"{source.resolve()}\n"
+                "# on this host's detected hardware. Do not edit; edit the\n"
+                "# source profile and restart the coordinator instead.\n"
+            )
+            yaml.safe_dump(
+                _to_plain(experiment.as_dict()),
+                stream,
+                sort_keys=True,
+                default_flow_style=False,
+            )
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, resolved_path)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return resolved_path
+
+
 def orchestrate_main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
         description="Coordinate one learner and one actor per inference GPU"
@@ -1652,25 +1746,46 @@ def orchestrate_main(argv: list[str] | None = None) -> None:
 
     experiment = load_config(arguments.config)
     directories = RunDirectories.from_experiment(experiment)
+    worker_config = materialize_worker_config(
+        arguments.config, experiment, directories
+    )
     specs = build_worker_specs(
         experiment,
-        config_path=arguments.config,
+        config_path=worker_config,
         directories=directories,
         python_executable=arguments.python,
     )
     stop = SignalLatch()
     stop.install()
-    expected_gpu_indices = sorted({gpu_id for spec in specs for gpu_id in spec.gpu_ids})
-    requires_cuda_health = experiment.learner.device.startswith(
+    worker_device = normalize_device_string(experiment.orchestration.device)
+    promotion_device = normalize_device_string(
+        experiment.orchestration.promotion.device
+    )
+    expected_gpu_indices: set[int] = set()
+    if worker_device.startswith("cuda"):
+        expected_gpu_indices.update(
+            gpu.gpu_id for gpu in experiment.orchestration.gpus
+        )
+    if experiment.orchestration.promotion.enabled and promotion_device.startswith(
         "cuda"
-    ) or experiment.orchestration.promotion.device.startswith("cuda")
+    ):
+        expected_gpu_indices.add(experiment.orchestration.promotion.gpu_id)
+    health = experiment.orchestration.hardware_health
     exit_code = Coordinator(
         experiment=experiment,
         specs=specs,
         directories=directories,
         hardware_health_probe=(
-            (lambda: query_gpu_health(expected_indices=expected_gpu_indices))
-            if requires_cuda_health
+            (
+                lambda: query_gpu_health(
+                    expected_indices=sorted(expected_gpu_indices),
+                    require_gpu_model=health.require_gpu_model,
+                    fail_on_aggregate_uncorrectable=(
+                        health.fail_on_aggregate_uncorrectable
+                    ),
+                )
+            )
+            if expected_gpu_indices
             else None
         ),
     ).run(stop_requested=stop.is_set)

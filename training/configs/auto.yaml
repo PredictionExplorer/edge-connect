@@ -1,9 +1,28 @@
+# Hardware-adaptive continuous profile.
+#
+# `startrain-orchestrate --config configs/auto.yaml` detects this host's
+# compute (CUDA GPU count, Apple Metal, or CPU-only), generates a matching
+# learner/actor/arena topology, and freezes the resolution into
+# `<run-root>/resolved-config.yaml` for every child worker:
+#
+#   - 4+ CUDA GPUs: learner on GPU 0, dedicated arena on the last GPU,
+#     actors on everything between.
+#   - 2-3 CUDA GPUs: learner on GPU 0, actors on the rest, arena
+#     pause-sharing the last actor GPU.
+#   - 1 CUDA GPU: learner and one actor colocated on GPU 0 with a
+#     pause-shared arena.
+#   - Apple Silicon (MPS) or CPU-only: one learner, one actor, and an arena
+#     process on the shared device. Development scale only.
+#
+# The measured H100 treatment profiles (configs/h100-*.yaml) remain the
+# reference for production runs; this profile favors portability.
 schema_version: 3
 profile: continuous
 game:
   mode: double
   pie_rule: false
   rings: [4, 6, 8, 10]
+
 model:
   width: 384
   rrt_groups: 5
@@ -12,10 +31,11 @@ model:
   bottleneck_ratio: 0.5
   ff_multiplier: 2.5
   dropout: 0.0
-  rms_norm_eps: 1.0e-06
+  rms_norm_eps: 0.000001
   score_margin_min: -151
   score_margin_max: 151
   soft_policy_temperature: 4.0
+
 loss:
   policy: 1.0
   outcome: 1.0
@@ -23,22 +43,22 @@ loss:
   ownership: 0.25
   alive: 0.1
   soft_policy: 0.25
+
 optimizer:
   kind: muon_adamw
   adamw_lr: 0.0003
   muon_lr: 0.02
   weight_decay: 0.01
-  betas:
-  - 0.9
-  - 0.95
+  betas: [0.9, 0.95]
   muon_momentum: 0.95
   muon_nesterov: true
   muon_ns_steps: 5
   fallback_to_adamw: true
+
 train:
-  per_rank_batch_size: 512
-  precision: bf16
-  compile: true
+  per_rank_batch_size: 256
+  precision: auto   # bf16 on CUDA, fp32 on MPS/CPU
+  compile: auto     # torch.compile on CUDA only
   seed: 17
   ema_decay: 0.9999
   gradient_clip_norm: 1.0
@@ -46,18 +66,20 @@ train:
     warmup_steps: 5000
     total_steps: 1000000
     min_lr_ratio: 0.05
+
 data:
   schema_version: 4
   ring_stratified: true
   d5_augmentation: true
-  workers: 16
+  workers: 8        # clamped to the host CPU count at runtime
   prefetch_factor: 4
-  pin_memory: true
-  shard_cache_size: 8
+  pin_memory: true  # ignored automatically off CUDA
+  shard_cache_size: 2
+
 selfplay:
   rings: 4
-  batch_size: 128
-  games: 128
+  batch_size: 16
+  games: 16
   fast_probability: 0.75
   full_probability: 0.25
   fast_simulations: 32
@@ -65,114 +87,39 @@ selfplay:
   simulation_reference_rings: 6
   simulation_ring_exponent: 1.0
   max_considered: 16
-  max_considered_ring_exponent: 1.0
-  max_considered_cap: 32
-  record_fast_policy_targets: true
-  fast_policy_weight: 0.25
+  max_considered_ring_exponent: 0.0
+  max_considered_cap: 64
+  record_fast_policy_targets: false
   c_visit: 50.0
   c_scale: 1.0
   score_utility_weight: 0.05
-  shard_size: 4096
+  shard_size: 1024
   seed: 17
+
 learner:
   steps: 1000000
-  unlimited: true
-  minimum_replay_samples: 100000
-  recent_samples_per_ring: 500000
-  minimum_unique_samples_per_ring: 4096
+  minimum_replay_samples: 20000
+  recent_samples_per_ring: 200000
+  minimum_unique_samples_per_ring: 1024
   max_replay_lag_steps: 50000
   steps_per_window: 1000
-  candidate_interval: 15000
-  recovery_interval_steps: 1000
+  candidate_interval: 5000
   metrics_interval: 10
   replay_poll_seconds: 2.0
   replay_wait_timeout_seconds: 0.0
   resume_latest: true
-  device: cuda
-  use_ring_mixture_curriculum: true
+  device: auto
+
 orchestration:
   enabled: true
-  gpus:
-  - gpu_id: 0
-    role: learner
-    cpu_threads: 16
-    cpu_affinity: 0-103
-  - gpu_id: 1
-    role: actor
-    cpu_threads: 8
-    actor_batch_size: 128
-    actor_lanes: 2
-    cpu_affinity: 0-103
-  - gpu_id: 2
-    role: actor
-    cpu_threads: 8
-    actor_batch_size: 128
-    actor_lanes: 2
-    cpu_affinity: 0-103
-  - gpu_id: 3
-    role: actor
-    cpu_threads: 8
-    actor_batch_size: 128
-    actor_lanes: 2
-    cpu_affinity: 0-103
-  - gpu_id: 4
-    role: actor
-    cpu_threads: 8
-    actor_batch_size: 128
-    actor_lanes: 2
-    cpu_affinity: 104-207
-  - gpu_id: 5
-    role: actor
-    cpu_threads: 8
-    actor_batch_size: 128
-    actor_lanes: 2
-    cpu_affinity: 104-207
-  - gpu_id: 6
-    role: actor
-    cpu_threads: 8
-    actor_batch_size: 128
-    actor_lanes: 2
-    cpu_affinity: 104-207
-  - gpu_id: 7
-    role: actor
-    cpu_threads: 8
-    actor_batch_size: 128
-    actor_lanes: 1
-    cpu_affinity: 104-207
-  actor_games_per_batch: 128
+  gpus: auto
   ring_mixture:
-    rings:
-    - 4
-    - 6
-    - 8
-    - 10
+    rings: [4, 6, 8, 10]
     curriculum:
-    - until_samples: 100000
-      rings:
-      - 4
-    - until_samples: 1000000
-      rings:
-      - 4
-      - 6
+      - {until_samples: 100000, rings: [4]}
+      - {until_samples: 1000000, rings: [4, 6]}
     uniform_weight: 1.0
-    deficit_weights:
-    - 1.0
-    - 1.25
-    - 1.5
-    - 2.0
-    step_weights:
-    - from_step: 360000
-      weights:
-      - 0.15
-      - 0.15
-      - 0.15
-      - 0.55
-    - from_step: 1000000
-      weights:
-      - 0.1
-      - 0.1
-      - 0.1
-      - 0.7
+    deficit_weights: [1.0, 1.25, 1.5, 2.0]
   model_refresh:
     manifest_poll_seconds: 2.0
     startup_timeout_seconds: 900.0
@@ -185,7 +132,7 @@ orchestration:
     maximum_backoff_seconds: 60.0
     stable_reset_seconds: 600.0
   directories:
-    root: runs/h100-8gpu-throughput
+    root: runs/auto
     replay: replay
     learner: learner
     logs: logs
@@ -201,40 +148,22 @@ orchestration:
   distributed:
     enabled: false
     backend: nccl
-  hardware_health:
-    require_gpu_model: H100
-  promotion:
-    enabled: true
-    gpu_id: 7
-    cpu_threads: 8
-    poll_seconds: 10.0
-    bootstrap_initial_champion: true
-    device: cuda
-    pause_sharing_mode: true
-    pause_ready_timeout_seconds: 930.0
-    pause_release_timeout_seconds: 120.0
-    final_drain_timeout_seconds: 57600.0
   plateau:
     enabled: true
-    max_learner_champion_lag_steps: 45000
-    consecutive_terminal_rejections: 2
+    max_learner_champion_lag_steps: 20000
+    consecutive_terminal_rejections: 3
     action: reset_from_champion
-    reset_learning_rate_scale: 0.5
     poll_seconds: 10.0
   retention:
     enabled: true
-    dry_run: false
-    recovery_dry_run: false
+    dry_run: true
     replay_shards_per_ring: 2000
     candidate_manifests: 20
     gc_interval_windows: 10
+
 arena:
-  rings:
-  - 4
-  - 6
-  - 8
-  - 10
-  pairs_per_ring: 50
+  rings: [4, 6, 8, 10]
+  pairs_per_ring: 25
   simulations: 1024
   max_considered: 32
   c_visit: 50.0

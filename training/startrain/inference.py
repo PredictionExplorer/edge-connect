@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import numbers
 from dataclasses import dataclass
 from typing import Protocol, Sequence, runtime_checkable
@@ -10,6 +11,7 @@ import torch
 from torch import nn
 
 from .contracts import SCORE_MARGIN_MAX, SCORE_MARGIN_MIN
+from .device import resolve_precision
 from .features import EncodedBatch
 from .native import (
     NativeStateDataProtocol,
@@ -54,8 +56,8 @@ class InferenceConfig:
     score_utility_weight: float = 0.0
 
     def __post_init__(self) -> None:
-        if self.precision not in ("fp32", "bf16"):
-            raise ValueError("inference precision must be fp32 or bf16")
+        if self.precision not in ("fp32", "bf16", "auto"):
+            raise ValueError("inference precision must be fp32, bf16, or auto")
         if not 0 <= self.score_utility_weight <= 1:
             raise ValueError("score_utility_weight must be in [0, 1]")
 
@@ -99,6 +101,9 @@ class GraphInferenceAdapter:
     ) -> None:
         self.model = model.to(device)
         self.device = torch.device(device)
+        resolved_precision = resolve_precision(config.precision, self.device)
+        if resolved_precision != config.precision:
+            config = dataclasses.replace(config, precision=resolved_precision)
         self.config = config
         self.model_version = model_version
         self.model_step = int(model_step)

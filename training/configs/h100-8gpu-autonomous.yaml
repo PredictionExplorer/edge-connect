@@ -193,6 +193,8 @@ orchestration:
   distributed:
     enabled: false
     backend: nccl
+  hardware_health:
+    require_gpu_model: H100
   promotion:
     enabled: true
     gpu_id: 0

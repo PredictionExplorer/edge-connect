@@ -12,6 +12,7 @@ import time
 from pathlib import Path
 
 from startrain.config import load_config
+from startrain.device import normalize_device_string
 from startrain.hardware_health import query_gpu_health, unhealthy_reasons
 
 
@@ -37,11 +38,32 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--allow-non-h100",
         action="store_true",
-        help="permit non-H100 GPUs for development-only profiles",
+        help="ignore the profile's required GPU model for development hosts",
     )
     arguments = parser.parse_args(argv)
 
     config = load_config(arguments.config)
+    health = config.orchestration.hardware_health
+    require_gpu_model = None if arguments.allow_non_h100 else health.require_gpu_model
+    worker_device = normalize_device_string(config.orchestration.device)
+    promotion_device = normalize_device_string(config.orchestration.promotion.device)
+    if not worker_device.startswith("cuda") and not promotion_device.startswith(
+        "cuda"
+    ):
+        report = {
+            "schema_version": 1,
+            "captured_ns": time.time_ns(),
+            "hostname": socket.gethostname(),
+            "config": str(arguments.config.resolve()),
+            "healthy": True,
+            "skipped": f"no CUDA workers (devices: {worker_device},"
+            f" {promotion_device}); NVIDIA health gate does not apply",
+            "gpus": [],
+        }
+        if arguments.output is not None:
+            _atomic_json(arguments.output, report)
+        print(json.dumps(report, sort_keys=True))
+        return 0
     expected_indices = sorted(
         {
             *(gpu.gpu_id for gpu in config.orchestration.gpus),
@@ -51,7 +73,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         report = query_gpu_health(
             expected_indices=expected_indices,
-            require_h100=not arguments.allow_non_h100,
+            require_gpu_model=require_gpu_model,
+            fail_on_aggregate_uncorrectable=health.fail_on_aggregate_uncorrectable,
             timeout=arguments.timeout_seconds,
         )
         report.update(

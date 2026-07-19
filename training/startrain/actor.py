@@ -16,6 +16,11 @@ import torch
 
 from .checkpoint import ModelManifest, load_ema_checkpoint, load_model_manifest
 from .config import ExperimentConfig, GPUWorkerConfig, RingMixtureConfig
+from .device import (
+    empty_device_cache,
+    peak_memory_stats,
+    reset_peak_memory_stats,
+)
 from .inference import GraphInferenceAdapter, InferenceConfig
 from .model import GraphResTNet
 from .replay_store import ReplayStore
@@ -726,20 +731,13 @@ class ActorSupervisor:
             raise
         finally:
             self.heartbeat.close(final_phase=final_phase)
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            empty_device_cache(self.device)
 
     def _reset_peak_cuda_memory(self) -> None:
-        if self.device.type == "cuda" and torch.cuda.is_available():
-            torch.cuda.reset_peak_memory_stats(self.device)
+        reset_peak_memory_stats(self.device)
 
     def _peak_cuda_memory(self) -> tuple[int | None, int | None]:
-        if self.device.type != "cuda" or not torch.cuda.is_available():
-            return None, None
-        return (
-            int(torch.cuda.max_memory_allocated(self.device)),
-            int(torch.cuda.max_memory_reserved(self.device)),
-        )
+        return peak_memory_stats(self.device)
 
     def _select_model_provider(
         self,

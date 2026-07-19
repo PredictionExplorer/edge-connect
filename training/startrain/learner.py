@@ -12,7 +12,7 @@ import time
 from bisect import bisect_right
 from collections import OrderedDict, defaultdict
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from fractions import Fraction
 from pathlib import Path
 
@@ -45,6 +45,18 @@ from .config import (
     TrainConfig,
 )
 from .contracts import FEATURE_SCHEMA_HASH, RULES_HASH_WIRE
+from .device import (
+    device_memory_snapshot,
+    empty_device_cache,
+    enable_fast_math,
+    resolve_compile,
+    resolve_device_string,
+    resolve_loader_workers,
+    resolve_pin_memory,
+    resolve_precision,
+    seed_all,
+    synchronize_device,
+)
 from .losses import LossWeights
 from .model import MODEL_SCHEMA_VERSION, GraphResTNet
 from .optim import build_optimizer
@@ -814,11 +826,29 @@ class LearnerLoop:
         if world_size <= 0 or rank < 0 or rank >= world_size:
             raise ValueError("invalid learner distributed rank")
         self.store = store
+        learner_config = replace(
+            learner_config,
+            device=resolve_device_string(learner_config.device),
+        )
         self.model = model.to(learner_config.device)
         self.optimizer = optimizer
         self.scheduler = scheduler
         self.ema = ema
         self.learner_config = learner_config
+        device = next(self.model.parameters()).device
+        enable_fast_math(device)
+        # "auto" precision/compile and CUDA-only dataloader features resolve
+        # against the device the model actually lives on.
+        train_config = replace(
+            train_config,
+            precision=resolve_precision(train_config.precision, device),
+            compile=resolve_compile(train_config.compile, device),
+        )
+        data_config = replace(
+            data_config,
+            pin_memory=resolve_pin_memory(data_config.pin_memory, device),
+            workers=resolve_loader_workers(data_config.workers),
+        )
         self.train_config = train_config
         self.data_config = data_config
         self.loss_weights = loss_weights
@@ -906,10 +936,14 @@ class LearnerLoop:
         rank: int = 0,
         world_size: int = 1,
     ) -> "LearnerLoop":
-        torch.manual_seed(config.train.seed)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(config.train.seed)
-        model = GraphResTNet(config.model).to(config.learner.device)
+        seed_all(config.train.seed)
+        learner_device = resolve_device_string(config.learner.device)
+        if learner_device != config.learner.device:
+            config = replace(
+                config,
+                learner=replace(config.learner, device=learner_device),
+            )
+        model = GraphResTNet(config.model).to(learner_device)
         optimizer = build_optimizer(model, config.optimizer)
         scheduler = build_scheduler(optimizer, config.train.scheduler)
         ema = ExponentialMovingAverage(model, decay=config.train.ema_decay)
@@ -2731,12 +2765,11 @@ class LearnerLoop:
                 device = next(self.model.parameters()).device
                 pause_error = None
                 try:
-                    if device.type == "cuda":
-                        torch.cuda.synchronize(device)
+                    synchronize_device(device)
                     if on_pause is not None:
                         on_pause()
-                    if device.type == "cuda":
-                        torch.cuda.empty_cache()
+                    empty_device_cache(device)
+                    if device.type in ("cuda", "mps"):
                         cuda_cache_released = True
                 except BaseException as exc:
                     pause_error = f"{type(exc).__name__}: {exc}"
@@ -2766,22 +2799,15 @@ class LearnerLoop:
                 return False
             if progress is not None and self.rank == 0:
                 device = next(self.model.parameters()).device
+                allocated_bytes, reserved_bytes = device_memory_snapshot(device)
                 progress(
                     phase="arena_gpu_pause",
                     step=self.step,
                     cuda_cache_released=cuda_cache_released,
                     pause_generation=self._gpu_pause_generation,
                     pause_checkpoint_step=pause_checkpoint_step,
-                    cuda_memory_allocated_bytes=(
-                        torch.cuda.memory_allocated(device)
-                        if device.type == "cuda"
-                        else 0
-                    ),
-                    cuda_memory_reserved_bytes=(
-                        torch.cuda.memory_reserved(device)
-                        if device.type == "cuda"
-                        else 0
-                    ),
+                    cuda_memory_allocated_bytes=allocated_bytes,
+                    cuda_memory_reserved_bytes=reserved_bytes,
                 )
             time.sleep(self._plateau_config().poll_seconds)
 

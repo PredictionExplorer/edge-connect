@@ -13,6 +13,7 @@ from torch import nn
 from .checkpoint import ExponentialMovingAverage
 from .config import SchedulerConfig
 from .contracts import SCORE_MARGIN_MAX, SCORE_MARGIN_MIN
+from .device import resolve_compile
 from .features import EncodedBatch
 from .losses import LossWeights, compute_losses
 from .replay import ReplayBatch
@@ -289,7 +290,7 @@ def unwrap_model(model: nn.Module) -> nn.Module:
 def maybe_compile_model(
     model: nn.Module,
     *,
-    enabled: bool,
+    enabled: bool | str,
     dynamic: bool = True,
     fullgraph: bool = True,
     backend: str | None = None,
@@ -297,6 +298,10 @@ def maybe_compile_model(
     recompile_limit: int | None = None,
     isolate_recompiles: bool = False,
 ) -> nn.Module:
+    if enabled == "auto":
+        enabled = resolve_compile("auto", next(model.parameters()).device)
+    elif not isinstance(enabled, bool):
+        raise ValueError("compile enabled must be a boolean or 'auto'")
     if not enabled:
         return model
     if recompile_limit is not None and recompile_limit <= 0:

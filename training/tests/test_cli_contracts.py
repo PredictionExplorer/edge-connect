@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 from collections.abc import Callable
+from pathlib import Path
 
 import pytest
 
@@ -16,6 +18,7 @@ from startrain.cli import (
 )
 from startrain.distill import distill_main
 from startrain.orchestration import orchestrate_main
+from startrain.preflight import preflight_main
 from startrain.promotion import promotion_main
 from startrain.publish import publish_browser_main
 
@@ -31,6 +34,7 @@ from startrain.publish import publish_browser_main
         promotion_main,
         publish_browser_main,
         orchestrate_main,
+        preflight_main,
         starserve_main,
     ],
 )
@@ -44,6 +48,30 @@ def test_every_operator_entrypoint_has_parseable_help(
     output = capsys.readouterr().out
     assert "usage:" in output.lower()
     assert "--help" in output
+
+
+def test_preflight_reports_detection_and_config_resolution(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    config = Path(__file__).parents[1] / "configs" / "small.yaml"
+    preflight_main(["--config", str(config)])
+    report = json.loads(capsys.readouterr().out)
+    assert report["schema_version"] == 1
+    assert report["detected"]["preferred_device"] in ("cuda", "mps", "cpu")
+    assert report["learner"]["device"] == "cpu"
+    assert report["learner"]["precision"] == "fp32"
+    assert report["orchestration"] == {"enabled": False}
+
+
+def test_preflight_exercise_proves_the_host_device(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    preflight_main(["--exercise"])
+    report = json.loads(capsys.readouterr().out)
+    results = report["exercise"]
+    assert len(results) == 1
+    assert results[0]["ok"] is True
+    assert results[0]["device"] == report["detected"]["preferred_device"]
 
 
 def test_dispatcher_rejects_missing_and_unknown_commands() -> None:

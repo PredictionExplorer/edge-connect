@@ -11,9 +11,12 @@ from typing import Any
 
 import torch
 import pytest
+import yaml
 
+import startrain.config as config_module
 import startrain.orchestration as orchestration_module
 from startrain.actor import ActorSupervisor, RingMixtureScheduler
+from startrain.device import AcceleratorInventory
 from startrain.checkpoint import (
     ExponentialMovingAverage,
     latest_checkpoint,
@@ -1514,3 +1517,240 @@ def test_evaluation_loader_requires_and_applies_ema_with_config_checks(
         assert "byte length" in str(error) or "SHA-256" in str(error)
     else:
         raise AssertionError("tampered checkpoint was accepted")
+
+
+def _patched_inventory(monkeypatch, inventory: AcceleratorInventory) -> None:
+    monkeypatch.setattr(config_module, "detect_accelerators", lambda: inventory)
+
+
+def _auto_experiment(monkeypatch, tmp_path, inventory: AcceleratorInventory):
+    _patched_inventory(monkeypatch, inventory)
+    experiment = load_config(CONFIGS / "auto.yaml")
+    return replace(
+        experiment,
+        orchestration=replace(
+            experiment.orchestration,
+            directories=RunDirectoryConfig(root=str(tmp_path / "auto-run")),
+        ),
+    )
+
+
+def test_auto_profile_resolves_eight_gpu_topology(monkeypatch, tmp_path) -> None:
+    inventory = AcceleratorInventory(
+        cuda_device_count=8, mps_available=False, cpu_count=208
+    )
+    experiment = _auto_experiment(monkeypatch, tmp_path, inventory)
+    orchestration = experiment.orchestration
+    assert orchestration.device == "cuda"
+    assert [gpu.gpu_id for gpu in orchestration.learner_gpus] == [0]
+    assert [gpu.gpu_id for gpu in orchestration.actor_gpus] == list(range(1, 7))
+    assert orchestration.promotion.gpu_id == 7
+    assert orchestration.promotion.bootstrap_initial_champion is True
+    assert not orchestration.promotion.pause_sharing_mode
+    assert experiment.learner.device == "cuda"
+
+    directories = RunDirectories.from_experiment(experiment)
+    specs = build_worker_specs(
+        experiment,
+        config_path=CONFIGS / "auto.yaml",
+        directories=directories,
+        python_executable="/test/python",
+        base_environment={},
+    )
+    learner = specs[0]
+    assert learner.environment["CUDA_VISIBLE_DEVICES"] == "0"
+    device_flag = learner.command[learner.command.index("--device") + 1]
+    assert device_flag == "cuda"
+
+
+def test_auto_profile_single_gpu_colocates_and_pause_shares(
+    monkeypatch, tmp_path
+) -> None:
+    inventory = AcceleratorInventory(
+        cuda_device_count=1, mps_available=False, cpu_count=16
+    )
+    experiment = _auto_experiment(monkeypatch, tmp_path, inventory)
+    orchestration = experiment.orchestration
+    assert orchestration.allow_colocated_workers is True
+    assert [(gpu.gpu_id, gpu.role) for gpu in orchestration.gpus] == [
+        (0, "learner"),
+        (0, "actor"),
+    ]
+    assert orchestration.promotion.gpu_id == 0
+    assert orchestration.promotion.pause_sharing_mode is True
+
+    directories = RunDirectories.from_experiment(experiment)
+    specs = build_worker_specs(
+        experiment,
+        config_path=CONFIGS / "auto.yaml",
+        directories=directories,
+        python_executable="/test/python",
+        base_environment={},
+    )
+    assert [spec.role for spec in specs] == ["learner", "actor", "arena"]
+    assert all(spec.environment["CUDA_VISIBLE_DEVICES"] == "0" for spec in specs)
+    coordinator = Coordinator(
+        experiment=experiment,
+        specs=specs,
+        directories=directories,
+        process_factory=lambda *args, **kwargs: FakeProcess(exit_immediately=False),
+    )
+    assert coordinator.pause_target is not None
+    assert coordinator.pause_target.spec.role == "actor"
+    assert coordinator.pause_owner is not None
+    assert coordinator.pause_owner.spec.role == "arena"
+
+
+def test_auto_profile_mps_host_runs_without_cuda_pinning(
+    monkeypatch, tmp_path
+) -> None:
+    inventory = AcceleratorInventory(
+        cuda_device_count=0, mps_available=True, cpu_count=10
+    )
+    experiment = _auto_experiment(monkeypatch, tmp_path, inventory)
+    orchestration = experiment.orchestration
+    assert orchestration.device == "mps"
+    assert orchestration.promotion.device == "mps"
+    assert experiment.learner.device == "mps"
+
+    directories = RunDirectories.from_experiment(experiment)
+    specs = build_worker_specs(
+        experiment,
+        config_path=CONFIGS / "auto.yaml",
+        directories=directories,
+        python_executable="/test/python",
+        base_environment={},
+    )
+    for spec in specs:
+        assert "CUDA_VISIBLE_DEVICES" not in spec.environment
+        assert spec.environment["PYTORCH_ENABLE_MPS_FALLBACK"] == "1"
+        device_flag = spec.command[spec.command.index("--device") + 1]
+        assert device_flag == "mps"
+        assert spec.environment["RAYON_NUM_THREADS"] == str(spec.cpu_threads)
+
+
+def test_auto_profile_cpu_host_topology(monkeypatch, tmp_path) -> None:
+    inventory = AcceleratorInventory(
+        cuda_device_count=0, mps_available=False, cpu_count=8
+    )
+    experiment = _auto_experiment(monkeypatch, tmp_path, inventory)
+    assert experiment.orchestration.device == "cpu"
+    assert experiment.learner.device == "cpu"
+    directories = RunDirectories.from_experiment(experiment)
+    specs = build_worker_specs(
+        experiment,
+        config_path=CONFIGS / "auto.yaml",
+        directories=directories,
+        python_executable="/test/python",
+        base_environment={},
+    )
+    assert [spec.role for spec in specs] == ["learner", "actor", "arena"]
+    for spec in specs:
+        assert "CUDA_VISIBLE_DEVICES" not in spec.environment
+
+
+def test_materialized_config_round_trips_without_auto_markers(
+    monkeypatch, tmp_path
+) -> None:
+    inventory = AcceleratorInventory(
+        cuda_device_count=2, mps_available=False, cpu_count=32
+    )
+    experiment = _auto_experiment(monkeypatch, tmp_path, inventory)
+    directories = RunDirectories.from_experiment(experiment)
+    resolved_path = orchestration_module.materialize_worker_config(
+        CONFIGS / "auto.yaml",
+        experiment,
+        directories,
+    )
+    assert resolved_path == directories.root / "resolved-config.yaml"
+    raw = resolved_path.read_text(encoding="utf-8")
+    parsed = yaml.safe_load(raw)
+    assert parsed["orchestration"]["gpus"] != "auto"
+    assert parsed["orchestration"]["device"] == "cuda"
+    assert parsed["learner"]["device"] == "cuda"
+    assert parsed["train"]["precision"] == "auto"  # resolved per worker device
+    # Reload with detection forced to a different host: the frozen file must
+    # win, proving children never re-detect hardware.
+    _patched_inventory(
+        monkeypatch,
+        AcceleratorInventory(cuda_device_count=0, mps_available=False, cpu_count=2),
+    )
+    reloaded = load_config(resolved_path)
+    assert reloaded.orchestration.device == "cuda"
+    assert [(gpu.gpu_id, gpu.role) for gpu in reloaded.orchestration.gpus] == [
+        (0, "learner"),
+        (1, "actor"),
+    ]
+    assert reloaded.orchestration.promotion.gpu_id == 1
+    assert reloaded.orchestration.promotion.pause_sharing_mode is True
+    assert reloaded.learner.device == "cuda"
+    assert "# Materialized by startrain-orchestrate" in raw
+
+
+def test_materialize_worker_config_passthrough_for_explicit_profiles(
+    tmp_path,
+) -> None:
+    experiment = load_config(CONFIGS / "h100-4gpu.yaml")
+    experiment = replace(
+        experiment,
+        orchestration=replace(
+            experiment.orchestration,
+            directories=RunDirectoryConfig(root=str(tmp_path / "explicit")),
+        ),
+    )
+    directories = RunDirectories.from_experiment(experiment)
+    resolved = orchestration_module.materialize_worker_config(
+        CONFIGS / "h100-4gpu.yaml",
+        experiment,
+        directories,
+    )
+    assert resolved == CONFIGS / "h100-4gpu.yaml"
+    assert not (directories.root / "resolved-config.yaml").exists()
+
+
+def test_colocated_workers_require_explicit_opt_in() -> None:
+    experiment = load_config(CONFIGS / "h100-4gpu.yaml")
+    with pytest.raises(ConfigError, match="allow_colocated_workers"):
+        replace(
+            experiment.orchestration,
+            gpus=(
+                GPUWorkerConfig(0, "learner", 8),
+                GPUWorkerConfig(0, "actor", 4, 32),
+            ),
+        )
+    colocated = replace(
+        experiment.orchestration,
+        allow_colocated_workers=True,
+        gpus=(
+            GPUWorkerConfig(0, "learner", 8),
+            GPUWorkerConfig(0, "actor", 4, 32),
+        ),
+        promotion=replace(
+            experiment.orchestration.promotion,
+            gpu_id=0,
+            pause_sharing_mode=True,
+        ),
+    )
+    assert colocated.allow_colocated_workers is True
+    with pytest.raises(ConfigError, match="distinct roles"):
+        replace(
+            colocated,
+            gpus=(
+                GPUWorkerConfig(0, "actor", 8, 32),
+                GPUWorkerConfig(0, "actor", 4, 32),
+            ),
+        )
+
+
+def test_auto_topology_rejects_autonomous_scratch_profiles(tmp_path) -> None:
+    source = (CONFIGS / "auto.yaml").read_text(encoding="utf-8")
+    mutated = source.replace(
+        "orchestration:\n  enabled: true\n  gpus: auto\n",
+        "orchestration:\n  enabled: true\n  gpus: auto\n"
+        "  autonomous:\n    enabled: true\n",
+    )
+    assert mutated != source
+    target = tmp_path / "auto-autonomous.yaml"
+    target.write_text(mutated, encoding="utf-8")
+    with pytest.raises(ConfigError, match="frozen explicit GPU topology"):
+        load_config(target)

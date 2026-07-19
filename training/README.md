@@ -67,6 +67,10 @@ The documented baseline is:
 - Node.js/npm for the web application, and `wasm-pack` plus the
   `wasm32-unknown-unknown` target for browser publication.
 
+Other machines (fewer GPUs, non-H100 NVIDIA GPUs, Apple Silicon, CPU-only)
+are supported through the hardware-adaptive profile described in
+[Run on any machine](#run-on-any-machine-auto-profile).
+
 Use fast durable local storage for `runs/`. Replay uses immutable compressed shards and
 a SQLite WAL manifest, while checkpoints and manifests are immutable and
 content-addressed.
@@ -185,6 +189,71 @@ startrain-train \
 Choose a new directory and run ID for a clean repeat. Outside `--cpu-smoke`,
 `startrain-selfplay --checkpoint` expects an immutable champion model manifest, not a
 raw `.pt` file.
+
+## Run on any machine (auto profile)
+
+The pipeline no longer assumes an H100 host. Device policy lives in
+`startrain/device.py`; every worker accepts `--device auto` and resolves
+`cuda` > `mps` > `cpu` with clear errors when an explicit device is
+unavailable.
+
+First inspect what this host offers and what a profile resolves to on it:
+
+```bash
+startrain-preflight --exercise
+startrain-preflight --config configs/auto.yaml --exercise
+```
+
+`--exercise` proves each resolved device with a tiny forward/backward pass.
+
+Then start the hardware-adaptive continuous profile:
+
+```bash
+startrain-orchestrate --config configs/auto.yaml
+```
+
+`orchestration.gpus: auto` detects the host at launch and generates the
+worker layout:
+
+| Host | Layout |
+| --- | --- |
+| 4+ CUDA GPUs | learner on GPU 0, actors on GPUs 1..N-2, dedicated arena on GPU N-1 |
+| 2-3 CUDA GPUs | learner on GPU 0, actors on the rest, arena pause-sharing the last actor GPU |
+| 1 CUDA GPU | learner and one actor colocated on GPU 0 (`allow_colocated_workers`), arena pause-sharing |
+| Apple Silicon (MPS) | one learner, one actor, one arena process on `mps` |
+| CPU-only | the same three workers on `cpu` |
+
+The coordinator freezes the resolution into `<run-root>/resolved-config.yaml`
+and passes that file to every child, so workers running under
+`CUDA_VISIBLE_DEVICES` masking never re-detect hardware. The file is
+regenerated at each coordinator start; edit the source profile, not the
+materialized copy.
+
+Per-device policy is applied automatically:
+
+- `train.precision: auto` selects bf16 on CUDA and fp32 on MPS/CPU. An
+  explicit `bf16` on MPS is rejected at startup with an actionable error.
+- `train.compile: auto` enables `torch.compile` on CUDA only.
+- `data.pin_memory` and the pinned-transfer prefetcher engage on CUDA only;
+  `data.workers` is clamped to the host CPU count.
+- TF32 tensor-core matmuls are enabled on CUDA workers
+  (`torch.set_float32_matmul_precision("high")`), which the fp32 Muon
+  Newton-Schulz iterations rely on for H100-class throughput.
+- On MPS, workers run with `PYTORCH_ENABLE_MPS_FALLBACK=1` so unsupported
+  operators fall back to CPU instead of aborting.
+
+The coordinator's `nvidia-smi` health gate runs only when workers use CUDA.
+`orchestration.hardware_health.require_gpu_model` controls the product-name
+gate: the shipped `h100-*.yaml` profiles pin `H100` (unchanged fail-closed
+behavior), while `auto.yaml` accepts any healthy NVIDIA GPU. ECC, MIG,
+row-remap and repair checks stay fail-closed everywhere; fields a consumer
+GPU reports as `N/A` are treated as absent features, not failures.
+
+MPS and CPU hosts are development-scale: they run the full contract
+(self-play, replay, learner, arena, promotion) but are orders of magnitude
+slower than CUDA hosts. Multi-GPU DDP for the learner remains CUDA-only and
+opt-in via `orchestration.distributed`. `gpus: auto` cannot be combined with
+`autonomous.enabled`, which requires a frozen explicit topology.
 
 ## Start a 4- or 8-H100 run
 

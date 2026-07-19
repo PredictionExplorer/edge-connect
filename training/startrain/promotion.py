@@ -31,6 +31,13 @@ from .checkpoint import (
 )
 from .checkpoint import write_model_pointer
 from .config import ArenaConfig, ExperimentConfig, load_config
+from .device import (
+    empty_device_cache,
+    peak_memory_stats,
+    reset_peak_memory_stats,
+    resolve_device_string,
+    synchronize_device,
+)
 from .inference import GraphInferenceAdapter, InferenceConfig
 from .historical_evaluation import (
     HISTORICAL_CROSSPLAY_RESULT_KIND,
@@ -793,9 +800,8 @@ class PromotionSupervisor:
                 del baseline_evaluator
         finally:
             del candidate_evaluator
-            if torch.device(self.device).type == "cuda" and torch.cuda.is_available():
-                torch.cuda.synchronize(torch.device(self.device))
-                torch.cuda.empty_cache()
+            synchronize_device(self.device)
+            empty_device_cache(self.device)
 
     def _evaluate_candidate_session(
         self,
@@ -875,8 +881,7 @@ class PromotionSupervisor:
         collect_cuda_metrics = (
             metric_device.type == "cuda" and torch.cuda.is_available()
         )
-        if collect_cuda_metrics:
-            torch.cuda.reset_peak_memory_stats(metric_device)
+        reset_peak_memory_stats(metric_device)
         arena_config = self._arena_config(candidate, champion)
         if progress is not None:
             progress(
@@ -1009,8 +1014,7 @@ class PromotionSupervisor:
         pair_starts: Mapping[int, int],
         pair_counts: Mapping[int, int],
     ) -> tuple[str, bool]:
-        if collect_cuda_metrics:
-            torch.cuda.synchronize(metric_device)
+        synchronize_device(metric_device)
         evaluation_metrics = result.get("evaluation_metrics")
         if evaluation_metrics is None:
             evaluation_metrics = {}
@@ -1018,15 +1022,12 @@ class PromotionSupervisor:
         elif not isinstance(evaluation_metrics, dict):
             raise ValueError("arena result evaluator metrics are invalid")
         evaluation_metrics["round_wall_seconds"] = time.perf_counter() - round_started
+        peak_allocated, peak_reserved = peak_memory_stats(metric_device)
         evaluation_metrics["peak_cuda_allocated_bytes"] = (
-            torch.cuda.max_memory_allocated(metric_device)
-            if collect_cuda_metrics
-            else None
+            peak_allocated if collect_cuda_metrics else None
         )
         evaluation_metrics["peak_cuda_reserved_bytes"] = (
-            torch.cuda.max_memory_reserved(metric_device)
-            if collect_cuda_metrics
-            else None
+            peak_reserved if collect_cuda_metrics else None
         )
         evaluation_metrics["requested_pairs"] = sum(pair_counts.values())
         evaluation_metrics["completed_pairs"] = len(self._pairs_from_result(result))
@@ -1504,7 +1505,9 @@ def promotion_main(argv: list[str] | None = None) -> None:
 
     experiment = load_config(arguments.config)
     run_identity = load_run_identity(arguments.run_identity)
-    device = arguments.device or experiment.orchestration.promotion.device
+    device = resolve_device_string(
+        arguments.device or experiment.orchestration.promotion.device
+    )
     native = load_star_native(required=True)
     assert native is not None
     stop = SignalLatch()

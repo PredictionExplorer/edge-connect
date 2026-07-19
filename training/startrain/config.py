@@ -9,6 +9,11 @@ from typing import Any, Literal, TypeVar, cast
 
 import yaml
 
+from .device import (
+    detect_accelerators,
+    generate_auto_topology,
+    resolve_device_string,
+)
 from .losses import LossWeights
 from .model import ModelConfig
 from .optim import OptimizerConfig
@@ -82,8 +87,8 @@ class SchedulerConfig:
 @dataclass(frozen=True, slots=True)
 class TrainConfig:
     per_rank_batch_size: int = 32
-    precision: Literal["fp32", "bf16"] = "fp32"
-    compile: bool = False
+    precision: Literal["fp32", "bf16", "auto"] = "fp32"
+    compile: bool | Literal["auto"] = False
     seed: int = 17
     ema_decay: float = 0.999
     gradient_clip_norm: float = 1.0
@@ -94,8 +99,10 @@ class TrainConfig:
             raise ConfigError(
                 "per_rank_batch_size and gradient_clip_norm must be positive"
             )
-        if self.precision not in ("fp32", "bf16"):
-            raise ConfigError("precision must be fp32 or bf16")
+        if self.precision not in ("fp32", "bf16", "auto"):
+            raise ConfigError("precision must be fp32, bf16, or auto")
+        if type(self.compile) is not bool and self.compile != "auto":
+            raise ConfigError("compile must be boolean or 'auto'")
         if not 0 <= self.ema_decay < 1:
             raise ConfigError("ema_decay must be in [0, 1)")
 
@@ -590,6 +597,28 @@ class DistributedConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class HardwareHealthConfig:
+    """Gates for the coordinator's periodic ``nvidia-smi`` health probe.
+
+    ``require_gpu_model`` is a substring matched against the reported product
+    name (for example ``"H100"``). ``None`` accepts any NVIDIA GPU. The probe
+    itself only runs when orchestrated workers use CUDA devices.
+    """
+
+    require_gpu_model: str | None = None
+    fail_on_aggregate_uncorrectable: bool = True
+
+    def __post_init__(self) -> None:
+        if self.require_gpu_model is not None and (
+            not isinstance(self.require_gpu_model, str)
+            or not self.require_gpu_model.strip()
+        ):
+            raise ConfigError("require_gpu_model must be a non-empty string or null")
+        if type(self.fail_on_aggregate_uncorrectable) is not bool:
+            raise ConfigError("fail_on_aggregate_uncorrectable must be boolean")
+
+
+@dataclass(frozen=True, slots=True)
 class PromotionConfig:
     enabled: bool = False
     gpu_id: int = 0
@@ -771,6 +800,8 @@ class OrchestrationConfig:
     enabled: bool = False
     run_id: str | None = None
     gpus: tuple[GPUWorkerConfig, ...] = ()
+    device: str = "cuda"
+    allow_colocated_workers: bool = False
     actor_games_per_batch: int = 256
     ring_mixture: RingMixtureConfig = RingMixtureConfig()
     model_refresh: ModelRefreshConfig = ModelRefreshConfig()
@@ -779,6 +810,7 @@ class OrchestrationConfig:
     shutdown: ShutdownConfig = ShutdownConfig()
     distributed: DistributedConfig = DistributedConfig()
     promotion: PromotionConfig = PromotionConfig()
+    hardware_health: HardwareHealthConfig = HardwareHealthConfig()
     historical_evaluation: HistoricalEvaluationConfig = HistoricalEvaluationConfig()
     plateau: PlateauConfig = PlateauConfig()
     autonomous: AutonomousConfig = AutonomousConfig()
@@ -787,6 +819,13 @@ class OrchestrationConfig:
     def __post_init__(self) -> None:
         if type(self.enabled) is not bool:
             raise ConfigError("orchestration.enabled must be boolean")
+        if type(self.allow_colocated_workers) is not bool:
+            raise ConfigError("allow_colocated_workers must be boolean")
+        if self.device not in ("cuda", "mps", "cpu", "auto"):
+            raise ConfigError(
+                "orchestration.device must be cuda, mps, cpu, or auto; per-worker "
+                "CUDA pinning uses gpu_id, so device indexes are not accepted"
+            )
         if self.run_id is not None:
             from .runtime import validate_identifier
 
@@ -799,7 +838,18 @@ class OrchestrationConfig:
             raise ConfigError("actor_games_per_batch must be positive")
         ids = [gpu.gpu_id for gpu in self.gpus]
         if len(ids) != len(set(ids)):
-            raise ConfigError("a physical GPU may have only one configured role")
+            if not self.allow_colocated_workers:
+                raise ConfigError(
+                    "a physical GPU may have only one configured role; set "
+                    "allow_colocated_workers to share one GPU between the "
+                    "learner and an actor"
+                )
+            role_ids = [(gpu.gpu_id, gpu.role) for gpu in self.gpus]
+            if len(role_ids) != len(set(role_ids)):
+                raise ConfigError(
+                    "colocated workers on one GPU must have distinct roles; "
+                    "use actor_lanes for multiple actors per GPU"
+                )
         learners = [gpu for gpu in self.gpus if gpu.role == "learner"]
         actors = [gpu for gpu in self.gpus if gpu.role == "actor"]
         if any(
@@ -841,6 +891,8 @@ class OrchestrationConfig:
             )
         if not self.distributed.enabled and len(learners) > 1:
             raise ConfigError("multiple learner GPUs require distributed.enabled")
+        if self.distributed.enabled and self.device not in ("cuda", "auto"):
+            raise ConfigError("distributed training requires CUDA worker devices")
         if self.distributed.enabled and len(learners) < 2:
             raise ConfigError("distributed training requires at least two learner GPUs")
         if self.distributed.enabled and len({gpu.cpu_threads for gpu in learners}) != 1:
@@ -1026,6 +1078,56 @@ def _curriculum_values(values: object) -> dict[str, Any]:
     return output
 
 
+class _HostInventory:
+    """One lazy hardware-detection snapshot shared by a single config load."""
+
+    def __init__(self) -> None:
+        self._inventory = None
+
+    def get(self):
+        if self._inventory is None:
+            self._inventory = detect_accelerators()
+        return self._inventory
+
+    def resolve(self, requested: str) -> str:
+        return resolve_device_string(requested, inventory=self.get())
+
+
+def _resolve_auto_orchestration(
+    values: dict[str, Any],
+    host: _HostInventory,
+) -> dict[str, Any]:
+    """Materialize ``gpus: auto`` into a host-matched worker topology.
+
+    Detection is deterministic per host, so the coordinator and standalone
+    CLIs resolve identical topologies. Orchestrated child processes never
+    re-detect: the coordinator hands them a fully resolved config file.
+    Explicit keys in the operator's YAML always win over generated values.
+    """
+
+    if values.get("gpus") != "auto":
+        if values.get("device") == "auto":
+            values["device"] = host.resolve("auto")
+        return values
+    autonomous = values.get("autonomous")
+    if isinstance(autonomous, dict) and autonomous.get("enabled"):
+        raise ConfigError(
+            "autonomous runs require a frozen explicit GPU topology; "
+            "'gpus: auto' cannot be combined with autonomous.enabled"
+        )
+    fragment = generate_auto_topology(host.get())
+    values["gpus"] = fragment["gpus"]
+    for key in ("device", "actor_games_per_batch", "allow_colocated_workers"):
+        if key in fragment and key not in values:
+            values[key] = fragment[key]
+    generated_promotion = dict(cast(dict[str, Any], fragment["promotion"]))
+    generated_promotion.update(_mapping("promotion", values.get("promotion", {})))
+    values["promotion"] = generated_promotion
+    if values.get("device") == "auto":
+        values["device"] = host.resolve("auto")
+    return values
+
+
 def _ring_weight_values(values: object) -> dict[str, Any]:
     output = _mapping("ring weight stage", values)
     output["weights"] = tuple(output.get("weights", ()))
@@ -1068,7 +1170,9 @@ def load_config(path: str | Path) -> ExperimentConfig:
     )
     game_values = _mapping("game", raw["game"])
     game_values["rings"] = tuple(game_values.get("rings", SUPPORTED_RINGS))
+    host = _HostInventory()
     orchestration_values = _mapping("orchestration", raw.get("orchestration", {}))
+    orchestration_values = _resolve_auto_orchestration(orchestration_values, host)
     orchestration_values["gpus"] = tuple(
         _construct(GPUWorkerConfig, value)
         for value in orchestration_values.get("gpus", ())
@@ -1093,6 +1197,10 @@ def load_config(path: str | Path) -> ExperimentConfig:
         for value in ring_values.get("step_weights", ())
     )
     orchestration_values["ring_mixture"] = _construct(RingMixtureConfig, ring_values)
+    promotion_values = _mapping("promotion", orchestration_values.get("promotion", {}))
+    if promotion_values.get("device") == "auto":
+        promotion_values["device"] = host.resolve("auto")
+    orchestration_values["promotion"] = promotion_values
     for key, cls in (
         ("model_refresh", ModelRefreshConfig),
         ("restart", RestartPolicyConfig),
@@ -1100,12 +1208,16 @@ def load_config(path: str | Path) -> ExperimentConfig:
         ("shutdown", ShutdownConfig),
         ("distributed", DistributedConfig),
         ("promotion", PromotionConfig),
+        ("hardware_health", HardwareHealthConfig),
         ("historical_evaluation", HistoricalEvaluationConfig),
         ("plateau", PlateauConfig),
         ("autonomous", AutonomousConfig),
         ("retention", RetentionConfig),
     ):
         orchestration_values[key] = _construct(cls, orchestration_values.get(key, {}))
+    learner_values = _mapping("learner", raw["learner"])
+    if learner_values.get("device") == "auto":
+        learner_values["device"] = host.resolve("auto")
     arena_values = _mapping("arena", raw.get("arena", {}))
     arena_values["rings"] = tuple(arena_values.get("rings", SUPPORTED_RINGS))
     arena_values["per_ring_regression_floor_elo"] = {
@@ -1124,7 +1236,7 @@ def load_config(path: str | Path) -> ExperimentConfig:
         train=_construct(TrainConfig, train_values),
         data=_construct(DataConfig, raw["data"]),
         selfplay=_construct(SelfPlayConfig, raw["selfplay"]),
-        learner=_construct(LearnerConfig, raw["learner"]),
+        learner=_construct(LearnerConfig, learner_values),
         orchestration=_construct(OrchestrationConfig, orchestration_values),
         arena=_construct(ArenaConfig, arena_values),
         profile=raw.get("profile", "standalone-smoke"),

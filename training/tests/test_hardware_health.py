@@ -102,6 +102,92 @@ def test_query_failure_is_explicit() -> None:
         query_gpu_health(expected_indices=(0,), runner=runner)
 
 
+def _consumer_gpu_xml(index: int) -> str:
+    """A GeForce-style report: no serial, N/A MIG/ECC, missing repair nodes."""
+
+    return f"""
+    <gpu id="00000000:{index:02x}:00.0">
+      <product_name>NVIDIA GeForce RTX 4090</product_name>
+      <uuid>GPU-{index}</uuid>
+      <serial>N/A</serial>
+      <minor_number>{index}</minor_number>
+      <pci><pci_bus_id>00000000:{index:02x}:00.0</pci_bus_id></pci>
+      <mig_mode><current_mig>N/A</current_mig></mig_mode>
+      <ecc_mode><current_ecc>N/A</current_ecc></ecc_mode>
+      <ecc_errors>
+        <volatile>
+          <sram_uncorrectable_parity>N/A</sram_uncorrectable_parity>
+          <sram_uncorrectable_secded>N/A</sram_uncorrectable_secded>
+          <dram_uncorrectable>N/A</dram_uncorrectable>
+        </volatile>
+        <aggregate>
+          <sram_uncorrectable_parity>N/A</sram_uncorrectable_parity>
+          <sram_uncorrectable_secded>N/A</sram_uncorrectable_secded>
+          <dram_uncorrectable>N/A</dram_uncorrectable>
+        </aggregate>
+      </ecc_errors>
+      <remapped_rows>
+        <remapped_row_pending>N/A</remapped_row_pending>
+        <remapped_row_failure>N/A</remapped_row_failure>
+      </remapped_rows>
+    </gpu>
+    """
+
+
+def test_default_model_gate_accepts_any_nvidia_gpu() -> None:
+    report = parse_nvidia_smi_xml(
+        _xml(_consumer_gpu_xml(0)),
+        expected_indices=(0,),
+        require_gpu_model=None,
+    )
+
+    assert report["healthy"] is True
+    assert report["gpus"][0]["reasons"] == ()
+
+
+def test_required_model_substring_fails_other_gpus() -> None:
+    report = parse_nvidia_smi_xml(
+        _xml(_consumer_gpu_xml(0)),
+        expected_indices=(0,),
+        require_gpu_model="H100",
+    )
+
+    assert report["healthy"] is False
+    assert "unexpected_gpu_model" in report["gpus"][0]["reasons"]
+
+
+def test_actively_bad_states_still_fail_on_consumer_gpus() -> None:
+    payload = _consumer_gpu_xml(0).replace(
+        "<current_mig>N/A</current_mig>",
+        "<current_mig>Enabled</current_mig>",
+    )
+    report = parse_nvidia_smi_xml(
+        _xml(payload),
+        expected_indices=(0,),
+        require_gpu_model=None,
+    )
+
+    assert report["healthy"] is False
+    assert "mig_enabled" in report["gpus"][0]["reasons"]
+
+
+def test_h100_profiles_pin_the_model_gate_and_auto_does_not() -> None:
+    configs = Path(__file__).parents[1] / "configs"
+    from startrain.config import load_config
+
+    for name in (
+        "h100-4gpu",
+        "h100-8gpu",
+        "h100-8gpu-optimized",
+        "h100-8gpu-throughput",
+        "h100-8gpu-autonomous",
+    ):
+        experiment = load_config(configs / f"{name}.yaml")
+        assert experiment.orchestration.hardware_health.require_gpu_model == "H100"
+    auto = load_config(configs / "auto.yaml")
+    assert auto.orchestration.hardware_health.require_gpu_model is None
+
+
 def test_preflight_writes_failure_report(tmp_path: Path, monkeypatch) -> None:
     profile = Path(__file__).parents[1] / "configs" / "small.yaml"
     output = tmp_path / "health.json"

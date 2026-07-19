@@ -1,4 +1,11 @@
-"""Fail-closed NVIDIA GPU health inspection for training hosts."""
+"""Fail-closed NVIDIA GPU health inspection for training hosts.
+
+Checks are fail-closed for hardware that reports a feature in a bad state,
+and tolerant of hardware that does not expose a feature at all (consumer
+GPUs report ``N/A`` for ECC/MIG/row-remap fields, and some drivers omit the
+nodes entirely). The production H100 gate is expressed through
+``require_gpu_model`` instead of being hardcoded.
+"""
 
 from __future__ import annotations
 
@@ -12,6 +19,7 @@ from typing import Protocol
 
 GPU_HEALTH_SCHEMA_VERSION = 1
 _INTEGER = re.compile(r"^-?\d+")
+_ABSENT = ("", "n/a", "none", "not active", "unknown error")
 
 
 class CompletedProcessProtocol(Protocol):
@@ -62,8 +70,17 @@ def _text(node: ET.Element, path: str, *, required: bool = True) -> str:
     return value
 
 
+def _optional_text(node: ET.Element, path: str, *, default: str) -> str:
+    value = _text(node, path, required=False)
+    return value if value else default
+
+
 def _integer(node: ET.Element, path: str) -> int:
-    value = _text(node, path)
+    """Parse a counter; missing or N/A nodes mean the feature is absent."""
+
+    value = _text(node, path, required=False)
+    if value.casefold() in _ABSENT:
+        return 0
     match = _INTEGER.match(value)
     if match is None:
         raise ValueError(f"nvidia-smi XML gpu/{path} is not an integer: {value!r}")
@@ -77,7 +94,7 @@ def _yes(value: str, *, path: str) -> bool:
     normalized = value.casefold()
     if normalized in ("yes", "pending"):
         return True
-    if normalized in ("no", "none", "not active", "n/a"):
+    if normalized in ("no", *_ABSENT):
         return False
     raise ValueError(f"nvidia-smi XML gpu/{path} has unknown state {value!r}")
 
@@ -86,7 +103,7 @@ def parse_nvidia_smi_xml(
     payload: str,
     *,
     expected_indices: Iterable[int] | None = None,
-    require_h100: bool = True,
+    require_gpu_model: str | None = "H100",
     fail_on_aggregate_uncorrectable: bool = True,
 ) -> dict[str, object]:
     """Parse ``nvidia-smi -q -x`` and return a deterministic health report."""
@@ -105,9 +122,9 @@ def parse_nvidia_smi_xml(
         # device-node identifier and is not guaranteed to match that index.
         index = fallback
         product_name = _text(gpu, "product_name")
-        mig_mode = _text(gpu, "mig_mode/current_mig")
-        ecc_mode = _text(gpu, "ecc_mode/current_ecc")
-        recovery_action = _text(gpu, "gpu_recovery_action")
+        mig_mode = _optional_text(gpu, "mig_mode/current_mig", default="N/A")
+        ecc_mode = _optional_text(gpu, "ecc_mode/current_ecc", default="N/A")
+        recovery_action = _optional_text(gpu, "gpu_recovery_action", default="None")
         volatile_parity = _integer(gpu, "ecc_errors/volatile/sram_uncorrectable_parity")
         volatile_secded = _integer(gpu, "ecc_errors/volatile/sram_uncorrectable_secded")
         volatile_dram = _integer(gpu, "ecc_errors/volatile/dram_uncorrectable")
@@ -119,32 +136,38 @@ def parse_nvidia_smi_xml(
         )
         aggregate_dram = _integer(gpu, "ecc_errors/aggregate/dram_uncorrectable")
         threshold = _yes(
-            _text(gpu, "ecc_errors/aggregate/sram_threshold_exceeded"),
+            _optional_text(
+                gpu,
+                "ecc_errors/aggregate/sram_threshold_exceeded",
+                default="No",
+            ),
             path="ecc_errors/aggregate/sram_threshold_exceeded",
         )
         channel_repair = _yes(
-            _text(gpu, "ecc_errors/channel_repair_pending"),
+            _optional_text(gpu, "ecc_errors/channel_repair_pending", default="No"),
             path="ecc_errors/channel_repair_pending",
         )
         tpc_repair = _yes(
-            _text(gpu, "ecc_errors/tpc_repair_pending"),
+            _optional_text(gpu, "ecc_errors/tpc_repair_pending", default="No"),
             path="ecc_errors/tpc_repair_pending",
         )
         remap_pending = _yes(
-            _text(gpu, "remapped_rows/remapped_row_pending"),
+            _optional_text(gpu, "remapped_rows/remapped_row_pending", default="No"),
             path="remapped_rows/remapped_row_pending",
         )
         remap_failure = _yes(
-            _text(gpu, "remapped_rows/remapped_row_failure"),
+            _optional_text(gpu, "remapped_rows/remapped_row_failure", default="No"),
             path="remapped_rows/remapped_row_failure",
         )
 
         reasons = []
-        if require_h100 and "H100" not in product_name:
+        if require_gpu_model and require_gpu_model not in product_name:
             reasons.append("unexpected_gpu_model")
-        if mig_mode.casefold() != "disabled":
+        # "N/A" means the GPU does not support the feature; only an actively
+        # bad state (MIG on, ECC deliberately disabled) fails the gate.
+        if mig_mode.casefold() not in ("disabled", "n/a"):
             reasons.append("mig_enabled")
-        if ecc_mode.casefold() != "enabled":
+        if ecc_mode.casefold() not in ("enabled", "n/a"):
             reasons.append("ecc_disabled")
         if recovery_action.casefold() not in ("none", "n/a"):
             reasons.append("gpu_recovery_action")
@@ -169,7 +192,7 @@ def parse_nvidia_smi_xml(
             GPUHealth(
                 index=index,
                 uuid=_text(gpu, "uuid"),
-                serial=_text(gpu, "serial"),
+                serial=_optional_text(gpu, "serial", default="N/A"),
                 pci_bus_id=_text(gpu, "pci/pci_bus_id"),
                 product_name=product_name,
                 mig_mode=mig_mode,
@@ -220,7 +243,7 @@ def parse_nvidia_smi_xml(
 def query_gpu_health(
     *,
     expected_indices: Iterable[int] | None = None,
-    require_h100: bool = True,
+    require_gpu_model: str | None = "H100",
     fail_on_aggregate_uncorrectable: bool = True,
     runner: CommandRunner = subprocess.run,
     timeout: float = 30.0,
@@ -245,7 +268,7 @@ def query_gpu_health(
     return parse_nvidia_smi_xml(
         completed.stdout,
         expected_indices=expected_indices,
-        require_h100=require_h100,
+        require_gpu_model=require_gpu_model,
         fail_on_aggregate_uncorrectable=fail_on_aggregate_uncorrectable,
     )
 
