@@ -357,6 +357,51 @@ def test_apply_writes_immutable_profile_record_and_complete_backup(
     assert not (fixture.root / "coordinator.lock").exists()
 
 
+def test_additive_default_field_accepts_legacy_chain_hash(tmp_path: Path) -> None:
+    fixture = _fixture(tmp_path)
+    config = load_config(fixture.old_profile)
+    materialized = migration.canonical_config_sha256(config)
+    compatible = migration._compatible_source_config_sha256s(config)
+    legacy_hashes = compatible - {materialized}
+    assert len(legacy_hashes) == 1
+    legacy_hash = legacy_hashes.pop()
+    source_profile_sha256 = hashlib.sha256(fixture.old_profile_bytes).hexdigest()
+    record = {
+        "schema_version": 1,
+        "timestamp_ns": 1,
+        "run_id": "continuous-test-run",
+        "generation_family": "family-continuous-test",
+        "from_config_sha256": "d" * 64,
+        "to_config_sha256": legacy_hash,
+        "from_profile": "profile-legacy.yaml",
+        "to_profile": fixture.old_profile.name,
+        "from_profile_sha256": "e" * 64,
+        "to_profile_sha256": source_profile_sha256,
+        "learner_step": 90,
+        "examples_consumed": 46_080,
+        "committed_replay_samples": 50_000,
+        "from_source_commit": "9" * 40,
+        "to_source_commit": "a" * 40,
+        "reason": "legacy-default-boundary",
+        "changes": [
+            {
+                "path": "arena.continuation_pairs_per_ring",
+                "from": None,
+                "to": 150,
+            }
+        ],
+    }
+    (fixture.root / "continuous-migrations.jsonl").write_text(
+        json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+
+    result = migration.migrate_continuous_profile(fixture.request)
+
+    assert result["mode"] == "dry-run"
+    assert result["source"]["config_sha256"] == legacy_hash
+
+
 def test_chained_apply_advances_profile_and_source_authority(tmp_path: Path) -> None:
     fixture = _fixture(tmp_path)
     migration.migrate_continuous_profile(fixture.request, apply=True)

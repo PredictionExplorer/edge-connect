@@ -191,12 +191,38 @@ def _sha256_file(path: Path) -> str:
 def canonical_config_sha256(config: ExperimentConfig) -> str:
     """Return the stable hash of a fully materialized profile."""
 
-    encoded = json.dumps(
-        config.as_dict(),
+    encoded = _canonical_config_bytes(config.as_dict())
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _canonical_config_bytes(config: Mapping[str, object]) -> bytes:
+    return json.dumps(
+        config,
         sort_keys=True,
         separators=(",", ":"),
     ).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
+
+
+def _compatible_source_config_sha256s(config: ExperimentConfig) -> set[str]:
+    materialized = config.as_dict()
+    compatible = {hashlib.sha256(_canonical_config_bytes(materialized)).hexdigest()}
+    orchestration = materialized.get("orchestration")
+    promotion = (
+        orchestration.get("promotion") if isinstance(orchestration, dict) else None
+    )
+    if (
+        isinstance(orchestration, dict)
+        and isinstance(promotion, dict)
+        and promotion.get("finish_inflight_candidate") is False
+    ):
+        legacy: dict[str, object] = dict(materialized)
+        legacy_orchestration: dict[str, object] = dict(orchestration)
+        legacy_promotion: dict[str, object] = dict(promotion)
+        legacy_promotion.pop("finish_inflight_candidate")
+        legacy_orchestration["promotion"] = legacy_promotion
+        legacy["orchestration"] = legacy_orchestration
+        compatible.add(hashlib.sha256(_canonical_config_bytes(legacy)).hexdigest())
+    return compatible
 
 
 def _json_bytes(payload: Mapping[str, object]) -> bytes:
@@ -478,7 +504,7 @@ def _read_migration_chain(
     *,
     run_id: str,
     generation_family: str,
-    source_config_sha256: str,
+    compatible_source_config_sha256s: set[str],
     source_profile_name: str,
     source_profile_sha256: str,
 ) -> tuple[tuple[dict[str, Any], ...], bytes | None]:
@@ -565,7 +591,7 @@ def _read_migration_chain(
         raise MigrationError("continuous migration chain exists but is empty")
     head = records[-1]
     if (
-        head["to_config_sha256"] != source_config_sha256
+        head["to_config_sha256"] not in compatible_source_config_sha256s
         or head["to_profile"] != source_profile_name
         or head["to_profile_sha256"] != source_profile_sha256
     ):
@@ -936,9 +962,10 @@ def plan_migration(request: MigrationRequest) -> MigrationPlan:
         old_profile,
         actual_sha256=source_profile_sha256,
     )
-    source_config_sha256 = canonical_config_sha256(old_config)
+    materialized_source_config_sha256 = canonical_config_sha256(old_config)
+    compatible_source_config_sha256s = _compatible_source_config_sha256s(old_config)
     target_config_sha256 = canonical_config_sha256(new_config)
-    if source_config_sha256 == target_config_sha256:
+    if materialized_source_config_sha256 == target_config_sha256:
         raise MigrationError("target canonical hash does not change the profile")
 
     run_path = run_root / "run.json"
@@ -956,9 +983,14 @@ def plan_migration(request: MigrationRequest) -> MigrationPlan:
         migrations_path,
         run_id=run_id,
         generation_family=generation_family,
-        source_config_sha256=source_config_sha256,
+        compatible_source_config_sha256s=compatible_source_config_sha256s,
         source_profile_name=old_profile.name,
         source_profile_sha256=source_profile_sha256,
+    )
+    source_config_sha256 = (
+        str(chain[-1]["to_config_sha256"])
+        if chain
+        else materialized_source_config_sha256
     )
     from_source_commit, to_source_commit, source_commit_data = _resolve_source_commits(
         request, run_root=run_root, chain=chain
