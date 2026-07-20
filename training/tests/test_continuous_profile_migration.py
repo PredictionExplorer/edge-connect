@@ -441,6 +441,99 @@ def test_chained_apply_advances_profile_and_source_authority(tmp_path: Path) -> 
     )
 
 
+def test_chained_migration_accepts_verified_plateau_cutover(tmp_path: Path) -> None:
+    fixture = _fixture(tmp_path)
+    first = migration.migrate_continuous_profile(fixture.request, apply=True)
+    current_profile = fixture.root / fixture.target_name
+    chain_head = json.loads(
+        (fixture.root / "continuous-migrations.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()[-1]
+    )
+    original = torch.load(fixture.checkpoint, map_location="cpu", weights_only=True)
+
+    def checkpoint_at(step: int, examples: int) -> Path:
+        payload = deepcopy(original)
+        payload["step"] = step
+        payload["extra"]["examples_consumed"] = examples
+        staging = fixture.root / "learner" / "recovery" / f"staging-{step}.pt"
+        torch.save(payload, staging)
+        digest = hashlib.sha256(staging.read_bytes()).hexdigest()
+        destination = staging.with_name(f"sha256-{digest}.pt")
+        staging.replace(destination)
+        return destination
+
+    cutover_checkpoint = checkpoint_at(90, 46_080)
+    recovery_checkpoint = checkpoint_at(95, 48_640)
+    cutover_created_ns = int(chain_head["timestamp_ns"]) + 1
+    _write_json(
+        fixture.root / "learner" / "resume-cutover.json",
+        {
+            "format": "startrain.resume-cutover",
+            "schema_version": 1,
+            "checkpoint": f"recovery/{cutover_checkpoint.name}",
+            "checkpoint_sha256": cutover_checkpoint.stem.removeprefix("sha256-"),
+            "checkpoint_bytes": cutover_checkpoint.stat().st_size,
+            "step": 90,
+            "run_id": "continuous-test-run",
+            "generation_family": "family-continuous-test",
+            "created_ns": cutover_created_ns,
+        },
+    )
+    _write_json(
+        fixture.root / "learner" / "recovery.json",
+        {
+            "format": "startrain.recovery-pointer",
+            "schema_version": 1,
+            "checkpoint": f"recovery/{recovery_checkpoint.name}",
+            "checkpoint_sha256": recovery_checkpoint.stem.removeprefix("sha256-"),
+            "checkpoint_bytes": recovery_checkpoint.stat().st_size,
+            "step": 95,
+            "epoch": 8,
+            "examples_consumed": 48_640,
+            "run_id": "continuous-test-run",
+            "generation_family": "family-continuous-test",
+            "updated_ns": cutover_created_ns + 1,
+        },
+    )
+    heartbeat = json.loads(
+        (fixture.root / "status" / "learner.heartbeat.json").read_text()
+    )
+    heartbeat.update(
+        {
+            "step": 95,
+            "examples_consumed": 48_640,
+            "heartbeat_ns": cutover_created_ns + 2,
+        }
+    )
+    _write_json(fixture.root / "status" / "learner.heartbeat.json", heartbeat)
+
+    target = yaml.safe_load(current_profile.read_text(encoding="utf-8"))
+    target["arena"]["continuation_pairs_per_ring"] = 20
+    candidate = tmp_path / "profile-after-cutover.yaml"
+    candidate.write_text(yaml.safe_dump(target, sort_keys=False), encoding="utf-8")
+    request = migration.MigrationRequest(
+        run_root=fixture.root,
+        old_profile=current_profile,
+        new_profile=candidate,
+        target_profile_name="profile-throughput-v3.yaml",
+        reason="migrate-after-plateau-cutover",
+        from_source_commit="b" * 40,
+        to_source_commit="c" * 40,
+    )
+
+    result = migration.migrate_continuous_profile(request)
+
+    assert result["mode"] == "dry-run"
+    record = result["boundary"]
+    assert record["learner_step"] == 95
+    plan = migration.plan_migration(request)
+    assert plan.migration_record["boundary_reset_from_learner_step"] == 100
+    assert plan.migration_record["resume_cutover_step"] == 90
+    assert plan.migration_record["resume_cutover_created_ns"] == cutover_created_ns
+    assert first["target"]["profile"] == current_profile.name
+
+
 def test_live_coordinator_lock_is_rejected_without_writes(tmp_path: Path) -> None:
     fixture = _fixture(tmp_path)
     _write_json(

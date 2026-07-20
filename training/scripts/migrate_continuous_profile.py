@@ -574,14 +574,31 @@ def _read_migration_chain(
         _validate_change_list(record.get("changes"))
         if records:
             previous = records[-1]
+            boundary_regressed = (
+                record["learner_step"] < previous["learner_step"]
+                or record["examples_consumed"] < previous["examples_consumed"]
+            )
+            reset_valid = not boundary_regressed
+            if boundary_regressed:
+                reset_created_ns = record.get("resume_cutover_created_ns")
+                reset_step = record.get("resume_cutover_step")
+                reset_from_step = record.get("boundary_reset_from_learner_step")
+                reset_valid = (
+                    isinstance(reset_created_ns, int)
+                    and not isinstance(reset_created_ns, bool)
+                    and reset_created_ns > previous["timestamp_ns"]
+                    and isinstance(reset_step, int)
+                    and not isinstance(reset_step, bool)
+                    and 0 <= reset_step <= record["learner_step"]
+                    and reset_from_step == previous["learner_step"]
+                )
             if (
                 record["timestamp_ns"] <= previous["timestamp_ns"]
                 or record["from_config_sha256"] != previous["to_config_sha256"]
                 or record["from_profile"] != previous["to_profile"]
                 or record["from_profile_sha256"] != previous["to_profile_sha256"]
                 or record["from_source_commit"] != previous["to_source_commit"]
-                or record["learner_step"] < previous["learner_step"]
-                or record["examples_consumed"] < previous["examples_consumed"]
+                or not reset_valid
                 or record["committed_replay_samples"]
                 < previous["committed_replay_samples"]
             ):
@@ -734,6 +751,47 @@ def _validate_recovery(
     if _sha256_file(checkpoint) != checkpoint_sha256:
         raise MigrationError("recovery checkpoint SHA-256 is invalid")
     return step, examples, checkpoint_sha256, checkpoint_bytes, checkpoint
+
+
+def _validate_resume_cutover(
+    payload: Mapping[str, object],
+    *,
+    path: Path,
+    run_id: str,
+    generation_family: str,
+) -> tuple[int, int, str]:
+    if (
+        payload.get("format") != "startrain.resume-cutover"
+        or payload.get("schema_version") != 1
+        or payload.get("run_id") != run_id
+        or payload.get("generation_family") != generation_family
+    ):
+        raise MigrationError("resume cutover identity is incompatible")
+    step = _nonnegative_int("resume cutover step", payload.get("step"))
+    created_ns = _positive_int("resume cutover created_ns", payload.get("created_ns"))
+    checkpoint_sha256 = _sha256_text(
+        "resume cutover checkpoint_sha256", payload.get("checkpoint_sha256")
+    )
+    checkpoint_bytes = _positive_int(
+        "resume cutover checkpoint_bytes", payload.get("checkpoint_bytes")
+    )
+    checkpoint_value = payload.get("checkpoint")
+    if not isinstance(checkpoint_value, str) or not checkpoint_value:
+        raise MigrationError("resume cutover checkpoint path is invalid")
+    checkpoint = Path(checkpoint_value)
+    if not checkpoint.is_absolute():
+        checkpoint = path.parent / checkpoint
+    checkpoint = checkpoint.resolve()
+    recovery_directory = (path.parent / "recovery").resolve()
+    if (
+        checkpoint.parent != recovery_directory
+        or checkpoint.name != f"sha256-{checkpoint_sha256}.pt"
+        or not checkpoint.is_file()
+        or checkpoint.stat().st_size != checkpoint_bytes
+        or _sha256_file(checkpoint) != checkpoint_sha256
+    ):
+        raise MigrationError("resume cutover checkpoint is invalid")
+    return step, created_ns, checkpoint_sha256
 
 
 def _validate_recovery_checkpoint_payload(
@@ -971,6 +1029,7 @@ def plan_migration(request: MigrationRequest) -> MigrationPlan:
     run_path = run_root / "run.json"
     heartbeat_path = run_root / "status" / "learner.heartbeat.json"
     recovery_path = run_root / "learner" / "recovery.json"
+    resume_cutover_path = run_root / "learner" / "resume-cutover.json"
     champion_path = run_root / "learner" / "champion.json"
     migrations_path = run_root / "continuous-migrations.jsonl"
 
@@ -999,6 +1058,9 @@ def plan_migration(request: MigrationRequest) -> MigrationPlan:
     heartbeat_payload, _ = _read_json(heartbeat_path, "learner heartbeat")
     recovery_payload, recovery_data = _read_json(recovery_path, "learner recovery")
     champion_payload, champion_data = _read_json(champion_path, "learner champion")
+    resume_cutover_payload: dict[str, Any] | None = None
+    if resume_cutover_path.is_file():
+        resume_cutover_payload, _ = _read_json(resume_cutover_path, "resume cutover")
 
     heartbeat_step, heartbeat_examples = _validate_heartbeat(heartbeat_payload)
     (
@@ -1046,14 +1108,39 @@ def plan_migration(request: MigrationRequest) -> MigrationPlan:
         generation_family=generation_family,
         created_ns=created_ns,
     )
+    resume_cutover_step: int | None = None
+    resume_cutover_created_ns: int | None = None
+    resume_cutover_checkpoint_sha256: str | None = None
     if chain:
         head = chain[-1]
-        if (
-            learner_step < int(head["learner_step"])
-            or examples_consumed < int(head["examples_consumed"])
-            or replay_boundary.committed_samples < int(head["committed_replay_samples"])
-        ):
+        if replay_boundary.committed_samples < int(head["committed_replay_samples"]):
             raise MigrationError("durable boundary moves behind the migration chain")
+        boundary_regressed = learner_step < int(
+            head["learner_step"]
+        ) or examples_consumed < int(head["examples_consumed"])
+        if boundary_regressed:
+            if resume_cutover_payload is None:
+                raise MigrationError(
+                    "durable boundary regressed without a resume cutover"
+                )
+            (
+                resume_cutover_step,
+                resume_cutover_created_ns,
+                resume_cutover_checkpoint_sha256,
+            ) = _validate_resume_cutover(
+                resume_cutover_payload,
+                path=resume_cutover_path,
+                run_id=run_id,
+                generation_family=generation_family,
+            )
+            if (
+                resume_cutover_created_ns <= int(head["timestamp_ns"])
+                or resume_cutover_step > learner_step
+                or resume_cutover_step != champion_step
+            ):
+                raise MigrationError(
+                    "resume cutover does not authorize the durable boundary regression"
+                )
 
     timestamp_ns = time.time_ns()
     if chain and timestamp_ns <= int(chain[-1]["timestamp_ns"]):
@@ -1091,6 +1178,15 @@ def plan_migration(request: MigrationRequest) -> MigrationPlan:
         "champion_manifest_sha256": champion_manifest_sha256,
         "champion_pointer_sha256": _sha256_bytes(champion_data),
     }
+    if resume_cutover_step is not None:
+        migration_record.update(
+            {
+                "boundary_reset_from_learner_step": int(chain[-1]["learner_step"]),
+                "resume_cutover_step": resume_cutover_step,
+                "resume_cutover_created_ns": resume_cutover_created_ns,
+                "resume_cutover_checkpoint_sha256": (resume_cutover_checkpoint_sha256),
+            }
+        )
 
     required_paths = [
         (old_profile, "old profile"),
@@ -1105,6 +1201,7 @@ def plan_migration(request: MigrationRequest) -> MigrationPlan:
         (run_root / "source-commit.txt", "source commit"),
         (run_root / "status" / "coordinator.json", "coordinator status"),
         (run_root / "learner" / "candidate.json", "learner candidate"),
+        (resume_cutover_path, "resume cutover"),
         (run_root / "arena" / "promotion-status.json", "promotion status"),
         (run_root / "replay" / "initialized.json", "replay initialization"),
     )
@@ -1188,6 +1285,13 @@ def plan_migration(request: MigrationRequest) -> MigrationPlan:
             "history_complete": True,
         },
     }
+    if resume_cutover_step is not None:
+        backup_evidence["resume_cutover"] = {
+            "pointer": str(resume_cutover_path.relative_to(run_root)),
+            "step": resume_cutover_step,
+            "created_ns": resume_cutover_created_ns,
+            "checkpoint_sha256": resume_cutover_checkpoint_sha256,
+        }
     if source_commit_data is not None:
         backup_evidence["source_commit_sha256"] = _sha256_bytes(source_commit_data)
 
