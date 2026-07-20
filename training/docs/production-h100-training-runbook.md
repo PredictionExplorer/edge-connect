@@ -393,7 +393,7 @@ orchestration:
 `steps` remains the monitoring milestone. The cosine scheduler still reaches
 `min_lr_ratio` at one million and then holds that floor. Recovery checkpoints
 are not promotion candidates and do not change the throughput profile's
-15,000-step arena cadence. Autonomous profiles publish promotion candidates by
+28,000-step arena cadence. Autonomous profiles publish promotion candidates by
 `candidate_interval_examples` while independently refreshing actor models with
 the `selfplay_snapshot_*` example cadence.
 At the hard replay-lag boundary, a terminal rejection resets to the champion
@@ -676,7 +676,7 @@ Normal startup order:
 6. The learner waits until replay count and per-ring uniqueness gates pass.
 7. The learner begins BF16 compiled updates and publishes later promotion
    candidates at the frozen profile's cadence: 5,000 steps in the historical
-   control, 15,000 in the throughput profile, or
+   control, 28,000 in the throughput profile, or
    `candidate_interval_examples` in the autonomous profile. Autonomous actors
    refresh from separate self-play snapshots every one million examples during
    warmup and every three million afterward.
@@ -1045,7 +1045,69 @@ The shipped single-learner production profile can still run without NCCL, but
 do not enable custom DDP. Check driver versions, GPU topology, NCCL environment,
 shared memory, and firewall/network interfaces first.
 
-## 20. Controlled migration of an initialized autonomous run
+## 20. Controlled migration of an initialized continuous run
+
+### Non-autonomous throughput runs
+
+Do not edit an initialized throughput profile or pull/rebuild its active checkout
+in place. Build a new immutable release while training continues, stage the
+candidate profile outside the run root, and stop the coordinator only after the
+current arena wave is durable.
+
+If learner batch size is under consideration, benchmark the stopped recovery
+checkpoint against read-only replay before selecting it:
+
+```bash
+python scripts/benchmark_learner_batches.py \
+  --config "$PROFILE" \
+  --checkpoint "$RECOVERY_CHECKPOINT" \
+  --replay-root "$RUN_ROOT/replay" \
+  --device cuda:0 \
+  --batch-sizes 512 768 1024 \
+  --warmups 2 \
+  --repeats 5 \
+  --output "$RUN_ROOT/learner-batch-benchmark.json"
+```
+
+Keep batch 512 unless a larger batch improves sustained end-to-end throughput by
+at least 15%, remains finite, and allocates no more than 72 GiB. The benchmark
+reloads the same state for every candidate and never opens the replay ledger
+writable.
+
+Run the non-autonomous migrator in dry-run mode, inspect its exact allowlisted
+diff and durable boundary, then apply the same request:
+
+```bash
+python scripts/migrate_continuous_profile.py \
+  --run-root "$RUN_ROOT" \
+  --old-profile "$PROFILE" \
+  --new-profile /absolute/staging/profile-throughput-next.yaml \
+  --target-profile-name profile-throughput-next.yaml \
+  --reason "reduce-arena-supersession-and-benchmark-learner-batch"
+
+python scripts/migrate_continuous_profile.py \
+  --run-root "$RUN_ROOT" \
+  --old-profile "$PROFILE" \
+  --new-profile /absolute/staging/profile-throughput-next.yaml \
+  --target-profile-name profile-throughput-next.yaml \
+  --reason "reduce-arena-supersession-and-benchmark-learner-batch" \
+  --apply
+```
+
+The utility rejects live workers, autonomous provenance, schema/model/game/loss/
+optimizer drift, unverified checkpoints, incomplete replay history, and every
+profile field outside the narrow batch/candidate-lag/arena continuation allowlist.
+It writes a new read-only profile and checksum, an append-only
+`continuous-migrations.jsonl`, and a rollback bundle. Repoint the training and
+backup units to the new immutable release and newly named profile, then start
+normally. The service still runs profile validation, H100 health, and replay
+restore gates before the coordinator starts.
+
+This utility intentionally does not introduce update-to-data control. Adding a
+UTD target to an existing throughput run requires a separately reviewed
+prospective segment migration; adding only the YAML value fails closed.
+
+### Autonomous runs
 
 Prefer a new run root for treatment changes. If an initialized autonomous run
 must continue across a code/profile migration, preserve an explicit treatment

@@ -213,6 +213,47 @@ def test_collect_snapshot_reports_healthy_run(tmp_path, monkeypatch) -> None:
     assert "elo=42.00" in monitor.format_text(snapshot)
 
 
+def test_snapshot_warns_about_fragmented_arena_continuation(
+    tmp_path, monkeypatch
+) -> None:
+    now_ns = 10_000_000_000
+    root = _fixture(tmp_path, now_ns=now_ns)
+    profile = yaml.safe_load((root / "profile.yaml").read_text(encoding="utf-8"))
+    profile["arena"] = {
+        "pairs_per_ring": 50,
+        "minimum_pairs_per_ring": 50,
+        "max_pairs_per_ring": 200,
+    }
+    (root / "profile.yaml").write_text(
+        yaml.safe_dump(profile, sort_keys=False),
+        encoding="utf-8",
+    )
+    _write_json(
+        root / "arena" / "superseded.json",
+        {
+            "schema_version": 3,
+            "candidate": "candidate",
+            "baseline": "baseline",
+            "completed_ns": now_ns,
+            "promotion": {"decision": "superseded"},
+            "aggregate": {
+                "elo_difference": 10.0,
+                "games": 400,
+                "wins": 210,
+                "losses": 190,
+            },
+        },
+    )
+    _healthy_dependencies(monkeypatch)
+
+    snapshot: Any = monitor.collect_snapshot(root, now_ns=now_ns)
+
+    warning_codes = {item["code"] for item in snapshot["warnings"]}
+    assert "arena_continuation_fragmented" in warning_codes
+    assert snapshot["arena_history"]["completed_superseded_evaluations"] == 1
+    assert snapshot["arena_history"]["completed_superseded_fraction"] == 1.0
+
+
 def test_collect_snapshot_reports_unlimited_recovery_state(
     tmp_path, monkeypatch
 ) -> None:

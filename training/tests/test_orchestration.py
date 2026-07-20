@@ -1601,9 +1601,7 @@ def test_auto_profile_single_gpu_colocates_and_pause_shares(
     assert coordinator.pause_owner.spec.role == "arena"
 
 
-def test_auto_profile_mps_host_runs_without_cuda_pinning(
-    monkeypatch, tmp_path
-) -> None:
+def test_auto_profile_mps_host_runs_without_cuda_pinning(monkeypatch, tmp_path) -> None:
     inventory = AcceleratorInventory(
         cuda_device_count=0, mps_available=True, cpu_count=10
     )

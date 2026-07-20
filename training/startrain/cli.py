@@ -178,9 +178,7 @@ def train_main(argv: list[str] | None = None) -> None:
             raise RuntimeError(
                 "configured DDP learner must be launched through torchrun"
             )
-        device = resolve_device_string(
-            arguments.device or experiment.learner.device
-        )
+        device = resolve_device_string(arguments.device or experiment.learner.device)
     if device:
         experiment = replace(
             experiment,

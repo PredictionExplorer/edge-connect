@@ -437,9 +437,9 @@ class ModelRefreshConfig:
     startup_timeout_seconds: float = 600.0
     refresh_only_between_batches: bool = True
     inference_compile_dynamic: bool = True
-    inference_compile_mode: Literal[
-        "default", "reduce-overhead", "max-autotune"
-    ] = "default"
+    inference_compile_mode: Literal["default", "reduce-overhead", "max-autotune"] = (
+        "default"
+    )
     selfplay_source: Literal[
         "champion",
         "candidate",
@@ -667,13 +667,8 @@ class PromotionConfig:
             )
         if not isinstance(self.device, str) or not self.device:
             raise ConfigError("promotion device must be non-empty")
-        if (
-            self.inter_wave_cooldown_seconds
-            and self.max_waves_per_lease is None
-        ):
-            raise ConfigError(
-                "promotion inter-wave cooldown requires a bounded lease"
-            )
+        if self.inter_wave_cooldown_seconds and self.max_waves_per_lease is None:
+            raise ConfigError("promotion inter-wave cooldown requires a bounded lease")
 
 
 @dataclass(frozen=True, slots=True)

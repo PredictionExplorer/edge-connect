@@ -85,9 +85,7 @@ def select_historical_evaluation(
             existing_crossplay[(candidate, baseline)] = (path, dict(result))
             continue
         promotion = result.get("promotion")
-        decision = (
-            promotion.get("decision") if isinstance(promotion, Mapping) else None
-        )
+        decision = promotion.get("decision") if isinstance(promotion, Mapping) else None
         completed_ns = result.get("completed_ns")
         if (
             decision == "promote"
@@ -133,9 +131,7 @@ def select_historical_evaluation(
                 result_path=path,
                 previous=payload,
             )
-        name = (
-            f"crossplay-{champion.model_identity}-vs-{baseline.model_identity}.json"
-        )
+        name = f"crossplay-{champion.model_identity}-vs-{baseline.model_identity}.json"
         return HistoricalEvaluationPlan(
             candidate=champion,
             baseline=baseline,

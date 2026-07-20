@@ -450,14 +450,14 @@ def test_manifest_provider_reuses_compiled_evaluator_and_refreshes_weights(
     assert compile_calls == [
         (
             load_models[0],
-                {
-                    "enabled": True,
-                    "dynamic": True,
-                    "fullgraph": True,
-                    "mode": "default",
-                    "recompile_limit": None,
-                    "isolate_recompiles": False,
-                },
+            {
+                "enabled": True,
+                "dynamic": True,
+                "fullgraph": True,
+                "mode": "default",
+                "recompile_limit": None,
+                "isolate_recompiles": False,
+            },
         )
     ]
     assert first_output.values[0] < 0

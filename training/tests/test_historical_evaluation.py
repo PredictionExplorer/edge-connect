@@ -49,9 +49,7 @@ def test_selects_nearest_non_adjacent_promoted_checkpoint(tmp_path: Path) -> Non
     zero = manifest(tmp_path, identity="model-zero", step=0)
     first = manifest(tmp_path, identity="model-first", step=10)
     champion = manifest(tmp_path, identity="model-champion", step=20)
-    manifests = {
-        item.model_identity: item for item in (zero, first, champion)
-    }
+    manifests = {item.model_identity: item for item in (zero, first, champion)}
     results = [
         promotion(
             tmp_path,
@@ -88,9 +86,7 @@ def test_completed_crossplay_is_idempotent_and_partial_result_resumes(
     zero = manifest(tmp_path, identity="model-zero", step=0)
     first = manifest(tmp_path, identity="model-first", step=10)
     champion = manifest(tmp_path, identity="model-champion", step=20)
-    manifests = {
-        item.model_identity: item for item in (zero, first, champion)
-    }
+    manifests = {item.model_identity: item for item in (zero, first, champion)}
     results = [
         promotion(
             tmp_path,
@@ -165,9 +161,7 @@ def test_schedule_and_legacy_result_classification(tmp_path: Path) -> None:
         select_historical_evaluation(
             config=HistoricalEvaluationConfig(enabled=True, every_promotions=3),
             champion=champion,
-            manifests={
-                item.model_identity: item for item in (zero, first, champion)
-            },
+            manifests={item.model_identity: item for item in (zero, first, champion)},
             arena_results=results,
             results_directory=tmp_path,
         )

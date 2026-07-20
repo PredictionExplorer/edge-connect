@@ -1746,9 +1746,7 @@ def orchestrate_main(argv: list[str] | None = None) -> None:
 
     experiment = load_config(arguments.config)
     directories = RunDirectories.from_experiment(experiment)
-    worker_config = materialize_worker_config(
-        arguments.config, experiment, directories
-    )
+    worker_config = materialize_worker_config(arguments.config, experiment, directories)
     specs = build_worker_specs(
         experiment,
         config_path=worker_config,
@@ -1763,9 +1761,7 @@ def orchestrate_main(argv: list[str] | None = None) -> None:
     )
     expected_gpu_indices: set[int] = set()
     if worker_device.startswith("cuda"):
-        expected_gpu_indices.update(
-            gpu.gpu_id for gpu in experiment.orchestration.gpus
-        )
+        expected_gpu_indices.update(gpu.gpu_id for gpu in experiment.orchestration.gpus)
     if experiment.orchestration.promotion.enabled and promotion_device.startswith(
         "cuda"
     ):

@@ -143,6 +143,19 @@ def _validate_throughput_config(config: ExperimentConfig) -> None:
         or plateau.reset_learning_rate_scale > 0.5
     ):
         raise ValueError("continuous service requires bounded lower-LR champion resets")
+    arena = config.arena
+    continuation = arena.continuation_pairs_per_ring or arena.pairs_per_ring
+    remaining_after_minimum = arena.max_pairs_per_ring - arena.minimum_pairs_per_ring
+    continuation_waves = (
+        (remaining_after_minimum + continuation - 1) // continuation
+        if remaining_after_minimum
+        else 0
+    )
+    if continuation_waves > 1:
+        raise ValueError(
+            "continuous service requires arena continuation to reach the maximum "
+            "within one post-minimum wave"
+        )
 
 
 def validate_continuous_config(config: ExperimentConfig) -> None:

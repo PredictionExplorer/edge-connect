@@ -159,7 +159,21 @@ def test_yaml_configs_load_strictly() -> None:
     )
     assert throughput.orchestration.plateau.consecutive_terminal_rejections == 2
     assert throughput.orchestration.plateau.reset_learning_rate_scale == 0.5
+    assert throughput.learner.candidate_interval == 28_000
+    assert throughput.learner.max_replay_lag_steps == 60_000
+    assert throughput.orchestration.plateau.max_learner_champion_lag_steps == 60_000
+    assert throughput.arena.continuation_pairs_per_ring == 150
     validate_continuous_config(throughput)
+    with pytest.raises(ValueError, match="one post-minimum wave"):
+        validate_continuous_config(
+            replace(
+                throughput,
+                arena=replace(
+                    throughput.arena,
+                    continuation_pairs_per_ring=50,
+                ),
+            )
+        )
     autonomous = load_config(CONFIGS / "h100-8gpu-autonomous.yaml")
     assert autonomous.orchestration.autonomous.enabled is True
     assert autonomous.orchestration.model_refresh.selfplay_source == (
@@ -180,9 +194,7 @@ def test_yaml_configs_load_strictly() -> None:
     assert autonomous.orchestration.historical_evaluation.pairs_per_ring == 10
     assert autonomous.orchestration.promotion.gpu_id == 0
     assert autonomous.orchestration.promotion.max_waves_per_lease == 1
-    assert (
-        autonomous.orchestration.promotion.inter_wave_cooldown_seconds == 1_800
-    )
+    assert autonomous.orchestration.promotion.inter_wave_cooldown_seconds == 1_800
     assert sum(gpu.actor_lanes for gpu in autonomous.orchestration.actor_gpus) == 14
     assert replace(autonomous.selfplay, rings=10).considered_actions() == 53
     validate_continuous_config(autonomous)

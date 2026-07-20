@@ -108,9 +108,7 @@ def _exercise_device(device: str, *, precision: str) -> dict[str, object]:
             batch, nodes, neighbors, dtype=torch.long, device=device
         )
         node_mask = torch.ones(batch, nodes, dtype=torch.bool, device=device)
-        legal_action_mask = torch.ones(
-            batch, nodes, dtype=torch.bool, device=device
-        )
+        legal_action_mask = torch.ones(batch, nodes, dtype=torch.bool, device=device)
         autocast_enabled = precision == "bf16"
         with torch.autocast(
             device_type=torch.device(device).type,
@@ -127,8 +125,7 @@ def _exercise_device(device: str, *, precision: str) -> dict[str, object]:
                 legal_action_mask,
             )
             loss = (
-                output.policy_logits.float().sum()
-                + output.outcome_logits.float().sum()
+                output.policy_logits.float().sum() + output.outcome_logits.float().sum()
             )
         loss.backward()
     except Exception as exc:  # fail-closed: any device error is the finding
@@ -196,9 +193,7 @@ def preflight_main(argv: list[str] | None = None) -> None:
         ]
     print(json.dumps(report, sort_keys=True))
     exercised = report.get("exercise")
-    if isinstance(exercised, list) and any(
-        not entry.get("ok") for entry in exercised
-    ):
+    if isinstance(exercised, list) and any(not entry.get("ok") for entry in exercised):
         sys.exit(2)
 
 

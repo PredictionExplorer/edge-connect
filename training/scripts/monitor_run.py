@@ -623,11 +623,17 @@ def _arena_history(run_root: Path, *, limit: int = 5) -> dict[str, object]:
         kind: sum(row.get("result_category") == kind for row in completed)
         for kind in ("promotion", "crossplay", "unknown")
     }
+    completed_superseded = sum(
+        row.get("result_category") == "promotion"
+        and row.get("decision") == "superseded"
+        for row in completed
+    )
+    promotion_evaluations = result_category_counts["promotion"]
     return {
         "completed_evaluations": len(completed),
         "result_kind_counts": result_kind_counts,
         "result_category_counts": result_category_counts,
-        "promotion_evaluations": result_category_counts["promotion"],
+        "promotion_evaluations": promotion_evaluations,
         "crossplay_evaluations": result_category_counts["crossplay"],
         "promotions": sum(row.get("decision") == "promote" for row in completed),
         "rejections": sum(
@@ -636,6 +642,12 @@ def _arena_history(run_root: Path, *, limit: int = 5) -> dict[str, object]:
             for row in completed
         ),
         "superseded_candidates": superseded,
+        "completed_superseded_evaluations": completed_superseded,
+        "completed_superseded_fraction": (
+            completed_superseded / promotion_evaluations
+            if promotion_evaluations
+            else None
+        ),
         "recent": completed[-limit:],
     }
 
@@ -1376,6 +1388,31 @@ def collect_snapshot(
 
     arena = _read_json(root / "arena" / "promotion-status.json") or {}
     arena_history = _arena_history(root)
+    arena_config = _mapping(profile.get("arena"))
+    pairs_per_ring = _number(arena_config.get("pairs_per_ring"))
+    minimum_pairs = _number(arena_config.get("minimum_pairs_per_ring"))
+    maximum_pairs = _number(arena_config.get("max_pairs_per_ring"))
+    continuation_pairs = _number(arena_config.get("continuation_pairs_per_ring"))
+    if (
+        pairs_per_ring is not None
+        and minimum_pairs is not None
+        and maximum_pairs is not None
+        and maximum_pairs > minimum_pairs
+    ):
+        continuation = continuation_pairs or pairs_per_ring
+        if continuation > 0:
+            continuation_waves = math.ceil(
+                (maximum_pairs - minimum_pairs) / continuation
+            )
+            if continuation_waves > 1:
+                _add_warning(
+                    warnings,
+                    "WARN",
+                    "arena_continuation_fragmented",
+                    "arena needs "
+                    f"{continuation_waves} post-minimum waves; newer candidates may "
+                    "supersede completed evaluation work",
+                )
     strength_efficiency = _strength_efficiency_status(root)
     pause_request = _read_json(root / "status" / "arena-gpu-pause.json")
     pause_ack = _read_json(root / "status" / "arena-gpu-pause.ack.json")

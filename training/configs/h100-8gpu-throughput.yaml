@@ -80,9 +80,9 @@ learner:
   minimum_replay_samples: 100000
   recent_samples_per_ring: 500000
   minimum_unique_samples_per_ring: 4096
-  max_replay_lag_steps: 50000
+  max_replay_lag_steps: 60000
   steps_per_window: 1000
-  candidate_interval: 15000
+  candidate_interval: 28000
   recovery_interval_steps: 1000
   metrics_interval: 10
   replay_poll_seconds: 2.0
@@ -216,7 +216,7 @@ orchestration:
     final_drain_timeout_seconds: 57600.0
   plateau:
     enabled: true
-    max_learner_champion_lag_steps: 45000
+    max_learner_champion_lag_steps: 60000
     consecutive_terminal_rejections: 2
     action: reset_from_champion
     reset_learning_rate_scale: 0.5
@@ -235,6 +235,7 @@ arena:
   - 8
   - 10
   pairs_per_ring: 50
+  continuation_pairs_per_ring: 150
   simulations: 1024
   max_considered: 32
   c_visit: 50.0

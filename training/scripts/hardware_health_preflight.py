@@ -47,9 +47,7 @@ def main(argv: list[str] | None = None) -> int:
     require_gpu_model = None if arguments.allow_non_h100 else health.require_gpu_model
     worker_device = normalize_device_string(config.orchestration.device)
     promotion_device = normalize_device_string(config.orchestration.promotion.device)
-    if not worker_device.startswith("cuda") and not promotion_device.startswith(
-        "cuda"
-    ):
+    if not worker_device.startswith("cuda") and not promotion_device.startswith("cuda"):
         report = {
             "schema_version": 1,
             "captured_ns": time.time_ns(),

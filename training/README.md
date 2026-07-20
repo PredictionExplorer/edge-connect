@@ -309,7 +309,33 @@ startrain-orchestrate --config configs/h100-8gpu-throughput.yaml
 It combines decode-once replay loading, real pinned asynchronous learner transfers,
 truthful wall-step telemetry, two independent actor lanes on GPUs 1–6, compiled
 concurrent arena search, and NUMA affinity. GPU 7 remains single-lane so the
-coordinator's actor/arena pause lease still has exactly one target.
+coordinator's actor/arena pause lease still has exactly one target. Promotion
+candidates are spaced far enough apart for a complete arena decision, and the
+post-minimum continuation is grouped into one persisted wave so newer candidates
+cannot repeatedly strand completed evaluation work.
+
+Before changing the learner batch on an initialized run, stop the coordinator and
+benchmark the verified recovery checkpoint against read-only replay:
+
+```bash
+python scripts/benchmark_learner_batches.py \
+  --config "$PROFILE" \
+  --checkpoint "$RECOVERY_CHECKPOINT" \
+  --replay-root "$RUN_ROOT/replay" \
+  --device cuda:0 \
+  --batch-sizes 512 768 1024 \
+  --warmups 2 \
+  --repeats 5 \
+  --output "$RUN_ROOT/learner-batch-benchmark.json"
+```
+
+The benchmark reloads the same model/optimizer state for every candidate, isolates
+OOM failures, never opens replay writable, and recommends a larger batch only after
+a 15% end-to-end throughput gain with peak allocation at or below 72 GiB.
+Apply an accepted treatment change to a stopped non-autonomous run with
+`scripts/migrate_continuous_profile.py`; dry-run first, then repeat with `--apply`.
+The utility writes a new frozen profile and append-only migration boundary rather
+than modifying the active profile.
 
 For a new self-contained research run that must learn without imported weights,
 replay, positions, or human data, start from a frozen copy of:
@@ -374,17 +400,19 @@ For the 8-GPU profile, `runs/h100-8gpu/` contains:
 At startup the learner publishes an initial candidate. The shipped H100 profiles
 explicitly allow the promotion supervisor to bootstrap that first candidate as
 champion, which releases actors waiting for `champion.json`. Later candidates are
-immutable EMA checkpoints emitted at the configured cadence (15,000 learner
+immutable EMA checkpoints emitted at the configured cadence (28,000 learner
 steps in the continuous throughput profile). The autonomous profile publishes
 promotion candidates every five million examples and separate actor snapshots
 every one million warmup examples, then every three million.
 
 The arena compares each candidate with the current champion using reversed-role pairs,
 all rings, forced and unforced openings, a pair-level mixture-betting e-process and
-anytime-valid per-ring regression checks. The continuous gate takes 50 new pairs per ring
-per look, requires at least 50, allows at most 200, tests a +35 Elo alternative against
-0 Elo, and rejects a material ring regression. Only a `promote` result atomically
-advances `champion.json`; inconclusive results accumulate more non-overlapping pairs.
+anytime-valid per-ring regression checks. The continuous gate starts with 50 pairs per
+ring, requires at least 50, allows at most 200, and groups the remaining 150 pairs per
+ring into one continuation wave when the first look is inconclusive. This changes only
+the persistence/scheduling boundary: the +35 Elo alternative, 0 Elo null, error levels,
+opening schedule, and per-ring regression floors are unchanged. Only a `promote` result
+atomically advances `champion.json`.
 The shipped `model_refresh.selfplay_source: champion` means rejected candidates never
 feed self-play. Research ablations may select `candidate` or
 `candidate_champion_mix`; the selected role and policy-supervision rate are written to
