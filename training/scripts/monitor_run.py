@@ -1389,6 +1389,8 @@ def collect_snapshot(
     arena = _read_json(root / "arena" / "promotion-status.json") or {}
     arena_history = _arena_history(root)
     arena_config = _mapping(profile.get("arena"))
+    promotion_config = _mapping(orchestration.get("promotion"))
+    finish_inflight = promotion_config.get("finish_inflight_candidate") is True
     pairs_per_ring = _number(arena_config.get("pairs_per_ring"))
     minimum_pairs = _number(arena_config.get("minimum_pairs_per_ring"))
     maximum_pairs = _number(arena_config.get("max_pairs_per_ring"))
@@ -1404,7 +1406,7 @@ def collect_snapshot(
             continuation_waves = math.ceil(
                 (maximum_pairs - minimum_pairs) / continuation
             )
-            if continuation_waves > 1:
+            if continuation_waves > 1 and not finish_inflight:
                 _add_warning(
                     warnings,
                     "WARN",

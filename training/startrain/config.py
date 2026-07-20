@@ -632,12 +632,14 @@ class PromotionConfig:
     final_drain_timeout_seconds: float = 7_200.0
     max_waves_per_lease: int | None = None
     inter_wave_cooldown_seconds: float = 0.0
+    finish_inflight_candidate: bool = False
 
     def __post_init__(self) -> None:
         if (
             type(self.enabled) is not bool
             or type(self.bootstrap_initial_champion) is not bool
             or type(self.pause_sharing_mode) is not bool
+            or type(self.finish_inflight_candidate) is not bool
         ):
             raise ConfigError("promotion booleans must be boolean")
         if (

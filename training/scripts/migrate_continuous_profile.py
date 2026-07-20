@@ -44,6 +44,7 @@ _ALLOWED_PROFILE_PATHS = {
     ("learner", "candidate_interval"),
     ("learner", "max_replay_lag_steps"),
     ("orchestration", "plateau", "max_learner_champion_lag_steps"),
+    ("orchestration", "promotion", "finish_inflight_candidate"),
     ("arena", "continuation_pairs_per_ring"),
 }
 

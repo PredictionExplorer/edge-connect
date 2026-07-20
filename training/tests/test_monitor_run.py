@@ -253,6 +253,16 @@ def test_snapshot_warns_about_fragmented_arena_continuation(
     assert snapshot["arena_history"]["completed_superseded_evaluations"] == 1
     assert snapshot["arena_history"]["completed_superseded_fraction"] == 1.0
 
+    profile["orchestration"]["promotion"] = {"finish_inflight_candidate": True}
+    profile["arena"]["continuation_pairs_per_ring"] = 25
+    (root / "profile.yaml").write_text(
+        yaml.safe_dump(profile, sort_keys=False),
+        encoding="utf-8",
+    )
+    migrated: Any = monitor.collect_snapshot(root, now_ns=now_ns)
+    migrated_codes = {item["code"] for item in migrated["warnings"]}
+    assert "arena_continuation_fragmented" not in migrated_codes
+
 
 def test_collect_snapshot_reports_unlimited_recovery_state(
     tmp_path, monkeypatch

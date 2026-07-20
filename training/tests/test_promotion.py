@@ -973,6 +973,61 @@ def test_newer_candidate_supersedes_between_session_waves(
     assert result["result_kind"] == "promotion"
 
 
+def test_newer_candidate_does_not_supersede_inflight_evidence(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    case = _promotion_wave_case(tmp_path, monkeypatch)
+    case.supervisor.experiment = replace(
+        case.experiment,
+        orchestration=replace(
+            case.experiment.orchestration,
+            promotion=replace(
+                case.experiment.orchestration.promotion,
+                finish_inflight_candidate=True,
+            ),
+        ),
+    )
+    published = []
+
+    def publish_newer(wave: int) -> None:
+        if wave != 1:
+            return
+        with torch.no_grad():
+            next(case.model.parameters()).add_(0.01)
+        case.ema.update(case.model)
+        published.append(
+            case.publisher.publish(
+                model=case.model,
+                optimizer=case.optimizer,
+                scheduler=case.scheduler,
+                ema=case.ema,
+                step=2,
+                epoch=2,
+                config=case.supervisor.experiment.as_dict(),
+            )
+        )
+
+    def progress(**details) -> None:
+        if details.get("phase") == "arena_terminal":
+            case.state.stop = True
+
+    case.state.after_wave = publish_newer
+    assert (
+        case.supervisor.run(
+            stop_requested=lambda: case.state.stop,
+            progress=progress,
+        )
+        == 3
+    )
+
+    result = json.loads(case.result_path.read_text(encoding="utf-8"))
+    assert len(published) == 1
+    assert case.state.wave_starts == [{4: 0}, {4: 2}, {4: 4}]
+    assert result["terminal"] is True
+    assert result["promotion"]["decision"] == "reject_max_pairs"
+
+
 class LeaseClock:
     def __init__(self, on_sleep=None) -> None:
         self.value = 0.0

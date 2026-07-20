@@ -49,6 +49,8 @@ def _fixture(tmp_path: Path) -> _Fixture:
     old_raw["orchestration"]["run_id"] = run_id
     old_raw["orchestration"]["directories"]["root"] = str(root)
     old_raw["orchestration"]["autonomous"] = {"enabled": False}
+    old_raw["orchestration"]["promotion"]["finish_inflight_candidate"] = False
+    old_raw["arena"]["continuation_pairs_per_ring"] = 150
 
     old_profile = root / "profile-throughput-v1.yaml"
     old_profile.write_text(yaml.safe_dump(old_raw, sort_keys=False), encoding="utf-8")
@@ -72,7 +74,8 @@ def _fixture(tmp_path: Path) -> _Fixture:
     target_raw["orchestration"]["plateau"]["max_learner_champion_lag_steps"] = (
         target_raw["learner"]["max_replay_lag_steps"]
     )
-    target_raw["arena"]["continuation_pairs_per_ring"] += 1
+    target_raw["orchestration"]["promotion"]["finish_inflight_candidate"] = True
+    target_raw["arena"]["continuation_pairs_per_ring"] = 25
     candidate_profile = tmp_path / "profile-candidate.yaml"
     candidate_profile.write_text(
         yaml.safe_dump(target_raw, sort_keys=False),
@@ -281,6 +284,7 @@ def test_dry_run_does_not_write(tmp_path: Path) -> None:
         "learner.candidate_interval",
         "learner.max_replay_lag_steps",
         "orchestration.plateau.max_learner_champion_lag_steps",
+        "orchestration.promotion.finish_inflight_candidate",
         "arena.continuation_pairs_per_ring",
     }
     assert _snapshot(fixture.root) == before

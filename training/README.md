@@ -311,8 +311,9 @@ truthful wall-step telemetry, two independent actor lanes on GPUs 1–6, compile
 concurrent arena search, and NUMA affinity. GPU 7 remains single-lane so the
 coordinator's actor/arena pause lease still has exactly one target. Promotion
 candidates are spaced far enough apart for a complete arena decision, and the
-post-minimum continuation is grouped into one persisted wave so newer candidates
-cannot repeatedly strand completed evaluation work.
+active candidate keeps its evidence when a newer checkpoint appears. Small
+post-minimum continuation waves persist frequently and can terminate as soon as
+the anytime-valid gate resolves.
 
 Before changing the learner batch on an initialized run, stop the coordinator and
 benchmark the verified recovery checkpoint against read-only replay:
@@ -408,11 +409,12 @@ every one million warmup examples, then every three million.
 The arena compares each candidate with the current champion using reversed-role pairs,
 all rings, forced and unforced openings, a pair-level mixture-betting e-process and
 anytime-valid per-ring regression checks. The continuous gate starts with 50 pairs per
-ring, requires at least 50, allows at most 200, and groups the remaining 150 pairs per
-ring into one continuation wave when the first look is inconclusive. This changes only
-the persistence/scheduling boundary: the +35 Elo alternative, 0 Elo null, error levels,
-opening schedule, and per-ring regression floors are unchanged. Only a `promote` result
-atomically advances `champion.json`.
+ring, requires at least 50, allows at most 200, and persists 25-pair continuation
+waves when the first look is inconclusive. Newer checkpoints may queue, but cannot
+supersede an evaluation after it has durable pairs. This changes only scheduling:
+the +35 Elo alternative, 0 Elo null, error levels, opening schedule, and per-ring
+regression floors are unchanged. Only a `promote` result atomically advances
+`champion.json`.
 The shipped `model_refresh.selfplay_source: champion` means rejected candidates never
 feed self-play. Research ablations may select `candidate` or
 `candidate_champion_mix`; the selected role and policy-supervision rate are written to

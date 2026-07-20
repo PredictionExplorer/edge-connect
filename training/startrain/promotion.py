@@ -820,8 +820,12 @@ class PromotionSupervisor:
             progress=progress,
         ):
             return 0, "stopped"
+        accumulated = self._pairs_from_result(previous)
         newer = self._newer_candidate(candidate, champion)
-        if newer is not None:
+        if newer is not None and not (
+            self.experiment.orchestration.promotion.finish_inflight_candidate
+            and accumulated
+        ):
             marked = self._mark_superseded(
                 candidate,
                 champion,
@@ -835,7 +839,6 @@ class PromotionSupervisor:
                 )
             return 0, "superseded"
 
-        accumulated = self._pairs_from_result(previous)
         starts, counts = self._wave_plan(accumulated)
         if all(count <= 0 for count in counts.values()):
             if previous is None:
@@ -923,7 +926,10 @@ class PromotionSupervisor:
                     if stop_requested():
                         return waves, "stopped"
                     newer = self._newer_candidate(candidate, champion)
-                    if newer is not None:
+                    if newer is not None and not (
+                        self.experiment.orchestration.promotion.finish_inflight_candidate
+                        and accumulated
+                    ):
                         marked = self._mark_superseded(
                             candidate,
                             champion,

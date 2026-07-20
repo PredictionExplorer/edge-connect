@@ -209,6 +209,7 @@ orchestration:
     cpu_threads: 8
     poll_seconds: 10.0
     bootstrap_initial_champion: true
+    finish_inflight_candidate: true
     device: cuda
     pause_sharing_mode: true
     pause_ready_timeout_seconds: 930.0
@@ -235,7 +236,7 @@ arena:
   - 8
   - 10
   pairs_per_ring: 50
-  continuation_pairs_per_ring: 150
+  continuation_pairs_per_ring: 25
   simulations: 1024
   max_considered: 32
   c_visit: 50.0

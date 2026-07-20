@@ -162,15 +162,19 @@ def test_yaml_configs_load_strictly() -> None:
     assert throughput.learner.candidate_interval == 28_000
     assert throughput.learner.max_replay_lag_steps == 60_000
     assert throughput.orchestration.plateau.max_learner_champion_lag_steps == 60_000
-    assert throughput.arena.continuation_pairs_per_ring == 150
+    assert throughput.orchestration.promotion.finish_inflight_candidate is True
+    assert throughput.arena.continuation_pairs_per_ring == 25
     validate_continuous_config(throughput)
-    with pytest.raises(ValueError, match="one post-minimum wave"):
+    with pytest.raises(ValueError, match="resumable in-flight"):
         validate_continuous_config(
             replace(
                 throughput,
-                arena=replace(
-                    throughput.arena,
-                    continuation_pairs_per_ring=50,
+                orchestration=replace(
+                    throughput.orchestration,
+                    promotion=replace(
+                        throughput.orchestration.promotion,
+                        finish_inflight_candidate=False,
+                    ),
                 ),
             )
         )

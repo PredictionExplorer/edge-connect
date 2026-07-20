@@ -145,16 +145,13 @@ def _validate_throughput_config(config: ExperimentConfig) -> None:
         raise ValueError("continuous service requires bounded lower-LR champion resets")
     arena = config.arena
     continuation = arena.continuation_pairs_per_ring or arena.pairs_per_ring
-    remaining_after_minimum = arena.max_pairs_per_ring - arena.minimum_pairs_per_ring
-    continuation_waves = (
-        (remaining_after_minimum + continuation - 1) // continuation
-        if remaining_after_minimum
-        else 0
-    )
-    if continuation_waves > 1:
+    if (
+        not config.orchestration.promotion.finish_inflight_candidate
+        or continuation > max(1, arena.pairs_per_ring // 2)
+    ):
         raise ValueError(
-            "continuous service requires arena continuation to reach the maximum "
-            "within one post-minimum wave"
+            "continuous service requires resumable in-flight candidates and "
+            "bounded continuation waves"
         )
 
 

@@ -1103,6 +1103,12 @@ backup units to the new immutable release and newly named profile, then start
 normally. The service still runs profile validation, H100 health, and replay
 restore gates before the coordinator starts.
 
+The throughput profile uses 25-pair post-minimum continuation waves and
+`promotion.finish_inflight_candidate: true`. A newer checkpoint may replace
+queued candidates, but it cannot discard an evaluation after any pair is durable.
+Every wave remains resumable and the unchanged anytime-valid gate can stop at the
+first conclusive look instead of forcing a 200-pair maximum.
+
 This utility intentionally does not introduce update-to-data control. Adding a
 UTD target to an existing throughput run requires a separately reviewed
 prospective segment migration; adding only the YAML value fails closed.
