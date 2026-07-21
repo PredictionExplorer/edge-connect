@@ -314,6 +314,63 @@ describe('persisted app-state validation', () => {
 });
 
 describe('history navigation AI pause', () => {
+  it('rewinds several actions at once exactly like repeated undo', () => {
+    const log = [
+      { type: 'place' as const, node: 0 },
+      { type: 'place' as const, node: 1 },
+      { type: 'place' as const, node: 2 },
+      { type: 'place' as const, node: 3 },
+    ];
+    useAppStore.setState({
+      phase: 'playing',
+      config: double,
+      controllers: ['human', 'human'],
+      aiPaused: false,
+      log,
+      redoStack: [],
+      earlyOutcome: null,
+    });
+
+    useAppStore.getState().rewindTo(1);
+    expect(useAppStore.getState()).toMatchObject({
+      log: [{ type: 'place', node: 0 }],
+      redoStack: [
+        { type: 'place', node: 3 },
+        { type: 'place', node: 2 },
+        { type: 'place', node: 1 },
+      ],
+      aiPaused: true,
+      earlyOutcome: null,
+    });
+
+    // Redo restores the original order one action at a time.
+    useAppStore.getState().redo();
+    useAppStore.getState().redo();
+    useAppStore.getState().redo();
+    expect(useAppStore.getState().log).toEqual(log);
+    expect(useAppStore.getState().redoStack).toEqual([]);
+  });
+
+  it('ignores rewind targets outside the current log', () => {
+    useAppStore.setState({
+      phase: 'playing',
+      config: double,
+      controllers: ['human', 'human'],
+      aiPaused: false,
+      log: [{ type: 'place', node: 0 }],
+      redoStack: [],
+    });
+
+    for (const ply of [-1, 1, 5, 0.5]) {
+      useAppStore.getState().rewindTo(ply);
+      expect(useAppStore.getState()).toMatchObject({
+        log: [{ type: 'place', node: 0 }],
+        redoStack: [],
+        aiPaused: false,
+      });
+    }
+  });
+
   it('pauses after undo and preserves redo when a player takes over', () => {
     useAppStore.setState({
       phase: 'playing',

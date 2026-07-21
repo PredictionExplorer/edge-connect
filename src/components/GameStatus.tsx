@@ -1,6 +1,7 @@
 import {
   CircleAlert,
   Eye,
+  History,
   LoaderCircle,
   PauseCircle,
   ShieldCheck,
@@ -17,6 +18,7 @@ export type GameStatusState =
   | 'clinch'
   | 'proof'
   | 'confirming'
+  | 'review'
   | 'over';
 
 interface GameStatusProps {
@@ -25,6 +27,10 @@ interface GameStatusProps {
   controllerName: string;
   mode: Mode;
   movesLeft: number;
+  /** Placement progress of the turn on display (for the pips). */
+  turnProgress?: { placed: number; total: number } | null;
+  /** Position being reviewed, when state is 'review'. */
+  review?: { ply: number; total: number } | null;
   color: {
     base: string;
     bright: string;
@@ -39,11 +45,23 @@ export function GameStatus({
   controllerName,
   mode,
   movesLeft,
+  turnProgress = null,
+  review = null,
   color,
   className = '',
 }: GameStatusProps) {
   const presentation =
-    state === 'over'
+    state === 'review'
+      ? {
+          icon: History,
+          title: review
+            ? review.ply === 0
+              ? 'Reviewing the start'
+              : `Reviewing move ${review.ply} of ${review.total}`
+            : 'Reviewing history',
+          detail: `${playerName} to play here. Step with \u2190 \u2192, or return to live.`,
+        }
+      : state === 'over'
       ? {
           icon: Trophy,
           title: 'The sky is settled',
@@ -90,11 +108,21 @@ export function GameStatus({
                 title: `${playerName} to play`,
                 detail:
                   mode === 'double'
-                    ? `${movesLeft} stone${movesLeft === 1 ? '' : 's'} left this turn`
+                    ? turnProgress && turnProgress.total > 1
+                      ? turnProgress.placed === 0
+                        ? 'Two stones this turn — place the first.'
+                        : 'One more stone finishes the turn.'
+                      : movesLeft === 1 && turnProgress?.total === 1
+                        ? 'Opening turn — place a single stone.'
+                        : `${movesLeft} stone${movesLeft === 1 ? '' : 's'} left this turn`
                     : 'Place one stone on any open node.',
               };
 
   const Icon = presentation.icon;
+  const showPips =
+    (state === 'human' || state === 'thinking') &&
+    turnProgress !== null &&
+    turnProgress.total > 1;
 
   return (
     <section
@@ -104,11 +132,11 @@ export function GameStatus({
       className={`panel-surface flex min-h-[4.875rem] min-w-0 items-center gap-3 rounded-2xl px-4 py-3 ${className}`}
       style={{
         borderColor:
-          state === 'over' || state === 'clinch' || state === 'proof'
+          state === 'over' || state === 'clinch' || state === 'proof' || state === 'review'
             ? 'rgba(232,196,139,0.5)'
             : `${color.base}66`,
         background:
-          state === 'over' || state === 'clinch' || state === 'proof'
+          state === 'over' || state === 'clinch' || state === 'proof' || state === 'review'
             ? 'linear-gradient(145deg, rgba(232,196,139,0.14), rgba(16,21,42,0.9))'
             : `linear-gradient(145deg, ${color.soft}, rgba(16,21,42,0.9))`,
       }}
@@ -122,10 +150,35 @@ export function GameStatus({
           className={`h-5 w-5 ${state === 'thinking' ? 'motion-safe:animate-spin' : ''}`}
         />
       </span>
-      <div className="min-w-0">
-        <p className="text-sm font-medium leading-tight" style={{ color: color.bright }}>
-          {presentation.title}
-        </p>
+      <div className="min-w-0 flex-1">
+        <div className="flex items-center justify-between gap-2">
+          <p
+            className="min-w-0 truncate text-sm font-medium leading-tight"
+            style={{ color: color.bright }}
+          >
+            {presentation.title}
+          </p>
+          {showPips && (
+            <span
+              className="flex shrink-0 items-center gap-1"
+              role="img"
+              aria-label={`${turnProgress.placed} of ${turnProgress.total} stones placed this turn`}
+              data-turn-pips
+            >
+              {Array.from({ length: turnProgress.total }, (_, pip) => (
+                <span
+                  key={pip}
+                  className="h-2 w-2 rounded-full border transition-colors"
+                  style={{
+                    borderColor: color.base,
+                    background: pip < turnProgress.placed ? color.base : 'transparent',
+                    opacity: pip < turnProgress.placed ? 1 : 0.55,
+                  }}
+                />
+              ))}
+            </span>
+          )}
+        </div>
         <p className="mt-0.5 text-xs leading-tight text-muted">{presentation.detail}</p>
       </div>
     </section>

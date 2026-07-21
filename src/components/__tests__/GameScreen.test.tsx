@@ -534,6 +534,117 @@ describe('GameScreen AI lifecycle', () => {
   });
 });
 
+describe('GameScreen move review', () => {
+  const fourMoves = [0, 1, 2, 3].map((node) => ({
+    type: 'place' as const,
+    node,
+  }));
+
+  it('reviews an earlier position without touching the live log', async () => {
+    const user = userEvent.setup();
+    resetPlayingStore({ controllers: ['human', 'human'], log: fourMoves });
+    render(<GameScreen />);
+
+    const panel = screen.getByRole('region', { name: 'Move history' });
+    expect(within(panel).getByText('Live position')).toBeInTheDocument();
+
+    await user.click(
+      within(panel).getByRole('button', { name: 'Go to move 2: Grace at S10' }),
+    );
+
+    // The board becomes a read-only snapshot of the position after move 2.
+    expect(
+      screen.getByRole('img', {
+        name: /\*star board with 4 rings, 2 of 50 nodes occupied/i,
+      }),
+    ).toBeInTheDocument();
+    expect(screen.getByText('Reviewing move 2 of 4')).toBeInTheDocument();
+    expect(screen.getByText('Position at move 2')).toBeInTheDocument();
+    expect(useAppStore.getState().log).toHaveLength(4);
+    expect(useAppStore.getState().redoStack).toHaveLength(0);
+
+    // Arrow keys step through the history.
+    await user.keyboard('{ArrowLeft}');
+    expect(screen.getByText('Reviewing move 1 of 4')).toBeInTheDocument();
+    await user.keyboard('{ArrowRight}');
+    expect(screen.getByText('Reviewing move 2 of 4')).toBeInTheDocument();
+
+    await user.click(screen.getByRole('button', { name: 'Back to live' }));
+    expect(
+      screen.getByRole('group', {
+        name: /\*star board with 4 rings, 4 of 50 nodes occupied/i,
+      }),
+    ).toBeInTheDocument();
+    expect(useAppStore.getState().log).toHaveLength(4);
+  });
+
+  it('keeps the finished pair highlighted after the turn ends', () => {
+    resetPlayingStore({ controllers: ['human', 'human'], log: fourMoves });
+    const { container } = render(<GameScreen />);
+
+    // Grace's completed pair (nodes 1 and 2) stays ringed while Ada plays.
+    expect(
+      container.querySelector('[data-last-turn-move="1"]'),
+    ).toBeInTheDocument();
+    expect(
+      container.querySelector('[data-move-badge="2"][data-move-order="2"]'),
+    ).toBeInTheDocument();
+    // Ada's in-progress stone is the pulsing last move, numbered 1 of 2.
+    expect(container.querySelector('[data-last-move="3"]')).toBeInTheDocument();
+    expect(
+      container.querySelector('[data-move-badge="3"][data-move-order="1"]'),
+    ).toBeInTheDocument();
+  });
+
+  it('rewinds the live game to the reviewed position with play-from-here', async () => {
+    const user = userEvent.setup();
+    resetPlayingStore({ controllers: ['human', 'human'], log: fourMoves });
+    render(<GameScreen />);
+
+    const panel = screen.getByRole('region', { name: 'Move history' });
+    await user.click(
+      within(panel).getByRole('button', { name: 'Go to move 2: Grace at S10' }),
+    );
+    await user.click(
+      within(panel).getByRole('button', { name: 'Play from here' }),
+    );
+
+    expect(useAppStore.getState().log).toEqual(fourMoves.slice(0, 2));
+    expect(useAppStore.getState().redoStack).toEqual([
+      fourMoves[3],
+      fourMoves[2],
+    ]);
+    expect(useAppStore.getState().aiPaused).toBe(true);
+    // Back on the live position, ready to branch.
+    expect(
+      screen.getByRole('group', {
+        name: /\*star board with 4 rings, 2 of 50 nodes occupied/i,
+      }),
+    ).toBeInTheDocument();
+    expect(within(panel).getByText('Live position')).toBeInTheDocument();
+  });
+
+  it('exits review when undo shortens the log past the viewed ply', async () => {
+    const user = userEvent.setup();
+    resetPlayingStore({ controllers: ['human', 'human'], log: fourMoves });
+    render(<GameScreen />);
+
+    const panel = screen.getByRole('region', { name: 'Move history' });
+    await user.click(
+      within(panel).getByRole('button', { name: 'Go to move 2: Grace at S10' }),
+    );
+    await user.click(screen.getByRole('button', { name: 'Undo' }));
+
+    expect(useAppStore.getState().log).toHaveLength(3);
+    expect(within(panel).getByText('Live position')).toBeInTheDocument();
+    expect(
+      screen.getByRole('group', {
+        name: /\*star board with 4 rings, 3 of 50 nodes occupied/i,
+      }),
+    ).toBeInTheDocument();
+  });
+});
+
 describe('GameScreen score guidance', () => {
   it('shows both extreme completion scores throughout play', () => {
     resetPlayingStore({ controllers: ['human', 'human'] });

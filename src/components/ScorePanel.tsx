@@ -12,7 +12,8 @@ interface ScorePanelProps {
   view?:
     | { kind: 'live' }
     | { kind: 'proof'; fillPlayer: 0 | 1 }
-    | { kind: 'ended' };
+    | { kind: 'ended' }
+    | { kind: 'review'; ply: number; total: number };
 }
 
 interface ScoreRow {
@@ -142,7 +143,11 @@ export function ScorePanel({
         ? 'Clinch proof'
         : view.kind === 'ended'
           ? 'Position when game ended'
-          : 'Current scoring projection';
+          : view.kind === 'review'
+            ? view.ply === 0
+              ? 'Position at the start'
+              : `Position at move ${view.ply}`
+            : 'Current scoring projection';
   const headingDetail =
     game.over
       ? null
@@ -150,7 +155,9 @@ export function ScorePanel({
         ? 'hypothetical boundary'
         : view.kind === 'ended'
           ? 'projection only'
-          : 'can change';
+          : view.kind === 'review'
+            ? `of ${view.total}`
+            : 'can change';
   const scoreAriaLabel =
     game.over
       ? 'Final player scores'
@@ -158,7 +165,9 @@ export function ScorePanel({
         ? 'Hypothetical clinch proof scores'
         : view.kind === 'ended'
           ? 'Projected player scores when game ended, not final scores'
-          : 'Current player scores';
+          : view.kind === 'review'
+            ? 'Projected player scores at the reviewed position'
+            : 'Current player scores';
   const rows: ScoreRow[] = [
     {
       label: 'Peries',
@@ -211,7 +220,9 @@ export function ScorePanel({
           <div className="flex items-end px-3 py-3 text-xs text-muted">Score</div>
           {([0, 1] as const).map((player) => {
             const active =
-              !game.over && view.kind === 'live' && game.toMove === player;
+              !game.over &&
+              (view.kind === 'live' || view.kind === 'review') &&
+              game.toMove === player;
             const color = PLAYER_COLORS[player];
             return (
               <div
@@ -240,7 +251,11 @@ export function ScorePanel({
                   {score.players[player].total}
                 </span>
                 <span className="sr-only">
-                  {active ? ', currently to play' : ''}
+                  {active
+                    ? view.kind === 'review'
+                      ? ', to play at this position'
+                      : ', currently to play'
+                    : ''}
                 </span>
               </div>
             );
@@ -277,6 +292,16 @@ export function ScorePanel({
             </span>{' '}
             — this is not a final score
           </>
+        ) : view.kind === 'review' ? (
+          view.ply === 0 ? (
+            <>the board before the first stone — return to live to continue</>
+          ) : (
+            <>
+              projection as of move{' '}
+              <span className="text-gold">{view.ply}</span> — return to live to
+              continue playing
+            </>
+          )
         ) : view.kind === 'ended' ? (
           <>this is the live position that was left on the board, not a final score</>
         ) : score.contestedPeries > 0 ? (

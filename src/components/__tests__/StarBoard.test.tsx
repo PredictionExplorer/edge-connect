@@ -323,6 +323,53 @@ describe('StarBoard', () => {
     expect((await axe(container)).violations).toEqual([]);
   });
 
+  it('marks the whole previous turn and numbers double-turn stones', () => {
+    const stones = emptyBoard();
+    stones[0] = 0; // opening
+    stones[1] = 1; // Grace's completed pair
+    stones[2] = 1;
+    stones[3] = 0; // Ada's in-progress first stone
+    const { container } = render(
+      <StarBoard
+        board={board}
+        stones={stones}
+        interactive
+        lastMove={3}
+        currentTurnMoves={[3]}
+        lastTurnMoves={[1, 2]}
+        currentTurnCapacity={2}
+        playerNames={['Ada', 'Grace']}
+      />,
+    );
+
+    // Both stones of Grace's finished pair stay ringed and numbered.
+    expect(container.querySelector('[data-last-turn-move="1"]')).toBeInTheDocument();
+    expect(container.querySelector('[data-last-turn-move="2"]')).toBeInTheDocument();
+    expect(
+      container.querySelector('[data-move-badge="1"][data-move-order="1"]'),
+    ).toHaveTextContent('1');
+    expect(
+      container.querySelector('[data-move-badge="2"][data-move-order="2"]'),
+    ).toHaveTextContent('2');
+
+    // Ada's mid-turn stone pulses as the last move and is numbered 1 of 2.
+    expect(container.querySelector('[data-last-move="3"]')).toBeInTheDocument();
+    expect(
+      container.querySelector('[data-move-badge="3"][data-move-order="1"]'),
+    ).toHaveTextContent('1');
+
+    expect(
+      screen.getByRole('button', {
+        name: /node s10, grace stone on interior node, placed last turn \(stone 1 of 2\)/i,
+      }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole('button', {
+        name: /node a10, ada stone on interior node, last move, placed this turn \(stone 1 of 2\)/i,
+      }),
+    ).toBeInTheDocument();
+  });
+
   it('has no detectable accessibility violations', async () => {
     const { container } = render(
       <StarBoard

@@ -124,6 +124,10 @@ export interface StarBoardProps {
   showTerritory?: boolean;
   lastMove?: number;
   currentTurnMoves?: number[];
+  /** Nodes of the most recent completed turn, in placement order. */
+  lastTurnMoves?: number[];
+  /** Total placements the in-progress turn allows, for numbering badges. */
+  currentTurnCapacity?: number;
   toMove?: 0 | 1;
   interactive?: boolean;
   onPlace?: (node: number) => void;
@@ -189,6 +193,8 @@ export const StarBoard = memo(function StarBoard({
   showTerritory = false,
   lastMove = -1,
   currentTurnMoves = [],
+  lastTurnMoves = [],
+  currentTurnCapacity = 1,
   toMove = 0,
   interactive = false,
   onPlace,
@@ -532,13 +538,27 @@ export const StarBoard = memo(function StarBoard({
         const inHighlightedGroup =
           !isEmpty && highlightedGroup >= 0 && groups.groupOf[u] === highlightedGroup;
         const nodeKind = quark ? 'quark peri' : peri ? 'peri' : 'interior node';
+        const currentTurnIdx = isEmpty ? -1 : currentTurnMoves.indexOf(u);
+        const lastTurnIdx = isEmpty ? -1 : lastTurnMoves.indexOf(u);
+        const moveMarker =
+          currentTurnIdx >= 0
+            ? `${u === lastMove ? ', last move' : ''}, placed this turn${
+                currentTurnCapacity > 1
+                  ? ` (stone ${currentTurnIdx + 1} of ${currentTurnCapacity})`
+                  : ''
+              }`
+            : lastTurnIdx >= 0
+              ? `${u === lastMove ? ', last move' : ''}, placed last turn${
+                  lastTurnMoves.length > 1
+                    ? ` (stone ${lastTurnIdx + 1} of ${lastTurnMoves.length})`
+                    : ''
+                }`
+              : u === lastMove
+                ? ', last move'
+                : '';
         const nodeState = isEmpty
           ? `empty ${nodeKind}; ${currentPlayerName} may place here`
-          : `${playerNames?.[stone as 0 | 1] || PLAYER_COLORS[stone as 0 | 1].name} stone on ${nodeKind}${
-              u === lastMove ? ', last move' : ''
-            }${
-              currentTurnMoves.includes(u) && u !== lastMove ? ', placed this turn' : ''
-            }${
+          : `${playerNames?.[stone as 0 | 1] || PLAYER_COLORS[stone as 0 | 1].name} stone on ${nodeKind}${moveMarker}${
               provablyDead
                 ? ', provably dead; cannot form a living star in any completion'
                 : notInStar
@@ -693,9 +713,33 @@ export const StarBoard = memo(function StarBoard({
               </g>
             )}
 
-            {/* current-turn + last-move markers */}
-            {currentTurnMoves.includes(u) && u !== lastMove && (
-              <circle cx={x} cy={y} r={stoneR * 0.22} fill="rgba(255,255,255,0.85)" />
+            {/* recent-move markers: last completed turn (white), in-progress
+                turn (gold), pulse on the newest placement */}
+            {lastTurnIdx >= 0 && u !== lastMove && (
+              <circle
+                aria-hidden
+                data-last-turn-move={u}
+                pointerEvents="none"
+                cx={x}
+                cy={y}
+                r={stoneR * 1.18}
+                fill="none"
+                stroke="rgba(255,255,255,0.85)"
+                strokeWidth="0.7"
+              />
+            )}
+            {currentTurnIdx >= 0 && u !== lastMove && (
+              <circle
+                aria-hidden
+                data-current-turn-move={u}
+                pointerEvents="none"
+                cx={x}
+                cy={y}
+                r={stoneR * 1.18}
+                fill="none"
+                stroke="rgba(247,220,166,0.95)"
+                strokeWidth="0.8"
+              />
             )}
             {u === lastMove && (
               <g aria-hidden pointerEvents="none">
@@ -705,15 +749,23 @@ export const StarBoard = memo(function StarBoard({
                   cy={y}
                   r={stoneR * 1.18}
                   fill="none"
-                  stroke="rgba(255,255,255,0.9)"
-                  strokeWidth="0.8"
+                  stroke={
+                    currentTurnIdx >= 0
+                      ? 'rgba(247,220,166,0.98)'
+                      : 'rgba(255,255,255,0.9)'
+                  }
+                  strokeWidth="0.9"
                 />
                 <circle
                   className="last-move-pulse"
                   cx={x}
                   cy={y}
                   fill="none"
-                  stroke="rgba(255,255,255,0.75)"
+                  stroke={
+                    currentTurnIdx >= 0
+                      ? 'rgba(247,220,166,0.8)'
+                      : 'rgba(255,255,255,0.75)'
+                  }
                 >
                   <animate
                     attributeName="r"
@@ -730,6 +782,47 @@ export const StarBoard = memo(function StarBoard({
                     fill="freeze"
                   />
                 </circle>
+              </g>
+            )}
+            {((currentTurnIdx >= 0 && currentTurnCapacity > 1) ||
+              (currentTurnIdx < 0 &&
+                lastTurnIdx >= 0 &&
+                lastTurnMoves.length > 1)) && (
+              <g
+                aria-hidden
+                pointerEvents="none"
+                data-move-badge={u}
+                data-move-order={
+                  (currentTurnIdx >= 0 ? currentTurnIdx : lastTurnIdx) + 1
+                }
+              >
+                <circle
+                  cx={x}
+                  cy={y}
+                  r={stoneR * 0.5}
+                  fill="rgba(6,8,18,0.78)"
+                  stroke={
+                    currentTurnIdx >= 0
+                      ? 'rgba(247,220,166,0.65)'
+                      : 'rgba(255,255,255,0.4)'
+                  }
+                  strokeWidth="0.3"
+                />
+                <text
+                  x={x}
+                  y={y}
+                  textAnchor="middle"
+                  dominantBaseline="central"
+                  fontSize={stoneR * 0.72}
+                  fontWeight={700}
+                  fill={
+                    currentTurnIdx >= 0
+                      ? 'rgba(247,220,166,0.98)'
+                      : 'rgba(255,255,255,0.95)'
+                  }
+                >
+                  {(currentTurnIdx >= 0 ? currentTurnIdx : lastTurnIdx) + 1}
+                </text>
               </g>
             )}
 

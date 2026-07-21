@@ -63,6 +63,8 @@ export interface AppState {
   act: (action: GameAction) => void;
   undo: () => void;
   redo: () => void;
+  /** Rewind the live game to the first `ply` actions, like repeated undo. */
+  rewindTo: (ply: number) => void;
   rematch: () => void;
   toSetup: () => void;
   resumeAi: () => void;
@@ -465,6 +467,21 @@ export const useAppStore = create<AppState>()(
                 earlyOutcome: null,
               },
         ),
+      rewindTo: (ply) =>
+        set((s) => {
+          if (!Number.isInteger(ply) || ply < 0 || ply >= s.log.length) {
+            return s;
+          }
+          return {
+            log: s.log.slice(0, ply),
+            // Same order repeated undo would produce: redo pops the earliest
+            // rewound action first.
+            redoStack: [...s.redoStack, ...s.log.slice(ply).reverse()],
+            aiPaused: true,
+            reviewing: false,
+            earlyOutcome: null,
+          };
+        }),
       rematch: () =>
         set({
           log: [],

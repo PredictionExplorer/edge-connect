@@ -6,6 +6,7 @@ import {
   useState,
   type RefObject,
 } from 'react';
+import { History } from 'lucide-react';
 import type { StarBoardProps } from './StarBoard';
 import { StarBoard } from './StarBoard';
 import styles from './GameScreen.module.css';
@@ -21,6 +22,8 @@ type BoardStageProps = Pick<
   | 'showTerritory'
   | 'lastMove'
   | 'currentTurnMoves'
+  | 'lastTurnMoves'
+  | 'currentTurnCapacity'
   | 'toMove'
   | 'interactive'
   | 'playerNames'
@@ -31,6 +34,12 @@ type BoardStageProps = Pick<
     label: string;
     detail: string;
     description: string;
+  } | null;
+  /** Non-null while an earlier position is on the board. */
+  review?: {
+    ply: number;
+    total: number;
+    onExit: () => void;
   } | null;
   focusRef?: RefObject<HTMLElement | null>;
   className?: string;
@@ -46,12 +55,15 @@ export const BoardStage = memo(function BoardStage({
   showTerritory,
   lastMove,
   currentTurnMoves,
+  lastTurnMoves,
+  currentTurnCapacity,
   toMove,
   interactive,
   playerNames,
   onPlace,
   filledCount,
   proof,
+  review,
   focusRef,
   className = '',
 }: BoardStageProps) {
@@ -65,6 +77,7 @@ export const BoardStage = memo(function BoardStage({
       aria-label={proof ? 'Clinch proof board' : 'Game board'}
       data-board-stage
       data-proof-active={proof ? 'true' : undefined}
+      data-review-active={review ? 'true' : undefined}
       className={`${styles.boardStage} ${className}`}
     >
       <div className={styles.boardFrame}>
@@ -79,6 +92,8 @@ export const BoardStage = memo(function BoardStage({
           showTerritory={showTerritory}
           lastMove={lastMove}
           currentTurnMoves={currentTurnMoves}
+          lastTurnMoves={lastTurnMoves}
+          currentTurnCapacity={currentTurnCapacity}
           toMove={toMove}
           interactive={interactive}
           playerNames={playerNames}
@@ -86,6 +101,35 @@ export const BoardStage = memo(function BoardStage({
           onHover={handleHover}
           className="block h-full w-full"
         />
+        {review && (
+          <div
+            data-review-banner
+            className="pop-in absolute left-1/2 top-2 z-10 flex max-w-[calc(100%-1rem)] -translate-x-1/2 items-center gap-2.5 rounded-full border border-gold/45 bg-night-surface-strong/95 py-1.5 pl-3.5 pr-1.5 shadow-[0_10px_36px_rgba(0,0,0,0.5)] backdrop-blur-md"
+          >
+            <History className="h-3.5 w-3.5 shrink-0 text-gold" aria-hidden />
+            <span className="whitespace-nowrap text-xs text-ink">
+              {review.ply === 0 ? (
+                'Start'
+              ) : (
+                <>
+                  Move{' '}
+                  <span className="font-mono tabular-nums text-gold-strong">
+                    {review.ply}
+                  </span>
+                </>
+              )}{' '}
+              of{' '}
+              <span className="font-mono tabular-nums">{review.total}</span>
+            </span>
+            <button
+              type="button"
+              onClick={review.onExit}
+              className="min-h-8 whitespace-nowrap rounded-full border border-gold/60 bg-gold-faint px-3 py-1 text-xs font-medium text-gold-strong transition-colors hover:bg-gold/25"
+            >
+              Back to live
+            </button>
+          </div>
+        )}
         <div
           aria-live="polite"
           className={`pointer-events-none absolute bottom-2 left-2 max-w-[calc(100%-1rem)] rounded-lg border px-2.5 py-1 font-mono text-xs backdrop-blur-sm ${

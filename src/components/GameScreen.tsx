@@ -38,6 +38,7 @@ import {
   scorePosition,
   validateTerminalWinner,
 } from '@/lib/star/scoring';
+import { buildTimeline, lastCompletedTurnMoves } from '@/lib/star/timeline';
 import { useAppStore } from '@/lib/store';
 import { BoardStage } from './BoardStage';
 import { EngineEstimatePanel } from './EngineEstimatePanel';
@@ -48,6 +49,7 @@ import {
 } from './EndGameDialogs';
 import { GameOverOverlay, type GameResult } from './GameOverOverlay';
 import { GameStatus, type GameStatusState } from './GameStatus';
+import { MovesPanel } from './MovesPanel';
 import { RulesDialog } from './RulesDialog';
 import { ScorePanel } from './ScorePanel';
 import {
@@ -108,6 +110,7 @@ export function GameScreen() {
   const act = useAppStore((state) => state.act);
   const undo = useAppStore((state) => state.undo);
   const redo = useAppStore((state) => state.redo);
+  const rewindTo = useAppStore((state) => state.rewindTo);
   const rematch = useAppStore((state) => state.rematch);
   const toSetup = useAppStore((state) => state.toSetup);
   const resumeAi = useAppStore((state) => state.resumeAi);
@@ -122,6 +125,8 @@ export function GameScreen() {
   const [rulesOpen, setRulesOpen] = useState(false);
   const [showInfluence, setShowInfluence] = useState(false);
   const [proofMode, setProofMode] = useState(false);
+  /** Number of log actions on the board while reviewing; null = live. */
+  const [viewPly, setViewPly] = useState<number | null>(null);
   const [endConfirmOpen, setEndConfirmOpen] = useState(false);
   const [resignConfirmOpen, setResignConfirmOpen] = useState(false);
   const [aiStatus, setAiStatus] = useState<AiStatus>({ kind: 'idle' });
@@ -142,6 +147,41 @@ export function GameScreen() {
   const score = useMemo(
     () => (game ? scorePosition(game.board, game.stones) : null),
     [game],
+  );
+
+  // Non-destructive move review: `historyView` selects a prefix of the log to
+  // put on the board; the live game (and any AI opponent) continues
+  // underneath, untouched. Every action that can shrink the log (undo, redo,
+  // rewind, rematch, leave) resets `viewPly`, so the render-time clamp only
+  // covers transient states.
+  const historyView = viewPly !== null && viewPly < log.length ? viewPly : null;
+  const viewingHistory = historyView !== null;
+
+  const seek = useCallback((ply: number | null) => {
+    const total = useAppStore.getState().log.length;
+    setViewPly(ply === null || ply >= total ? null : Math.max(0, ply));
+    setProofMode(false);
+  }, []);
+
+  const shownGame = useMemo(() => {
+    if (!game || historyView === null) return game;
+    return replay(config, log.slice(0, historyView));
+  }, [config, game, historyView, log]);
+
+  const shownScore = useMemo(() => {
+    if (!shownGame) return null;
+    if (shownGame === game) return score;
+    return scorePosition(shownGame.board, shownGame.stones);
+  }, [game, score, shownGame]);
+
+  const timeline = useMemo(
+    () => (game ? buildTimeline(config, log) : null),
+    [config, game, log],
+  );
+  const currentPly = historyView ?? log.length;
+  const lastTurnMoves = useMemo(
+    () => (timeline ? lastCompletedTurnMoves(timeline, currentPly) : []),
+    [currentPly, timeline],
   );
   const completionBounds = useMemo(
     () =>
@@ -373,6 +413,7 @@ export function GameScreen() {
   const leaveGame = useCallback(() => {
     cancelActiveAi();
     setProofMode(false);
+    setViewPly(null);
     setEndConfirmOpen(false);
     setResignConfirmOpen(false);
     if (controllers.includes('local')) disposeLocalAi();
@@ -381,18 +422,28 @@ export function GameScreen() {
 
   const undoAction = useCallback(() => {
     cancelActiveAi();
+    setViewPly(null);
     undo();
   }, [cancelActiveAi, undo]);
 
   const redoAction = useCallback(() => {
     cancelActiveAi();
+    setViewPly(null);
     redo();
   }, [cancelActiveAi, redo]);
+
+  const rewindToViewed = useCallback(() => {
+    if (historyView === null) return;
+    cancelActiveAi();
+    rewindTo(historyView);
+    setViewPly(null);
+  }, [cancelActiveAi, historyView, rewindTo]);
 
   const rematchAction = useCallback(() => {
     cancelActiveAi();
     setRulesOpen(false);
     setProofMode(false);
+    setViewPly(null);
     setEndConfirmOpen(false);
     setResignConfirmOpen(false);
     rematch();
@@ -451,7 +502,8 @@ export function GameScreen() {
     Boolean(game) &&
     currentController === 'human' &&
     !thinking &&
-    !uiBlocksPlay;
+    !uiBlocksPlay &&
+    !viewingHistory;
   const placeStone = useCallback(
     (node: number) => {
       if (!humanCanAct) return;
@@ -460,6 +512,45 @@ export function GameScreen() {
     },
     [act, humanCanAct],
   );
+
+  // Arrow keys step through the move history whenever no dialog needs them.
+  // Board-focused arrow presses call preventDefault first and are skipped.
+  const historyNavEnabled =
+    !rulesOpen &&
+    !clinchPending &&
+    !validProofMode &&
+    !validEndConfirmOpen &&
+    !validResignConfirmOpen &&
+    !(effectiveOver && !reviewing);
+
+  useEffect(() => {
+    if (!historyNavEnabled) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.defaultPrevented) return;
+      if (event.metaKey || event.ctrlKey || event.altKey || event.shiftKey) {
+        return;
+      }
+      if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return;
+      const target = event.target;
+      if (
+        target instanceof Element &&
+        target.closest('input, textarea, select, [contenteditable="true"]')
+      ) {
+        return;
+      }
+      if (event.key === 'ArrowLeft') {
+        if (currentPly > 0) {
+          event.preventDefault();
+          seek(currentPly - 1);
+        }
+      } else if (viewingHistory) {
+        event.preventDefault();
+        seek(currentPly + 1);
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [currentPly, historyNavEnabled, seek, viewingHistory]);
 
   const proofWinner =
     earlyOutcome?.reason === 'resignation'
@@ -494,6 +585,7 @@ export function GameScreen() {
     cancelActiveAi();
     setRulesOpen(false);
     setEndConfirmOpen(false);
+    setViewPly(null);
     setProofMode(true);
   }, [cancelActiveAi, proofScenario]);
 
@@ -522,11 +614,11 @@ export function GameScreen() {
     resign(resigningPlayer);
   }, [cancelActiveAi, resign, resigningPlayer]);
 
-  if (!game || !score) return null;
+  if (!game || !score || !shownGame || !shownScore || !timeline) return null;
 
   const { board } = game;
-  const displayedScore = proofActive ? proofScenario.score : score;
-  const showTerritory = game.over || showInfluence || proofActive;
+  const displayedScore = proofActive ? proofScenario.score : shownScore;
+  const showTerritory = shownGame.over || showInfluence || proofActive;
   const gameResult: GameResult | null = game.over
     ? {
         reason: 'full-board',
@@ -534,27 +626,39 @@ export function GameScreen() {
         score,
       }
     : earlyOutcome;
-  const statusPlayer =
-    gameResult?.winner ??
-    ((clinchPending || proofActive) && proofWinner !== null
-      ? proofWinner
-      : game.toMove);
+  const statusPlayer = viewingHistory
+    ? shownGame.toMove
+    : (gameResult?.winner ??
+      ((clinchPending || proofActive) && proofWinner !== null
+        ? proofWinner
+        : game.toMove));
   const activeColor = PLAYER_COLORS[statusPlayer];
-  const gameStatusState: GameStatusState = effectiveOver
-    ? 'over'
-    : proofActive
-      ? 'proof'
-      : clinchPending
-        ? 'clinch'
-        : validEndConfirmOpen || validResignConfirmOpen
-          ? 'confirming'
-          : currentController === 'human'
-            ? 'human'
-            : aiPaused
-              ? 'paused'
-              : activeAiError
-                ? 'error'
-                : 'thinking';
+  const gameStatusState: GameStatusState = viewingHistory
+    ? 'review'
+    : effectiveOver
+      ? 'over'
+      : proofActive
+        ? 'proof'
+        : clinchPending
+          ? 'clinch'
+          : validEndConfirmOpen || validResignConfirmOpen
+            ? 'confirming'
+            : currentController === 'human'
+              ? 'human'
+              : aiPaused
+                ? 'paused'
+                : activeAiError
+                  ? 'error'
+                  : 'thinking';
+  const shownTurnCapacity = shownGame.over
+    ? Math.max(shownGame.currentTurnMoves.length, 1)
+    : shownGame.currentTurnMoves.length + shownGame.movesLeft;
+  const turnProgress = {
+    placed: shownGame.currentTurnMoves.length,
+    total: shownTurnCapacity,
+  };
+  const canRewind =
+    earlyOutcome === null && !proofActive && !clinchPending;
   const currentControllerName =
     currentController === 'human'
       ? 'Human'
@@ -567,9 +671,11 @@ export function GameScreen() {
       : null;
   const scoreView = proofActive && proofLoser !== null
     ? ({ kind: 'proof', fillPlayer: proofLoser } as const)
-    : earlyOutcome
-      ? ({ kind: 'ended' } as const)
-      : ({ kind: 'live' } as const);
+    : viewingHistory
+      ? ({ kind: 'review', ply: currentPly, total: log.length } as const)
+      : earlyOutcome
+        ? ({ kind: 'ended' } as const)
+        : ({ kind: 'live' } as const);
 
   return (
     <main
@@ -632,21 +738,34 @@ export function GameScreen() {
         <BoardStage
           className={styles.boardArea}
           board={board}
-          stones={proofActive ? proofScenario.stones : game.stones}
+          stones={proofActive ? proofScenario.stones : shownGame.stones}
           nodeOwner={displayedScore.nodeOwner}
           aliveStone={displayedScore.aliveStone}
           provablyDeadStone={
-            proofActive ? null : completionBounds?.provablyDeadStone
+            proofActive || viewingHistory
+              ? null
+              : completionBounds?.provablyDeadStone
           }
           syntheticStone={proofMask}
           showTerritory={showTerritory}
-          lastMove={proofActive ? -1 : game.lastMove}
-          currentTurnMoves={proofActive ? [] : game.currentTurnMoves}
-          toMove={game.toMove}
+          lastMove={proofActive ? -1 : shownGame.lastMove}
+          currentTurnMoves={proofActive ? [] : shownGame.currentTurnMoves}
+          lastTurnMoves={proofActive ? [] : lastTurnMoves}
+          currentTurnCapacity={shownTurnCapacity}
+          toMove={shownGame.toMove}
           interactive={!effectiveOver && humanCanAct}
           playerNames={config.playerNames}
           onPlace={placeStone}
-          filledCount={proofActive ? board.n : game.stonesPlaced}
+          filledCount={proofActive ? board.n : shownGame.stonesPlaced}
+          review={
+            viewingHistory
+              ? {
+                  ply: currentPly,
+                  total: log.length,
+                  onExit: () => seek(null),
+                }
+              : null
+          }
           focusRef={boardStageRef}
           proof={
             proofDescription && proofScenario && proofLoser !== null
@@ -671,7 +790,11 @@ export function GameScreen() {
             playerName={config.playerNames[statusPlayer]}
             controllerName={currentControllerName}
             mode={config.mode}
-            movesLeft={game.movesLeft}
+            movesLeft={shownGame.movesLeft}
+            turnProgress={turnProgress}
+            review={
+              viewingHistory ? { ply: currentPly, total: log.length } : null
+            }
             color={activeColor}
           />
           <div className={`${styles.rail} thin-scroll flex min-w-0 flex-col gap-3`}>
@@ -837,11 +960,21 @@ export function GameScreen() {
             )}
 
           <ScorePanel
-            game={game}
+            game={shownGame}
             score={displayedScore}
             completionBounds={completionBounds}
             view={scoreView}
           />
+
+            <MovesPanel
+              timeline={timeline}
+              total={log.length}
+              currentPly={currentPly}
+              playerNames={config.playerNames}
+              canRewind={canRewind}
+              onSeek={seek}
+              onRewind={rewindToViewed}
+            />
 
             {devtools && publishedAnalysis && (
               <EngineEstimatePanel
@@ -903,7 +1036,7 @@ export function GameScreen() {
               <input
                 type="checkbox"
                 checked={showTerritory}
-                disabled={game.over || proofActive}
+                disabled={shownGame.over || proofActive}
                 onChange={(e) => setShowInfluence(e.target.checked)}
                 className="h-4 w-4 accent-[#e8c48b]"
               />
