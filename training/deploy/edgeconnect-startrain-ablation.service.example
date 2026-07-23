@@ -1,0 +1,24 @@
+[Unit]
+Description=EdgeConnect bounded Elo ablation @TREATMENT@
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=@USER@
+WorkingDirectory=@TRAINING_DIR@
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONPATH=@TRAINING_DIR@
+Environment=PATH=@TRAINING_DIR@/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStartPre=@TRAINING_DIR@/.venv/bin/python -c "from startrain.config import load_config; load_config('@PROFILE@')"
+ExecStart=@TRAINING_DIR@/.venv/bin/python @TRAINING_DIR@/scripts/run_elo_ablation.py --config @PROFILE@
+Restart=no
+KillSignal=SIGTERM
+KillMode=mixed
+TimeoutStopSec=1000
+OOMPolicy=stop
+LimitNOFILE=1048576
+NoNewPrivileges=true
+UMask=0027
