@@ -1116,6 +1116,18 @@ def test_decoupled_model_cadence_migrates_existing_run_without_reset(
         assert initial.model_step == 0
         learner.step = 18
         learner.examples_consumed = 18
+        learner.cadence_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "run_id": identity.run_id,
+                    "generation_family": identity.generation_family,
+                    "candidate_examples": 0,
+                    "selfplay_examples": None,
+                }
+            ),
+            encoding="utf-8",
+        )
 
         learner._load_cadence_state()
 

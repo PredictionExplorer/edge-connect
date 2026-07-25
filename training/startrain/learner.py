@@ -1209,6 +1209,16 @@ class LearnerLoop:
                 raise ValueError("learner cadence counters are invalid")
             self._last_candidate_examples = candidate_examples
             self._last_selfplay_examples = selfplay_examples
+            if self.selfplay_publisher is not None and selfplay_examples is None:
+                if not self.selfplay_publisher.candidate_path.is_file():
+                    candidate = load_model_manifest(self.publisher.candidate_path)
+                    write_model_pointer(
+                        self.selfplay_publisher.candidate_path,
+                        candidate,
+                        role="candidate",
+                    )
+                self._last_selfplay_examples = candidate_examples
+                self._write_cadence_state()
             return
 
         self._last_candidate_examples = self._pointer_examples(
