@@ -13,7 +13,8 @@ import time
 from pathlib import Path
 from typing import Any
 
-from startrain.config import load_config
+from startrain.config import ExperimentConfig, load_config
+from startrain.replay_store import ReplayStore
 from startrain.runtime import atomic_json, load_run_identity
 
 SCHEMA_VERSION = 1
@@ -102,6 +103,46 @@ def _rotate_branch_runtime(destination: Path) -> None:
     (destination / "coordinator.lock").unlink(missing_ok=True)
 
 
+def _prepare_utd_segment(
+    destination: Path,
+    *,
+    experiment: ExperimentConfig,
+    run_id: str,
+    generation_family: str,
+) -> dict[str, object] | None:
+    target = experiment.learner.target_updates_per_new_sample
+    if target is None:
+        return None
+    segment_path = destination / "learner" / "utd-segment.json"
+    if segment_path.is_file():
+        return _read_json(segment_path)
+    recovery = _read_json(destination / "learner" / "recovery.json")
+    examples = recovery.get("examples_consumed")
+    if isinstance(examples, bool) or not isinstance(examples, int) or examples < 0:
+        raise ValueError("recovery pointer lacks a valid UTD examples baseline")
+    with ReplayStore(destination / "replay") as store:
+        if not store.committed_sample_history_is_complete(
+            run_id=run_id,
+            generation_family=generation_family,
+        ):
+            raise ValueError("UTD treatment requires complete committed-sample history")
+        committed = store.total_committed_sample_count(
+            run_id=run_id,
+            generation_family=generation_family,
+        )
+    payload: dict[str, object] = {
+        "schema_version": 1,
+        "run_id": run_id,
+        "generation_family": generation_family,
+        "target_updates_per_new_sample": float(target),
+        "baseline_examples_consumed": examples,
+        "baseline_committed_replay_samples": committed,
+        "created_ns": time.time_ns(),
+    }
+    atomic_json(segment_path, payload)
+    return payload
+
+
 def _plan_treatment(plan: dict[str, Any], treatment: str) -> dict[str, str]:
     raw = plan.get("treatments")
     if not isinstance(raw, list):
@@ -174,6 +215,12 @@ def fork_elo_ablation(
         _rotate_branch_runtime(destination)
         installed_profile = destination / "profile-elo-ablation.yaml"
         shutil.copy2(profile_path, installed_profile)
+        utd_segment = _prepare_utd_segment(
+            destination,
+            experiment=experiment,
+            run_id=identity.run_id,
+            generation_family=identity.generation_family,
+        )
         champion = _read_json(destination / "learner" / "champion.json")
         candidate_path = destination / "learner" / "candidate.json"
         candidate = _read_json(candidate_path) if candidate_path.is_file() else None
@@ -207,6 +254,7 @@ def fork_elo_ablation(
                 if candidate is not None
                 else None
             ),
+            "utd_segment": utd_segment,
             "storage": counters,
         }
         atomic_json(destination / "ablation.json", metadata)

@@ -8,6 +8,8 @@ import pytest
 
 from scripts.fork_elo_ablation import fork_elo_ablation, main
 from scripts.prepare_elo_ablation import prepare_elo_ablation
+from startrain.replay_store import ReplayStore
+from startrain.runtime import load_run_identity
 
 CONFIGS = Path(__file__).parents[1] / "configs"
 
@@ -42,6 +44,16 @@ def _source_run(tmp_path: Path) -> Path:
             "model_identity": "candidate-id",
             "model_step": 392_000,
             "updated_ns": 11,
+        },
+    )
+    _write_json(
+        source / "learner" / "recovery.json",
+        {
+            "schema_version": 1,
+            "format": "startrain.recovery-pointer",
+            "run_id": "shared-run",
+            "generation_family": "shared-family",
+            "examples_consumed": 100,
         },
     )
     files = {
@@ -141,6 +153,51 @@ def test_fork_refuses_active_source_and_changed_profile(tmp_path: Path) -> None:
             plan_path=plan_path,
             treatment="control",
         )
+
+
+def test_fork_prepares_utd_segment_for_existing_run(tmp_path: Path) -> None:
+    source = _source_run(tmp_path)
+    (source / "replay" / "manifest.sqlite3").unlink()
+    identity = load_run_identity(source / "run.json")
+    with ReplayStore(source / "replay") as store:
+        store.register_run(identity)
+    output = tmp_path / "utd-profiles"
+    prepare_elo_ablation(
+        base_config=CONFIGS / "h100-8gpu-throughput.yaml",
+        output_dir=output,
+        run_root_parent=tmp_path / "runs",
+        run_id="shared-run",
+        source_run_root=source,
+        prefix="utd",
+        seed=17,
+        wall_budget_hours=8,
+        leaf_budget=2_000_000_000,
+        guard_floor_elo=-35,
+        treatments=("utd-1",),
+    )
+
+    metadata = fork_elo_ablation(
+        source_run_root=source,
+        plan_path=output / "ablation-plan.json",
+        treatment="utd-1",
+    )
+
+    segment = metadata["utd_segment"]
+    assert segment == {
+        "schema_version": 1,
+        "run_id": "shared-run",
+        "generation_family": "shared-family",
+        "target_updates_per_new_sample": 1.0,
+        "baseline_examples_consumed": 100,
+        "baseline_committed_replay_samples": 0,
+        "created_ns": segment["created_ns"],
+    }
+    persisted = json.loads(
+        (
+            tmp_path / "runs" / "utd-utd-1-seed17" / "learner" / "utd-segment.json"
+        ).read_text()
+    )
+    assert persisted == segment
 
 
 def test_fork_cli_reports_unknown_treatment_as_json(
