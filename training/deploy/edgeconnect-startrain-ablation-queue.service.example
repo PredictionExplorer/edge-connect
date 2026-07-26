@@ -1,0 +1,33 @@
+[Unit]
+Description=EdgeConnect durable Elo ablation queue
+Wants=network-online.target
+After=network-online.target
+OnSuccess=@FINALIZE_UNIT@
+OnFailure=@FINALIZE_UNIT@
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+User=@USER@
+WorkingDirectory=@TRAINING_DIR@
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONPATH=@TRAINING_DIR@
+Environment=PATH=@TRAINING_DIR@/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+EnvironmentFile=@ENVIRONMENT_FILE@
+ExecStartPre=@TRAINING_DIR@/.venv/bin/python @TRAINING_DIR@/scripts/run_elo_ablation_queue.py verify --manifest @DEPLOYMENT_MANIFEST@
+ExecStart=@TRAINING_DIR@/.venv/bin/python @TRAINING_DIR@/scripts/run_elo_ablation_queue.py run --manifest @DEPLOYMENT_MANIFEST@
+Restart=on-failure
+RestartPreventExitStatus=2 3
+RestartSec=30
+KillSignal=SIGTERM
+KillMode=control-group
+TimeoutStartSec=infinity
+TimeoutStopSec=1000
+OOMPolicy=stop
+LimitNOFILE=1048576
+NoNewPrivileges=true
+UMask=0027
+
+[Install]
+WantedBy=multi-user.target

@@ -14,7 +14,12 @@ from typing import Literal
 
 import torch
 
-from .checkpoint import ModelManifest, load_ema_checkpoint, load_model_manifest
+from .checkpoint import (
+    ModelManifest,
+    load_ema_checkpoint,
+    load_model_manifest,
+    load_resume_cutover,
+)
 from .config import ExperimentConfig, GPUWorkerConfig, RingMixtureConfig
 from .device import (
     empty_device_cache,
@@ -214,6 +219,7 @@ class HistoricalModelPool:
         pool_size: int,
         evaluator_cache_size: int = 2,
         additional_manifest_directories: Sequence[str | Path] = (),
+        cutover_path: str | Path | None = None,
     ) -> None:
         if pool_size <= 0 or evaluator_cache_size <= 0:
             raise ValueError("historical model pool sizes must be positive")
@@ -231,6 +237,7 @@ class HistoricalModelPool:
         self.pool_size = pool_size
         self.evaluator_cache_size = min(pool_size, evaluator_cache_size)
         self.providers: OrderedDict[str, ManifestModelProvider] = OrderedDict()
+        self.cutover_path = Path(cutover_path) if cutover_path is not None else None
 
     def select(
         self,
@@ -239,6 +246,7 @@ class HistoricalModelPool:
         exclude: set[str],
     ) -> ManifestModelProvider | None:
         by_identity: dict[str, ModelManifest] = {}
+        cutover_ns = self._cutover_created_ns()
         for directory in self.manifest_directories:
             for path in sorted(directory.glob("manifest-*.json")):
                 try:
@@ -250,6 +258,7 @@ class HistoricalModelPool:
                     and manifest.run_id == self.run_identity.run_id
                     and manifest.generation_family
                     == self.run_identity.generation_family
+                    and manifest.published_ns >= cutover_ns
                     and manifest.model_identity not in exclude
                 ):
                     by_identity[manifest.model_identity] = manifest
@@ -273,6 +282,28 @@ class HistoricalModelPool:
         while len(self.providers) > self.evaluator_cache_size:
             self.providers.popitem(last=False)
         return provider
+
+    def _cutover_created_ns(self) -> int:
+        if self.cutover_path is None or not self.cutover_path.is_file():
+            return 0
+        load_resume_cutover(
+            self.cutover_path,
+            expected_run_id=self.run_identity.run_id,
+            expected_generation_family=self.run_identity.generation_family,
+            verify_artifact=False,
+        )
+        try:
+            payload = json.loads(self.cutover_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError(f"cannot read history cutover: {exc}") from exc
+        created_ns = payload.get("created_ns") if isinstance(payload, dict) else None
+        if (
+            isinstance(created_ns, bool)
+            or not isinstance(created_ns, int)
+            or created_ns <= 0
+        ):
+            raise ValueError("history cutover created_ns is invalid")
+        return created_ns
 
     def _spaced_candidates(
         self,
@@ -350,16 +381,21 @@ class ActorSupervisor:
             if source != "champion"
             else None
         )
+        candidate_root = self.candidate_manifest_path.parent
+        learner_root = (
+            candidate_root.parent
+            if candidate_root.name == "selfplay"
+            else candidate_root
+        )
         self.history_pool = (
             HistoricalModelPool(
                 experiment,
-                self.candidate_manifest_path.parent / "manifests",
+                candidate_root / "manifests",
                 device=device,
                 run_identity=run_identity,
                 pool_size=experiment.orchestration.model_refresh.history_pool_size,
-                additional_manifest_directories=(
-                    self.candidate_manifest_path.parent.parent / "manifests",
-                ),
+                additional_manifest_directories=(learner_root / "manifests",),
+                cutover_path=learner_root / "resume-cutover.json",
             )
             if source == "candidate_champion_history_mix"
             else None

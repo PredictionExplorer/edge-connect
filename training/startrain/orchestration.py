@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import json
 import os
+import random
 import shutil
 import signal
 import subprocess
@@ -13,6 +14,7 @@ import sys
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
 from typing import Protocol, TextIO
 
@@ -44,8 +46,28 @@ class ProcessProtocol(Protocol):
 
 ProcessFactory = Callable[..., ProcessProtocol]
 HardwareHealthProbe = Callable[[], Mapping[str, object]]
-HARDWARE_HEALTH_EXIT_CODE = 78
+FATAL_WORKER_EXIT_CODE = 78
+TRANSIENT_WORKER_EXIT_CODE = 75
+HARDWARE_HEALTH_EXIT_CODE = FATAL_WORKER_EXIT_CODE
 HARDWARE_HEALTH_INTERVAL_SECONDS = 60.0
+WORKER_FAILURE_PATH_ENV = "STARTRAIN_WORKER_FAILURE_PATH"
+WORKER_NAME_ENV = "STARTRAIN_WORKER_NAME"
+WORKER_ROLE_ENV = "STARTRAIN_WORKER_ROLE"
+
+
+class FailureClass(StrEnum):
+    """Stable worker-failure classes shared by child CLIs and the coordinator."""
+
+    FATAL = "fatal"
+    TRANSIENT = "transient"
+
+
+@dataclass(frozen=True, slots=True)
+class WorkerFailure:
+    failure_class: FailureClass
+    reason: str
+    exit_code: int
+    exception_type: str | None = None
 
 
 def gpu_pause_ack_path(request_path: str | Path) -> Path:
@@ -195,6 +217,7 @@ class WorkerSpec:
     heartbeat_path: Path
     metrics_path: Path
     log_path: Path
+    failure_path: Path
     cpu_affinity: tuple[int, ...] | None = None
 
 
@@ -209,9 +232,13 @@ class ManagedWorker:
     state: str = "pending"
     last_exit_code: int | None = None
     failure_reason: str | None = None
+    failure_class: FailureClass | None = None
+    failure_exit_code: int | None = None
     termination_deadline: float = 0.0
     last_progress: object | None = None
     last_progress_at: float = 0.0
+    process_group_id: int | None = None
+    last_pid: int | None = None
 
     @property
     def live(self) -> bool:
@@ -331,6 +358,14 @@ def build_worker_specs(
         cpu_affinity=learner_affinity,
         device=worker_device,
     )
+    learner_failure_path = directories.status / "learner.failure.json"
+    learner_environment.update(
+        _worker_failure_environment(
+            name="learner",
+            role="learner",
+            failure_path=learner_failure_path,
+        )
+    )
     train_arguments = (
         "--config",
         config,
@@ -390,6 +425,7 @@ def build_worker_specs(
             heartbeat_path=directories.status / "learner.heartbeat.json",
             metrics_path=directories.learner / "metrics.jsonl",
             log_path=directories.logs / "learner.log",
+            failure_path=learner_failure_path,
             cpu_affinity=learner_affinity,
         )
     ]
@@ -404,6 +440,21 @@ def build_worker_specs(
                 f"actor-gpu-{gpu.gpu_id}"
                 if gpu.actor_lanes == 1
                 else f"actor-gpu-{gpu.gpu_id}-lane-{lane_id}"
+            )
+            failure_path = directories.status / f"{name}.failure.json"
+            actor_environment = _worker_environment(
+                environment,
+                gpu_ids=(gpu.gpu_id,),
+                cpu_threads=gpu.cpu_threads,
+                cpu_affinity=affinity,
+                device=worker_device,
+            )
+            actor_environment.update(
+                _worker_failure_environment(
+                    name=name,
+                    role="actor",
+                    failure_path=failure_path,
+                )
             )
             specs.append(
                 WorkerSpec(
@@ -439,22 +490,18 @@ def build_worker_specs(
                         "--device",
                         worker_device,
                     ),
-                    environment=_worker_environment(
-                        environment,
-                        gpu_ids=(gpu.gpu_id,),
-                        cpu_threads=gpu.cpu_threads,
-                        cpu_affinity=affinity,
-                        device=worker_device,
-                    ),
+                    environment=actor_environment,
                     heartbeat_path=directories.status / f"{name}.heartbeat.json",
                     metrics_path=directories.metrics / f"{name}.jsonl",
                     log_path=directories.logs / f"{name}.log",
+                    failure_path=failure_path,
                     cpu_affinity=affinity,
                 )
             )
     promotion = orchestration.promotion
     if promotion.enabled:
         name = "arena-promotion"
+        failure_path = directories.status / f"{name}.failure.json"
         promotion_gpu = next(
             (gpu for gpu in orchestration.gpus if gpu.gpu_id == promotion.gpu_id),
             None,
@@ -463,6 +510,20 @@ def build_worker_specs(
             parse_cpu_affinity(promotion_gpu.cpu_affinity)
             if promotion_gpu is not None and promotion_gpu.cpu_affinity is not None
             else None
+        )
+        promotion_environment = _worker_environment(
+            environment,
+            gpu_ids=(promotion.gpu_id,),
+            cpu_threads=promotion.cpu_threads,
+            cpu_affinity=promotion_affinity,
+            device=promotion_device,
+        )
+        promotion_environment.update(
+            _worker_failure_environment(
+                name=name,
+                role="arena",
+                failure_path=failure_path,
+            )
         )
         specs.append(
             WorkerSpec(
@@ -495,16 +556,11 @@ def build_worker_specs(
                         else ()
                     ),
                 ),
-                environment=_worker_environment(
-                    environment,
-                    gpu_ids=(promotion.gpu_id,),
-                    cpu_threads=promotion.cpu_threads,
-                    cpu_affinity=promotion_affinity,
-                    device=promotion_device,
-                ),
+                environment=promotion_environment,
                 heartbeat_path=directories.status / f"{name}.heartbeat.json",
                 metrics_path=directories.metrics / f"{name}.jsonl",
                 log_path=directories.logs / f"{name}.log",
+                failure_path=failure_path,
                 cpu_affinity=promotion_affinity,
             )
         )
@@ -543,6 +599,19 @@ def _worker_environment(
     return output
 
 
+def _worker_failure_environment(
+    *,
+    name: str,
+    role: str,
+    failure_path: Path,
+) -> dict[str, str]:
+    return {
+        WORKER_FAILURE_PATH_ENV: str(failure_path),
+        WORKER_NAME_ENV: name,
+        WORKER_ROLE_ENV: role,
+    }
+
+
 class Coordinator:
     def __init__(
         self,
@@ -553,6 +622,7 @@ class Coordinator:
         process_factory: ProcessFactory = subprocess.Popen,
         clock: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
+        random_fraction: Callable[[], float] = random.random,
         hardware_health_probe: HardwareHealthProbe | None = None,
         hardware_health_interval_seconds: float = HARDWARE_HEALTH_INTERVAL_SECONDS,
     ) -> None:
@@ -566,6 +636,7 @@ class Coordinator:
         self.process_factory = process_factory
         self.clock = clock
         self.sleep = sleep
+        self.random_fraction = random_fraction
         self.hardware_health_probe = hardware_health_probe
         self.hardware_health_interval_seconds = hardware_health_interval_seconds
         self.next_hardware_health_at = 0.0
@@ -575,6 +646,8 @@ class Coordinator:
         self.lock = CoordinatorLock(directories.root / "coordinator.lock")
         self.metrics_path = directories.metrics / "coordinator.jsonl"
         self.status_path = directories.status / "coordinator.json"
+        self.fatal_path = directories.status / "fatal.json"
+        self.terminal_failure: dict[str, object] | None = None
         self.stopping = False
         self.draining = False
         self.drain_deadline = 0.0
@@ -620,30 +693,64 @@ class Coordinator:
     ) -> int:
         notifier = SystemdNotifier()
         self.directories.create()
-        validate_autonomous_run_root(self.experiment, self.directories)
         self.lock.acquire()
         exit_code = 0
         cycles = 0
         try:
-            identity = load_or_create_run_identity(
-                self.directories.run_identity,
-                requested_run_id=self.experiment.orchestration.run_id,
-            )
-            ensure_autonomous_provenance(
-                self.experiment,
-                self.directories,
-                identity,
-            )
+            self.fatal_path.unlink(missing_ok=True)
+            try:
+                validate_autonomous_run_root(self.experiment, self.directories)
+                identity = load_or_create_run_identity(
+                    self.directories.run_identity,
+                    requested_run_id=self.experiment.orchestration.run_id,
+                )
+                ensure_autonomous_provenance(
+                    self.experiment,
+                    self.directories,
+                    identity,
+                )
+            except ValueError as error:
+                self._record_terminal_failure(
+                    failure_class=FailureClass.FATAL,
+                    reason=str(error),
+                    exception_type=type(error).__name__,
+                    worker=None,
+                    worker_exit_code=FATAL_WORKER_EXIT_CODE,
+                    coordinator_exit_code=FATAL_WORKER_EXIT_CODE,
+                    terminal_reason="coordinator_startup_validation",
+                )
+                return FATAL_WORKER_EXIT_CODE
             if self._hardware_health_failed(self.clock(), force=True):
+                self._record_terminal_failure(
+                    failure_class=FailureClass.FATAL,
+                    reason=self.hardware_failure_reason or "GPU health gate failed",
+                    exception_type=None,
+                    worker=None,
+                    worker_exit_code=HARDWARE_HEALTH_EXIT_CODE,
+                    coordinator_exit_code=HARDWARE_HEALTH_EXIT_CODE,
+                    terminal_reason="hardware_health_failure",
+                )
                 return HARDWARE_HEALTH_EXIT_CODE
             if stop_requested():
                 return 0
+            exhausted = False
             for worker in self.workers.values():
-                self._start_or_schedule(worker)
+                exhausted = self._start_or_schedule(worker) or exhausted
+            if exhausted:
+                return self._terminal_exit_code()
             notifier.ready("StarTrain coordinator is running")
             while not stop_requested():
                 now = self.clock()
                 if self._hardware_health_failed(now):
+                    self._record_terminal_failure(
+                        failure_class=FailureClass.FATAL,
+                        reason=self.hardware_failure_reason or "GPU health gate failed",
+                        exception_type=None,
+                        worker=None,
+                        worker_exit_code=HARDWARE_HEALTH_EXIT_CODE,
+                        coordinator_exit_code=HARDWARE_HEALTH_EXIT_CODE,
+                        terminal_reason="hardware_health_failure",
+                    )
                     exit_code = HARDWARE_HEALTH_EXIT_CODE
                     break
                 self._reconcile_pause_lease(now)
@@ -653,9 +760,11 @@ class Coordinator:
                 exhausted = self.pause_failed or exhausted
                 self._write_status()
                 notifier.watchdog(
-                    "StarTrain coordinator healthy"
-                    if not exhausted
-                    else "StarTrain coordinator restarting after worker failure"
+                    (
+                        "StarTrain coordinator healthy"
+                        if not exhausted
+                        else "StarTrain coordinator stopping after worker failure"
+                    )
                 )
                 if self.draining and self._drain_complete():
                     exit_code = 0
@@ -665,7 +774,7 @@ class Coordinator:
                     self._event_drain_timeout()
                     break
                 if exhausted:
-                    exit_code = 1
+                    exit_code = self._terminal_exit_code()
                     break
                 cycles += 1
                 if max_monitor_cycles is not None and cycles >= max_monitor_cycles:
@@ -674,6 +783,17 @@ class Coordinator:
                     self.experiment.orchestration.shutdown.monitor_interval_seconds
                 )
             return exit_code
+        except ValueError as error:
+            self._record_terminal_failure(
+                failure_class=FailureClass.FATAL,
+                reason=str(error),
+                exception_type=type(error).__name__,
+                worker=None,
+                worker_exit_code=FATAL_WORKER_EXIT_CODE,
+                coordinator_exit_code=FATAL_WORKER_EXIT_CODE,
+                terminal_reason="coordinator_state_validation",
+            )
+            return FATAL_WORKER_EXIT_CODE
         finally:
             notifier.stopping("StarTrain coordinator is stopping")
             self.stopping = True
@@ -712,6 +832,7 @@ class Coordinator:
                 "schema_version": 1,
                 "timestamp_ns": time.time_ns(),
                 "event": "hardware_health_failure",
+                "failure_class": FailureClass.FATAL.value,
                 "reason": reason,
                 "report": report,
             },
@@ -781,21 +902,28 @@ class Coordinator:
                 if self._learner_completion_identity() is not None:
                     worker.state = "completed"
                     worker.last_exit_code = code
-                    self._close_worker_process(worker)
+                    if not self._reap_worker_process_group(worker):
+                        return self._process_group_cleanup_failed(
+                            worker,
+                            reason="learner completion left a live process group",
+                        )
                     self._event("worker_completed", worker, exit_code=code)
                     self._begin_drain(now)
                     return False
-                self._schedule_restart(worker, code=1, now=now)
                 worker.failure_reason = "learner exited without completion marker"
-                return False
+                return self._handle_worker_exit(worker, code=1, now=now)
             if worker.state == "draining" or (
                 self.draining and worker.spec.role == "actor"
             ):
                 worker.state = "drained"
                 worker.last_exit_code = code
-                self._close_worker_process(worker)
+                if not self._reap_worker_process_group(worker):
+                    return self._process_group_cleanup_failed(
+                        worker,
+                        reason="drained worker left a live process group",
+                    )
                 return False
-            self._schedule_restart(worker, code=code, now=now)
+            return self._handle_worker_exit(worker, code=code, now=now)
         elif worker.state in ("pause_terminating", "lease_terminating") and (
             now >= worker.termination_deadline
         ):
@@ -817,8 +945,8 @@ class Coordinator:
         elif worker.state in ("pause_killing", "lease_killing") and (
             now >= worker.termination_deadline
         ):
-            worker.state = "exhausted"
             worker.failure_reason = "pause participant ignored SIGKILL"
+            worker.failure_class = FailureClass.TRANSIENT
             self._fail_pause_lease(worker.failure_reason)
             return True
         elif worker.state == "terminating" and now >= worker.termination_deadline:
@@ -829,23 +957,20 @@ class Coordinator:
                 now + self.experiment.orchestration.shutdown.kill_grace_seconds
             )
         elif worker.state == "killing" and now >= worker.termination_deadline:
-            worker.state = "exhausted"
             worker.failure_reason = "worker ignored SIGKILL"
-            return True
+            worker.failure_class = FailureClass.TRANSIENT
+            return self._exhaust_worker(
+                worker,
+                terminal_reason="worker_ignored_sigkill",
+            )
 
         if worker.state == "backoff" and now >= worker.next_start_at:
             if self.draining and worker.spec.role == "actor":
                 worker.state = "drained"
             elif worker is self.pause_owner and self.pause_lease is not None:
                 return False
-            elif (
-                worker.restart_count
-                > self.experiment.orchestration.restart.max_restarts
-            ):
-                worker.state = "exhausted"
-                return True
             else:
-                self._start_or_schedule(worker)
+                return self._start_or_schedule(worker)
         return False
 
     def _reconcile_pause_lease(self, now: float) -> None:
@@ -1031,7 +1156,9 @@ class Coordinator:
             return
         if code is not None:
             target.last_exit_code = code
-        self._close_worker_process(target)
+        if not self._reap_worker_process_group(target):
+            self._fail_pause_lease("shared worker process group could not be reaped")
+            return
         target.state = "paused"
         lease.target_reaped = True
         self._mark_pause_ready(lease)
@@ -1040,9 +1167,13 @@ class Coordinator:
         assert self.pause_target is not None
         target = self.pause_target
         if not target.live:
+            if not self._reap_worker_process_group(target):
+                self._fail_pause_lease(
+                    "paused learner process group could not be reaped"
+                )
+                return
             lease.target_reaped = True
             target.state = "paused"
-            self._close_worker_process(target)
             self._mark_pause_ready(lease)
             return
         try:
@@ -1100,7 +1231,9 @@ class Coordinator:
         assert self.pause_lease is not None
         lease = self.pause_lease
         worker.last_exit_code = code
-        self._close_worker_process(worker)
+        if not self._reap_worker_process_group(worker):
+            self._fail_pause_lease("pause target process group could not be reaped")
+            return
         lease.target_reaped = True
         learner_completed = (
             worker.spec.role == "learner"
@@ -1183,7 +1316,8 @@ class Coordinator:
             exit_code=code,
             reason=lease.failure_reason,
         )
-        self._schedule_restart(worker, code=code, now=now)
+        if self._handle_worker_exit(worker, code=code, now=now):
+            self._fail_pause_lease(lease.failure_reason)
         self._finish_pause_release(now)
 
     def _finish_pause_release(self, now: float) -> None:
@@ -1270,6 +1404,19 @@ class Coordinator:
                 token=lease.token,
                 reason=reason,
             )
+        self._record_terminal_failure(
+            failure_class=FailureClass.TRANSIENT,
+            reason=reason,
+            exception_type=None,
+            worker=self.pause_target,
+            worker_exit_code=(
+                self.pause_target.last_exit_code
+                if self.pause_target is not None
+                else None
+            ),
+            coordinator_exit_code=1,
+            terminal_reason="pause_lease_failed",
+        )
 
     def _write_pause_ack(
         self,
@@ -1309,15 +1456,70 @@ class Coordinator:
     @staticmethod
     def _close_worker_process(worker: ManagedWorker) -> None:
         worker.process = None
+        worker.process_group_id = None
         if worker.log_stream is not None:
             worker.log_stream.close()
             worker.log_stream = None
 
+    def _reap_worker_process_group(self, worker: ManagedWorker) -> bool:
+        """Reap the leader and remove every child in its isolated session."""
+
+        process = worker.process
+        if process is None:
+            self._close_worker_process(worker)
+            return True
+        if not isinstance(process, subprocess.Popen):
+            self._close_worker_process(worker)
+            return True
+
+        pid = process.pid
+        process_group_id = worker.process_group_id or pid
+        try:
+            process.wait(timeout=0)
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+        try:
+            os.killpg(process_group_id, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except PermissionError:
+            return False
+
+        deadline = (
+            self.clock() + self.experiment.orchestration.shutdown.kill_grace_seconds
+        )
+        while self._process_group_exists(process_group_id):
+            remaining = deadline - self.clock()
+            if remaining <= 0:
+                return False
+            self.sleep(min(0.05, remaining))
+        self._event(
+            "worker_process_group_reaped",
+            worker,
+            pid=pid,
+            process_group_id=process_group_id,
+        )
+        self._close_worker_process(worker)
+        return True
+
+    @staticmethod
+    def _process_group_exists(process_group_id: int) -> bool:
+        try:
+            os.killpg(process_group_id, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        return True
+
     def _start(self, worker: ManagedWorker) -> None:
-        if worker.live:
-            raise RuntimeError(f"refusing to duplicate live worker {worker.spec.name}")
+        if worker.process is not None:
+            raise RuntimeError(
+                f"worker {worker.spec.name} was not reaped before restart"
+            )
         if worker.log_stream is not None:
             worker.log_stream.close()
+        worker.spec.failure_path.unlink(missing_ok=True)
         worker.spec.log_path.parent.mkdir(parents=True, exist_ok=True)
         worker.log_stream = worker.spec.log_path.open(
             "a", encoding="utf-8", buffering=1
@@ -1342,16 +1544,20 @@ class Coordinator:
             start_new_session=True,
         )
         worker.process = process
+        worker.process_group_id = process.pid
+        worker.last_pid = process.pid
         worker.started_at = self.clock()
         worker.state = "running"
         worker.last_exit_code = None
         worker.failure_reason = None
+        worker.failure_class = None
+        worker.failure_exit_code = None
         worker.termination_deadline = 0.0
         worker.last_progress = None
         worker.last_progress_at = worker.started_at
         self._event("worker_started", worker)
 
-    def _start_or_schedule(self, worker: ManagedWorker) -> None:
+    def _start_or_schedule(self, worker: ManagedWorker) -> bool:
         try:
             self._start(worker)
         except OSError as error:
@@ -1359,52 +1565,338 @@ class Coordinator:
                 worker.log_stream.close()
                 worker.log_stream = None
             worker.process = None
+            worker.process_group_id = None
             worker.restart_count += 1
+            worker.failure_class = FailureClass.TRANSIENT
+            worker.failure_reason = str(error)
+            worker.failure_exit_code = None
+            restart = self.experiment.orchestration.restart
+            if worker.restart_count > restart.max_restarts:
+                self._event(
+                    "worker_spawn_failed",
+                    worker,
+                    failure_class=FailureClass.TRANSIENT.value,
+                    reason=str(error),
+                    restart_in_seconds=None,
+                )
+                return self._exhaust_worker(
+                    worker,
+                    terminal_reason="restart_budget_exhausted",
+                )
             worker.state = "backoff"
-            worker.failure_reason = f"spawn failed: {error}"
-            backoff = self._restart_backoff(worker.restart_count)
+            backoff = self._restart_backoff(worker)
             worker.next_start_at = self.clock() + backoff
             self._event(
                 "worker_spawn_failed",
                 worker,
-                error=str(error),
+                failure_class=FailureClass.TRANSIENT.value,
+                reason=str(error),
                 restart_in_seconds=backoff,
             )
+        return False
+
+    def _handle_worker_exit(
+        self,
+        worker: ManagedWorker,
+        *,
+        code: int,
+        now: float,
+    ) -> bool:
+        failure = self._read_worker_failure(worker, code=code)
+        worker.last_exit_code = code
+        worker.failure_class = failure.failure_class
+        worker.failure_reason = failure.reason
+        worker.failure_exit_code = failure.exit_code
+        if failure.failure_class is FailureClass.FATAL:
+            reaped = self._reap_worker_process_group(worker)
+            worker.state = "fatal"
+            self._event(
+                "worker_exited",
+                worker,
+                exit_code=code,
+                failure_exit_code=failure.exit_code,
+                failure_class=failure.failure_class.value,
+                reason=failure.reason,
+                exception_type=failure.exception_type,
+                restart_in_seconds=None,
+                process_group_reaped=reaped,
+            )
+            self._record_terminal_failure(
+                failure_class=failure.failure_class,
+                reason=failure.reason,
+                exception_type=failure.exception_type,
+                worker=worker,
+                worker_exit_code=failure.exit_code,
+                coordinator_exit_code=FATAL_WORKER_EXIT_CODE,
+                terminal_reason="fatal_worker_failure",
+                details={
+                    "process_exit_code": code,
+                    "process_group_reaped": reaped,
+                },
+            )
+            return True
+        return self._schedule_restart(
+            worker,
+            code=code,
+            now=now,
+            failure=failure,
+        )
 
     def _schedule_restart(
-        self, worker: ManagedWorker, *, code: int, now: float
-    ) -> None:
+        self,
+        worker: ManagedWorker,
+        *,
+        code: int,
+        now: float,
+        failure: WorkerFailure,
+    ) -> bool:
         if self.draining and worker.spec.role == "actor":
             worker.last_exit_code = code
             worker.state = "drained"
-            self._close_worker_process(worker)
-            self._event("worker_drained", worker, exit_code=code)
-            return
+            if not self._reap_worker_process_group(worker):
+                return self._process_group_cleanup_failed(
+                    worker,
+                    reason="drained worker process group remained live",
+                    original_reason=failure.reason,
+                )
+            self._event(
+                "worker_drained",
+                worker,
+                exit_code=code,
+                failure_exit_code=failure.exit_code,
+                failure_class=failure.failure_class.value,
+                reason=failure.reason,
+            )
+            return False
         runtime = max(0.0, now - worker.started_at)
         restart = self.experiment.orchestration.restart
         if runtime >= restart.stable_reset_seconds:
             worker.restart_count = 0
         worker.restart_count += 1
         worker.last_exit_code = code
+        worker.failure_class = failure.failure_class
+        worker.failure_reason = failure.reason
+        if not self._reap_worker_process_group(worker):
+            return self._process_group_cleanup_failed(
+                worker,
+                reason="stale worker process group remained live",
+                original_reason=failure.reason,
+            )
+        if worker.restart_count > restart.max_restarts:
+            self._event(
+                "worker_exited",
+                worker,
+                exit_code=code,
+                failure_exit_code=failure.exit_code,
+                failure_class=failure.failure_class.value,
+                reason=failure.reason,
+                exception_type=failure.exception_type,
+                restart_in_seconds=None,
+            )
+            return self._exhaust_worker(
+                worker,
+                terminal_reason="restart_budget_exhausted",
+            )
         worker.state = "backoff"
-        worker.process = None
-        if worker.log_stream is not None:
-            worker.log_stream.close()
-            worker.log_stream = None
-        backoff = self._restart_backoff(worker.restart_count)
+        backoff = self._restart_backoff(worker)
         worker.next_start_at = now + backoff
         self._event(
             "worker_exited",
             worker,
             exit_code=code,
+            failure_exit_code=failure.exit_code,
+            failure_class=failure.failure_class.value,
+            reason=failure.reason,
+            exception_type=failure.exception_type,
             restart_in_seconds=backoff,
         )
+        return False
 
-    def _restart_backoff(self, restart_count: int) -> float:
+    def _read_worker_failure(
+        self, worker: ManagedWorker, *, code: int
+    ) -> WorkerFailure:
+        failure_class = (
+            FailureClass.FATAL
+            if code == FATAL_WORKER_EXIT_CODE
+            else FailureClass.TRANSIENT
+        )
+        reason = worker.failure_reason or (
+            f"worker terminated by signal {-code}"
+            if code < 0
+            else f"worker exited with code {code}"
+        )
+        exception_type = None
+        recorded_exit_code = code
+        try:
+            payload = json.loads(worker.spec.failure_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            payload = None
+        if (
+            isinstance(payload, dict)
+            and payload.get("format") == "startrain.worker-failure"
+            and payload.get("schema_version") == 1
+        ):
+            try:
+                failure_class = FailureClass(payload.get("failure_class"))
+            except (TypeError, ValueError):
+                pass
+            recorded_reason = payload.get("reason")
+            if isinstance(recorded_reason, str):
+                reason = recorded_reason
+            recorded_type = payload.get("exception_type")
+            if isinstance(recorded_type, str):
+                exception_type = recorded_type
+            candidate_exit_code = payload.get("exit_code")
+            if isinstance(candidate_exit_code, int) and not isinstance(
+                candidate_exit_code, bool
+            ):
+                recorded_exit_code = candidate_exit_code
+        return WorkerFailure(
+            failure_class=failure_class,
+            reason=reason,
+            exit_code=recorded_exit_code,
+            exception_type=exception_type,
+        )
+
+    def _restart_backoff(self, worker: ManagedWorker) -> float:
         restart = self.experiment.orchestration.restart
-        return min(
+        base = min(
             restart.maximum_backoff_seconds,
-            restart.initial_backoff_seconds * (2 ** (restart_count - 1)),
+            restart.initial_backoff_seconds * (2 ** (worker.restart_count - 1)),
+        )
+        if worker.spec.role != "learner":
+            return base
+        fraction = float(self.random_fraction())
+        if not 0.0 <= fraction <= 1.0:
+            fraction = 0.5
+        jittered = base * (0.8 + 0.4 * fraction)
+        return min(restart.maximum_backoff_seconds, jittered)
+
+    def _process_group_cleanup_failed(
+        self,
+        worker: ManagedWorker,
+        *,
+        reason: str,
+        original_reason: str | None = None,
+    ) -> bool:
+        worker.state = "exhausted"
+        worker.failure_class = worker.failure_class or FailureClass.TRANSIENT
+        worker.failure_reason = original_reason or worker.failure_reason or reason
+        self._event(
+            "worker_process_group_cleanup_failed",
+            worker,
+            failure_class=worker.failure_class.value,
+            reason=worker.failure_reason,
+            cleanup_reason=reason,
+            process_group_id=worker.process_group_id,
+        )
+        self._record_terminal_failure(
+            failure_class=worker.failure_class,
+            reason=worker.failure_reason,
+            exception_type=None,
+            worker=worker,
+            worker_exit_code=worker.failure_exit_code or worker.last_exit_code,
+            coordinator_exit_code=1,
+            terminal_reason="process_group_cleanup_failed",
+            details={
+                "cleanup_reason": reason,
+                "process_group_id": worker.process_group_id,
+            },
+        )
+        return True
+
+    def _exhaust_worker(
+        self,
+        worker: ManagedWorker,
+        *,
+        terminal_reason: str,
+    ) -> bool:
+        worker.state = "exhausted"
+        worker.failure_class = worker.failure_class or FailureClass.TRANSIENT
+        worker.failure_reason = (
+            worker.failure_reason or "worker restart budget exhausted"
+        )
+        self._event(
+            "worker_restart_exhausted",
+            worker,
+            failure_class=worker.failure_class.value,
+            reason=worker.failure_reason,
+            last_exit_code=worker.last_exit_code,
+            max_restarts=self.experiment.orchestration.restart.max_restarts,
+        )
+        self._record_terminal_failure(
+            failure_class=worker.failure_class,
+            reason=worker.failure_reason,
+            exception_type=None,
+            worker=worker,
+            worker_exit_code=worker.failure_exit_code or worker.last_exit_code,
+            coordinator_exit_code=1,
+            terminal_reason=terminal_reason,
+        )
+        return True
+
+    def _record_terminal_failure(
+        self,
+        *,
+        failure_class: FailureClass,
+        reason: str,
+        exception_type: str | None,
+        worker: ManagedWorker | None,
+        worker_exit_code: int | None,
+        coordinator_exit_code: int,
+        terminal_reason: str,
+        details: Mapping[str, object] | None = None,
+    ) -> None:
+        if self.terminal_failure is not None:
+            return
+        payload: dict[str, object] = {
+            "format": "startrain.coordinator-fatal",
+            "schema_version": 1,
+            "timestamp_ns": time.time_ns(),
+            "coordinator_pid": os.getpid(),
+            "terminal_reason": terminal_reason,
+            "failure_class": failure_class.value,
+            "reason": reason,
+            "exception_type": exception_type,
+            "worker_exit_code": worker_exit_code,
+            "coordinator_exit_code": coordinator_exit_code,
+            "worker": worker.spec.name if worker is not None else None,
+            "role": worker.spec.role if worker is not None else None,
+            "pid": worker.last_pid if worker is not None else None,
+            "restart_count": worker.restart_count if worker is not None else 0,
+        }
+        if details:
+            payload.update(details)
+        self.terminal_failure = payload
+        atomic_json(self.fatal_path, payload)
+        append_jsonl(
+            self.metrics_path,
+            {
+                "schema_version": 1,
+                "timestamp_ns": time.time_ns(),
+                "event": "coordinator_terminal_failure",
+                "terminal_reason": terminal_reason,
+                "failure_class": failure_class.value,
+                "reason": reason,
+                "exception_type": exception_type,
+                "worker": worker.spec.name if worker is not None else None,
+                "role": worker.spec.role if worker is not None else None,
+                "worker_exit_code": worker_exit_code,
+                "coordinator_exit_code": coordinator_exit_code,
+                "restart_count": worker.restart_count if worker is not None else 0,
+                **dict(details or {}),
+            },
+            durable=True,
+        )
+
+    def _terminal_exit_code(self) -> int:
+        if self.terminal_failure is None:
+            return 1
+        exit_code = self.terminal_failure.get("coordinator_exit_code")
+        return (
+            exit_code
+            if isinstance(exit_code, int) and not isinstance(exit_code, bool)
+            else 1
         )
 
     def _heartbeat_failure(self, worker: ManagedWorker, now: float) -> str | None:
@@ -1558,10 +2050,13 @@ class Coordinator:
             timeout=self.experiment.orchestration.shutdown.kill_grace_seconds,
         )
         for worker in self.workers.values():
+            reaped = worker.process is None
             if worker.process is not None:
                 worker.last_exit_code = worker.process.poll()
-            if worker.state not in ("completed", "exhausted"):
-                worker.state = "stopped" if not worker.live else "unkillable"
+                if not worker.live:
+                    reaped = self._reap_worker_process_group(worker)
+            if worker.state not in ("completed", "exhausted", "fatal"):
+                worker.state = "stopped" if reaped else "unkillable"
             if worker.log_stream is not None:
                 worker.log_stream.close()
                 worker.log_stream = None
@@ -1583,7 +2078,11 @@ class Coordinator:
                 "worker": worker.spec.name,
                 "role": worker.spec.role,
                 "gpu_ids": list(worker.spec.gpu_ids),
-                "pid": worker.process.pid if worker.process is not None else None,
+                "pid": (
+                    worker.process.pid
+                    if worker.process is not None
+                    else worker.last_pid
+                ),
                 "restart_count": worker.restart_count,
                 **details,
             },
@@ -1601,6 +2100,7 @@ class Coordinator:
                 "draining": self.draining,
                 "hardware_health": self.hardware_health,
                 "hardware_failure_reason": self.hardware_failure_reason,
+                "failure": self.terminal_failure,
                 "pause_sharing": (
                     {
                         "token": self.pause_lease.token,
@@ -1637,7 +2137,13 @@ class Coordinator:
                         "state": worker.state,
                         "restart_count": worker.restart_count,
                         "last_exit_code": worker.last_exit_code,
+                        "failure_exit_code": worker.failure_exit_code,
                         "failure_reason": worker.failure_reason,
+                        "failure_class": (
+                            worker.failure_class.value
+                            if worker.failure_class is not None
+                            else None
+                        ),
                         "last_progress": worker.last_progress,
                         "heartbeat": str(worker.spec.heartbeat_path),
                     }
@@ -1744,46 +2250,92 @@ def orchestrate_main(argv: list[str] | None = None) -> None:
     parser.add_argument("--python", default=sys.executable)
     arguments = parser.parse_args(argv)
 
-    experiment = load_config(arguments.config)
-    directories = RunDirectories.from_experiment(experiment)
-    worker_config = materialize_worker_config(arguments.config, experiment, directories)
-    specs = build_worker_specs(
-        experiment,
-        config_path=worker_config,
-        directories=directories,
-        python_executable=arguments.python,
-    )
-    stop = SignalLatch()
-    stop.install()
-    worker_device = normalize_device_string(experiment.orchestration.device)
-    promotion_device = normalize_device_string(
-        experiment.orchestration.promotion.device
-    )
-    expected_gpu_indices: set[int] = set()
-    if worker_device.startswith("cuda"):
-        expected_gpu_indices.update(gpu.gpu_id for gpu in experiment.orchestration.gpus)
-    if experiment.orchestration.promotion.enabled and promotion_device.startswith(
-        "cuda"
-    ):
-        expected_gpu_indices.add(experiment.orchestration.promotion.gpu_id)
-    health = experiment.orchestration.hardware_health
-    exit_code = Coordinator(
-        experiment=experiment,
-        specs=specs,
-        directories=directories,
-        hardware_health_probe=(
-            (
-                lambda: query_gpu_health(
-                    expected_indices=sorted(expected_gpu_indices),
-                    require_gpu_model=health.require_gpu_model,
-                    fail_on_aggregate_uncorrectable=(
-                        health.fail_on_aggregate_uncorrectable
-                    ),
-                )
+    directories: RunDirectories | None = None
+    try:
+        experiment = load_config(arguments.config)
+        directories = RunDirectories.from_experiment(experiment)
+        worker_config = materialize_worker_config(
+            arguments.config, experiment, directories
+        )
+        specs = build_worker_specs(
+            experiment,
+            config_path=worker_config,
+            directories=directories,
+            python_executable=arguments.python,
+        )
+        stop = SignalLatch()
+        stop.install()
+        worker_device = normalize_device_string(experiment.orchestration.device)
+        promotion_device = normalize_device_string(
+            experiment.orchestration.promotion.device
+        )
+        expected_gpu_indices: set[int] = set()
+        if worker_device.startswith("cuda"):
+            expected_gpu_indices.update(
+                gpu.gpu_id for gpu in experiment.orchestration.gpus
             )
-            if expected_gpu_indices
-            else None
-        ),
-    ).run(stop_requested=stop.is_set)
+        if experiment.orchestration.promotion.enabled and promotion_device.startswith(
+            "cuda"
+        ):
+            expected_gpu_indices.add(experiment.orchestration.promotion.gpu_id)
+        health = experiment.orchestration.hardware_health
+        exit_code = Coordinator(
+            experiment=experiment,
+            specs=specs,
+            directories=directories,
+            hardware_health_probe=(
+                (
+                    lambda: query_gpu_health(
+                        expected_indices=sorted(expected_gpu_indices),
+                        require_gpu_model=health.require_gpu_model,
+                        fail_on_aggregate_uncorrectable=(
+                            health.fail_on_aggregate_uncorrectable
+                        ),
+                    )
+                )
+                if expected_gpu_indices
+                else None
+            ),
+        ).run(stop_requested=stop.is_set)
+    except ValueError as error:
+        if directories is not None:
+            directories.create()
+            payload: dict[str, object] = {
+                "format": "startrain.coordinator-fatal",
+                "schema_version": 1,
+                "timestamp_ns": time.time_ns(),
+                "coordinator_pid": os.getpid(),
+                "terminal_reason": "orchestrator_configuration",
+                "failure_class": FailureClass.FATAL.value,
+                "reason": str(error),
+                "exception_type": type(error).__name__,
+                "worker_exit_code": None,
+                "coordinator_exit_code": FATAL_WORKER_EXIT_CODE,
+                "worker": None,
+                "role": None,
+                "pid": None,
+                "restart_count": 0,
+            }
+            atomic_json(directories.status / "fatal.json", payload)
+            append_jsonl(
+                directories.metrics / "coordinator.jsonl",
+                {
+                    "schema_version": 1,
+                    "timestamp_ns": time.time_ns(),
+                    "event": "coordinator_terminal_failure",
+                    "terminal_reason": "orchestrator_configuration",
+                    "failure_class": FailureClass.FATAL.value,
+                    "reason": str(error),
+                    "exception_type": type(error).__name__,
+                    "worker": None,
+                    "role": None,
+                    "worker_exit_code": None,
+                    "coordinator_exit_code": FATAL_WORKER_EXIT_CODE,
+                    "restart_count": 0,
+                },
+                durable=True,
+            )
+        print(f"{type(error).__name__}: {error}", file=sys.stderr)
+        raise SystemExit(FATAL_WORKER_EXIT_CODE) from None
     if exit_code:
         raise SystemExit(exit_code)

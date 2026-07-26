@@ -16,6 +16,7 @@ from startrain.checkpoint import (
     ExponentialMovingAverage,
     load_model_manifest,
     save_checkpoint,
+    write_model_pointer,
 )
 from startrain.config import (
     CurriculumStage,
@@ -64,7 +65,7 @@ from startrain.replay_store import (
     ReplayStore,
     ShardRecord,
 )
-from startrain.runtime import RunIdentity
+from startrain.runtime import RunIdentity, atomic_json
 from startrain.scoring import PlayerScore, ScoreResult, score_position
 from startrain.selfplay import (
     SelfPlayActor,
@@ -714,6 +715,44 @@ def test_legacy_replay_counter_migration_fails_closed_after_unknown_gc(
         learner.examples_consumed = 0
         with pytest.raises(ValueError, match="complete committed-sample history"):
             learner._utd_step_budget()
+
+
+def test_legacy_replay_counter_reconciles_only_with_complete_shard_proof(
+    tmp_path,
+) -> None:
+    identity = run_identity(tmp_path)
+    root = tmp_path / "provable-legacy-counter"
+    with ReplayStore(root) as store:
+        generation = store.lease_generation(identity, "actor-test")
+        for index in range(2):
+            append_replay(
+                store,
+                [
+                    make_replay_sample(
+                        identity=identity,
+                        generation=generation,
+                        game_id=f"provable-legacy-{index}",
+                    )
+                ],
+                identity,
+                model_step=0,
+                generation=generation,
+            )
+        store.connection.execute("DROP TABLE run_counters")
+
+    with ReplayStore(root) as migrated:
+        assert (
+            migrated.total_committed_sample_count(
+                run_id=identity.run_id,
+                generation_family=identity.generation_family,
+            )
+            == 2
+        )
+        assert migrated.committed_sample_history_is_complete(
+            run_id=identity.run_id,
+            generation_family=identity.generation_family,
+        )
+        assert migrated.reconciliation_metrics["legacy_history_reconciled"] == 1
 
 
 def tiny_model() -> GraphResTNet:
@@ -1658,6 +1697,239 @@ def test_prospective_fractional_utd_state_and_target_mismatch_fail_closed(
         assert override._utd_step_budget() == 2
 
 
+def test_checkpoint_utd_segment_cannot_start_after_checkpoint_examples(
+    tmp_path,
+) -> None:
+    identity = run_identity(tmp_path)
+    with ReplayStore(tmp_path / "invalid-utd-replay") as store:
+        learner = make_test_learner(
+            store,
+            identity,
+            tmp_path / "invalid-utd-learner",
+            learner_config=LearnerConfig(
+                target_updates_per_new_sample=1.0,
+                device="cpu",
+            ),
+        )
+        checkpoint = save_checkpoint(
+            tmp_path / "invalid-utd.pt",
+            model=learner.model,
+            optimizer=learner.optimizer,
+            scheduler=learner.scheduler,
+            ema=learner.ema,
+            step=10,
+            config=learner.serialized_config,
+            extra={
+                "run_id": identity.run_id,
+                "generation_family": identity.generation_family,
+                "examples_consumed": 10,
+                "utd_segment": {
+                    "schema_version": 1,
+                    "run_id": identity.run_id,
+                    "generation_family": identity.generation_family,
+                    "target_updates_per_new_sample": 1.0,
+                    "baseline_examples_consumed": 11,
+                    "baseline_committed_replay_samples": 0,
+                },
+            },
+        )
+        before = {
+            name: value.detach().clone()
+            for name, value in learner.model.state_dict().items()
+        }
+
+        with pytest.raises(ValueError, match="precedes its UTD segment baseline"):
+            learner.resume(checkpoint)
+
+        assert learner.step == 0
+        assert learner.examples_consumed == 0
+        for name, value in learner.model.state_dict().items():
+            torch.testing.assert_close(value, before[name])
+
+
+def test_rewind_transaction_rebases_utd_and_cadence_and_recovers_partial_apply(
+    tmp_path,
+) -> None:
+    identity = run_identity(tmp_path)
+    output = tmp_path / "rewind-learner"
+    with ReplayStore(tmp_path / "rewind-replay") as store:
+        generation = store.lease_generation(identity, "actor-test")
+        append_replay(
+            store,
+            [
+                make_replay_sample(
+                    identity=identity,
+                    generation=generation,
+                    game_id=f"rewind-{index}",
+                )
+                for index in range(4)
+            ],
+            identity,
+            model_step=0,
+            generation=generation,
+        )
+        learner = make_test_learner(
+            store,
+            identity,
+            output,
+            learner_config=LearnerConfig(
+                target_updates_per_new_sample=1.0,
+                selfplay_snapshot_interval_examples=10,
+                device="cpu",
+            ),
+        )
+        learner.step = 50
+        learner.examples_consumed = 50
+        learner._rebase_state_after_rewind(
+            previous_step=100,
+            previous_examples=100,
+            reason="test_plateau_reset",
+        )
+
+        segment = json.loads((output / "utd-segment.json").read_text(encoding="utf-8"))
+        cadence = json.loads((output / "cadence.json").read_text(encoding="utf-8"))
+        rebase = json.loads((output / "state-rebase.json").read_text(encoding="utf-8"))
+        assert segment["baseline_examples_consumed"] == 50
+        assert segment["baseline_committed_replay_samples"] == 4
+        assert cadence["candidate_examples"] == cadence["selfplay_examples"] == 50
+        assert rebase["from_examples_consumed"] == 100
+        assert rebase["to_examples_consumed"] == 50
+        assert not (output / "state-rebase.pending.json").exists()
+        assert learner._utd_step_budget() == 0
+
+        (output / "utd-segment.json").write_text(
+            json.dumps({**segment, "baseline_examples_consumed": 99}),
+            encoding="utf-8",
+        )
+        (output / "cadence.json").write_text(
+            json.dumps(
+                {
+                    **cadence,
+                    "candidate_examples": 99,
+                    "selfplay_examples": 99,
+                }
+            ),
+            encoding="utf-8",
+        )
+        (output / "state-rebase.pending.json").write_text(
+            json.dumps(rebase),
+            encoding="utf-8",
+        )
+        learner._utd_segment_state = None
+        learner._last_candidate_examples = None
+        learner._last_selfplay_examples = None
+
+        learner._recover_pending_state_rebase()
+
+        assert (
+            json.loads((output / "utd-segment.json").read_text(encoding="utf-8"))
+            == segment
+        )
+        recovered_cadence = json.loads(
+            (output / "cadence.json").read_text(encoding="utf-8")
+        )
+        assert recovered_cadence["candidate_examples"] == 50
+        assert recovered_cadence["selfplay_examples"] == 50
+        assert not (output / "state-rebase.pending.json").exists()
+
+
+def test_plateau_reset_rebases_state_before_writing_recovery(
+    tmp_path,
+) -> None:
+    identity = run_identity(tmp_path)
+    output = tmp_path / "plateau-rebase-learner"
+    with ReplayStore(tmp_path / "plateau-rebase-replay") as store:
+        learner = make_test_learner(
+            store,
+            identity,
+            output,
+            learner_config=LearnerConfig(
+                target_updates_per_new_sample=1.0,
+                selfplay_snapshot_interval_examples=10,
+                recovery_interval_steps=10,
+                candidate_interval=10,
+                device="cpu",
+            ),
+        )
+        initial_segment = UTDSegmentState(
+            run_id=identity.run_id,
+            generation_family=identity.generation_family,
+            target_updates_per_new_sample=1.0,
+            baseline_examples_consumed=0,
+            baseline_committed_replay_samples=0,
+        )
+        atomic_json(output / "utd-segment.json", initial_segment.as_dict())
+        learner.step = 10
+        learner.examples_consumed = 10
+        champion = learner._publish()
+        write_model_pointer(
+            output / "champion.json",
+            champion,
+            role="champion",
+            promotion_result="bootstrap",
+        )
+
+        advanced_segment = UTDSegmentState(
+            run_id=identity.run_id,
+            generation_family=identity.generation_family,
+            target_updates_per_new_sample=1.0,
+            baseline_examples_consumed=15,
+            baseline_committed_replay_samples=0,
+        )
+        atomic_json(output / "utd-segment.json", advanced_segment.as_dict())
+        learner._utd_segment_state = advanced_segment
+        learner.step = 20
+        learner.examples_consumed = 20
+        candidate = learner._publish()
+        learner._last_candidate_examples = 20
+        learner._last_selfplay_examples = 20
+        learner._write_cadence_state()
+        learner.promotion_status_path = tmp_path / "arena" / "promotion-status.json"
+        learner._plateau_config = lambda: PlateauConfig(
+            enabled=True,
+            action="reset_from_champion",
+            reset_learning_rate_scale=0.5,
+        )
+        learner._rank_zero_plateau_action = lambda _configured: {
+            "kind": "reset",
+            "reset_reason": "terminal_rejection_streak",
+            "checkpoint": str(champion.checkpoint),
+            "sha256": champion.checkpoint_sha256,
+            "bytes": champion.checkpoint_bytes,
+            "candidate_identity": candidate.model_identity,
+            "candidate_step": candidate.model_step,
+            "champion_identity": champion.model_identity,
+            "champion_step": champion.model_step,
+        }
+        learner._broadcast_object = lambda value: value
+        learner._distributed_barrier = lambda: None
+
+        assert learner._plateau_control(
+            stop_requested=lambda: False,
+            progress=None,
+        )
+
+        assert learner.step == 10
+        assert learner.examples_consumed == 10
+        segment = json.loads((output / "utd-segment.json").read_text(encoding="utf-8"))
+        cadence = json.loads((output / "cadence.json").read_text(encoding="utf-8"))
+        assert segment["baseline_examples_consumed"] == 10
+        assert cadence["candidate_examples"] == cadence["selfplay_examples"] == 10
+        recovery_pointer = json.loads(
+            (output / "recovery.json").read_text(encoding="utf-8")
+        )
+        recovery_payload = torch.load(
+            output / recovery_pointer["checkpoint"],
+            map_location="cpu",
+            weights_only=True,
+        )
+        assert recovery_payload["extra"]["examples_consumed"] == 10
+        assert (
+            recovery_payload["extra"]["utd_segment"]["baseline_examples_consumed"] == 10
+        )
+        assert learner._utd_step_budget() == 0
+
+
 def test_learner_publishes_initial_ema_then_times_out_on_short_batch(
     tmp_path,
 ) -> None:
@@ -1760,6 +2032,18 @@ def test_decoupled_model_cadence_migrates_existing_run_without_reset(
         assert initial.model_step == 0
         learner.step = 18
         learner.examples_consumed = 18
+        learner.cadence_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "run_id": identity.run_id,
+                    "generation_family": identity.generation_family,
+                    "candidate_examples": 0,
+                    "selfplay_examples": None,
+                }
+            ),
+            encoding="utf-8",
+        )
 
         learner._load_cadence_state()
 
@@ -1771,6 +2055,17 @@ def test_decoupled_model_cadence_migrates_existing_run_without_reset(
             ).model_step
             == 0
         )
+        migrated_cadence = learner.cadence_path.read_bytes()
+        migrated_pointer = (
+            tmp_path / "cadence-learner" / "selfplay" / "candidate.json"
+        ).read_bytes()
+        learner._last_candidate_examples = None
+        learner._last_selfplay_examples = None
+        learner._load_cadence_state()
+        assert learner.cadence_path.read_bytes() == migrated_cadence
+        assert (
+            tmp_path / "cadence-learner" / "selfplay" / "candidate.json"
+        ).read_bytes() == migrated_pointer
 
         candidate, selfplay = learner._publish_due_models()
         assert candidate is not None and candidate.model_step == 18
@@ -1815,6 +2110,20 @@ def test_decoupled_model_cadence_migrates_existing_run_without_reset(
         learner._load_cadence_state()
         assert learner._last_candidate_examples == 23
         assert learner._last_selfplay_examples == 22
+
+
+def test_selfplay_snapshot_warmup_is_relative_to_training_segment() -> None:
+    learner = object.__new__(LearnerLoop)
+    learner.learner_config = LearnerConfig(
+        selfplay_snapshot_interval_examples=3,
+        selfplay_snapshot_warmup_examples=20,
+        selfplay_snapshot_warmup_interval_examples=1,
+    )
+    learner._segment_baseline_examples = 100
+    learner.examples_consumed = 119
+    assert learner._selfplay_snapshot_interval() == 1
+    learner.examples_consumed = 120
+    assert learner._selfplay_snapshot_interval() == 3
 
 
 def test_lazy_replay_sampler_is_unique_deterministic_and_homogeneous(

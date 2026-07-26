@@ -28,6 +28,7 @@ from .checkpoint import (
     ResumeCheckpoint,
     collect_model_garbage,
     collect_recovery_garbage,
+    inspect_checkpoint,
     load_checkpoint,
     load_model_manifest,
     save_checkpoint,
@@ -81,6 +82,10 @@ from .training import (
 
 UTD_SEGMENT_SCHEMA_VERSION = 1
 UTD_SEGMENT_FILENAME = "utd-segment.json"
+STATE_REBASE_FORMAT = "startrain.learner-state-rebase"
+STATE_REBASE_SCHEMA_VERSION = 1
+STATE_REBASE_FILENAME = "state-rebase.json"
+STATE_REBASE_PENDING_FILENAME = "state-rebase.pending.json"
 _UNSET = object()
 
 
@@ -871,6 +876,7 @@ class LearnerLoop:
         self._utd_segment_state: UTDSegmentState | None = None
         self._resume_utd_segment_state: UTDSegmentState | None = None
         self._resume_utd_target: object = _UNSET
+        self._segment_baseline_examples = 0
         self.publisher = ImmutableModelPublisher(output_root, run_identity)
         self.selfplay_publisher = (
             ImmutableModelPublisher(output_root / "selfplay", run_identity)
@@ -878,6 +884,8 @@ class LearnerLoop:
             else None
         )
         self.cadence_path = output_root / "cadence.json"
+        self.state_rebase_path = output_root / STATE_REBASE_FILENAME
+        self.state_rebase_pending_path = output_root / STATE_REBASE_PENDING_FILENAME
         self._last_candidate_examples: int | None = None
         self._last_selfplay_examples: int | None = None
         self.metrics = JSONLMetrics(output_root / "metrics.jsonl")
@@ -1001,19 +1009,64 @@ class LearnerLoop:
         self.step = int(metadata["step"])
         self.epoch = int(metadata["epoch"])
         self.examples_consumed = self._resume_examples_consumed(metadata)
+        self._segment_baseline_examples = self._checkpoint_segment_baseline(
+            metadata,
+            examples_consumed=self.examples_consumed,
+        )
         self._resume_utd_target = resume_utd_target
         self._resume_utd_segment_state = resume_utd_segment
         self._last_recovery_step = self.step
 
     def _validate_resume_metadata(self, metadata: Mapping[str, object]) -> None:
-        self._resume_examples_consumed(metadata)
-        self._checkpoint_utd_target(metadata)
+        examples_consumed = self._resume_examples_consumed(metadata)
+        self._checkpoint_segment_baseline(
+            metadata,
+            examples_consumed=examples_consumed,
+        )
+        checkpoint_target = self._checkpoint_utd_target(metadata)
         segment = self._checkpoint_utd_segment(metadata)
         if segment is not None and (
             segment.run_id != self.run_identity.run_id
             or segment.generation_family != self.run_identity.generation_family
         ):
             raise ValueError("checkpoint UTD segment run identity does not match")
+        if (
+            segment is not None
+            and checkpoint_target is not None
+            and segment.target_updates_per_new_sample != checkpoint_target
+        ):
+            raise ValueError("checkpoint UTD segment target does not match its profile")
+        if (
+            segment is not None
+            and segment.baseline_examples_consumed > examples_consumed
+        ):
+            raise ValueError(
+                "checkpoint examples_consumed precedes its UTD segment baseline"
+            )
+
+    @staticmethod
+    def _checkpoint_segment_baseline(
+        metadata: Mapping[str, object],
+        *,
+        examples_consumed: int,
+    ) -> int:
+        extra = metadata.get("extra")
+        training_segment = (
+            extra.get("training_segment") if isinstance(extra, Mapping) else None
+        )
+        if training_segment is None:
+            return 0
+        if not isinstance(training_segment, Mapping):
+            raise ValueError("checkpoint training segment must be a mapping")
+        baseline = training_segment.get("baseline_examples_consumed")
+        if (
+            isinstance(baseline, bool)
+            or not isinstance(baseline, int)
+            or baseline < 0
+            or baseline > examples_consumed
+        ):
+            raise ValueError("checkpoint training segment baseline is invalid")
+        return baseline
 
     @staticmethod
     def _checkpoint_utd_target(metadata: Mapping[str, object]) -> float | None:
@@ -1082,6 +1135,7 @@ class LearnerLoop:
             else (None if self.learner_config.unlimited else self.learner_config.steps)
         )
         completion_path = self.publisher.root / "learner-complete.json"
+        self._recover_pending_state_rebase()
         if self.learner_config.target_updates_per_new_sample is not None:
             self._ensure_utd_segment_state()
         if self.rank == 0 and (target is None or self.step < target):
@@ -1880,8 +1934,17 @@ class LearnerLoop:
                 )
             ):
                 raise ValueError("learner cadence counters are invalid")
+            if candidate_examples > self.examples_consumed or (
+                selfplay_examples is not None
+                and selfplay_examples > self.examples_consumed
+            ):
+                raise ValueError(
+                    "learner cadence counters are ahead of restored examples"
+                )
             self._last_candidate_examples = candidate_examples
             self._last_selfplay_examples = selfplay_examples
+            if self.selfplay_publisher is not None and selfplay_examples is None:
+                self._migrate_null_selfplay_cadence(candidate_examples)
             return
 
         self._last_candidate_examples = self._pointer_examples(
@@ -1900,8 +1963,49 @@ class LearnerLoop:
             )
         self._write_cadence_state()
 
+    def _migrate_null_selfplay_cadence(self, candidate_examples: int) -> None:
+        """Idempotently enable self-play snapshots on an existing cadence."""
+
+        if self.selfplay_publisher is None:
+            raise RuntimeError("self-play cadence migration has no publisher")
+        candidate = load_model_manifest(self.publisher.candidate_path)
+        if (
+            candidate.run_id != self.run_identity.run_id
+            or candidate.generation_family != self.run_identity.generation_family
+        ):
+            raise ValueError("candidate pointer belongs to another run")
+        pointer = self.selfplay_publisher.candidate_path
+        if pointer.is_file():
+            existing = load_model_manifest(pointer)
+            if (
+                existing.run_id != self.run_identity.run_id
+                or existing.generation_family != self.run_identity.generation_family
+            ):
+                raise ValueError("self-play pointer belongs to another run")
+        else:
+            write_model_pointer(pointer, candidate, role="candidate")
+        self._last_selfplay_examples = candidate_examples
+        self._write_cadence_state()
+
     def _pointer_examples(self, pointer: Path) -> int:
         manifest = load_model_manifest(pointer)
+        metadata = inspect_checkpoint(
+            manifest.checkpoint,
+            expected_run_id=manifest.run_id,
+            expected_generation_family=manifest.generation_family,
+            expected_sha256=manifest.checkpoint_sha256,
+            expected_bytes=manifest.checkpoint_bytes,
+        )
+        extra = metadata.get("extra")
+        examples = (
+            extra.get("examples_consumed") if isinstance(extra, Mapping) else None
+        )
+        if (
+            isinstance(examples, int)
+            and not isinstance(examples, bool)
+            and examples >= 0
+        ):
+            return examples
         return manifest.model_step * self.train_config.global_batch_size(
             self.world_size
         )
@@ -1909,6 +2013,11 @@ class LearnerLoop:
     def _write_cadence_state(self) -> None:
         if self._last_candidate_examples is None:
             raise RuntimeError("candidate cadence was not initialized")
+        if self._last_candidate_examples > self.examples_consumed or (
+            self._last_selfplay_examples is not None
+            and self._last_selfplay_examples > self.examples_consumed
+        ):
+            raise ValueError("cannot persist cadence ahead of learner examples")
         atomic_json(
             self.cadence_path,
             {
@@ -1928,7 +2037,7 @@ class LearnerLoop:
         warmup = self.learner_config.selfplay_snapshot_warmup_interval_examples
         if (
             warmup is not None
-            and self.examples_consumed
+            and self.examples_consumed - self._segment_baseline_examples
             < self.learner_config.selfplay_snapshot_warmup_examples
         ):
             return warmup
@@ -2220,6 +2329,250 @@ class LearnerLoop:
             return sum(count // batch for count in counts.values())
         return sum(counts.values()) // batch
 
+    def _recover_pending_state_rebase(self) -> None:
+        outcome: dict[str, object] | None = None
+        if self.rank == 0:
+            try:
+                if self.state_rebase_pending_path.is_file():
+                    payload = json.loads(
+                        self.state_rebase_pending_path.read_text(encoding="utf-8")
+                    )
+                    state, candidate, selfplay = self._parse_state_rebase(payload)
+                    self._rank_zero_complete_state_rebase(
+                        payload,
+                        state=state,
+                        candidate_examples=candidate,
+                        selfplay_examples=selfplay,
+                    )
+                    outcome = {"recovered": True, "state": payload}
+                else:
+                    outcome = {"recovered": False}
+            except (OSError, ValueError, json.JSONDecodeError) as exc:
+                outcome = {"error": str(exc)}
+        broadcast = self._broadcast_object(outcome)
+        if not isinstance(broadcast, dict):
+            raise RuntimeError("distributed state-rebase recovery is invalid")
+        error = broadcast.get("error")
+        if isinstance(error, str):
+            raise ValueError(f"cannot recover learner state rebase: {error}")
+        if broadcast.get("recovered") is not True:
+            return
+        state_payload = broadcast.get("state")
+        state, candidate, selfplay = self._parse_state_rebase(state_payload)
+        self._utd_segment_state = state
+        self._resume_utd_segment_state = state
+        self._last_candidate_examples = candidate
+        self._last_selfplay_examples = selfplay
+        to_examples = (
+            state_payload.get("to_examples_consumed")
+            if isinstance(state_payload, Mapping)
+            else None
+        )
+        if isinstance(to_examples, bool) or not isinstance(to_examples, int):
+            raise ValueError("recovered state rebase examples are invalid")
+        self._segment_baseline_examples = to_examples
+
+    def _rebase_state_after_rewind(
+        self,
+        *,
+        previous_step: int,
+        previous_examples: int,
+        reason: str,
+    ) -> None:
+        """Start a new cadence/UTD segment after a checkpoint rewind."""
+
+        if self.examples_consumed >= previous_examples:
+            return
+        outcome: dict[str, object] | None = None
+        if self.rank == 0:
+            try:
+                target = self.learner_config.target_updates_per_new_sample
+                state = None
+                committed_samples = 0
+                if target is not None:
+                    if not self.store.committed_sample_history_is_complete(
+                        run_id=self.run_identity.run_id,
+                        generation_family=self.run_identity.generation_family,
+                    ):
+                        raise ValueError(
+                            "cannot rebase UTD without complete committed-sample "
+                            "history"
+                        )
+                    committed_samples = self.store.total_committed_sample_count(
+                        run_id=self.run_identity.run_id,
+                        generation_family=self.run_identity.generation_family,
+                    )
+                    state = UTDSegmentState(
+                        run_id=self.run_identity.run_id,
+                        generation_family=self.run_identity.generation_family,
+                        target_updates_per_new_sample=float(target),
+                        baseline_examples_consumed=self.examples_consumed,
+                        baseline_committed_replay_samples=committed_samples,
+                    )
+                candidate_examples = self.examples_consumed
+                selfplay_examples = (
+                    self.examples_consumed
+                    if self.selfplay_publisher is not None
+                    else None
+                )
+                created_ns = time.time_ns()
+                payload: dict[str, object] = {
+                    "format": STATE_REBASE_FORMAT,
+                    "schema_version": STATE_REBASE_SCHEMA_VERSION,
+                    "run_id": self.run_identity.run_id,
+                    "generation_family": self.run_identity.generation_family,
+                    "reason": reason,
+                    "from_step": previous_step,
+                    "to_step": self.step,
+                    "from_examples_consumed": previous_examples,
+                    "to_examples_consumed": self.examples_consumed,
+                    "committed_replay_samples": committed_samples,
+                    "utd_segment": state.as_dict() if state is not None else None,
+                    "cadence": {
+                        "candidate_examples": candidate_examples,
+                        "selfplay_examples": selfplay_examples,
+                    },
+                    "created_ns": created_ns,
+                }
+                atomic_json(self.state_rebase_pending_path, payload)
+                self._rank_zero_complete_state_rebase(
+                    payload,
+                    state=state,
+                    candidate_examples=candidate_examples,
+                    selfplay_examples=selfplay_examples,
+                )
+                outcome = {"state": payload}
+            except (OSError, ValueError) as exc:
+                outcome = {"error": str(exc)}
+        broadcast = self._broadcast_object(outcome)
+        if not isinstance(broadcast, dict):
+            raise RuntimeError("distributed state rebase is invalid")
+        error = broadcast.get("error")
+        if isinstance(error, str):
+            raise ValueError(f"learner rewind state rebase failed: {error}")
+        state_payload = broadcast.get("state")
+        state, candidate, selfplay = self._parse_state_rebase(state_payload)
+        self._utd_segment_state = state
+        self._resume_utd_segment_state = state
+        self._resume_utd_target = (
+            state.target_updates_per_new_sample if state is not None else None
+        )
+        self._last_candidate_examples = candidate
+        self._last_selfplay_examples = selfplay
+        self._segment_baseline_examples = self.examples_consumed
+
+    def _rank_zero_complete_state_rebase(
+        self,
+        payload: Mapping[str, object],
+        *,
+        state: UTDSegmentState | None,
+        candidate_examples: int,
+        selfplay_examples: int | None,
+    ) -> None:
+        created_ns = payload.get("created_ns")
+        if isinstance(created_ns, bool) or not isinstance(created_ns, int):
+            raise ValueError("learner state rebase created_ns is invalid")
+        if state is not None:
+            atomic_json(self.utd_segment_path, state.as_dict())
+        atomic_json(
+            self.cadence_path,
+            {
+                "schema_version": 1,
+                "run_id": self.run_identity.run_id,
+                "generation_family": self.run_identity.generation_family,
+                "candidate_examples": candidate_examples,
+                "selfplay_examples": selfplay_examples,
+                "updated_ns": created_ns,
+            },
+        )
+        atomic_json(self.state_rebase_path, payload)
+        self.state_rebase_pending_path.unlink(missing_ok=True)
+        descriptor = os.open(self.publisher.root, os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+    def _parse_state_rebase(
+        self,
+        payload: object,
+    ) -> tuple[UTDSegmentState | None, int, int | None]:
+        if (
+            not isinstance(payload, dict)
+            or payload.get("format") != STATE_REBASE_FORMAT
+            or payload.get("schema_version") != STATE_REBASE_SCHEMA_VERSION
+            or payload.get("run_id") != self.run_identity.run_id
+            or payload.get("generation_family") != self.run_identity.generation_family
+        ):
+            raise ValueError("learner state rebase is incompatible")
+        for name in (
+            "from_step",
+            "to_step",
+            "from_examples_consumed",
+            "to_examples_consumed",
+            "committed_replay_samples",
+        ):
+            value = payload.get(name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"learner state rebase {name} is invalid")
+        created_ns = payload.get("created_ns")
+        if (
+            isinstance(created_ns, bool)
+            or not isinstance(created_ns, int)
+            or created_ns <= 0
+        ):
+            raise ValueError("learner state rebase created_ns is invalid")
+        if (
+            payload["to_step"] != self.step
+            or payload["to_examples_consumed"] != self.examples_consumed
+        ):
+            raise ValueError("learner state rebase does not match restored state")
+        cadence = payload.get("cadence")
+        if not isinstance(cadence, dict):
+            raise ValueError("learner state rebase cadence is invalid")
+        candidate = cadence.get("candidate_examples")
+        selfplay = cadence.get("selfplay_examples")
+        if (
+            isinstance(candidate, bool)
+            or not isinstance(candidate, int)
+            or candidate < 0
+            or candidate > self.examples_consumed
+            or (
+                selfplay is not None
+                and (
+                    isinstance(selfplay, bool)
+                    or not isinstance(selfplay, int)
+                    or selfplay < 0
+                    or selfplay > self.examples_consumed
+                )
+            )
+        ):
+            raise ValueError("learner state rebase cadence counters are invalid")
+        raw_state = payload.get("utd_segment")
+        state = None if raw_state is None else self._parse_utd_segment_state(raw_state)
+        if state is not None:
+            if (
+                state.run_id != self.run_identity.run_id
+                or state.generation_family != self.run_identity.generation_family
+                or state.baseline_examples_consumed != self.examples_consumed
+                or state.baseline_committed_replay_samples
+                != payload["committed_replay_samples"]
+            ):
+                raise ValueError("learner state rebase UTD boundary is invalid")
+        assert isinstance(candidate, int)
+        assert selfplay is None or isinstance(selfplay, int)
+        return state, candidate, selfplay
+
+    def _state_rebase_authorizes(self, state: UTDSegmentState) -> bool:
+        if not self.state_rebase_path.is_file():
+            return False
+        try:
+            payload = json.loads(self.state_rebase_path.read_text(encoding="utf-8"))
+            expected, _, _ = self._parse_state_rebase(payload)
+        except (OSError, ValueError, json.JSONDecodeError):
+            return False
+        return expected == state
+
     def _ensure_utd_segment_state(self) -> UTDSegmentState | None:
         configured_target = self.learner_config.target_updates_per_new_sample
         if configured_target is None:
@@ -2232,6 +2585,7 @@ class LearnerLoop:
                     "configured update-to-data target does not match "
                     "the persisted UTD segment state"
                 )
+            self._validate_utd_segment_boundary(self._utd_segment_state)
             return self._utd_segment_state
 
         outcome = None
@@ -2264,10 +2618,12 @@ class LearnerLoop:
             self._resume_utd_segment_state is not None
             and state != self._resume_utd_segment_state
             and self._resume_utd_target == float(configured_target)
+            and not self._state_rebase_authorizes(state)
         ):
             raise ValueError(
                 "persisted UTD segment state disagrees with the resume checkpoint"
             )
+        self._validate_utd_segment_boundary(state)
         self._utd_segment_state = state
         return state
 
@@ -2303,6 +2659,10 @@ class LearnerLoop:
         )
         atomic_json(self.utd_segment_path, state.as_dict())
         return state
+
+    def _validate_utd_segment_boundary(self, state: UTDSegmentState) -> None:
+        if state.baseline_examples_consumed > self.examples_consumed:
+            raise ValueError("learner examples precede the UTD segment baseline")
 
     def _can_initialize_utd_origin(self, configured_target: float) -> bool:
         if self._resume_utd_target is not _UNSET:
@@ -2515,6 +2875,7 @@ class LearnerLoop:
             if kind == "reset":
                 checkpoint = Path(str(action["checkpoint"]))
                 previous_step = self.step
+                previous_examples = self.examples_consumed
                 champion_manifest = None
                 if self.rank == 0:
                     champion_manifest = load_model_manifest(
@@ -2527,6 +2888,11 @@ class LearnerLoop:
                     expected_bytes=int(action["bytes"]),
                 )
                 self._scale_learning_rates(configured.reset_learning_rate_scale)
+                self._rebase_state_after_rewind(
+                    previous_step=previous_step,
+                    previous_examples=previous_examples,
+                    reason="plateau_reset",
+                )
                 if self.rank == 0:
                     assert champion_manifest is not None
                     self._last_recovery_step = max(0, self.step - 1)
@@ -2548,6 +2914,12 @@ class LearnerLoop:
                         champion_manifest,
                         role="candidate",
                     )
+                    if self.selfplay_publisher is not None:
+                        write_model_pointer(
+                            self.selfplay_publisher.candidate_path,
+                            champion_manifest,
+                            role="candidate",
+                        )
                     if self.promotion_status_path is not None:
                         atomic_json(
                             self.promotion_status_path,
@@ -2598,9 +2970,16 @@ class LearnerLoop:
                 return True
             if kind == "recover":
                 previous_step = self.step
+                previous_examples = getattr(self, "examples_consumed", None)
                 self._scale_learning_rates(configured.reset_learning_rate_scale)
                 if configured.clear_optimizer_state_on_recovery:
                     self._clear_optimizer_state()
+                if previous_examples is not None:
+                    self._rebase_state_after_rewind(
+                        previous_step=previous_step,
+                        previous_examples=previous_examples,
+                        reason="plateau_recovery",
+                    )
                 if self.rank == 0:
                     self._last_recovery_step = max(0, self.step - 1)
                     recovery = self._maybe_write_recovery_checkpoint(force=True)

@@ -42,8 +42,11 @@ from startrain.model import GraphResTNet, ModelConfig
 from startrain.optim import OptimizerConfig, build_optimizer
 from startrain.orchestration import (
     Coordinator,
+    FATAL_WORKER_EXIT_CODE,
     HARDWARE_HEALTH_EXIT_CODE,
     RunDirectories,
+    TRANSIENT_WORKER_EXIT_CODE,
+    WORKER_FAILURE_PATH_ENV,
     build_worker_specs,
     ensure_autonomous_provenance,
     gpu_pause_ack_path,
@@ -502,6 +505,7 @@ class FakeProcess:
         self,
         *,
         exit_immediately: bool,
+        exit_code: int = 7,
         exit_on_terminate: bool = True,
         exit_on_kill: bool = True,
     ) -> None:
@@ -509,6 +513,7 @@ class FakeProcess:
         FakeProcess.next_pid += 1
         self.returncode: int | None = None
         self.exit_immediately = exit_immediately
+        self.exit_code = exit_code
         self.exit_on_terminate = exit_on_terminate
         self.exit_on_kill = exit_on_kill
         self.terminate_calls = 0
@@ -516,7 +521,7 @@ class FakeProcess:
 
     def poll(self) -> int | None:
         if self.returncode is None and self.exit_immediately:
-            self.returncode = 7
+            self.returncode = self.exit_code
         return self.returncode
 
     def terminate(self) -> None:
@@ -679,6 +684,61 @@ def coordinator_events(directories: RunDirectories) -> list[dict[str, object]]:
     ]
 
 
+def recovery_experiment(
+    tmp_path: Path,
+    *,
+    max_restarts: int,
+):
+    experiment = load_config(CONFIGS / "h100-4gpu.yaml")
+    return replace(
+        experiment,
+        orchestration=replace(
+            experiment.orchestration,
+            directories=RunDirectoryConfig(root=str(tmp_path / "recovery-run")),
+            restart=RestartPolicyConfig(
+                max_restarts=max_restarts,
+                initial_backoff_seconds=0.01,
+                maximum_backoff_seconds=0.02,
+                stable_reset_seconds=100.0,
+            ),
+            shutdown=ShutdownConfig(
+                monitor_interval_seconds=0.01,
+                heartbeat_interval_seconds=1.0,
+                stale_heartbeat_seconds=100.0,
+                stall_timeout_seconds=200.0,
+                terminate_grace_seconds=0.01,
+                kill_grace_seconds=0.01,
+            ),
+        ),
+    )
+
+
+def write_worker_failure(
+    options: dict[str, Any],
+    *,
+    failure_class: str,
+    exit_code: int,
+    reason: str,
+    exception_type: str,
+) -> None:
+    environment = options["env"]
+    atomic_json(
+        Path(environment[WORKER_FAILURE_PATH_ENV]),
+        {
+            "format": "startrain.worker-failure",
+            "schema_version": 1,
+            "timestamp_ns": time.time_ns(),
+            "pid": 123,
+            "worker": environment["STARTRAIN_WORKER_NAME"],
+            "role": environment["STARTRAIN_WORKER_ROLE"],
+            "failure_class": failure_class,
+            "exit_code": exit_code,
+            "exception_type": exception_type,
+            "reason": reason,
+        },
+    )
+
+
 def test_coordinator_restarts_failed_actor_without_duplicate(tmp_path) -> None:
     experiment = load_config(CONFIGS / "h100-4gpu.yaml")
     orchestration = replace(
@@ -756,6 +816,265 @@ def test_coordinator_restarts_failed_actor_without_duplicate(tmp_path) -> None:
     )
     assert status["state"] == "stopped"
     assert not (directories.root / "coordinator.lock").exists()
+
+
+def test_fatal_worker_exit_is_not_retried_and_persists_reason(tmp_path) -> None:
+    experiment = recovery_experiment(tmp_path, max_restarts=3)
+    directories = RunDirectories.from_experiment(experiment)
+    specs = build_worker_specs(
+        experiment,
+        config_path=CONFIGS / "h100-4gpu.yaml",
+        directories=directories,
+        base_environment={},
+    )
+    launches: dict[str, int] = {}
+    reason = "checkpoint schema is incompatible"
+
+    def process_factory(command: list[str], **options: Any) -> FakeProcess:
+        name = worker_name(command)
+        launches[name] = launches.get(name, 0) + 1
+        if name == "learner":
+            write_worker_failure(
+                options,
+                failure_class="fatal",
+                exit_code=FATAL_WORKER_EXIT_CODE,
+                reason=reason,
+                exception_type="ValueError",
+            )
+            return FakeProcess(
+                exit_immediately=True,
+                exit_code=FATAL_WORKER_EXIT_CODE,
+            )
+        return FakeProcess(exit_immediately=False)
+
+    clock = FakeClock()
+    coordinator = Coordinator(
+        experiment=experiment,
+        specs=specs,
+        directories=directories,
+        process_factory=process_factory,
+        clock=clock,
+        sleep=clock.sleep,
+    )
+
+    assert coordinator.run(stop_requested=lambda: False) == FATAL_WORKER_EXIT_CODE
+    assert launches["learner"] == 1
+    assert coordinator.workers["learner"].restart_count == 0
+    fatal = json.loads(coordinator.fatal_path.read_text(encoding="utf-8"))
+    assert fatal["failure_class"] == "fatal"
+    assert fatal["reason"] == reason
+    assert fatal["terminal_reason"] == "fatal_worker_failure"
+    events = coordinator_events(directories)
+    assert any(
+        event["event"] == "worker_exited"
+        and event["failure_class"] == "fatal"
+        and event["reason"] == reason
+        and event["restart_in_seconds"] is None
+        for event in events
+    )
+
+
+def test_transient_learner_exit_retries_with_bounded_jitter(tmp_path) -> None:
+    experiment = recovery_experiment(tmp_path, max_restarts=2)
+    directories = RunDirectories.from_experiment(experiment)
+    specs = build_worker_specs(
+        experiment,
+        config_path=CONFIGS / "h100-4gpu.yaml",
+        directories=directories,
+        base_environment={},
+    )
+    launches: dict[str, int] = {}
+    reason = "DataLoader worker exited unexpectedly"
+
+    def process_factory(command: list[str], **options: Any) -> FakeProcess:
+        name = worker_name(command)
+        launches[name] = launches.get(name, 0) + 1
+        if name == "learner" and launches[name] == 1:
+            write_worker_failure(
+                options,
+                failure_class="transient",
+                exit_code=TRANSIENT_WORKER_EXIT_CODE,
+                reason=reason,
+                exception_type="RuntimeError",
+            )
+            return FakeProcess(
+                exit_immediately=True,
+                exit_code=TRANSIENT_WORKER_EXIT_CODE,
+            )
+        return FakeProcess(exit_immediately=False)
+
+    clock = FakeClock()
+    coordinator = Coordinator(
+        experiment=experiment,
+        specs=specs,
+        directories=directories,
+        process_factory=process_factory,
+        clock=clock,
+        sleep=clock.sleep,
+        random_fraction=lambda: 0.0,
+    )
+
+    assert (
+        coordinator.run(
+            stop_requested=lambda: False,
+            max_monitor_cycles=3,
+        )
+        == 0
+    )
+    assert launches["learner"] == 2
+    assert not coordinator.fatal_path.exists()
+    events = coordinator_events(directories)
+    learner_exit = next(
+        event
+        for event in events
+        if event["event"] == "worker_exited" and event["worker"] == "learner"
+    )
+    assert learner_exit["failure_class"] == "transient"
+    assert learner_exit["reason"] == reason
+    assert learner_exit["restart_in_seconds"] == pytest.approx(0.008)
+
+
+def test_transient_learner_exhausts_bounded_restart_budget(tmp_path) -> None:
+    experiment = recovery_experiment(tmp_path, max_restarts=1)
+    directories = RunDirectories.from_experiment(experiment)
+    specs = build_worker_specs(
+        experiment,
+        config_path=CONFIGS / "h100-4gpu.yaml",
+        directories=directories,
+        base_environment={},
+    )
+    launches: dict[str, int] = {}
+    reason = "CUDA out of memory during DataLoader startup"
+
+    def process_factory(command: list[str], **options: Any) -> FakeProcess:
+        name = worker_name(command)
+        launches[name] = launches.get(name, 0) + 1
+        if name == "learner":
+            write_worker_failure(
+                options,
+                failure_class="transient",
+                exit_code=TRANSIENT_WORKER_EXIT_CODE,
+                reason=reason,
+                exception_type="RuntimeError",
+            )
+            return FakeProcess(
+                exit_immediately=True,
+                exit_code=TRANSIENT_WORKER_EXIT_CODE,
+            )
+        return FakeProcess(exit_immediately=False)
+
+    clock = FakeClock()
+    coordinator = Coordinator(
+        experiment=experiment,
+        specs=specs,
+        directories=directories,
+        process_factory=process_factory,
+        clock=clock,
+        sleep=clock.sleep,
+        random_fraction=lambda: 0.0,
+    )
+
+    assert coordinator.run(stop_requested=lambda: False) == 1
+    assert launches["learner"] == 2
+    learner = coordinator.workers["learner"]
+    assert learner.state == "exhausted"
+    assert learner.restart_count == 2
+    fatal = json.loads(coordinator.fatal_path.read_text(encoding="utf-8"))
+    assert fatal["failure_class"] == "transient"
+    assert fatal["reason"] == reason
+    assert fatal["terminal_reason"] == "restart_budget_exhausted"
+    assert any(
+        event["event"] == "worker_restart_exhausted"
+        and event["failure_class"] == "transient"
+        and event["reason"] == reason
+        for event in coordinator_events(directories)
+    )
+
+
+def test_process_group_is_reaped_before_worker_restart(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    experiment = recovery_experiment(tmp_path, max_restarts=2)
+    directories = RunDirectories.from_experiment(experiment)
+    directories.create()
+    specs = build_worker_specs(
+        experiment,
+        config_path=CONFIGS / "h100-4gpu.yaml",
+        directories=directories,
+        base_environment={},
+    )
+    actions: list[tuple[str, int]] = []
+    process_group_id = 42_424
+    live_groups = {process_group_id}
+
+    class SessionProcess:
+        pid = process_group_id
+        returncode = TRANSIENT_WORKER_EXIT_CODE
+
+        def poll(self) -> int:
+            return self.returncode
+
+        def wait(self, *, timeout: float) -> int:
+            assert timeout == 0
+            actions.append(("wait", self.pid))
+            return self.returncode
+
+        def terminate(self) -> None:
+            raise AssertionError("exited process leader was terminated again")
+
+        def kill(self) -> None:
+            raise AssertionError("exited process leader was killed directly")
+
+    def kill_process_group(pgid: int, sent: int) -> None:
+        actions.append(("killpg", sent))
+        if sent == 0:
+            if pgid not in live_groups:
+                raise ProcessLookupError
+            return
+        assert sent == signal.SIGKILL
+        live_groups.discard(pgid)
+
+    def process_factory(*_args: Any, **_kwargs: Any) -> FakeProcess:
+        actions.append(("launch", 0))
+        return FakeProcess(exit_immediately=False)
+
+    monkeypatch.setattr(orchestration_module.subprocess, "Popen", SessionProcess)
+    monkeypatch.setattr(orchestration_module.os, "killpg", kill_process_group)
+    clock = FakeClock()
+    coordinator = Coordinator(
+        experiment=experiment,
+        specs=specs,
+        directories=directories,
+        process_factory=process_factory,
+        clock=clock,
+        sleep=clock.sleep,
+        random_fraction=lambda: 0.5,
+    )
+    worker = coordinator.workers["learner"]
+    worker.process = SessionProcess()
+    worker.process_group_id = process_group_id
+    worker.last_pid = process_group_id
+    worker.started_at = 0.0
+    worker.state = "running"
+
+    assert (
+        coordinator._handle_worker_exit(
+            worker,
+            code=TRANSIENT_WORKER_EXIT_CODE,
+            now=1.0,
+        )
+        is False
+    )
+    clock.value = worker.next_start_at
+    assert coordinator._monitor_worker(worker, clock()) is False
+
+    wait_index = actions.index(("wait", process_group_id))
+    kill_index = actions.index(("killpg", signal.SIGKILL))
+    launch_index = actions.index(("launch", 0))
+    assert wait_index < kill_index < launch_index
+    assert live_groups == set()
+    coordinator._close_worker_process(worker)
 
 
 def test_pause_lease_reaps_actor_before_ready_and_restarts_once(tmp_path) -> None:

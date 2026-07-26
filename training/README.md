@@ -53,6 +53,8 @@ Research inspirations:
 Use the [training ablation protocol](docs/training-ablation-protocol.md) before
 changing shipped self-play sources, target retention, candidate scaling, precision or
 search settings.
+For fixed-budget ring-10 optimization on a stopped production snapshot, follow the
+[Elo-per-hour ablation runbook](docs/elo-per-hour-ablation-runbook.md).
 
 ## Prerequisites
 

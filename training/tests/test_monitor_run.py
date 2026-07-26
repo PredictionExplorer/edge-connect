@@ -444,6 +444,59 @@ def test_snapshot_surfaces_persistent_sram_threshold_with_zero_volatile(
     assert "gpu_health_gate" in {warning["code"] for warning in snapshot["warnings"]}
 
 
+def test_snapshot_and_text_surface_durable_coordinator_failure(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    now_ns = 300_000_000_000
+    root = _fixture(tmp_path, now_ns=now_ns)
+    reason = "checkpoint schema is incompatible"
+    _write_json(
+        root / "status" / "fatal.json",
+        {
+            "format": "startrain.coordinator-fatal",
+            "schema_version": 1,
+            "timestamp_ns": now_ns,
+            "terminal_reason": "fatal_worker_failure",
+            "failure_class": "fatal",
+            "reason": reason,
+            "exception_type": "ValueError",
+            "worker": "learner",
+            "role": "learner",
+            "worker_exit_code": 78,
+            "coordinator_exit_code": 78,
+            "restart_count": 0,
+        },
+    )
+    coordinator_path = root / "status" / "coordinator.json"
+    coordinator = json.loads(coordinator_path.read_text(encoding="utf-8"))
+    coordinator["workers"]["learner"].update(
+        {
+            "state": "fatal",
+            "failure_class": "fatal",
+            "failure_reason": reason,
+            "last_exit_code": 78,
+        }
+    )
+    _write_json(coordinator_path, coordinator)
+    _healthy_dependencies(monkeypatch)
+
+    snapshot: Any = monitor.collect_snapshot(root, now_ns=now_ns)
+    text = monitor.format_text(snapshot)
+
+    assert snapshot["status"] == "ERROR"
+    assert snapshot["coordinator"]["failure"]["failure_class"] == "fatal"
+    assert snapshot["coordinator"]["failure"]["reason"] == reason
+    learner = next(
+        worker for worker in snapshot["workers"] if worker["name"] == "learner"
+    )
+    assert learner["failure_class"] == "fatal"
+    assert learner["failure_reason"] == reason
+    warnings = {warning["code"]: warning["message"] for warning in snapshot["warnings"]}
+    assert reason in warnings["coordinator_fatal"]
+    assert "failure=fatal" in text
+
+
 def test_actor_throughput_uses_completed_counters_and_merged_wall_intervals(
     tmp_path,
 ) -> None:

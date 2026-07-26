@@ -10,6 +10,7 @@ import pytest
 import torch
 from torch import nn
 
+import startrain.actor as actor_module
 from startrain.actor import ActorSupervisor, HistoricalModelPool, ManifestModelProvider
 from startrain.config import (
     ConfigError,
@@ -652,3 +653,50 @@ def test_historical_pool_selects_log_spaced_checkpoints() -> None:
     ]
     selected = pool._spaced_candidates(manifests)
     assert [item.model_step for item in selected] == [0, 4, 9]
+
+
+def test_historical_pool_excludes_manifests_before_resume_cutover(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifests = tmp_path / "manifests"
+    manifests.mkdir()
+    manifest_path = manifests / "manifest-old.json"
+    manifest_path.write_text("{}", encoding="utf-8")
+    cutover = tmp_path / "resume-cutover.json"
+    cutover.write_text(
+        json.dumps(
+            {
+                "format": "startrain.resume-cutover",
+                "schema_version": 1,
+                "checkpoint": "recovery/checkpoint.pt",
+                "checkpoint_sha256": "a" * 64,
+                "checkpoint_bytes": 1,
+                "step": 10,
+                "run_id": "run",
+                "generation_family": "family",
+                "created_ns": 200,
+            }
+        ),
+        encoding="utf-8",
+    )
+    identity = RunIdentity(tmp_path / "run.json", "run", "family", 1)
+    pool = object.__new__(HistoricalModelPool)
+    pool.manifest_directories = (manifests,)
+    pool.run_identity = identity
+    pool.cutover_path = cutover
+    pool.pool_size = 1
+    pool.providers = {}
+    monkeypatch.setattr(
+        actor_module,
+        "load_model_manifest",
+        lambda _path: SimpleNamespace(
+            role="direct",
+            run_id="run",
+            generation_family="family",
+            published_ns=100,
+            model_identity="old",
+        ),
+    )
+
+    assert pool.select(random_source=random.Random(1), exclude=set()) is None

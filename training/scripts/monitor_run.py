@@ -794,6 +794,16 @@ def collect_snapshot(
         _add_warning(warnings, "WARN", "service_restarted", "systemd restart observed")
 
     coordinator = _read_json(root / "status" / "coordinator.json") or {}
+    fatal = _read_json(root / "status" / "fatal.json")
+    if fatal is not None:
+        failure_class = fatal.get("failure_class")
+        reason = fatal.get("reason")
+        _add_warning(
+            warnings,
+            "ERROR",
+            "coordinator_fatal",
+            f"{failure_class or 'unknown'} failure: {reason or 'reason unavailable'}",
+        )
     if coordinator.get("state") not in ("running", "draining"):
         _add_warning(
             warnings,
@@ -857,6 +867,9 @@ def collect_snapshot(
                     "state": state,
                     "pid": worker.get("pid"),
                     "restart_count": restart_count,
+                    "failure_class": worker.get("failure_class"),
+                    "failure_reason": worker.get("failure_reason"),
+                    "last_exit_code": worker.get("last_exit_code"),
                     "phase": heartbeat.get("phase"),
                     "progress": heartbeat.get("progress"),
                     "active_ring_weights": heartbeat.get("active_ring_weights"),
@@ -1518,6 +1531,7 @@ def collect_snapshot(
             "state": coordinator.get("state"),
             "draining": coordinator.get("draining"),
             "pause_lease": coordinator.get("pause_lease"),
+            "failure": fatal or coordinator.get("failure"),
         },
         "workers": workers_output,
         "learner": learner,
@@ -1536,6 +1550,10 @@ def collect_snapshot(
 
 
 def format_text(snapshot: Mapping[str, object]) -> str:
+    coordinator = snapshot.get("coordinator")
+    coordinator = coordinator if isinstance(coordinator, Mapping) else {}
+    failure = coordinator.get("failure")
+    failure = failure if isinstance(failure, Mapping) else {}
     learner = snapshot.get("learner")
     learner = learner if isinstance(learner, Mapping) else {}
     actors = snapshot.get("actors")
@@ -1611,6 +1629,7 @@ def format_text(snapshot: Mapping[str, object]) -> str:
         f"promotion_evals={arena_history.get('promotion_evaluations', 0)} "
         f"crossplay_evals={arena_history.get('crossplay_evaluations', 0)} "
         f"elo={_compact(displayed_elo)} elo_source={elo_source or 'n/a'} "
+        f"failure={failure.get('failure_class', '-')} "
         f"warnings={warning_codes or '-'}"
     )
 

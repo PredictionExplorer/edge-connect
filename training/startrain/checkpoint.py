@@ -176,6 +176,23 @@ class ExponentialMovingAverage:
                 raise ValueError(f"invalid EMA tensor for {name}")
             average.copy_(value.to(device=average.device, dtype=average.dtype))
 
+    @torch.no_grad()
+    def reset_from_model(self, model: nn.Module) -> None:
+        """Start a fresh EMA segment from the model's current weights."""
+
+        model_state = model.state_dict()
+        expected = {
+            name for name, value in model_state.items() if value.is_floating_point()
+        }
+        if set(self.shadow) != expected:
+            raise ValueError("model state does not match EMA state")
+        for name, average in self.shadow.items():
+            value = model_state[name]
+            if value.shape != average.shape:
+                raise ValueError(f"invalid model tensor for EMA value {name}")
+            average.copy_(value.detach().to(average.device, dtype=average.dtype))
+        self.num_updates = 0
+
 
 def save_checkpoint(
     destination: str | Path,
@@ -329,6 +346,75 @@ def load_ema_checkpoint(
     )
 
 
+def load_ema_weights_for_warm_start(
+    source: str | Path,
+    *,
+    model: nn.Module,
+    ema: ExponentialMovingAverage,
+    expected_model_config: Mapping[str, Any],
+    expected_game_config: Mapping[str, Any],
+    map_location: torch.device | str = "cpu",
+    expected_run_id: str | None = None,
+    expected_generation_family: str | None = None,
+    expected_sha256: str | None = None,
+    expected_bytes: int | None = None,
+) -> dict[str, Any]:
+    """Load champion EMA weights while deliberately discarding train state."""
+
+    metadata = load_ema_checkpoint(
+        source,
+        model=model,
+        expected_model_config=expected_model_config,
+        expected_game_config=expected_game_config,
+        map_location=map_location,
+        expected_run_id=expected_run_id,
+        expected_generation_family=expected_generation_family,
+        expected_sha256=expected_sha256,
+        expected_bytes=expected_bytes,
+    )
+    ema.reset_from_model(model)
+    return metadata
+
+
+def inspect_checkpoint(
+    source: str | Path,
+    *,
+    map_location: torch.device | str = "cpu",
+    expected_model_config: Mapping[str, Any] | None = None,
+    expected_game_config: Mapping[str, Any] | None = None,
+    expected_run_id: str | None = None,
+    expected_generation_family: str | None = None,
+    expected_sha256: str | None = None,
+    expected_bytes: int | None = None,
+) -> dict[str, Any]:
+    """Validate checkpoint contracts and return metadata without a model load."""
+
+    checkpoint_path = Path(source)
+    if expected_sha256 is not None or expected_bytes is not None:
+        verify_file(
+            checkpoint_path,
+            expected_sha256=expected_sha256,
+            expected_bytes=expected_bytes,
+        )
+    payload = torch.load(checkpoint_path, map_location=map_location, weights_only=True)
+    _validate_checkpoint_payload(
+        payload,
+        expected_model_config=expected_model_config,
+        expected_game_config=expected_game_config,
+        expected_run_id=expected_run_id,
+        expected_generation_family=expected_generation_family,
+    )
+    return {
+        "step": int(payload["step"]),
+        "epoch": int(payload["epoch"]),
+        "config": payload["config"],
+        "extra": payload["extra"],
+        "has_optimizer": payload["optimizer"] is not None,
+        "has_scheduler": payload["scheduler"] is not None,
+        "has_ema": payload["ema"] is not None,
+    }
+
+
 def load_model_manifest(path: str | Path) -> ModelManifest:
     source = Path(path)
     payload = _read_json(source, "model publication")
@@ -441,12 +527,72 @@ def write_recovery_checkpoint(
     examples_consumed: int,
     global_batch_size: int,
     utd_segment: Mapping[str, object] | None = None,
+    extra: Mapping[str, object] | None = None,
 ) -> ResumeCheckpoint:
+    recovery = create_recovery_checkpoint_artifact(
+        root,
+        model=model,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        ema=ema,
+        step=step,
+        epoch=epoch,
+        config=config,
+        run_id=run_id,
+        generation_family=generation_family,
+        examples_consumed=examples_consumed,
+        global_batch_size=global_batch_size,
+        utd_segment=utd_segment,
+        extra=extra,
+    )
+    return publish_recovery_checkpoint(
+        root,
+        recovery=recovery,
+        examples_consumed=examples_consumed,
+    )
+
+
+def create_recovery_checkpoint_artifact(
+    root: str | Path,
+    *,
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler.LRScheduler,
+    ema: ExponentialMovingAverage,
+    step: int,
+    epoch: int,
+    config: Mapping[str, Any],
+    run_id: str,
+    generation_family: str,
+    examples_consumed: int,
+    global_batch_size: int,
+    utd_segment: Mapping[str, object] | None = None,
+    extra: Mapping[str, object] | None = None,
+) -> ResumeCheckpoint:
+    """Create a durable recovery artifact without activating its pointer."""
+
     directory = Path(root)
     recovery_directory = directory / "recovery"
     recovery_directory.mkdir(parents=True, exist_ok=True)
     run_id = validate_identifier("run_id", run_id)
     family = validate_identifier("generation_family", generation_family)
+    if examples_consumed < 0 or global_batch_size <= 0:
+        raise ValueError("recovery example metadata is invalid")
+    additional = dict(extra or {})
+    reserved = {
+        "training_step_version",
+        "run_id",
+        "generation_family",
+        "examples_consumed",
+        "global_batch_size",
+        "utd_segment",
+    }
+    collision = reserved & additional.keys()
+    if collision:
+        raise ValueError(
+            "recovery extra metadata overrides reserved fields: "
+            + ", ".join(sorted(collision))
+        )
     staged = recovery_directory / f".recovery-{step:012d}.staging.pt"
     save_checkpoint(
         staged,
@@ -464,6 +610,7 @@ def write_recovery_checkpoint(
             "examples_consumed": examples_consumed,
             "global_batch_size": global_batch_size,
             **({"utd_segment": dict(utd_segment)} if utd_segment else {}),
+            **additional,
         },
     )
     checkpoint_sha256 = sha256_file(staged)
@@ -483,18 +630,52 @@ def write_recovery_checkpoint(
             os.fsync(descriptor)
         finally:
             os.close(descriptor)
+    return ResumeCheckpoint(
+        checkpoint=checkpoint.resolve(),
+        checkpoint_sha256=checkpoint_sha256,
+        checkpoint_bytes=checkpoint_bytes,
+        step=step,
+        epoch=epoch,
+        run_id=run_id,
+        generation_family=family,
+        source="prepared-recovery",
+    )
+
+
+def publish_recovery_checkpoint(
+    root: str | Path,
+    *,
+    recovery: ResumeCheckpoint,
+    examples_consumed: int,
+    updated_ns: int | None = None,
+) -> ResumeCheckpoint:
+    """Activate a previously created recovery artifact."""
+
+    directory = Path(root)
+    run_id = validate_identifier("run_id", recovery.run_id)
+    family = validate_identifier("generation_family", recovery.generation_family)
+    if examples_consumed < 0:
+        raise ValueError("recovery examples_consumed must be non-negative")
+    checkpoint = recovery.checkpoint.resolve()
+    if checkpoint.parent != (directory / "recovery").resolve():
+        raise ValueError("prepared recovery escaped its artifact directory")
+    verify_file(
+        checkpoint,
+        expected_sha256=recovery.checkpoint_sha256,
+        expected_bytes=recovery.checkpoint_bytes,
+    )
     payload: dict[str, object] = {
         "format": RECOVERY_POINTER_FORMAT,
         "schema_version": RECOVERY_POINTER_VERSION,
         "checkpoint": os.path.relpath(checkpoint, directory),
-        "checkpoint_sha256": checkpoint_sha256,
-        "checkpoint_bytes": checkpoint_bytes,
-        "step": step,
-        "epoch": epoch,
+        "checkpoint_sha256": recovery.checkpoint_sha256,
+        "checkpoint_bytes": recovery.checkpoint_bytes,
+        "step": recovery.step,
+        "epoch": recovery.epoch,
         "examples_consumed": examples_consumed,
         "run_id": run_id,
         "generation_family": family,
-        "updated_ns": time.time_ns(),
+        "updated_ns": time.time_ns() if updated_ns is None else updated_ns,
     }
     append_jsonl(directory / "recovery.journal.jsonl", payload, durable=True)
     atomic_json(directory / "recovery.json", payload)
@@ -539,6 +720,45 @@ def write_resume_cutover(
         payload,
         expected_run_id=run_id,
         expected_generation_family=family,
+    )
+
+
+def load_recovery_pointer(
+    path: str | Path,
+    *,
+    expected_run_id: str,
+    expected_generation_family: str,
+    verify_artifact: bool = True,
+) -> ResumeCheckpoint:
+    source = Path(path)
+    return _parse_recovery_pointer(
+        source,
+        _read_json(source, "recovery pointer"),
+        expected_run_id=validate_identifier("run_id", expected_run_id),
+        expected_generation_family=validate_identifier(
+            "generation_family", expected_generation_family
+        ),
+        source_name="recovery",
+        verify_artifact=verify_artifact,
+    )
+
+
+def load_resume_cutover(
+    path: str | Path,
+    *,
+    expected_run_id: str,
+    expected_generation_family: str,
+    verify_artifact: bool = True,
+) -> ResumeCheckpoint:
+    source = Path(path)
+    return _parse_resume_cutover(
+        source,
+        _read_json(source, "resume cutover"),
+        expected_run_id=validate_identifier("run_id", expected_run_id),
+        expected_generation_family=validate_identifier(
+            "generation_family", expected_generation_family
+        ),
+        verify_artifact=verify_artifact,
     )
 
 

@@ -178,6 +178,19 @@ def test_yaml_configs_load_strictly() -> None:
                 ),
             )
         )
+    warmstart = load_config(CONFIGS / "h100-8gpu-champion-warmstart.yaml")
+    assert warmstart.optimizer.adamw_lr == pytest.approx(1.5e-4)
+    assert warmstart.optimizer.muon_lr == pytest.approx(1e-2)
+    assert warmstart.learner.target_updates_per_new_sample == 1.0
+    assert warmstart.learner.candidate_interval_examples == 5_000_000
+    assert warmstart.learner.minimum_unique_samples_per_ring == 8_192
+    assert warmstart.orchestration.model_refresh.selfplay_source == "champion"
+    assert warmstart.arena.per_ring_regression_floor_elo == {
+        4: -35.0,
+        6: -35.0,
+        8: -35.0,
+    }
+    validate_continuous_config(warmstart)
     autonomous = load_config(CONFIGS / "h100-8gpu-autonomous.yaml")
     assert autonomous.orchestration.autonomous.enabled is True
     assert autonomous.orchestration.model_refresh.selfplay_source == (
