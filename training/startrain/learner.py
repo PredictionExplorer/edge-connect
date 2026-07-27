@@ -543,9 +543,9 @@ class ReplayWindowSession:
             return []
         return self.prefetcher.pop_copy_events()
 
-    def shutdown(self) -> None:
+    def shutdown(self, *, strict: bool = True) -> BaseException | None:
         if self.closed:
-            return
+            return None
         loader = self.loader
         prefetcher = self.prefetcher
         failure: BaseException | None = None
@@ -586,8 +586,9 @@ class ReplayWindowSession:
             self.loader = None
             self.suspended = False
             self.closed = True
-        if failure is not None:
+        if failure is not None and strict:
             raise failure
+        return failure
 
     def suspend_for_gpu_pause(self) -> int:
         if self.closed:
@@ -1667,7 +1668,7 @@ class LearnerLoop:
                     recovery_boundary=self._next_recovery_boundary(),
                     ring_weight_boundary=None,
                 )
-                failed.shutdown()
+                failed.shutdown(strict=False)
             if self.rank == 0:
                 self.store.clear_gc_watermark(watermark_name)
             raise
@@ -1702,11 +1703,26 @@ class LearnerLoop:
     ) -> None:
         if window.closed:
             return
+        failure = None
         try:
-            window.shutdown()
+            failure = window.shutdown(strict=False)
         finally:
             if self.rank == 0:
                 self.store.clear_gc_watermark(self._watermark_name())
+        if failure is not None and self.rank == 0:
+            self.metrics.append(
+                {
+                    "schema_version": 1,
+                    "timestamp_ns": time.time_ns(),
+                    "worker": "learner",
+                    "event": "replay_window_shutdown_warning",
+                    "step": self.step,
+                    "epoch": self.epoch,
+                    "window_refresh_reason": reason,
+                    "error_type": type(failure).__name__,
+                    "error": str(failure),
+                }
+            )
         if self.rank == 0:
             self.metrics.append(
                 {

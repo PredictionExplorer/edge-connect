@@ -83,6 +83,40 @@ Verify each root has:
 - empty live `status/`, `logs/`, and `metrics/` directories
 - the expected champion identity in `ablation.json`
 
+## Prepare a clean champion warm start
+
+For post-plateau research, use
+`configs/h100-8gpu-champion-warmstart.yaml` and the clean treatments
+`control`, `lr-quarter`, `fresh-source`, `hard-replay`, and `fresh-hard`.
+Every arm still reuses the same validated replay, but it must discard the weak
+learner optimizer trajectory:
+
+```bash
+python scripts/preflight_run_state.py \
+  --run-root "$TREATMENT_ROOT" \
+  --profile "$TREATMENT_ROOT/profile-elo-ablation.yaml" \
+  --apply
+
+python scripts/prepare_champion_warm_start.py \
+  --run-root "$TREATMENT_ROOT" \
+  --profile "$TREATMENT_ROOT/profile-elo-ablation.yaml" \
+  --apply
+
+python scripts/preflight_run_state.py \
+  --run-root "$TREATMENT_ROOT" \
+  --profile "$TREATMENT_ROOT/profile-elo-ablation.yaml"
+```
+
+The warm start loads champion EMA weights into both the raw model and a fresh
+EMA, creates empty optimizer and scheduler state at segment step zero, preserves
+the absolute champion model step, resets cadence, and records an explicit
+segment-relative UTD baseline. By default it grants at most one configured
+recent replay window as initial credit. Historical self-play manifests older
+than the resulting resume cutover are excluded from the opponent pool.
+
+Do not generate the deployment manifest until every arm reports an active
+`learner/champion-warm-start.json` marker and a clean preflight.
+
 ## Freeze the deployment
 
 Run queues only from a clean, committed checkout. Render these templates to

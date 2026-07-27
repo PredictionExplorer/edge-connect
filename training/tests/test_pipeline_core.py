@@ -1416,6 +1416,26 @@ def test_replay_window_shutdown_closes_workers_and_stop_clears_watermark(
     assert failing.closed is True
     assert failing.loader is None
     assert failing.prefetcher is None
+    lenient_iterator = WorkerIterator()
+    lenient = ReplayWindowSession(
+        selection=ReplaySelection((), {}, 0),
+        loader=SimpleNamespace(_iterator=lenient_iterator),
+        prefetcher=SimpleNamespace(_stream=FailingStream()),
+        batches_allocated=1,
+        effective_workers=1,
+        setup_seconds=0.0,
+        refresh_reason="plateau",
+        opened_step=0,
+        opened_epoch=0,
+        active_rings=(),
+        ring_weights=None,
+        recovery_boundary=None,
+        ring_weight_boundary=None,
+    )
+    failure = lenient.shutdown(strict=False)
+    assert isinstance(failure, RuntimeError)
+    assert str(failure) == "stream failed"
+    assert lenient_iterator.shutdowns == 1
 
     identity = run_identity(tmp_path)
     with ReplayStore(tmp_path / "shutdown-replay") as store:

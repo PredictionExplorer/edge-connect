@@ -898,6 +898,11 @@ export RUNS_BASE="/mnt/nvme/edgeconnect"  # same mount used at creation
 export RUN_ROOT="$RUNS_BASE/$RUN_ID"
 export PROFILE="$RUN_ROOT/profile.yaml"
 
+python scripts/preflight_run_state.py \
+  --run-root "$RUN_ROOT" \
+  --profile "$PROFILE" \
+  --apply
+
 tmux new-session -d -s "$RUN_ID" \
   "bash -lc 'set -o pipefail; cd \"$PWD\" && source .venv/bin/activate && startrain-orchestrate --config \"$PROFILE\" 2>&1 | tee \"$RUN_ROOT/coordinator-console.log\"'"
 ```
