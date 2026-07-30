@@ -17,6 +17,11 @@ from startrain.config import ExperimentConfig, load_config
 from startrain.replay_store import ReplayStore
 from startrain.runtime import atomic_json, load_run_identity
 
+if __package__:
+    from .prepare_elo_ablation import verify_winner_snapshot
+else:
+    from prepare_elo_ablation import verify_winner_snapshot
+
 SCHEMA_VERSION = 1
 REPORT_NAME = "startrain-elo-ablation-branch"
 _ROTATED_DIRECTORIES = ("status", "logs", "metrics")
@@ -88,7 +93,16 @@ def _copy_function(
 
 def _rotate_branch_runtime(destination: Path) -> None:
     parent = destination / "ablation-parent"
+    inherited_parent = destination / ".inherited-ablation-parent"
+    if parent.exists() or parent.is_symlink():
+        if inherited_parent.exists() or inherited_parent.is_symlink():
+            raise FileExistsError(
+                "forked ablation contains conflicting inherited parent artifacts"
+            )
+        parent.rename(inherited_parent)
     parent.mkdir()
+    if inherited_parent.exists() or inherited_parent.is_symlink():
+        inherited_parent.rename(parent / "ancestor")
     for name in _ROTATED_DIRECTORIES:
         current = destination / name
         if current.exists():
@@ -184,6 +198,14 @@ def fork_elo_ablation(
         or Path(configured_source).expanduser().resolve() != source
     ):
         raise ValueError("plan source run root does not match requested source")
+    raw_winner_snapshot = plan.get("source_winner_snapshot")
+    winner_snapshot = (
+        verify_winner_snapshot(source, raw_winner_snapshot)
+        if isinstance(raw_winner_snapshot, dict)
+        else None
+    )
+    if raw_winner_snapshot is not None and winner_snapshot is None:
+        raise ValueError("plan source winner snapshot is malformed")
     entry = _plan_treatment(plan, treatment)
     profile_path = Path(entry["profile"]).expanduser().resolve()
     if not profile_path.is_file() or _sha256(profile_path) != entry["profile_sha256"]:
@@ -232,6 +254,16 @@ def fork_elo_ablation(
             generation_family=identity.generation_family,
         )
         champion = _read_json(destination / "learner" / "champion.json")
+        if winner_snapshot is not None:
+            selected = winner_snapshot["champion"]
+            assert isinstance(selected, dict)
+            if any(
+                champion.get(field) != selected.get(field)
+                for field in ("model_identity", "model_step")
+            ):
+                raise ValueError(
+                    "forked champion differs from the verified winner snapshot"
+                )
         candidate_path = destination / "learner" / "candidate.json"
         candidate = _read_json(candidate_path) if candidate_path.is_file() else None
         metadata: dict[str, object] = {
@@ -242,6 +274,8 @@ def fork_elo_ablation(
             "source_run_id": identity.run_id,
             "source_generation_family": identity.generation_family,
             "source_created_ns": identity.created_ns,
+            "source_winner_snapshot": winner_snapshot,
+            "futility_policy": plan.get("futility_policy"),
             "prepared_ns": time.time_ns(),
             "measurement_started_ns": None,
             "measurement_stopped_ns": None,

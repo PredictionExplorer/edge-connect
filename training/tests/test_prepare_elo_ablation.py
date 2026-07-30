@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -15,6 +16,48 @@ from scripts.prepare_elo_ablation import (
 from startrain.config import load_config
 
 CONFIGS = Path(__file__).parents[1] / "configs"
+
+
+def _winner_snapshot(source: Path) -> dict[str, object]:
+    run_path = source / "run.json"
+    champion_path = source / "learner" / "champion.json"
+    champion_path.parent.mkdir(parents=True, exist_ok=True)
+    run = {
+        "schema_version": 1,
+        "run_id": "shared-parent-run",
+        "generation_family": "selected-family",
+        "created_ns": 1,
+    }
+    champion = {
+        "model_identity": "selected-champion",
+        "model_step": 400_000,
+        "updated_ns": 2,
+    }
+    run_path.write_text(json.dumps(run), encoding="utf-8")
+    champion_path.write_text(json.dumps(champion), encoding="utf-8")
+    return {
+        "schema_version": 1,
+        "status": "verified",
+        "label": "upstream-winner",
+        "run_root": str(source.resolve()),
+        "run_identity": {
+            key: run[key] for key in ("run_id", "generation_family", "created_ns")
+        },
+        "run_identity_artifact": {
+            "path": str(run_path.resolve()),
+            "sha256": hashlib.sha256(run_path.read_bytes()).hexdigest(),
+        },
+        "champion": champion,
+        "champion_pointer_artifact": {
+            "path": str(champion_path.resolve()),
+            "sha256": hashlib.sha256(champion_path.read_bytes()).hexdigest(),
+        },
+        "source_anchor": {
+            "model_identity": "older",
+            "model_step": 300_000,
+        },
+        "selection": "guarded_chronological_champion_frontier",
+    }
 
 
 def _prepare(tmp_path: Path) -> tuple[dict[str, object], Path]:
@@ -162,6 +205,51 @@ def test_prepare_generates_optional_system_screening_profiles(tmp_path: Path) ->
     learner_1024 = load_config(output / "learner-batch-1024.yaml")
     assert learner_1024.train.per_rank_batch_size == 1024
     assert learner_1024.learner.target_updates_per_new_sample == 1.0
+
+
+def test_prepare_requires_staged_winner_snapshot_to_match_current_champion(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "selected-source"
+    source.mkdir()
+    snapshot = _winner_snapshot(source)
+    output = tmp_path / "selected-profiles"
+
+    manifest = prepare_elo_ablation(
+        base_config=CONFIGS / "h100-8gpu-throughput.yaml",
+        output_dir=output,
+        run_root_parent=tmp_path / "selected-runs",
+        run_id="shared-parent-run",
+        source_run_root=source,
+        prefix="selected",
+        seed=37,
+        wall_budget_hours=1,
+        leaf_budget=10,
+        guard_floor_elo=-35,
+        treatments=("control",),
+        winner_snapshot=snapshot,
+    )
+
+    assert manifest["source_winner_snapshot"] == snapshot
+    champion_path = source / "learner" / "champion.json"
+    champion = json.loads(champion_path.read_text(encoding="utf-8"))
+    champion["model_identity"] = "newer-champion"
+    champion_path.write_text(json.dumps(champion), encoding="utf-8")
+    with pytest.raises(ValueError, match="artifact is stale"):
+        prepare_elo_ablation(
+            base_config=CONFIGS / "h100-8gpu-throughput.yaml",
+            output_dir=tmp_path / "stale-profiles",
+            run_root_parent=tmp_path / "stale-runs",
+            run_id="shared-parent-run",
+            source_run_root=source,
+            prefix="stale",
+            seed=37,
+            wall_budget_hours=1,
+            leaf_budget=10,
+            guard_floor_elo=-35,
+            treatments=("control",),
+            winner_snapshot=snapshot,
+        )
 
 
 def test_prepare_generates_clean_warmstart_treatments(tmp_path: Path) -> None:

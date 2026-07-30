@@ -7,7 +7,11 @@ from types import SimpleNamespace
 import pytest
 
 from scripts import hardware_health_preflight
-from startrain.hardware_health import parse_nvidia_smi_xml, query_gpu_health
+from startrain.hardware_health import (
+    GPUHealthProbeUnavailable,
+    parse_nvidia_smi_xml,
+    query_gpu_health,
+)
 
 
 def _gpu_xml(
@@ -75,6 +79,8 @@ def test_aggregate_sram_threshold_fails_with_zero_volatile_errors() -> None:
     )
 
     assert report["healthy"] is False
+    assert report["probe_status"] == "available"
+    assert report["safety_status"] == "unsafe"
     row = report["gpus"][0]
     assert row["volatile_sram_uncorrectable_parity"] == 0
     assert row["aggregate_sram_uncorrectable_parity"] == 65_535
@@ -98,7 +104,15 @@ def test_query_failure_is_explicit() -> None:
     def runner(*_args, **_kwargs):
         return SimpleNamespace(returncode=9, stdout="", stderr="driver unavailable")
 
-    with pytest.raises(RuntimeError, match="driver unavailable"):
+    with pytest.raises(GPUHealthProbeUnavailable, match="driver unavailable"):
+        query_gpu_health(expected_indices=(0,), runner=runner)
+
+
+def test_malformed_query_is_unavailable_not_parsed_unsafe() -> None:
+    def runner(*_args, **_kwargs):
+        return SimpleNamespace(returncode=0, stdout="<not-xml", stderr="")
+
+    with pytest.raises(GPUHealthProbeUnavailable, match="response was unavailable"):
         query_gpu_health(expected_indices=(0,), runner=runner)
 
 

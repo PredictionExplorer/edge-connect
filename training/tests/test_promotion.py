@@ -596,6 +596,7 @@ def _promotion_wave_case(
         runner_instances=0,
         wave_starts=[],
         persisted_pairs=[],
+        runner_stop_callbacks=[],
         wave_calls=0,
         stop=False,
         stop_after_wave=None,
@@ -621,7 +622,8 @@ def _promotion_wave_case(
             self.candidate = options["candidate"]
             self.baseline = options["baseline"]
 
-        def run(self, *, pair_starts, pair_counts, **_options):
+        def run(self, *, pair_starts, pair_counts, stop_requested, **_options):
+            state.runner_stop_callbacks.append(stop_requested)
             if result_path.is_file():
                 persisted = json.loads(result_path.read_text(encoding="utf-8"))
                 state.persisted_pairs.append(
@@ -741,6 +743,37 @@ def test_promotion_runs_waves_in_one_lease_and_pins_result_manifests(
     )
     assert Path(result["candidate_manifest"]).is_file()
     assert case.candidate.checkpoint.is_file()
+
+
+def test_promotion_persists_each_bounded_pair_chunk(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    case = _promotion_wave_case(tmp_path, monkeypatch)
+    case.supervisor.experiment = replace(
+        case.experiment,
+        arena=replace(case.experiment.arena, pair_chunk_size=1),
+    )
+
+    evaluated, state = case.supervisor._evaluate_candidate_session(
+        candidate=case.candidate,
+        champion=case.champion,
+        previous=None,
+        stop_requested=lambda: False,
+        progress=None,
+        once=True,
+    )
+
+    assert evaluated == 1
+    assert state == "once"
+    assert case.state.wave_starts == [{4: 0}, {4: 1}]
+    assert case.state.persisted_pairs == [[], [0]]
+    result = json.loads(case.result_path.read_text(encoding="utf-8"))
+    assert [pair["pair"] for pair in result["pairs"]] == [0, 1]
+    assert [item["pair_counts"] for item in result["wave_history"]] == [
+        {"4": 1},
+        {"4": 1},
+    ]
 
 
 def test_learner_shared_promotion_yields_after_one_wave_and_cools_down(
@@ -878,6 +911,8 @@ def test_promotion_stop_persists_wave_and_once_resumes_next_pair_indices(
     assert first["terminal"] is False
     assert [pair["pair"] for pair in first["pairs"]] == [0, 1]
     assert case.state.lease_entries == 1
+    assert len(case.state.runner_stop_callbacks) == 1
+    assert case.state.runner_stop_callbacks[0]() is True
     assert case.state.evaluator_loads == [
         case.candidate.model_identity,
         case.champion.model_identity,

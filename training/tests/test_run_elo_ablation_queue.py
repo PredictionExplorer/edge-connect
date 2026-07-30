@@ -35,6 +35,7 @@ class DeploymentFixture:
     manifest: Path
     state: Path
     comparison: Path
+    handoff: Path
     source: Path
     installed_profile: Path
     script: Path
@@ -123,6 +124,7 @@ def _deployment(
     scripts.mkdir(parents=True)
     for name in (
         "run_elo_ablation_queue.py",
+        "run_staged_elo_pipeline.py",
         "run_elo_ablation.py",
         "compare_elo_ablation.py",
         "preflight_run_state.py",
@@ -157,6 +159,7 @@ def _deployment(
         manifest=manifest,
         state=state,
         comparison=comparison,
+        handoff=state.with_name("continuity-handoff-request.json"),
         source=source,
         installed_profile=(
             tmp_path / "runs" / "queue-control-seed17" / "profile-elo-ablation.yaml"
@@ -202,6 +205,33 @@ def _fatal_report() -> dict[str, object]:
         exit_code=78,
         failure="orchestrator exited before budget with code 78",
     )
+
+
+def _isolated_fatal_report() -> dict[str, object]:
+    return {
+        **_fatal_report(),
+        "failure_domain": "arm",
+        "failure_phase": "pre_cutoff",
+        "measurement_cutoff_ns": 90,
+        "resource_released_ns": 100,
+        "teardown_status": "clean",
+    }
+
+
+def _complete_with_teardown_warning_report() -> dict[str, object]:
+    return {
+        **_complete_report(),
+        "status": "complete",
+        "completion_status": "complete_with_warning",
+        "measurement_cutoff_ns": 90,
+        "resource_released_ns": 100,
+        "failure_phase": "post_cutoff",
+        "teardown_status": "unexpected_exit",
+        "teardown": {"status": "unexpected_exit", "failure": "kill escalation"},
+        "integrity_status": "valid",
+        "integrity": {"status": "valid", "valid": True},
+        "failure": "post-cutoff kill escalation",
+    }
 
 
 def _transient_report() -> dict[str, object]:
@@ -396,6 +426,12 @@ def test_queue_runs_exclusively_persists_completion_and_finalizes(
     persisted = json.loads(deployment.state.read_text(encoding="utf-8"))
     assert persisted["finalization"]["status"] == "completed"
     assert persisted["finalization"]["comparison_status"] == "incomplete"
+    handoff = json.loads(deployment.handoff.read_text(encoding="utf-8"))
+    assert handoff["report"] == "startrain-continuity-handoff-request"
+    assert handoff["requested"] is True
+    assert handoff["action"] == "request_fallback"
+    assert handoff["requested_action"] == "reconcile_training_continuity"
+    assert handoff["source"]["queue_status"] == "completed"
     with exclusive_queue_lock(deployment.state):
         with pytest.raises(QueueBusyError, match="another ablation queue"):
             with exclusive_queue_lock(deployment.state):
@@ -436,6 +472,98 @@ def test_queue_retries_transient_crash_then_resumes_same_arm(tmp_path: Path) -> 
     assert control["attempts"] == 2
     assert control["transient_failures"] == 1
     assert control["status"] == "completed"
+
+
+def test_budget_completion_with_verified_teardown_warning_is_completed(
+    tmp_path: Path,
+) -> None:
+    deployment = _deployment(tmp_path)
+    calls = 0
+
+    def runner(**_kwargs: object) -> dict[str, object]:
+        nonlocal calls
+        calls += 1
+        return (
+            _complete_with_teardown_warning_report()
+            if calls == 1
+            else _complete_report()
+        )
+
+    state = run_ablation_queue(
+        deployment.manifest,
+        arm_runner=runner,
+        current_source_commit=SOURCE_COMMIT,
+        source_tree_clean=True,
+    )
+    control = _arms(state)["control"]
+
+    assert state["queue_status"] == "completed"
+    assert control["status"] == "completed"
+    assert control["completion_status"] == "complete_with_warning"
+    assert control["measurement_cutoff_ns"] == 90
+    assert control["resource_released_ns"] == 100
+    assert control["teardown_status"] == "unexpected_exit"
+    assert control["integrity_status"] == "valid"
+
+
+def test_unreleased_resources_block_queue_advancement_and_continuity_handoff(
+    tmp_path: Path,
+) -> None:
+    deployment = _deployment(tmp_path)
+    report = {
+        **_complete_with_teardown_warning_report(),
+        "resource_released_ns": None,
+        "failure_domain": "process_cleanup",
+        "failure": "process group release was not confirmed",
+    }
+
+    state = run_ablation_queue(
+        deployment.manifest,
+        arm_runner=lambda **_kwargs: report,
+        current_source_commit=SOURCE_COMMIT,
+        source_tree_clean=True,
+    )
+    arms = _arms(state)
+    handoff = json.loads(deployment.handoff.read_text(encoding="utf-8"))
+
+    assert state["queue_status"] == "failed"
+    assert arms["control"]["status"] == "failed"
+    assert arms["plateau-keep"]["status"] == "pending"
+    assert handoff["status"] == "blocked"
+    assert handoff["requested"] is False
+    assert handoff["reason"] == "resources_not_released"
+    assert handoff["unreleased_arms"][0]["treatment"] == "control"
+
+
+def test_structured_isolated_fatal_arm_is_quarantined_and_queue_continues(
+    tmp_path: Path,
+) -> None:
+    deployment = _deployment(tmp_path)
+    calls = 0
+
+    def runner(**_kwargs: object) -> dict[str, object]:
+        nonlocal calls
+        calls += 1
+        return _isolated_fatal_report() if calls == 1 else _complete_report()
+
+    state = run_ablation_queue(
+        deployment.manifest,
+        arm_runner=runner,
+        current_source_commit=SOURCE_COMMIT,
+        source_tree_clean=True,
+    )
+    arms = _arms(state)
+    handoff = json.loads(deployment.handoff.read_text(encoding="utf-8"))
+
+    assert calls == 2
+    assert state["queue_status"] == "failed"
+    assert arms["control"]["status"] == "quarantined"
+    assert arms["control"]["quarantine"]["isolated"] is True
+    assert arms["control"]["quarantine"]["failure_domain"] == "arm"
+    assert arms["plateau-keep"]["status"] == "completed"
+    assert state["finalization"]["status"] == "completed"
+    assert handoff["reason"] == "queue_completed_with_quarantined_arms"
+    assert handoff["quarantined_arms"][0]["treatment"] == "control"
 
 
 def test_exhausted_transient_retry_budget_stops_queue(tmp_path: Path) -> None:

@@ -250,6 +250,10 @@ gate: the shipped `h100-*.yaml` profiles pin `H100` (unchanged fail-closed
 behavior), while `auto.yaml` accepts any healthy NVIDIA GPU. ECC, MIG,
 row-remap and repair checks stay fail-closed everywhere; fields a consumer
 GPU reports as `N/A` are treated as absent features, not failures.
+An unqueryable probe is distinct from proven unsafe hardware: the coordinator
+retries it with the configured short transient budget and exits with the
+transient code only after that budget is exhausted. A probe canceled by a
+latched graceful shutdown cannot create a hardware-fatal record.
 
 MPS and CPU hosts are development-scale: they run the full contract
 (self-play, replay, learner, arena, promotion) but are orders of magnitude

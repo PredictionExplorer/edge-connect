@@ -44,6 +44,7 @@ from startrain.orchestration import (
     Coordinator,
     FATAL_WORKER_EXIT_CODE,
     HARDWARE_HEALTH_EXIT_CODE,
+    LEARNER_DATA_WORKERS_ENV,
     RunDirectories,
     TRANSIENT_WORKER_EXIT_CODE,
     WORKER_FAILURE_PATH_ENV,
@@ -81,6 +82,11 @@ def test_finite_and_continuous_systemd_restart_policies_are_distinct() -> None:
     assert "RestartPreventExitStatus=78" in finite
     assert "WatchdogSignal=SIGTERM" in finite
     assert "WatchdogSignal=SIGTERM" in continuous
+    ablation = (
+        DEPLOY / "edgeconnect-startrain-ablation-queue.service.example"
+    ).read_text()
+    assert "KillMode=mixed" in ablation
+    assert "KillMode=control-group" not in ablation
     report_service = (
         DEPLOY / "edgeconnect-startrain-report.service.example"
     ).read_text()
@@ -546,6 +552,112 @@ class FakeClock:
         self.value += seconds
 
 
+def test_hardware_probe_unavailability_exhausts_as_transient(
+    tmp_path: Path,
+) -> None:
+    experiment = load_config(CONFIGS / "h100-4gpu.yaml")
+    health = replace(
+        experiment.orchestration.hardware_health,
+        transient_probe_attempts=3,
+        transient_probe_retry_seconds=0.1,
+    )
+    experiment = replace(
+        experiment,
+        orchestration=replace(
+            experiment.orchestration,
+            directories=RunDirectoryConfig(root=str(tmp_path / "health-unavailable")),
+            hardware_health=health,
+        ),
+    )
+    directories = RunDirectories.from_experiment(experiment)
+    specs = build_worker_specs(
+        experiment,
+        config_path=CONFIGS / "h100-4gpu.yaml",
+        directories=directories,
+        base_environment={},
+    )
+    probes = 0
+    launches = 0
+
+    def unavailable() -> dict[str, object]:
+        nonlocal probes
+        probes += 1
+        raise RuntimeError("nvidia-smi health query failed: driver unavailable")
+
+    def process_factory(*_args, **_kwargs):
+        nonlocal launches
+        launches += 1
+        return FakeProcess(exit_immediately=False)
+
+    clock = FakeClock()
+    coordinator = Coordinator(
+        experiment=experiment,
+        specs=specs,
+        directories=directories,
+        process_factory=process_factory,
+        hardware_health_probe=unavailable,
+        clock=clock,
+        sleep=clock.sleep,
+    )
+
+    assert coordinator.run(stop_requested=lambda: False) == TRANSIENT_WORKER_EXIT_CODE
+    assert probes == 3
+    assert launches == 0
+    fatal = json.loads(coordinator.fatal_path.read_text(encoding="utf-8"))
+    assert fatal["failure_class"] == "transient"
+    assert fatal["terminal_reason"] == "hardware_health_unavailable"
+    assert fatal["coordinator_exit_code"] == TRANSIENT_WORKER_EXIT_CODE
+
+
+def test_shutdown_cancellation_cannot_create_hardware_fatal(
+    tmp_path: Path,
+) -> None:
+    experiment = load_config(CONFIGS / "h100-4gpu.yaml")
+    experiment = replace(
+        experiment,
+        orchestration=replace(
+            experiment.orchestration,
+            directories=RunDirectoryConfig(root=str(tmp_path / "health-cancelled")),
+        ),
+    )
+    directories = RunDirectories.from_experiment(experiment)
+    specs = build_worker_specs(
+        experiment,
+        config_path=CONFIGS / "h100-4gpu.yaml",
+        directories=directories,
+        base_environment={},
+    )
+    stopping = False
+    launches = 0
+
+    def cancelled_probe() -> dict[str, object]:
+        nonlocal stopping
+        stopping = True
+        raise RuntimeError("nvidia-smi health query failed: exit status -15")
+
+    def process_factory(*_args, **_kwargs):
+        nonlocal launches
+        launches += 1
+        return FakeProcess(exit_immediately=False)
+
+    coordinator = Coordinator(
+        experiment=experiment,
+        specs=specs,
+        directories=directories,
+        process_factory=process_factory,
+        hardware_health_probe=cancelled_probe,
+    )
+
+    assert coordinator.run(stop_requested=lambda: stopping) == 0
+    assert launches == 0
+    assert not coordinator.fatal_path.exists()
+    health = json.loads(
+        (directories.status / "hardware-health.json").read_text(encoding="utf-8")
+    )
+    assert health["probe_status"] == "unavailable"
+    assert health["shutdown_cancelled"] is True
+
+
 def test_coordinator_applies_configured_cpu_affinity(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -884,11 +996,14 @@ def test_transient_learner_exit_retries_with_bounded_jitter(tmp_path) -> None:
         base_environment={},
     )
     launches: dict[str, int] = {}
+    learner_environments: list[dict[str, str]] = []
     reason = "DataLoader worker exited unexpectedly"
 
     def process_factory(command: list[str], **options: Any) -> FakeProcess:
         name = worker_name(command)
         launches[name] = launches.get(name, 0) + 1
+        if name == "learner":
+            learner_environments.append(dict(options["env"]))
         if name == "learner" and launches[name] == 1:
             write_worker_failure(
                 options,
@@ -922,6 +1037,10 @@ def test_transient_learner_exit_retries_with_bounded_jitter(tmp_path) -> None:
         == 0
     )
     assert launches["learner"] == 2
+    assert LEARNER_DATA_WORKERS_ENV not in learner_environments[0]
+    assert learner_environments[1][LEARNER_DATA_WORKERS_ENV] == str(
+        experiment.data.workers // 2
+    )
     assert not coordinator.fatal_path.exists()
     events = coordinator_events(directories)
     learner_exit = next(
@@ -932,6 +1051,67 @@ def test_transient_learner_exit_retries_with_bounded_jitter(tmp_path) -> None:
     assert learner_exit["failure_class"] == "transient"
     assert learner_exit["reason"] == reason
     assert learner_exit["restart_in_seconds"] == pytest.approx(0.008)
+    assert any(
+        event["event"] == "learner_loader_degraded"
+        and event["effective_workers"] == experiment.data.workers // 2
+        for event in events
+    )
+
+
+def test_repeated_dataloader_failure_retries_once_with_zero_workers(tmp_path) -> None:
+    experiment = recovery_experiment(tmp_path, max_restarts=3)
+    directories = RunDirectories.from_experiment(experiment)
+    specs = build_worker_specs(
+        experiment,
+        config_path=CONFIGS / "h100-4gpu.yaml",
+        directories=directories,
+        base_environment={},
+    )
+    learner_environments: list[dict[str, str]] = []
+
+    def process_factory(command: list[str], **options: Any) -> FakeProcess:
+        name = worker_name(command)
+        if name != "learner":
+            return FakeProcess(exit_immediately=False)
+        learner_environments.append(dict(options["env"]))
+        if len(learner_environments) <= 2:
+            write_worker_failure(
+                options,
+                failure_class="transient",
+                exit_code=TRANSIENT_WORKER_EXIT_CODE,
+                reason="DataLoader worker exited unexpectedly",
+                exception_type="RuntimeError",
+            )
+            return FakeProcess(
+                exit_immediately=True,
+                exit_code=TRANSIENT_WORKER_EXIT_CODE,
+            )
+        return FakeProcess(exit_immediately=False)
+
+    clock = FakeClock()
+    coordinator = Coordinator(
+        experiment=experiment,
+        specs=specs,
+        directories=directories,
+        process_factory=process_factory,
+        clock=clock,
+        sleep=clock.sleep,
+        random_fraction=lambda: 0.0,
+    )
+
+    assert (
+        coordinator.run(
+            stop_requested=lambda: False,
+            max_monitor_cycles=5,
+        )
+        == 0
+    )
+    assert len(learner_environments) == 3
+    assert LEARNER_DATA_WORKERS_ENV not in learner_environments[0]
+    assert learner_environments[1][LEARNER_DATA_WORKERS_ENV] == str(
+        experiment.data.workers // 2
+    )
+    assert learner_environments[2][LEARNER_DATA_WORKERS_ENV] == "0"
 
 
 def test_transient_learner_exhausts_bounded_restart_budget(tmp_path) -> None:

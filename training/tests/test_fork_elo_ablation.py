@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -93,6 +94,33 @@ def _plan(tmp_path: Path, source: Path) -> Path:
     return output / "ablation-plan.json"
 
 
+def _winner_snapshot(source: Path) -> dict[str, object]:
+    run_path = source / "run.json"
+    champion_path = source / "learner" / "champion.json"
+    run = json.loads(run_path.read_text(encoding="utf-8"))
+    champion = json.loads(champion_path.read_text(encoding="utf-8"))
+    return {
+        "schema_version": 1,
+        "status": "verified",
+        "label": "selected",
+        "run_root": str(source.resolve()),
+        "run_identity": {
+            key: run[key] for key in ("run_id", "generation_family", "created_ns")
+        },
+        "run_identity_artifact": {
+            "path": str(run_path.resolve()),
+            "sha256": hashlib.sha256(run_path.read_bytes()).hexdigest(),
+        },
+        "champion": champion,
+        "champion_pointer_artifact": {
+            "path": str(champion_path.resolve()),
+            "sha256": hashlib.sha256(champion_path.read_bytes()).hexdigest(),
+        },
+        "source_anchor": {"model_identity": "older", "model_step": 0},
+        "selection": "guarded_chronological_champion_frontier",
+    }
+
+
 def test_fork_links_immutable_artifacts_and_rotates_runtime(tmp_path: Path) -> None:
     source = _source_run(tmp_path)
     plan = _plan(tmp_path, source)
@@ -135,6 +163,27 @@ def test_fork_links_immutable_artifacts_and_rotates_runtime(tmp_path: Path) -> N
         os.stat(mutable).st_ino
         != os.stat(source / mutable.relative_to(destination)).st_ino
     )
+
+
+def test_fork_preserves_nested_ablation_ancestry(tmp_path: Path) -> None:
+    source = _source_run(tmp_path)
+    inherited = source / "ablation-parent" / "ancestor-marker.json"
+    inherited.parent.mkdir()
+    inherited.write_text('{"generation": 1}', encoding="utf-8")
+    plan = _plan(tmp_path, source)
+
+    fork_elo_ablation(
+        source_run_root=source,
+        plan_path=plan,
+        treatment="control",
+    )
+
+    destination = tmp_path / "runs" / "pilot-control-seed17"
+    preserved = destination / "ablation-parent" / "ancestor" / "ancestor-marker.json"
+    assert preserved.read_text(encoding="utf-8") == '{"generation": 1}'
+    assert (
+        destination / "ablation-parent" / "learner-metrics.jsonl"
+    ).read_bytes() == b"old learner metrics\n"
 
 
 def test_fork_refuses_active_source_and_changed_profile(tmp_path: Path) -> None:
@@ -203,6 +252,66 @@ def test_fork_prepares_utd_segment_for_existing_run(tmp_path: Path) -> None:
         ).read_text()
     )
     assert persisted == segment
+
+
+def test_fork_preserves_verified_staged_winner_and_rejects_stale_source(
+    tmp_path: Path,
+) -> None:
+    source = _source_run(tmp_path)
+    snapshot = _winner_snapshot(source)
+    output = tmp_path / "staged-profiles"
+    prepare_elo_ablation(
+        base_config=CONFIGS / "h100-8gpu-throughput.yaml",
+        output_dir=output,
+        run_root_parent=tmp_path / "staged-runs",
+        run_id="shared-run",
+        source_run_root=source,
+        prefix="staged",
+        seed=41,
+        wall_budget_hours=1,
+        leaf_budget=10,
+        guard_floor_elo=-35,
+        treatments=("control",),
+        winner_snapshot=snapshot,
+    )
+    plan = output / "ablation-plan.json"
+
+    metadata = fork_elo_ablation(
+        source_run_root=source,
+        plan_path=plan,
+        treatment="control",
+    )
+
+    assert metadata["source_winner_snapshot"] == snapshot
+    assert metadata["anchor"]["model_identity"] == "champion-id"
+
+    stale_source = _source_run(tmp_path / "stale")
+    stale_snapshot = _winner_snapshot(stale_source)
+    stale_output = tmp_path / "stale-profiles"
+    prepare_elo_ablation(
+        base_config=CONFIGS / "h100-8gpu-throughput.yaml",
+        output_dir=stale_output,
+        run_root_parent=tmp_path / "stale-runs",
+        run_id="shared-run",
+        source_run_root=stale_source,
+        prefix="stale",
+        seed=43,
+        wall_budget_hours=1,
+        leaf_budget=10,
+        guard_floor_elo=-35,
+        treatments=("control",),
+        winner_snapshot=stale_snapshot,
+    )
+    champion_path = stale_source / "learner" / "champion.json"
+    champion = json.loads(champion_path.read_text(encoding="utf-8"))
+    champion["model_step"] = 400_001
+    champion_path.write_text(json.dumps(champion), encoding="utf-8")
+    with pytest.raises(ValueError, match="artifact is stale"):
+        fork_elo_ablation(
+            source_run_root=stale_source,
+            plan_path=stale_output / "ablation-plan.json",
+            treatment="control",
+        )
 
 
 def test_fork_cli_reports_unknown_treatment_as_json(

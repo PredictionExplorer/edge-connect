@@ -73,7 +73,11 @@ def _run_fixture(
     )
     for role, identity, step in (
         ("candidate", candidate, 10),
-        ("champion", anchor, 0),
+        (
+            "champion",
+            candidate if decision == "promote" else anchor,
+            10 if decision == "promote" else 0,
+        ),
     ):
         (root / "learner" / f"{role}.json").write_text(
             json.dumps(
@@ -242,6 +246,22 @@ def _install_ablation_metadata(
         json.dumps(new_result, sort_keys=True),
         encoding="utf-8",
     )
+    champion_identity = (
+        candidate if new_result["promotion"]["decision"] == "promote" else frozen_anchor
+    )
+    champion_step = 10 if champion_identity == candidate else 5
+    (root / "learner" / "champion.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "role": "champion",
+                "model_identity": champion_identity,
+                "model_step": champion_step,
+                "updated_ns": new_result["completed_ns"],
+            }
+        ),
+        encoding="utf-8",
+    )
     old_result = json.loads(json.dumps(new_result))
     old_result.update(
         {
@@ -357,6 +377,15 @@ def test_comparison_ranks_common_anchor_elo_lcb_and_retains_operations_metrics(
     assert efficiency["ring_10_elo_lcb_per_provisioned_gpu_hour"] == pytest.approx(
         expected_lower / 64
     )
+    deployment_metric = stronger_result["deployment_metric"]
+    assert deployment_metric["value"] == pytest.approx(expected_lower / 8)
+    assert report["ranking_metric"].startswith("guarded_champion_frontier")
+    assert report["selector"]["status"] == "verified"
+    assert report["selector"]["winner_snapshot"]["label"] == "stronger"
+    assert (
+        report["selector"]["winner_snapshot"]["champion"]["model_identity"]
+        == "checkpoint-stronger"
+    )
 
     latency = stronger_result["candidate_publish_to_terminal"]
     assert isinstance(latency, dict)
@@ -463,6 +492,12 @@ def test_resilient_lifecycle_rejects_fatal_exit_even_with_budget_stop_reason(
             "measurement_outcome": "fatal_orchestrator_exit",
             "measurement_attempt_count": 1,
             "measurement_failure": "orchestrator exited before budget with code 78",
+            "measurement_cutoff_ns": metadata["measurement_stopped_ns"],
+            "resource_released_ns": metadata["measurement_stopped_ns"] + 1,
+            "failure_phase": "pre_cutoff",
+            "teardown_status": "warning",
+            "integrity_status": "verified",
+            "integrity": {"status": "verified", "valid": True},
         }
     )
     metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
@@ -476,6 +511,122 @@ def test_resilient_lifecycle_rejects_fatal_exit_even_with_budget_stop_reason(
     assert failed_result["measurement"]["attempt_count"] == 1
     assert failed_result["eligible"] is False
     assert "incomplete_measurement" in _reason_codes(failed_result)
+
+
+def test_structured_post_cutoff_warning_uses_total_resource_wall_time(
+    tmp_path: Path,
+) -> None:
+    control = _run_fixture(tmp_path, "control")
+    warning = _run_fixture(tmp_path, "warning", ring_wins=72, ring_losses=28)
+    _install_ablation_metadata(control)
+    _install_ablation_metadata(warning)
+    metadata_path = warning / "ablation.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    cutoff_ns = metadata["measurement_stopped_ns"]
+    metadata.update(
+        {
+            "measurement_status": "complete",
+            "measurement_completion_status": "complete_with_warning",
+            "measurement_outcome": "budget_completion",
+            "measurement_attempt_count": 1,
+            "measurement_cutoff_ns": cutoff_ns,
+            "resource_released_ns": cutoff_ns + HOUR_NS // 4,
+            "failure_phase": "post_cutoff",
+            "teardown_status": "unexpected_exit",
+            "teardown": {
+                "status": "unexpected_exit",
+                "failure": "coordinator required kill escalation",
+            },
+            "integrity_status": "valid",
+            "integrity": {"status": "valid", "valid": True},
+        }
+    )
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+    report = build_elo_ablation_comparison({"control": control, "warning": warning})
+    result = _by_label(report)["warning"]
+
+    assert report["status"] == "complete"
+    assert result["eligible"] is True
+    assert result["measurement"]["wall_seconds"] == 8 * 3_600
+    assert result["measurement"]["teardown_status"] == "unexpected_exit"
+    accounting = result["resource_accounting"]
+    assert accounting["teardown_wall_seconds"] == 15 * 60
+    assert accounting["total_provisioned_wall_hours"] == pytest.approx(8.25)
+    metric = result["deployment_metric"]
+    assert metric["value"] == pytest.approx(
+        metric["champion_frontier_ring_10_elo_one_sided_95_lower_bound"] / 8.25
+    )
+
+
+def test_explicit_null_resource_release_is_not_treated_as_legacy_cutoff(
+    tmp_path: Path,
+) -> None:
+    control = _run_fixture(tmp_path, "control")
+    missing = _run_fixture(tmp_path, "missing", ring_wins=72, ring_losses=28)
+    _install_ablation_metadata(control)
+    _install_ablation_metadata(missing)
+    metadata_path = missing / "ablation.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata.update(
+        {
+            "measurement_status": "complete",
+            "measurement_completion_status": "complete_with_warning",
+            "measurement_outcome": "budget_completion",
+            "measurement_attempt_count": 1,
+            "measurement_cutoff_ns": metadata["measurement_stopped_ns"],
+            "resource_released_ns": None,
+            "failure_phase": "post_cutoff",
+            "teardown_status": "resources_not_released",
+            "integrity_status": "valid",
+            "integrity": {"status": "valid", "valid": True},
+        }
+    )
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+    report = build_elo_ablation_comparison({"control": control, "missing": missing})
+    result = _by_label(report)["missing"]
+
+    assert result["eligible"] is False
+    assert result["measurement"]["resource_released_ns"] is None
+    assert result["measurement"]["resource_wall_seconds"] is None
+    assert "incomplete_measurement" in _reason_codes(result)
+    assert "invalid_resource_wall_time" in _reason_codes(result)
+
+
+def test_primary_metric_never_cherry_picks_rejected_terminal_candidate(
+    tmp_path: Path,
+) -> None:
+    promoted = _run_fixture(
+        tmp_path,
+        "promoted",
+        ring_wins=60,
+        ring_losses=40,
+        decision="promote",
+    )
+    rejected = _run_fixture(
+        tmp_path,
+        "rejected",
+        ring_wins=90,
+        ring_losses=10,
+        decision="reject",
+    )
+
+    report = build_elo_ablation_comparison({"promoted": promoted, "rejected": rejected})
+    results = _by_label(report)
+
+    assert report["status"] == "complete"
+    assert results["rejected"]["endpoint"]["identity"] == "checkpoint-rejected"
+    assert (
+        results["rejected"]["diagnostics"]["latest_terminal_endpoint"]
+        == (results["rejected"]["endpoint"])
+    )
+    assert (
+        results["rejected"]["champion_frontier"]["identity"]
+        == "checkpoint-common-anchor"
+    )
+    assert results["rejected"]["deployment_metric"]["point_value"] == 0
+    assert report["selector"]["winner_snapshot"]["label"] == "promoted"
 
 
 def test_queue_can_force_unfinished_arm_ineligible(tmp_path: Path) -> None:

@@ -120,6 +120,33 @@ The orchestration soak is complete only after it demonstrates:
 - metrics sufficient to reproduce games/hour, leaf evaluations/second,
   learner examples/second, and promotion latency.
 
+Before certifying unattended training, run an isolated continuity canary with a
+separate primary and verified fallback root. The canary must exercise:
+
+1. wall-budget expiry while a GPU health probe is in flight;
+2. one actor exit and one learner exit, each followed by bounded recovery;
+3. coordinator termination followed by systemd/continuity reconciliation;
+4. a malformed canary checkpoint and replay shard, proving verified fallback or
+   quarantine without modifying the production root;
+5. an unavailable `nvidia-smi` response, proving bounded transient handling;
+6. a synthetic unsafe GPU report, proving that active work is stopped and
+   fallback is blocked; and
+7. queue completion/failure handoff to the verified last-known-good workload.
+
+Do not inject real ECC errors, reset a production GPU, or fill the host
+filesystem. Use isolated artifacts and deterministic fault hooks. Certification
+requires:
+
+- no false `hardware_health_failure` at a planned shutdown;
+- no orphan compute process or second coordinator;
+- complete role-reversed arena pairs only;
+- resource release within 180 seconds for the full 8-H100 role-partitioned
+  canary profile;
+- productive fallback learner and actor progress within 180 seconds after an
+  immediate handoff, or 300 seconds through the timer backstop; and
+- all teardown, retry, fallback, and idle time included in provisioned wall
+  hours.
+
 ## Certification rule
 
 CPU, browser, or mocked distributed tests cannot certify H100 readiness.

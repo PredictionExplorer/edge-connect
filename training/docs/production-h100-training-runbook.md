@@ -647,6 +647,79 @@ the coordinator, allowing it to unwind learner DataLoader children and actor
 search waves, while still hard-killing the complete cgroup after
 `TimeoutStopSec` if graceful shutdown fails.
 
+### Host-level continuity and last-known-good fallback
+
+The coordinator recovers workers inside one run. Cross-run recovery is owned by
+the separate host continuity controller:
+
+- `deploy/edgeconnect-startrain-continuity.service.example`
+- `deploy/edgeconnect-startrain-continuity.timer.example`
+- `deploy/edgeconnect-startrain-continuity-workload.service.example`
+- `deploy/training-continuity-manifest.json.example`
+
+Create isolated primary and fallback run roots first. The fallback must have
+passed the full canary and must not share mutable state with the primary. Obtain
+the profile and run-identity descriptor hashes with:
+
+```bash
+python scripts/reconcile_training_continuity.py fingerprint \
+  --profile "$PROFILE" --run-root "$RUN_ROOT"
+```
+
+Render the manifest with absolute canonical paths and those exact hashes. Install
+the manifest and continuity release root-owned and not group/world writable.
+Each workload's `runtime` entry must also pin the root-owned immutable release
+manifest and its SHA-256, training directory, orchestrator path/hash, and
+installed systemd unit path/hash. The release manifest must enumerate hashes for
+every launch-critical source file. Profile/run verification alone does not
+identify the code that will execute.
+Keep mutable continuity state under `/var/lib/edgeconnect`, outside every run
+root. Pre-create the shared GPU execution lock for the training user and its
+private operations group:
+
+```bash
+sudo install -d -m 0750 -o root -g "$USER" \
+  /var/lib/edgeconnect/training-continuity
+sudo install -m 0660 -o "$USER" -g "$USER" /dev/null \
+  /var/lib/edgeconnect/elo-ablation-execution.lock
+```
+
+The queue and every continuity workload must use that same lock path. Render one
+workload unit per manifest workload, but do not enable workload units directly.
+Enable only the continuity timer; it selects the permitted unit:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now edgeconnect-startrain-continuity.timer
+sudo systemctl start edgeconnect-startrain-continuity.service
+```
+
+Install `deploy/edgeconnect-startrain-continuity-trigger.conf.example` as a
+drop-in on finite queue units for immediate handoff. The one-minute timer remains
+the boot/crash backstop.
+
+On a software failure, the controller records immutable metadata-only
+quarantine evidence, verifies the frozen fallback profile/run identity, requires
+a fresh healthy GPU report, and starts the fallback under the host lock. It
+never deletes or renames the failed run. Concrete GPU unsafety stops a registered
+active workload and blocks all fallback starts; an unavailable health query also
+blocks new starts but lets the coordinator's bounded transient probe policy
+handle an already-running workload.
+
+The continuity guarantee applies only while host power, storage, systemd, and a
+verified fallback remain available. Never configure automatic continuation
+through uncorrectable ECC, pending repair/remap, or an unverified fallback.
+Monitoring treats a continuity state whose unconditional reconciliation
+heartbeat is older than three minutes as an error, even when its last phase says
+`active`.
+
+After a transient learner failure whose recorded reason identifies DataLoader
+workers or multiprocessing semaphores, the coordinator automatically retries
+with half the configured loader workers, then with zero workers if the first
+degraded launch also fails. This degradation is recorded as
+`learner_loader_degraded` and resets only after the configured stable-runtime
+window.
+
 Inspect it:
 
 ```bash
@@ -1113,6 +1186,10 @@ The throughput profile uses 25-pair post-minimum continuation waves and
 queued candidates, but it cannot discard an evaluation after any pair is durable.
 Every wave remains resumable and the unchanged anytime-valid gate can stop at the
 first conclusive look instead of forcing a 200-pair maximum.
+`arena.pair_chunk_size` optionally persists smaller complete role-reversed
+chunks and bounds shutdown loss. Leaving it null preserves the full requested
+ring batch for throughput; any non-null production value requires an H100
+throughput benchmark because smaller batches can reduce evaluator efficiency.
 
 This utility intentionally does not introduce update-to-data control. Adding a
 UTD target to an existing throughput run requires a separately reviewed

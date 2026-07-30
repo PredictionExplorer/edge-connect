@@ -740,6 +740,52 @@ def summarize_arena_pairs(
     }
 
 
+def summarize_completed_arena_pairs(
+    pairs: Sequence[ArenaPair],
+    config: ArenaConfig,
+) -> dict[str, object]:
+    """Summarize complete pairs without treating partial ring coverage as a decision."""
+
+    if not pairs:
+        raise ValueError("arena summary requires pairs")
+    present = {pair.ring for pair in pairs}
+    if present == set(config.rings):
+        return summarize_arena_pairs(pairs, config)
+    unknown = present - set(config.rings)
+    if unknown:
+        raise ValueError("arena pair has an unconfigured ring")
+    per_ring = {
+        ring: [pair for pair in pairs if pair.ring == ring] for ring in config.rings
+    }
+    return {
+        "aggregate": summarize_pairs(
+            pairs,
+            confidence=config.confidence,
+            bootstrap_samples=config.bootstrap_samples,
+            seed=config.seed,
+        ),
+        "per_ring": {
+            str(ring): summarize_pairs(
+                values,
+                confidence=config.confidence,
+                bootstrap_samples=config.bootstrap_samples,
+                seed=config.seed + ring * 1_000_003,
+            )
+            for ring, values in per_ring.items()
+            if values
+        },
+        "promotion": {
+            "decision": "continue",
+            "sequential_state": "continue",
+            "reason": "incomplete_ring_coverage",
+            "incomplete_rings": [
+                ring for ring, values in per_ring.items() if not values
+            ],
+            "pair_model": "complete-role-reversed-pairs-only",
+        },
+    }
+
+
 class ArenaRunner:
     def __init__(
         self,
@@ -772,9 +818,11 @@ class ArenaRunner:
         progress: Callable[..., None] | None = None,
         pair_starts: Mapping[int, int] | None = None,
         pair_counts: Mapping[int, int] | None = None,
+        stop_requested: Callable[[], bool] | None = None,
     ) -> dict[str, object]:
         started_ns = time.time_ns()
         started = time.perf_counter()
+        should_stop = stop_requested or (lambda: False)
         candidate_calls_before = int(getattr(self.candidate, "evaluator_calls", 0))
         candidate_rows_before = int(getattr(self.candidate, "evaluator_rows", 0))
         baseline_calls_before = int(getattr(self.baseline, "evaluator_calls", 0))
@@ -784,6 +832,11 @@ class ArenaRunner:
         self._inference_calls = 0
         self._inference_seconds = 0.0
         self._inference_queue_wait_seconds = 0.0
+        requested_pairs = sum(
+            int((pair_counts or {}).get(ring, self.config.pairs_per_ring))
+            for ring in self.config.rings
+        )
+        interrupted = False
         # Dynamo/Inductor compiled models are not thread-safe. Keep the two
         # GIL-releasing native search groups parallel, but route both models
         # through one stable inference thread for the entire arena run.
@@ -797,57 +850,102 @@ class ArenaRunner:
                 pair_count = int(
                     (pair_counts or {}).get(ring, self.config.pairs_per_ring)
                 )
-                specifications: list[tuple[int, int, int, int | None]] = []
-                for pair in range(first_pair, first_pair + pair_count):
-                    opening_seed = _opening_seed(self.config.seed, ring, pair)
-                    forced_opening = _forced_opening(
-                        opening_seed, self.config.unforced_opening_fraction
+                final_pair = first_pair + pair_count
+                chunk_size = self.config.pair_chunk_size or max(1, pair_count)
+                for chunk_start in range(
+                    first_pair,
+                    final_pair,
+                    chunk_size,
+                ):
+                    if should_stop():
+                        interrupted = True
+                        break
+                    specifications: list[tuple[int, int, int, int | None]] = []
+                    chunk_stop = min(
+                        final_pair,
+                        chunk_start + chunk_size,
                     )
-                    opening_action = (
-                        opening_seed % node_count if forced_opening else None
-                    )
-                    for candidate_player in (0, 1):
-                        specifications.append(
-                            (
-                                pair,
-                                candidate_player,
-                                opening_seed,
-                                opening_action,
-                            )
+                    for pair in range(chunk_start, chunk_stop):
+                        opening_seed = _opening_seed(self.config.seed, ring, pair)
+                        forced_opening = _forced_opening(
+                            opening_seed, self.config.unforced_opening_fraction
                         )
-                ring_games = self._play_ring_batch(
-                    ring,
-                    specifications,
-                    progress=progress,
-                    inference_executor=inference_executor,
-                )
-                games.extend(ring_games)
-                for offset in range(0, len(ring_games), 2):
-                    pair_games = ring_games[offset : offset + 2]
-                    pair = pair_games[0].pair
-                    opening_seed = pair_games[0].opening_seed
-                    opening_action = pair_games[0].opening_action
-                    forced_opening = pair_games[0].forced_opening
-                    completed_pair = ArenaPair(
-                        ring=ring,
-                        pair=pair,
-                        opening_seed=opening_seed,
-                        opening_action=opening_action,
-                        forced_opening=forced_opening,
-                        outcomes=(
-                            pair_games[0].outcome,
-                            pair_games[1].outcome,
-                        ),
+                        opening_action = (
+                            opening_seed % node_count if forced_opening else None
+                        )
+                        for candidate_player in (0, 1):
+                            specifications.append(
+                                (
+                                    pair,
+                                    candidate_player,
+                                    opening_seed,
+                                    opening_action,
+                                )
+                            )
+                    ring_games = self._play_ring_batch(
+                        ring,
+                        specifications,
+                        progress=progress,
+                        inference_executor=inference_executor,
+                        stop_requested=should_stop,
                     )
-                    pairs.append(completed_pair)
-                    if progress is not None:
-                        progress(
-                            phase="arena",
+                    if len(ring_games) % 2:
+                        raise RuntimeError(
+                            "arena cancellation produced an incomplete role-reversed pair"
+                        )
+                    games.extend(ring_games)
+                    for offset in range(0, len(ring_games), 2):
+                        pair_games = ring_games[offset : offset + 2]
+                        pair = pair_games[0].pair
+                        if pair_games[1].pair != pair or {
+                            pair_games[0].candidate_player,
+                            pair_games[1].candidate_player,
+                        } != {0, 1}:
+                            raise RuntimeError(
+                                "arena batch did not preserve role-reversed pairs"
+                            )
+                        opening_seed = pair_games[0].opening_seed
+                        opening_action = pair_games[0].opening_action
+                        forced_opening = pair_games[0].forced_opening
+                        completed_pair = ArenaPair(
                             ring=ring,
                             pair=pair,
-                            completed_pairs=len(pairs),
+                            opening_seed=opening_seed,
+                            opening_action=opening_action,
+                            forced_opening=forced_opening,
+                            outcomes=(
+                                pair_games[0].outcome,
+                                pair_games[1].outcome,
+                            ),
                         )
-        statistical = summarize_arena_pairs(pairs, self.config)
+                        pairs.append(completed_pair)
+                        if progress is not None:
+                            progress(
+                                phase="arena",
+                                ring=ring,
+                                pair=pair,
+                                completed_pairs=len(pairs),
+                            )
+                    if len(ring_games) != len(specifications) or should_stop():
+                        interrupted = True
+                        break
+                if interrupted:
+                    break
+        statistical = (
+            summarize_completed_arena_pairs(pairs, self.config)
+            if pairs
+            else {
+                "aggregate": None,
+                "per_ring": {},
+                "promotion": {
+                    "decision": "continue",
+                    "sequential_state": "continue",
+                    "reason": "stopped_before_complete_pair",
+                    "incomplete_rings": list(self.config.rings),
+                    "pair_model": "complete-role-reversed-pairs-only",
+                },
+            }
+        )
         candidate_calls = (
             int(getattr(self.candidate, "evaluator_calls", 0)) - candidate_calls_before
         )
@@ -869,7 +967,7 @@ class ArenaRunner:
         baseline_metadata["identity"] = self.baseline.model_version
         baseline_metadata["search_budget"] = self.baseline_search.metadata()
         baseline_metadata["deterministic"] = True
-        baseline_metadata["seed_schedule"] = "arena-runner-v1"
+        baseline_metadata["seed_schedule"] = "arena-runner-v2-pair-chunks"
         return {
             "schema_version": ARENA_RESULT_SCHEMA_VERSION,
             "candidate": self.candidate.model_version,
@@ -889,6 +987,8 @@ class ArenaRunner:
                 "serialized_inference_calls": self._inference_calls,
                 "serialized_inference_seconds": self._inference_seconds,
                 "inference_queue_wait_seconds": (self._inference_queue_wait_seconds),
+                "requested_pairs": requested_pairs,
+                "completed_pairs": len(pairs),
             },
             "search": {
                 "deterministic": True,
@@ -896,7 +996,14 @@ class ArenaRunner:
                 "pie_rule": False,
                 "search_workers": self.search_workers,
                 "inference_workers": 1,
+                "pair_chunk_size": self.config.pair_chunk_size,
+                "effective_pair_chunking": (
+                    "configured"
+                    if self.config.pair_chunk_size is not None
+                    else "full_requested_ring_batch"
+                ),
             },
+            "interrupted": interrupted,
             **statistical,
             "games": [asdict(game) for game in games],
             "pairs": [asdict(pair) for pair in pairs],
@@ -909,20 +1016,37 @@ class ArenaRunner:
         *,
         progress: Callable[..., None] | None,
         inference_executor: Executor,
+        stop_requested: Callable[[], bool],
     ) -> list[ArenaGame]:
         importer = getattr(self.native.StateBatch, "from_semantic", None)
         if not callable(importer):
-            return [
-                self._play_game(
-                    ring=ring,
-                    pair=pair,
-                    candidate_player=candidate_player,
-                    opening_seed=opening_seed,
-                    opening_action=opening_action,
-                    inference_executor=inference_executor,
-                )
-                for pair, candidate_player, opening_seed, opening_action in specifications
-            ]
+            output: list[ArenaGame] = []
+            for offset in range(0, len(specifications), 2):
+                if stop_requested():
+                    break
+                pair_games = []
+                for (
+                    pair,
+                    candidate_player,
+                    opening_seed,
+                    opening_action,
+                ) in specifications[offset : offset + 2]:
+                    game = self._play_game(
+                        ring=ring,
+                        pair=pair,
+                        candidate_player=candidate_player,
+                        opening_seed=opening_seed,
+                        opening_action=opening_action,
+                        inference_executor=inference_executor,
+                        stop_requested=stop_requested,
+                    )
+                    if game is None:
+                        break
+                    pair_games.append(game)
+                if len(pair_games) != 2:
+                    break
+                output.extend(pair_games)
+            return output
         states = self.native.StateBatch(ring, len(specifications))
         forced_rows = [
             index
@@ -942,6 +1066,8 @@ class ArenaRunner:
             thread_name_prefix="arena-search",
         ) as executor:
             while True:
+                if stop_requested():
+                    break
                 data = states.data()
                 active = [
                     row for row, terminal in enumerate(data.terminal) if not terminal
@@ -984,10 +1110,15 @@ class ArenaRunner:
                             len(rows),
                             rows,
                             inference_executor,
+                            stop_requested,
                         )
                     )
-                for future in futures:
-                    rows, actions = future.result()
+                search_results = [future.result() for future in futures]
+                if any(result is None for result in search_results):
+                    break
+                for result in search_results:
+                    assert result is not None
+                    rows, actions = result
                     states.apply_many(rows, actions)
                     for row in rows:
                         searched_moves[row] += 1
@@ -1003,27 +1134,36 @@ class ArenaRunner:
                         active_games=len(active),
                         wave=wave,
                     )
+        terminal = [bool(value) for value in states.data().terminal]
         winners = [int(value) for value in states.score_data().winner]
         output = []
-        for row, specification in enumerate(specifications):
-            pair, candidate_player, opening_seed, opening_action = specification
-            winner = winners[row]
-            if winner not in (0, 1):
-                raise RuntimeError("arena terminal result cannot be tied")
-            outcome = 1 if winner == candidate_player else -1
-            output.append(
-                ArenaGame(
-                    ring=ring,
-                    pair=pair,
-                    candidate_player=candidate_player,
-                    opening_seed=opening_seed,
-                    opening_action=opening_action,
-                    forced_opening=opening_action is not None,
-                    winner=winner,
-                    outcome=outcome,
-                    searched_moves=searched_moves[row],
+        for offset in range(0, len(specifications), 2):
+            if offset + 1 >= len(specifications):
+                break
+            pair_rows = (offset, offset + 1)
+            if not all(terminal[row] for row in pair_rows):
+                break
+            for row in pair_rows:
+                pair, candidate_player, opening_seed, opening_action = specifications[
+                    row
+                ]
+                winner = winners[row]
+                if winner not in (0, 1):
+                    raise RuntimeError("arena terminal result cannot be tied")
+                outcome = 1 if winner == candidate_player else -1
+                output.append(
+                    ArenaGame(
+                        ring=ring,
+                        pair=pair,
+                        candidate_player=candidate_player,
+                        opening_seed=opening_seed,
+                        opening_action=opening_action,
+                        forced_opening=opening_action is not None,
+                        winner=winner,
+                        outcome=outcome,
+                        searched_moves=searched_moves[row],
+                    )
                 )
-            )
         return output
 
     def _search_group(
@@ -1035,7 +1175,10 @@ class ArenaRunner:
         row_count: int,
         rows: Sequence[int],
         inference_executor: Executor,
-    ) -> tuple[list[int], list[int]]:
+        stop_requested: Callable[[], bool],
+    ) -> tuple[list[int], list[int]] | None:
+        if stop_requested():
+            return None
         search = self.native.SearchBatch(
             states,
             simulations=budget.simulations,
@@ -1050,9 +1193,13 @@ class ArenaRunner:
             evaluator,
             roots,
         )
+        if stop_requested():
+            return None
         search.initialize_roots(*response.submit_args())
         guard = 0
         while not search.is_done():
+            if stop_requested():
+                return None
             guard += 1
             if guard > budget.simulations * row_count * 4 + 16:
                 raise RuntimeError("batched arena search failed to make progress")
@@ -1064,6 +1211,8 @@ class ArenaRunner:
                 evaluator,
                 requests,
             )
+            if stop_requested():
+                return None
             search.submit(*response.submit_args())
         results = search.results()
         actions = [int(value) for value in results.selected_actions]
@@ -1119,7 +1268,8 @@ class ArenaRunner:
         opening_seed: int,
         opening_action: int | None,
         inference_executor: Executor,
-    ) -> ArenaGame:
+        stop_requested: Callable[[], bool],
+    ) -> ArenaGame | None:
         states = self.native.StateBatch(ring, 1)
         # Both games in a pair receive the same legal one-stone opening. The
         # native rules expose no swap/pie action, so role reversal cannot alter it.
@@ -1128,6 +1278,8 @@ class ArenaRunner:
         moves = 0
         maximum_moves = get_topology(ring).n
         while True:
+            if stop_requested():
+                return None
             state_data = states.data()
             if bool(state_data.terminal[0]):
                 break
@@ -1152,9 +1304,13 @@ class ArenaRunner:
                 evaluator,
                 roots,
             )
+            if stop_requested():
+                return None
             search.initialize_roots(*root_response.submit_args())
             guard = 0
             while not search.is_done():
+                if stop_requested():
+                    return None
                 guard += 1
                 if guard > budget.simulations * 4 + 16:
                     raise RuntimeError("arena native search failed to make progress")
@@ -1166,6 +1322,8 @@ class ArenaRunner:
                     evaluator,
                     requests,
                 )
+                if stop_requested():
+                    return None
                 search.submit(*response.submit_args())
             results = search.results()
             if bool(results.terminal[0]) or int(results.selected_actions[0]) < 0:

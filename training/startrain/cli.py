@@ -32,6 +32,7 @@ from .model import GraphResTNet
 from .native import load_star_native
 from .orchestration import (
     FATAL_WORKER_EXIT_CODE,
+    LEARNER_DATA_WORKERS_ENV,
     TRANSIENT_WORKER_EXIT_CODE,
     WORKER_FAILURE_PATH_ENV,
     WORKER_NAME_ENV,
@@ -153,6 +154,20 @@ def train_main(argv: list[str] | None = None) -> None:
     arguments = parser.parse_args(argv)
 
     experiment = load_config(arguments.config)
+    raw_data_workers = os.environ.get(LEARNER_DATA_WORKERS_ENV)
+    if raw_data_workers is not None:
+        try:
+            data_workers = int(raw_data_workers)
+        except ValueError as exc:
+            raise ValueError(f"{LEARNER_DATA_WORKERS_ENV} must be an integer") from exc
+        if data_workers < 0 or data_workers > experiment.data.workers:
+            raise ValueError(
+                f"{LEARNER_DATA_WORKERS_ENV} must be in [0, {experiment.data.workers}]"
+            )
+        experiment = replace(
+            experiment,
+            data=replace(experiment.data, workers=data_workers),
+        )
     run_identity = load_run_identity(arguments.run_identity)
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     rank = int(os.environ.get("RANK", "0"))

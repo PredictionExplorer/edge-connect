@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
 import time
@@ -264,6 +265,7 @@ def prepare_champion_warm_start(
     *,
     apply: bool = False,
     initial_replay_credit: int | None = None,
+    replace_existing: bool = False,
 ) -> dict[str, object]:
     """Validate and optionally activate a fresh optimizer segment."""
 
@@ -311,13 +313,33 @@ def prepare_champion_warm_start(
         raise WarmStartError("preflight returned invalid profile identity")
     profile_sha256 = str(profile_report["sha256"])
     marker_path = learner_root / "champion-warm-start.json"
-    existing = _existing_warm_start(
-        marker_path,
-        run_id=identity.run_id,
-        generation_family=identity.generation_family,
-        champion_identity=champion.model_identity,
-        profile_sha256=profile_sha256,
-    )
+    replaced_marker: dict[str, Any] | None = None
+    try:
+        existing = _existing_warm_start(
+            marker_path,
+            run_id=identity.run_id,
+            generation_family=identity.generation_family,
+            champion_identity=champion.model_identity,
+            profile_sha256=profile_sha256,
+        )
+    except WarmStartError:
+        if not replace_existing or not marker_path.is_file():
+            raise
+        candidate = _read_json(marker_path)
+        old_identity = candidate.get("source_model_identity")
+        old_profile_sha256 = candidate.get("profile_sha256")
+        if not isinstance(old_identity, str) or not isinstance(old_profile_sha256, str):
+            raise WarmStartError(
+                "existing champion warm-start marker cannot be safely replaced"
+            ) from None
+        replaced_marker = _existing_warm_start(
+            marker_path,
+            run_id=identity.run_id,
+            generation_family=identity.generation_family,
+            champion_identity=old_identity,
+            profile_sha256=old_profile_sha256,
+        )
+        existing = None
     if existing is not None:
         if existing.get("status") == "prepared" and apply:
             selfplay_enabled = (
@@ -481,11 +503,38 @@ def prepare_champion_warm_start(
         "cadence": cadence,
         "training_segment": training_segment,
         "preflight": preflight,
+        "replaces_warm_start": (
+            {
+                "source_model_identity": replaced_marker.get("source_model_identity"),
+                "source_model_step": replaced_marker.get("source_model_step"),
+                "profile_sha256": replaced_marker.get("profile_sha256"),
+                "status": replaced_marker.get("status"),
+            }
+            if replaced_marker is not None
+            else None
+        ),
     }
     if not apply:
         return plan
 
     with state_apply_guard(root):
+        if replaced_marker is not None:
+            encoded = json.dumps(
+                replaced_marker,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            history = learner_root / "champion-warm-start-history"
+            history.mkdir(parents=True, exist_ok=True)
+            archive = history / (
+                f"marker-{replaced_marker.get('source_model_step', 'unknown')}-"
+                f"{hashlib.sha256(encoded).hexdigest()[:16]}.json"
+            )
+            if archive.exists() and _read_json(archive) != replaced_marker:
+                raise WarmStartError(
+                    "existing champion warm-start history artifact is incompatible"
+                )
+            atomic_json(archive, replaced_marker)
         world_size = max(1, len(experiment.orchestration.learner_gpus))
         prepared = create_recovery_checkpoint_artifact(
             learner_root,
@@ -559,6 +608,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--run-root", required=True, type=Path)
     parser.add_argument("--profile", required=True, type=Path)
     parser.add_argument("--initial-replay-credit", type=int)
+    parser.add_argument(
+        "--replace-existing",
+        action="store_true",
+        help="archive and replace a valid prior champion warm-start marker",
+    )
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--dry-run", action="store_true")
     mode.add_argument("--apply", action="store_true")
@@ -575,6 +629,7 @@ def main(argv: list[str] | None = None) -> int:
             arguments.profile,
             apply=arguments.apply,
             initial_replay_credit=arguments.initial_replay_credit,
+            replace_existing=arguments.replace_existing,
         )
     except Exception as exc:
         print(

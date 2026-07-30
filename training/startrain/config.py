@@ -607,6 +607,9 @@ class HardwareHealthConfig:
 
     require_gpu_model: str | None = None
     fail_on_aggregate_uncorrectable: bool = True
+    transient_probe_attempts: int = 3
+    transient_probe_retry_seconds: float = 5.0
+    probe_timeout_seconds: float = 30.0
 
     def __post_init__(self) -> None:
         if self.require_gpu_model is not None and (
@@ -616,6 +619,28 @@ class HardwareHealthConfig:
             raise ConfigError("require_gpu_model must be a non-empty string or null")
         if type(self.fail_on_aggregate_uncorrectable) is not bool:
             raise ConfigError("fail_on_aggregate_uncorrectable must be boolean")
+        if (
+            isinstance(self.transient_probe_attempts, bool)
+            or not isinstance(self.transient_probe_attempts, int)
+            or self.transient_probe_attempts <= 0
+        ):
+            raise ConfigError("transient_probe_attempts must be a positive integer")
+        if (
+            isinstance(self.transient_probe_retry_seconds, bool)
+            or not isinstance(self.transient_probe_retry_seconds, int | float)
+            or not math.isfinite(float(self.transient_probe_retry_seconds))
+            or self.transient_probe_retry_seconds <= 0
+        ):
+            raise ConfigError(
+                "transient_probe_retry_seconds must be finite and positive"
+            )
+        if (
+            isinstance(self.probe_timeout_seconds, bool)
+            or not isinstance(self.probe_timeout_seconds, int | float)
+            or not math.isfinite(float(self.probe_timeout_seconds))
+            or self.probe_timeout_seconds <= 0
+        ):
+            raise ConfigError("probe_timeout_seconds must be finite and positive")
 
 
 @dataclass(frozen=True, slots=True)
@@ -918,6 +943,7 @@ class ArenaConfig:
     rings: tuple[int, ...] = SUPPORTED_RINGS
     pairs_per_ring: int = 20
     continuation_pairs_per_ring: int | None = None
+    pair_chunk_size: int | None = None
     simulations: int = 1_024
     max_considered: int = 32
     c_visit: float = 50.0
@@ -962,6 +988,14 @@ class ArenaConfig:
             raise ConfigError(
                 "arena requires at least two initial/continuation pairs per ring "
                 "and positive simulations"
+            )
+        if self.pair_chunk_size is not None and (
+            isinstance(self.pair_chunk_size, bool)
+            or not isinstance(self.pair_chunk_size, int)
+            or self.pair_chunk_size <= 0
+        ):
+            raise ConfigError(
+                "arena pair_chunk_size must be null or a positive integer"
             )
         if self.max_considered <= 0 or self.c_visit <= 0 or self.c_scale <= 0:
             raise ConfigError("arena search settings must be positive")

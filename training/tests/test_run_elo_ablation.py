@@ -14,6 +14,7 @@ from scripts.prepare_elo_ablation import prepare_elo_ablation
 from scripts.run_elo_ablation import (
     BUDGET_COMPLETION,
     FATAL_ORCHESTRATOR_EXIT,
+    FATAL_WORKER_EXIT_CODE,
     TRANSIENT_CRASH,
     EvaluatorRows,
     main,
@@ -152,15 +153,264 @@ while not stopping:
     metadata = json.loads((root / "ablation.json").read_text())
     assert metadata["measurement_started_ns"] > 0
     assert metadata["measurement_stopped_ns"] >= metadata["measurement_started_ns"]
+    assert (
+        metadata["measurement_stopped_ns"]
+        == metadata["measurement_cutoff_ns"]
+        <= metadata["resource_released_ns"]
+    )
     assert metadata["measurement_stop_reason"] == "wall_budget"
-    assert metadata["measurement_exit_code"] in (0, -15)
+    assert metadata["measurement_exit_code"] is None
+    assert metadata["measurement_resource_exit_code"] in (0, -signal.SIGTERM)
     assert metadata["measurement_status"] == "complete"
+    assert metadata["measurement_completion_status"] == "complete"
     assert metadata["measurement_outcome"] == BUDGET_COMPLETION
+    assert metadata["measurement_teardown_status"] == "clean"
+    assert metadata["measurement_teardown"]["status"] == "graceful"
+    assert metadata["measurement_teardown"]["term_target"] == "coordinator_pid"
+    assert metadata["measurement_teardown"]["kill_sent"] is False
     assert metadata["measurement_attempt_count"] == 1
     assert metadata["measurement_attempts"][0]["outcome"] == BUDGET_COMPLETION
     assert metadata["state_preflight"] == {"status": "ok", "mode": "apply"}
     assert signal.getsignal(signal.SIGINT) == previous_sigint
     assert signal.getsignal(signal.SIGTERM) == previous_sigterm
+
+
+def test_terminate_signals_leader_then_escalates_process_group(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeProcess:
+        pid = 123
+        returncode: int | None = None
+        waits = 0
+
+        def poll(self) -> int | None:
+            return self.returncode
+
+        def wait(self, timeout: float) -> int:
+            self.waits += 1
+            if self.waits == 1:
+                raise run_module.subprocess.TimeoutExpired("orchestrator", timeout)
+            self.returncode = -signal.SIGKILL
+            return self.returncode
+
+    leader_signals: list[tuple[int, int]] = []
+    group_signals: list[tuple[int, int]] = []
+    monkeypatch.setattr(
+        run_module.os,
+        "kill",
+        lambda pid, sent: leader_signals.append((pid, sent)),
+    )
+    monkeypatch.setattr(
+        run_module.os,
+        "killpg",
+        lambda pgid, sent: group_signals.append((pgid, sent)),
+    )
+    monkeypatch.setattr(run_module, "_process_group_exists", lambda _pgid: False)
+
+    teardown = run_module._terminate(
+        FakeProcess(),
+        terminate_grace_seconds=0.1,
+        kill_grace_seconds=0.1,
+    )
+
+    assert leader_signals == [(123, signal.SIGTERM)]
+    assert group_signals == [(123, signal.SIGKILL)]
+    assert teardown["status"] == "forced"
+    assert teardown["clean"] is False
+    assert teardown["resource_released_ns"] is not None
+
+
+def test_terminate_reaps_live_descendants_after_leader_already_exited(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ExitedProcess:
+        pid = 456
+        returncode = 0
+
+        def poll(self) -> int:
+            return self.returncode
+
+        def wait(self, timeout: float) -> int:
+            del timeout
+            return self.returncode
+
+    group_signals: list[tuple[int, int]] = []
+    probes = iter((True, False))
+    monkeypatch.setattr(
+        run_module,
+        "_process_group_exists",
+        lambda _pgid: next(probes),
+    )
+    monkeypatch.setattr(
+        run_module.os,
+        "killpg",
+        lambda pgid, sent: group_signals.append((pgid, sent)),
+    )
+
+    teardown = run_module._terminate(
+        ExitedProcess(),
+        terminate_grace_seconds=0.0,
+        kill_grace_seconds=0.1,
+    )
+
+    assert group_signals == [(456, signal.SIGKILL)]
+    assert teardown["status"] == "forced"
+    assert teardown["clean"] is False
+    assert teardown["process_group_released"] is True
+    assert teardown["resource_released_ns"] is not None
+
+
+def test_budget_completion_exposes_post_cutoff_teardown_failure(
+    tmp_path: Path,
+) -> None:
+    root, profile = _forked_run(tmp_path)
+    metadata_path = root / "ablation.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["wall_budget_seconds"] = 1.0
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+    orchestrator = tmp_path / "fatal-on-term-orchestrator"
+    orchestrator.write_text(
+        """#!/usr/bin/env python3
+import signal
+import time
+
+def stop(_signal, _frame):
+    raise SystemExit(78)
+
+signal.signal(signal.SIGTERM, stop)
+while True:
+    time.sleep(0.01)
+""",
+        encoding="utf-8",
+    )
+    os.chmod(orchestrator, 0o755)
+
+    report = run_elo_ablation(
+        config_path=profile,
+        orchestrator=str(orchestrator),
+        poll_seconds=0.01,
+    )
+
+    assert report["status"] == "complete"
+    assert report["outcome"] == BUDGET_COMPLETION
+    assert report["completion_status"] == "complete_with_warning"
+    assert report["exit_code"] is None
+    assert report["resource_exit_code"] == FATAL_WORKER_EXIT_CODE
+    assert report["measurement_cutoff_ns"] <= report["resource_released_ns"]
+    assert report["teardown_status"] == "unexpected_exit"
+    assert report["teardown"]["status"] == "unexpected_exit"
+    assert report["integrity_status"] == "valid"
+    assert report["integrity"]["valid"] is True
+    assert report["warnings"]
+    metadata = json.loads((root / "ablation.json").read_text(encoding="utf-8"))
+    assert metadata["measurement_status"] == "complete"
+    assert metadata["measurement_completion_status"] == "complete_with_warning"
+    assert metadata["measurement_exit_code"] is None
+    assert metadata["measurement_resource_exit_code"] == FATAL_WORKER_EXIT_CODE
+    assert metadata["teardown_status"] == "unexpected_exit"
+    assert metadata["integrity_status"] == "valid"
+
+
+def test_post_cutoff_warning_requires_valid_state_integrity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, profile = _forked_run(tmp_path)
+    metadata_path = root / "ablation.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["wall_budget_seconds"] = 1.0
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+    def preflight(_root: Path, _profile: Path, *, apply: bool):
+        if apply:
+            return {"status": "ok", "mode": "apply"}
+        raise RuntimeError("replay manifest integrity failed")
+
+    monkeypatch.setattr(run_module, "run_state_preflight", preflight)
+    orchestrator = tmp_path / "fatal-on-term-orchestrator"
+    orchestrator.write_text(
+        """#!/usr/bin/env python3
+import signal
+import time
+
+def stop(_signal, _frame):
+    raise SystemExit(78)
+
+signal.signal(signal.SIGTERM, stop)
+while True:
+    time.sleep(0.01)
+""",
+        encoding="utf-8",
+    )
+    os.chmod(orchestrator, 0o755)
+
+    report = run_elo_ablation(
+        config_path=profile,
+        orchestrator=str(orchestrator),
+        poll_seconds=0.01,
+    )
+
+    assert report["status"] == "failed"
+    assert report["outcome"] == BUDGET_COMPLETION
+    assert report["completion_status"] == "failed"
+    assert report["failure_phase"] == "post_cutoff"
+    assert report["failure_domain"] == "state_integrity"
+    assert report["integrity_status"] == "failed"
+    assert "replay manifest integrity failed" in str(report["failure"])
+
+
+def test_pre_cutoff_terminal_failure_cannot_be_reclassified_as_teardown(
+    tmp_path: Path,
+) -> None:
+    root, profile = _forked_run(tmp_path)
+    metadata_path = root / "ablation.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["wall_budget_seconds"] = 1.0
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+    fatal_path = root / "status" / "fatal.json"
+    orchestrator = tmp_path / "pre-cutoff-fatal-on-term-orchestrator"
+    orchestrator.write_text(
+        f"""#!/usr/bin/env python3
+import json
+from pathlib import Path
+import signal
+import time
+
+fatal = Path({str(fatal_path)!r})
+fatal.parent.mkdir(parents=True, exist_ok=True)
+fatal.write_text(json.dumps({{
+    "schema_version": 1,
+    "timestamp_ns": time.time_ns(),
+    "terminal_reason": "fatal_worker_failure",
+    "failure_class": "fatal",
+    "reason": "failure occurred before the budget boundary",
+}}))
+
+def stop(_signal, _frame):
+    raise SystemExit(78)
+
+signal.signal(signal.SIGTERM, stop)
+while True:
+    time.sleep(0.01)
+""",
+        encoding="utf-8",
+    )
+    os.chmod(orchestrator, 0o755)
+
+    report = run_elo_ablation(
+        config_path=profile,
+        orchestrator=str(orchestrator),
+        poll_seconds=0.01,
+    )
+
+    assert report["status"] == "failed"
+    assert report["outcome"] == BUDGET_COMPLETION
+    assert report["failure_phase"] == "pre_cutoff"
+    assert report["failure_domain"] == "orchestrator"
+    assert report["integrity_status"] == "failed"
+    terminal = report["integrity"]["terminal_failure"]
+    assert terminal["phase"] == "pre_cutoff"
+    assert terminal["failure"]["terminal_reason"] == "fatal_worker_failure"
 
 
 def test_runner_resumes_after_transient_signal_crash(tmp_path: Path) -> None:
@@ -292,6 +542,7 @@ def test_runner_records_and_refuses_fatal_orchestrator_exit(tmp_path: Path) -> N
     assert report["status"] == "failed"
     assert report["outcome"] == FATAL_ORCHESTRATOR_EXIT
     assert report["exit_code"] == 78
+    assert report["failure_domain"] == "run"
     metadata = json.loads(metadata_path.read_text())
     assert metadata["measurement_status"] == "failed"
     assert metadata["measurement_outcome"] == FATAL_ORCHESTRATOR_EXIT
@@ -301,6 +552,46 @@ def test_runner_records_and_refuses_fatal_orchestrator_exit(tmp_path: Path) -> N
             orchestrator=str(orchestrator),
             poll_seconds=0.01,
         )
+
+
+def test_hardware_fatal_is_classified_as_host_global(tmp_path: Path) -> None:
+    root, profile = _forked_run(tmp_path)
+    metadata_path = root / "ablation.json"
+    metadata = json.loads(metadata_path.read_text())
+    metadata["wall_budget_seconds"] = 5
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+    fatal_path = root / "status" / "fatal.json"
+    orchestrator = tmp_path / "hardware-fatal-orchestrator"
+    orchestrator.write_text(
+        f"""#!/usr/bin/env python3
+import json
+from pathlib import Path
+import time
+
+path = Path({str(fatal_path)!r})
+path.parent.mkdir(parents=True, exist_ok=True)
+path.write_text(json.dumps({{
+    "schema_version": 1,
+    "timestamp_ns": time.time_ns(),
+    "terminal_reason": "hardware_health_failure",
+    "failure_class": "fatal",
+    "reason": "uncorrectable ECC",
+}}))
+raise SystemExit(78)
+""",
+        encoding="utf-8",
+    )
+    os.chmod(orchestrator, 0o755)
+
+    report = run_elo_ablation(
+        config_path=profile,
+        orchestrator=str(orchestrator),
+        poll_seconds=0.01,
+    )
+
+    assert report["status"] == "failed"
+    assert report["outcome"] == FATAL_ORCHESTRATOR_EXIT
+    assert report["failure_domain"] == "host"
 
 
 def test_runner_marks_explicit_transient_orchestrator_exit_retryable(

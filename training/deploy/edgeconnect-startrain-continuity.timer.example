@@ -1,0 +1,12 @@
+[Unit]
+Description=Periodic EdgeConnect host training continuity reconciliation
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=1min
+AccuracySec=10s
+Persistent=true
+Unit=edgeconnect-startrain-continuity.service
+
+[Install]
+WantedBy=timers.target

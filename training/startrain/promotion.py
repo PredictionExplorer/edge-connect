@@ -21,7 +21,7 @@ from .arena import (
     ARENA_RESULT_SCHEMA_VERSION,
     ArenaPair,
     ArenaRunner,
-    summarize_arena_pairs,
+    summarize_completed_arena_pairs,
 )
 from .checkpoint import (
     ModelManifest,
@@ -744,9 +744,17 @@ class PromotionSupervisor:
                         progress=progress,
                         pair_starts=starts,
                         pair_counts=counts,
+                        stop_requested=stop_requested,
                     )
+                    completed = self._pairs_from_result(result)
+                    if not completed:
+                        if stop_requested():
+                            return waves
+                        raise RuntimeError(
+                            "historical arena completed no role-reversed pairs"
+                        )
                     unique = {(pair.ring, pair.pair): pair for pair in accumulated}
-                    for pair in self._pairs_from_result(result):
+                    for pair in completed:
                         key = (pair.ring, pair.pair)
                         existing = unique.get(key)
                         if existing is not None and existing != pair:
@@ -757,7 +765,9 @@ class PromotionSupervisor:
                     accumulated[:] = [unique[key] for key in sorted(unique)]
                     result["schema_version"] = ARENA_RESULT_SCHEMA_VERSION
                     result["pairs"] = [asdict(pair) for pair in accumulated]
-                    result.update(summarize_arena_pairs(accumulated, arena_config))
+                    result.update(
+                        summarize_completed_arena_pairs(accumulated, arena_config)
+                    )
                     if previous_result is not None:
                         old_games = previous_result.get("games", [])
                         new_games = result.get("games", [])
@@ -793,7 +803,7 @@ class PromotionSupervisor:
                     atomic_json(result_path, result)
                     previous_result = result
                     waves += 1
-                    if terminal or once:
+                    if terminal or once or stop_requested():
                         return waves
                 return waves
             finally:
@@ -959,33 +969,58 @@ class PromotionSupervisor:
                             candidate_step=candidate.model_step,
                             champion_step=champion.model_step,
                         )
-                    round_started = (
+                    wave_started = (
                         session_started if waves == 0 else time.perf_counter()
                     )
-                    result = runner.run(
-                        progress=progress,
-                        pair_starts=starts,
-                        pair_counts=counts,
-                    )
-                    decision, terminal = self._persist_wave(
-                        candidate=candidate,
-                        champion=champion,
-                        previous=previous_result,
-                        accumulated=accumulated,
-                        result=result,
-                        arena_config=arena_config,
-                        round_started=round_started,
-                        metric_device=metric_device,
-                        collect_cuda_metrics=collect_cuda_metrics,
-                        progress=progress,
-                        wave_index=waves,
-                        pair_starts=starts,
-                        pair_counts=counts,
-                    )
+                    persisted_chunk = False
+                    for chunk_starts, chunk_counts in self._pair_chunks(
+                        starts,
+                        counts,
+                        chunk_size=(
+                            arena_config.pair_chunk_size
+                            or max(counts.values(), default=1)
+                        ),
+                    ):
+                        if stop_requested():
+                            return waves + int(persisted_chunk), "stopped"
+                        chunk_started = (
+                            wave_started if not persisted_chunk else time.perf_counter()
+                        )
+                        result = runner.run(
+                            progress=progress,
+                            pair_starts=chunk_starts,
+                            pair_counts=chunk_counts,
+                            stop_requested=stop_requested,
+                        )
+                        completed = self._pairs_from_result(result)
+                        if not completed:
+                            if stop_requested():
+                                return waves + int(persisted_chunk), "stopped"
+                            raise RuntimeError(
+                                "promotion arena completed no role-reversed pairs"
+                            )
+                        decision, terminal = self._persist_wave(
+                            candidate=candidate,
+                            champion=champion,
+                            previous=previous_result,
+                            accumulated=accumulated,
+                            result=result,
+                            arena_config=arena_config,
+                            round_started=chunk_started,
+                            metric_device=metric_device,
+                            collect_cuda_metrics=collect_cuda_metrics,
+                            progress=progress,
+                            wave_index=waves,
+                            pair_starts=chunk_starts,
+                            pair_counts=chunk_counts,
+                        )
+                        persisted_chunk = True
+                        previous_result = result
+                        if terminal:
+                            return waves + 1, "terminal"
+                        if stop_requested():
+                            return waves + 1, "stopped"
                     waves += 1
-                    previous_result = result
-                    if terminal:
-                        return waves, "terminal"
                     if once:
                         return waves, "once"
                     max_waves = (
@@ -1093,7 +1128,7 @@ class PromotionSupervisor:
         accumulated[:] = [unique[key] for key in sorted(unique)]
         result["schema_version"] = ARENA_RESULT_SCHEMA_VERSION
         result["pairs"] = [asdict(pair) for pair in accumulated]
-        result.update(summarize_arena_pairs(accumulated, arena_config))
+        result.update(summarize_completed_arena_pairs(accumulated, arena_config))
         if previous is not None:
             previous_games = previous.get("games", [])
             result_games = result.get("games", [])
@@ -1163,6 +1198,25 @@ class PromotionSupervisor:
             if progress is not None:
                 progress(phase="model_gc", **gc_metrics)
         return decision, terminal
+
+    @staticmethod
+    def _pair_chunks(
+        starts: Mapping[int, int],
+        counts: Mapping[int, int],
+        *,
+        chunk_size: int,
+    ) -> list[tuple[dict[int, int], dict[int, int]]]:
+        maximum = max(counts.values(), default=0)
+        return [
+            (
+                {ring: int(start) + offset for ring, start in starts.items()},
+                {
+                    ring: min(chunk_size, max(0, int(count) - offset))
+                    for ring, count in counts.items()
+                },
+            )
+            for offset in range(0, maximum, chunk_size)
+        ]
 
     def _wave_plan(
         self,

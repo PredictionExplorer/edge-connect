@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import re
@@ -24,6 +25,12 @@ DEFAULT_GUARD_RINGS = (4, 6, 8)
 DEFAULT_GUARD_FLOOR_ELO = -35.0
 CONFIDENCE_LEVEL = 0.95
 ONE_SIDED_95_NORMAL_QUANTILE = 1.6448536269514722
+_VALID_INTEGRITY_STATUSES = frozenset(
+    {"ok", "pass", "passed", "valid", "verified", "healthy"}
+)
+_CLEAN_TEARDOWN_STATUSES = frozenset(
+    {"not_required", "clean", "complete", "completed", "released"}
+)
 
 _LABEL_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 _TERMINAL_DECISIONS = frozenset(
@@ -161,6 +168,14 @@ def _read_json(
         failures.append(_failure(path, "JSON document is not an object"))
         return None
     return loaded
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
 
 def _read_jsonl(
@@ -757,6 +772,64 @@ def _report_anchor(report: Mapping[str, object]) -> dict[str, object]:
     }
 
 
+def _normalized_status(value: object) -> str | None:
+    if isinstance(value, str) and value:
+        return value.lower().replace("-", "_").replace(" ", "_")
+    return None
+
+
+def _first_lifecycle_value(
+    sources: Sequence[Mapping[str, object]],
+    *names: str,
+) -> object:
+    for source in sources:
+        for name in names:
+            if name in source:
+                return source[name]
+    return None
+
+
+def _lifecycle_sections(
+    metadata: Mapping[str, object],
+) -> tuple[
+    Mapping[str, object],
+    Mapping[str, object],
+    Mapping[str, object],
+    Mapping[str, object],
+]:
+    lifecycle = _mapping(metadata.get("lifecycle")) or {}
+    measurement = (
+        _mapping(lifecycle.get("measurement"))
+        or _mapping(metadata.get("measurement"))
+        or {}
+    )
+    teardown = (
+        _mapping(metadata.get("teardown"))
+        or _mapping(metadata.get("teardown_status"))
+        or _mapping(lifecycle.get("teardown"))
+        or {}
+    )
+    integrity = (
+        _mapping(metadata.get("integrity"))
+        or _mapping(metadata.get("integrity_status"))
+        or _mapping(lifecycle.get("integrity"))
+        or _mapping(teardown.get("integrity"))
+        or {}
+    )
+    return lifecycle, measurement, teardown, integrity
+
+
+def _integrity_valid(
+    integrity: Mapping[str, object],
+    *,
+    status: str | None,
+) -> bool:
+    explicit = integrity.get("valid")
+    if type(explicit) is bool:
+        return explicit
+    return status in _VALID_INTEGRITY_STATUSES
+
+
 def _measurement_context(
     root: Path,
     report: Mapping[str, object],
@@ -780,12 +853,22 @@ def _measurement_context(
                 "status": "complete",
                 "started_ns": started_ns,
                 "stopped_ns": stopped_ns,
+                "cutoff_ns": stopped_ns,
                 "wall_seconds": wall_seconds,
+                "resource_released_ns": stopped_ns,
+                "resource_wall_seconds": wall_seconds,
                 "stop_reason": "last_observed_run_timestamp",
                 "exit_code": None,
                 "outcome": None,
                 "attempt_count": None,
                 "failure": None,
+                "lifecycle_status": None,
+                "completion_status": None,
+                "warnings": [],
+                "teardown_status": "not_recorded",
+                "teardown": None,
+                "integrity_status": "not_recorded",
+                "integrity": None,
                 "wall_budget_seconds": None,
                 "leaf_budget": None,
             },
@@ -801,12 +884,22 @@ def _measurement_context(
                 "status": "invalid",
                 "started_ns": None,
                 "stopped_ns": None,
+                "cutoff_ns": None,
                 "wall_seconds": None,
+                "resource_released_ns": None,
+                "resource_wall_seconds": None,
                 "stop_reason": None,
                 "exit_code": None,
                 "outcome": None,
                 "attempt_count": None,
                 "failure": "ablation.json could not be parsed",
+                "lifecycle_status": None,
+                "completion_status": None,
+                "warnings": [],
+                "teardown_status": None,
+                "teardown": None,
+                "integrity_status": None,
+                "integrity": None,
                 "wall_budget_seconds": None,
                 "leaf_budget": None,
             },
@@ -841,38 +934,92 @@ def _measurement_context(
             _failure(metadata_path, "ablation anchor model_step is invalid")
         )
 
-    raw_started = metadata.get("measurement_started_ns")
-    raw_stopped = metadata.get("measurement_stopped_ns")
+    lifecycle, measurement_section, teardown, integrity = _lifecycle_sections(metadata)
+    lifecycle_sources = (measurement_section, metadata, lifecycle)
+    raw_started = _first_lifecycle_value(
+        lifecycle_sources,
+        "measurement_started_ns",
+        "started_ns",
+    )
+    raw_legacy_stopped = metadata.get("measurement_stopped_ns")
+    raw_cutoff = _first_lifecycle_value(
+        lifecycle_sources,
+        "measurement_cutoff_ns",
+        "cutoff_ns",
+    )
+    if raw_cutoff is None:
+        raw_cutoff = raw_legacy_stopped
+    resource_sources = (metadata, lifecycle, teardown)
+    resource_release_recorded = any(
+        name in source
+        for source in resource_sources
+        for name in ("resource_released_ns", "released_ns")
+    )
+    raw_resource_released = _first_lifecycle_value(
+        resource_sources,
+        "resource_released_ns",
+        "released_ns",
+    )
+    if raw_resource_released is None and not resource_release_recorded:
+        raw_resource_released = raw_legacy_stopped or raw_cutoff
     started_ns = _positive_timestamp(raw_started)
-    stopped_ns = _positive_timestamp(raw_stopped)
+    cutoff_ns = _positive_timestamp(raw_cutoff)
+    resource_released_ns = _positive_timestamp(raw_resource_released)
     if raw_started is not None and started_ns is None:
         failures.append(
             _failure(metadata_path, "measurement_started_ns must be positive")
         )
-    if raw_stopped is not None and stopped_ns is None:
+    if raw_cutoff is not None and cutoff_ns is None:
+        failures.append(_failure(metadata_path, "measurement cutoff must be positive"))
+    if raw_resource_released is not None and resource_released_ns is None:
         failures.append(
-            _failure(metadata_path, "measurement_stopped_ns must be positive")
+            _failure(metadata_path, "resource_released_ns must be positive")
         )
-    stop_reason = metadata.get("measurement_stop_reason")
+    stop_reason = _first_lifecycle_value(
+        lifecycle_sources,
+        "measurement_stop_reason",
+        "stop_reason",
+    )
     if stop_reason is not None and not isinstance(stop_reason, str):
         failures.append(
             _failure(metadata_path, "measurement_stop_reason must be a string")
         )
         stop_reason = None
-    raw_exit_code = metadata.get("measurement_exit_code")
+    raw_exit_code = _first_lifecycle_value(
+        lifecycle_sources,
+        "measurement_exit_code",
+        "exit_code",
+    )
     exit_code = _integer(raw_exit_code)
     if raw_exit_code is not None and exit_code is None:
         failures.append(
             _failure(metadata_path, "measurement_exit_code must be an integer")
         )
-    raw_status = metadata.get("measurement_status")
-    measurement_status = raw_status if isinstance(raw_status, str) else None
+    raw_status = _first_lifecycle_value(
+        lifecycle_sources,
+        "measurement_status",
+        "status",
+    )
+    measurement_status = _normalized_status(raw_status)
     if raw_status is not None and measurement_status is None:
         failures.append(_failure(metadata_path, "measurement_status must be a string"))
-    elif measurement_status not in {None, "running", "retryable", "complete", "failed"}:
+    elif measurement_status not in {
+        None,
+        "running",
+        "retryable",
+        "complete",
+        "completed",
+        "completed_with_teardown_failure",
+        "completed_with_teardown_warning",
+        "failed",
+    }:
         failures.append(_failure(metadata_path, "measurement_status is not recognized"))
-    raw_outcome = metadata.get("measurement_outcome")
-    outcome = raw_outcome if isinstance(raw_outcome, str) else None
+    raw_outcome = _first_lifecycle_value(
+        lifecycle_sources,
+        "measurement_outcome",
+        "outcome",
+    )
+    outcome = _normalized_status(raw_outcome)
     if raw_outcome is not None and outcome is None:
         failures.append(_failure(metadata_path, "measurement_outcome must be a string"))
     elif outcome not in {
@@ -885,25 +1032,98 @@ def _measurement_context(
         failures.append(
             _failure(metadata_path, "measurement_outcome is not recognized")
         )
-    raw_attempt_count = metadata.get("measurement_attempt_count")
+    raw_attempt_count = _first_lifecycle_value(
+        lifecycle_sources,
+        "measurement_attempt_count",
+        "attempt_count",
+        "attempt",
+    )
     attempt_count = _nonnegative_integer(raw_attempt_count)
     if raw_attempt_count is not None and attempt_count is None:
         failures.append(
             _failure(metadata_path, "measurement_attempt_count must be non-negative")
         )
-    raw_failure = metadata.get("measurement_failure")
+    raw_failure = _first_lifecycle_value(
+        lifecycle_sources,
+        "measurement_failure",
+        "failure",
+    )
     measurement_failure = raw_failure if isinstance(raw_failure, str) else None
     if raw_failure is not None and measurement_failure is None:
         failures.append(_failure(metadata_path, "measurement_failure must be a string"))
-    ordered = (
-        started_ns is not None and stopped_ns is not None and stopped_ns >= started_ns
+    completion_status = _normalized_status(
+        _first_lifecycle_value(
+            lifecycle_sources,
+            "measurement_completion_status",
+            "completion_status",
+        )
     )
-    if started_ns is not None and stopped_ns is not None and stopped_ns < started_ns:
+    raw_warnings = _first_lifecycle_value(
+        lifecycle_sources,
+        "measurement_warnings",
+        "warnings",
+    )
+    lifecycle_warnings = (
+        [str(item) for item in raw_warnings] if isinstance(raw_warnings, list) else []
+    )
+    raw_teardown_status = _first_lifecycle_value(
+        (metadata, lifecycle),
+        "teardown_status",
+    )
+    if isinstance(raw_teardown_status, Mapping):
+        raw_teardown_status = raw_teardown_status.get("status")
+    if raw_teardown_status is None:
+        raw_teardown_status = teardown.get("status")
+    teardown_status = _normalized_status(raw_teardown_status)
+    if raw_teardown_status is not None and teardown_status is None:
+        failures.append(_failure(metadata_path, "teardown status must be a string"))
+    raw_integrity_status = _first_lifecycle_value(
+        (metadata, lifecycle, teardown),
+        "integrity_status",
+    )
+    if isinstance(raw_integrity_status, Mapping):
+        raw_integrity_status = raw_integrity_status.get("status")
+    if raw_integrity_status is None:
+        raw_integrity_status = integrity.get("status")
+    integrity_status = _normalized_status(raw_integrity_status)
+    if raw_integrity_status is not None and integrity_status is None:
+        failures.append(_failure(metadata_path, "integrity status must be a string"))
+    failure_domain = _normalized_status(
+        _first_lifecycle_value(
+            lifecycle_sources,
+            "failure_domain",
+            "domain",
+        )
+    )
+    failure_phase = _normalized_status(
+        _first_lifecycle_value(
+            lifecycle_sources,
+            "failure_phase",
+            "phase",
+        )
+    )
+    ordered = (
+        started_ns is not None and cutoff_ns is not None and cutoff_ns >= started_ns
+    )
+    resources_ordered = (
+        resource_released_ns is not None
+        and cutoff_ns is not None
+        and resource_released_ns >= cutoff_ns
+    )
+    if started_ns is not None and cutoff_ns is not None and cutoff_ns < started_ns:
         failures.append(
             _failure(
                 metadata_path,
-                "measurement_stopped_ns predates measurement_started_ns",
+                "measurement cutoff predates measurement_started_ns",
             )
+        )
+    if (
+        resource_released_ns is not None
+        and cutoff_ns is not None
+        and resource_released_ns < cutoff_ns
+    ):
+        failures.append(
+            _failure(metadata_path, "resource release predates measurement cutoff")
         )
     has_resilient_lifecycle = raw_status is not None or raw_outcome is not None
     if has_resilient_lifecycle and (attempt_count is None or attempt_count <= 0):
@@ -913,49 +1133,126 @@ def _measurement_context(
                 "resilient measurement lifecycle requires a positive attempt count",
             )
         )
-    complete = ordered and (
-        (
-            measurement_status == "complete"
-            and outcome == "budget_completion"
-            and stop_reason in {"wall_budget", "leaf_budget"}
-            and exit_code in {None, 0, -15}
-            and attempt_count is not None
-            and attempt_count > 0
+    structured_lifecycle = bool(
+        lifecycle
+        or measurement_section
+        or teardown
+        or integrity
+        or any(
+            name in metadata
+            for name in (
+                "measurement_cutoff_ns",
+                "resource_released_ns",
+                "teardown_status",
+                "integrity_status",
+                "failure_domain",
+                "failure_phase",
+            )
         )
-        if has_resilient_lifecycle
-        else (stop_reason in {"wall_budget", "leaf_budget"} and exit_code in {0, -15})
     )
+    teardown_warning = (
+        teardown_status is not None and teardown_status not in _CLEAN_TEARDOWN_STATUSES
+    )
+    integrity_is_valid = _integrity_valid(integrity, status=integrity_status)
+    lifecycle_complete = (
+        measurement_status
+        in {
+            "complete",
+            "completed",
+            "completed_with_teardown_failure",
+            "completed_with_teardown_warning",
+        }
+        and outcome == "budget_completion"
+        and stop_reason in {"wall_budget", "leaf_budget"}
+        and attempt_count is not None
+        and attempt_count > 0
+        and completion_status
+        in {
+            None,
+            "complete",
+            "completed",
+            "complete_with_warning",
+            "completed_with_teardown_failure",
+            "completed_with_teardown_warning",
+        }
+    )
+    if structured_lifecycle:
+        complete = (
+            ordered
+            and resources_ordered
+            and lifecycle_complete
+            and (integrity_status is None or integrity_is_valid)
+            and (
+                not teardown_warning
+                or (
+                    integrity_is_valid
+                    and failure_phase not in {"measurement", "pre_cutoff", "pre_budget"}
+                )
+            )
+        )
+    else:
+        complete = ordered and (
+            (lifecycle_complete and exit_code in {None, 0, -15})
+            if has_resilient_lifecycle
+            else (
+                stop_reason in {"wall_budget", "leaf_budget"} and exit_code in {0, -15}
+            )
+        )
     if ordered:
         assert started_ns is not None
-        assert stopped_ns is not None
-        wall_seconds = (stopped_ns - started_ns) / 1_000_000_000
+        assert cutoff_ns is not None
+        wall_seconds = (cutoff_ns - started_ns) / 1_000_000_000
     else:
         wall_seconds = None
+    resource_wall_seconds = (
+        (resource_released_ns - started_ns) / 1_000_000_000
+        if started_ns is not None
+        and resource_released_ns is not None
+        and resource_released_ns >= started_ns
+        else None
+    )
     if complete:
         incomplete_reason = None
     elif started_ns is None:
         incomplete_reason = "ablation measurement has not started"
-    elif stopped_ns is None:
-        incomplete_reason = "ablation measurement has not stopped"
+    elif cutoff_ns is None:
+        incomplete_reason = "ablation measurement has no cutoff"
+    elif resource_released_ns is None:
+        incomplete_reason = "ablation resources have not been released"
     else:
         incomplete_reason = (
             "ablation measurement is not an eligible budget completion "
             f"(status={measurement_status!r}, outcome={outcome!r}, "
             f"reason={stop_reason!r}, exit={exit_code!r}, "
-            f"failure={measurement_failure!r})"
+            f"teardown={teardown_status!r}, integrity={integrity_status!r}, "
+            f"failure_phase={failure_phase!r}, failure={measurement_failure!r})"
         )
     return (
         {
             "source": "ablation.json",
             "status": "complete" if complete else "incomplete",
             "started_ns": started_ns,
-            "stopped_ns": stopped_ns,
+            "stopped_ns": cutoff_ns,
+            "cutoff_ns": cutoff_ns,
             "wall_seconds": wall_seconds,
+            "resource_released_ns": resource_released_ns,
+            "resource_wall_seconds": resource_wall_seconds,
             "stop_reason": stop_reason,
             "exit_code": exit_code,
             "outcome": outcome,
             "attempt_count": attempt_count,
             "failure": measurement_failure,
+            "lifecycle_status": measurement_status,
+            "completion_status": completion_status,
+            "warnings": lifecycle_warnings,
+            "failure_domain": failure_domain,
+            "failure_phase": failure_phase,
+            "teardown_status": teardown_status
+            or ("not_recorded" if not structured_lifecycle else None),
+            "teardown": dict(teardown) if teardown else None,
+            "integrity_status": integrity_status
+            or ("not_recorded" if not structured_lifecycle else None),
+            "integrity": dict(integrity) if integrity else None,
             "wall_budget_seconds": metadata.get("wall_budget_seconds"),
             "leaf_budget": metadata.get("leaf_budget"),
         },
@@ -1084,6 +1381,149 @@ def _endpoint(
     )
 
 
+def _champion_frontier(
+    report: Mapping[str, object],
+    evaluations: Sequence[Mapping[str, object]],
+    *,
+    anchor_identity: str | None,
+) -> tuple[dict[str, object] | None, str | None]:
+    autonomous = _mapping(report.get("autonomous_elo")) or {}
+    primary = _mapping(autonomous.get("primary_ring_10")) or {}
+    if primary.get("status") != "available":
+        return None, str(primary.get("reason") or "ring-10 ladder is unavailable")
+    ladder = primary.get("ladder")
+    if not isinstance(ladder, list):
+        return None, "ring-10 ladder is missing"
+    estimates = {
+        item.get("identity"): item
+        for item in ladder
+        if isinstance(item, Mapping) and isinstance(item.get("identity"), str)
+    }
+    if anchor_identity is None:
+        return None, "common anchor identity is unavailable"
+    if anchor_identity not in estimates:
+        return None, f"common anchor {anchor_identity} is absent from ring-10 ladder"
+
+    current = anchor_identity
+    promotions = []
+    for evaluation in evaluations:
+        if evaluation.get("decision") != "promote":
+            continue
+        baseline = evaluation.get("baseline")
+        candidate = evaluation.get("candidate")
+        if baseline != current:
+            return (
+                None,
+                "promoted champion chain is not contiguous: "
+                f"expected baseline {current!r}, observed {baseline!r}",
+            )
+        if not isinstance(candidate, str) or candidate not in estimates:
+            return (
+                None,
+                f"promoted champion {candidate!r} is absent from ring-10 ladder",
+            )
+        promotions.append(
+            {
+                "from_identity": current,
+                "to_identity": candidate,
+                "completed_ns": evaluation.get("completed_ns"),
+                "path": evaluation.get("path"),
+            }
+        )
+        current = candidate
+
+    estimate = estimates[current]
+    rating = _number(estimate.get("rating"))
+    standard_error = _number(estimate.get("standard_error"))
+    if rating is None or standard_error is None or standard_error < 0:
+        return None, f"champion frontier {current} has an invalid Elo estimate"
+    return (
+        {
+            "identity": current,
+            "step": estimate.get("step"),
+            "rating_elo": rating,
+            "standard_error_elo": standard_error,
+            "two_sided_95_confidence_interval_elo": estimate.get("confidence_interval"),
+            "decisive_games": estimate.get("decisive_games"),
+            "promotion_count": len(promotions),
+            "promotions": promotions,
+            "selection": "chronological_promotions_from_common_anchor",
+            "non_promoted_terminal_count": len(evaluations) - len(promotions),
+        },
+        None,
+    )
+
+
+def _winner_snapshot(
+    root: Path,
+    *,
+    label: str,
+    frontier: Mapping[str, object] | None,
+    anchor: Mapping[str, object],
+    failures: list[dict[str, object]],
+) -> tuple[dict[str, object] | None, str | None]:
+    if frontier is None:
+        return None, "champion frontier is unavailable"
+    run_path = root / "run.json"
+    champion_path = root / "learner" / "champion.json"
+    run = _read_json(run_path, failures=failures)
+    champion = _read_json(champion_path, failures=failures)
+    if run is None or champion is None:
+        return None, "run identity or champion pointer could not be parsed"
+    identity = champion.get("model_identity")
+    step = _nonnegative_integer(champion.get("model_step"))
+    if identity != frontier.get("identity") or step != frontier.get("step"):
+        return (
+            None,
+            "champion pointer does not match the chronological promoted frontier "
+            f"(pointer={identity!r}@{step!r}, "
+            f"frontier={frontier.get('identity')!r}@{frontier.get('step')!r})",
+        )
+    run_id = run.get("run_id")
+    generation_family = run.get("generation_family")
+    created_ns = _positive_timestamp(run.get("created_ns"))
+    if (
+        not isinstance(run_id, str)
+        or not run_id
+        or not isinstance(generation_family, str)
+        or not generation_family
+        or created_ns is None
+    ):
+        return None, "run identity is incomplete"
+    return (
+        {
+            "schema_version": 1,
+            "status": "verified",
+            "label": label,
+            "run_root": str(root),
+            "run_identity": {
+                "run_id": run_id,
+                "generation_family": generation_family,
+                "created_ns": created_ns,
+            },
+            "run_identity_artifact": {
+                "path": str(run_path),
+                "sha256": _sha256(run_path),
+            },
+            "champion": {
+                "model_identity": identity,
+                "model_step": step,
+                "updated_ns": champion.get("updated_ns"),
+            },
+            "champion_pointer_artifact": {
+                "path": str(champion_path),
+                "sha256": _sha256(champion_path),
+            },
+            "source_anchor": {
+                "model_identity": anchor.get("identity"),
+                "model_step": anchor.get("step"),
+            },
+            "selection": "guarded_chronological_champion_frontier",
+        },
+        None,
+    )
+
+
 def _add_reason(reasons: list[dict[str, str]], code: str, message: str) -> None:
     reason = {"code": code, "message": message}
     if reason not in reasons:
@@ -1116,19 +1556,59 @@ def _empty_payload(
             "selection": None,
         },
         "endpoint": None,
+        "diagnostics": {
+            "latest_terminal_endpoint": None,
+            "latest_terminal_endpoint_error": None,
+        },
+        "champion_frontier": None,
+        "verified_winner_snapshot": None,
         "measurement": {
             "source": None,
             "status": "unavailable",
             "started_ns": None,
             "stopped_ns": None,
+            "cutoff_ns": None,
             "wall_seconds": None,
+            "resource_released_ns": None,
+            "resource_wall_seconds": None,
             "stop_reason": None,
             "exit_code": None,
             "outcome": None,
             "attempt_count": None,
             "failure": None,
+            "lifecycle_status": None,
+            "completion_status": None,
+            "warnings": [],
+            "failure_domain": None,
+            "failure_phase": None,
+            "teardown_status": None,
+            "teardown": None,
+            "integrity_status": None,
+            "integrity": None,
             "wall_budget_seconds": None,
             "leaf_budget": None,
+        },
+        "resource_accounting": {
+            "source": None,
+            "started_ns": None,
+            "measurement_cutoff_ns": None,
+            "resource_released_ns": None,
+            "measurement_wall_seconds": None,
+            "teardown_wall_seconds": None,
+            "total_provisioned_wall_seconds": None,
+            "total_provisioned_wall_hours": None,
+            "provisioned_gpus": provisioned_gpus,
+            "total_provisioned_gpu_hours": None,
+        },
+        "deployment_metric": {
+            "name": (
+                "guarded_champion_frontier_ring_10_elo_lcb_per_"
+                "total_provisioned_wall_hour"
+            ),
+            "value": None,
+            "point_value": None,
+            "time_basis": "measurement_started_ns_to_resource_released_ns",
+            "selection": "chronological_promotions_only",
         },
         "efficiency": {
             "accounting_basis": None,
@@ -1311,6 +1791,24 @@ def _analyze_treatment(
         anchor = anchor_estimate
         payload["anchor"] = anchor
     payload["endpoint"] = endpoint
+    payload["diagnostics"] = {
+        "latest_terminal_endpoint": endpoint,
+        "latest_terminal_endpoint_error": endpoint_error,
+    }
+    frontier, frontier_error = _champion_frontier(
+        report,
+        evaluations,
+        anchor_identity=anchor_identity,
+    )
+    payload["champion_frontier"] = frontier
+    winner_snapshot, snapshot_error = _winner_snapshot(
+        root,
+        label=label,
+        frontier=frontier,
+        anchor=anchor,
+        failures=failures,
+    )
+    payload["verified_winner_snapshot"] = winner_snapshot
 
     normalized_failures = _normalized_failures(failures)
     payload["parse_failure_count"] = len(normalized_failures)
@@ -1339,11 +1837,17 @@ def _analyze_treatment(
             "missing_common_anchor",
             endpoint_error or "common anchor is unavailable in the ring-10 ladder",
         )
-    if endpoint is None:
+    if frontier is None:
         _add_reason(
             reasons,
-            "missing_ring_10_endpoint",
-            endpoint_error or "ring-10 terminal endpoint is unavailable",
+            "missing_champion_frontier",
+            frontier_error or "ring-10 champion frontier is unavailable",
+        )
+    if winner_snapshot is None:
+        _add_reason(
+            reasons,
+            "unverified_winner_snapshot",
+            snapshot_error or "winner snapshot could not be verified",
         )
     if (_nonnegative_integer(guardrails.get("reject_ring_regression_count")) or 0) > 0:
         _add_reason(
@@ -1398,6 +1902,42 @@ def _analyze_treatment(
     provisioned_gpu_hours = (
         provisioned_gpus * wall_hours if wall_hours is not None else None
     )
+    resource_wall_seconds = _number(measurement.get("resource_wall_seconds"))
+    resource_wall_hours = (
+        resource_wall_seconds / 3_600.0
+        if resource_wall_seconds is not None and resource_wall_seconds > 0
+        else None
+    )
+    if resource_wall_hours is None:
+        _add_reason(
+            reasons,
+            "invalid_resource_wall_time",
+            "run has no positive start-to-resource-release interval",
+        )
+    total_provisioned_gpu_hours = (
+        provisioned_gpus * resource_wall_hours
+        if resource_wall_hours is not None
+        else None
+    )
+    teardown_wall_seconds = (
+        resource_wall_seconds - wall_seconds
+        if resource_wall_seconds is not None
+        and wall_seconds is not None
+        and resource_wall_seconds >= wall_seconds
+        else None
+    )
+    payload["resource_accounting"] = {
+        "source": measurement.get("source"),
+        "started_ns": measurement.get("started_ns"),
+        "measurement_cutoff_ns": measurement.get("cutoff_ns"),
+        "resource_released_ns": measurement.get("resource_released_ns"),
+        "measurement_wall_seconds": wall_seconds,
+        "teardown_wall_seconds": teardown_wall_seconds,
+        "total_provisioned_wall_seconds": resource_wall_seconds,
+        "total_provisioned_wall_hours": resource_wall_hours,
+        "provisioned_gpus": provisioned_gpus,
+        "total_provisioned_gpu_hours": total_provisioned_gpu_hours,
+    }
     anchor_rating = _number(anchor.get("rating_elo"))
     anchor_standard_error = _number(anchor.get("standard_error_elo"))
     rating = _number(endpoint.get("rating_elo")) if endpoint is not None else None
@@ -1419,12 +1959,12 @@ def _analyze_treatment(
         if elo_gained is not None and conservative_standard_error is not None
         else None
     )
-    point_score = (
+    endpoint_point_score = (
         elo_gained / wall_hours
         if elo_gained is not None and wall_hours is not None
         else None
     )
-    ranking_score = (
+    endpoint_ranking_score = (
         elo_lcb / wall_hours if elo_lcb is not None and wall_hours is not None else None
     )
     payload["efficiency"] = {
@@ -1442,8 +1982,8 @@ def _analyze_treatment(
         "ring_10_elo_gained": elo_gained,
         "ring_10_elo_gain_conservative_standard_error": (conservative_standard_error),
         "ring_10_elo_one_sided_95_lower_bound": elo_lcb,
-        "ring_10_elo_per_wall_hour": point_score,
-        "ring_10_elo_lcb_per_wall_hour": ranking_score,
+        "ring_10_elo_per_wall_hour": endpoint_point_score,
+        "ring_10_elo_lcb_per_wall_hour": endpoint_ranking_score,
         "ring_10_elo_per_provisioned_gpu_hour": (
             elo_gained / provisioned_gpu_hours
             if elo_gained is not None and provisioned_gpu_hours
@@ -1455,11 +1995,67 @@ def _analyze_treatment(
             else None
         ),
     }
+    frontier_rating = (
+        _number(frontier.get("rating_elo")) if frontier is not None else None
+    )
+    frontier_standard_error = (
+        _number(frontier.get("standard_error_elo")) if frontier is not None else None
+    )
+    frontier_gain = (
+        frontier_rating - anchor_rating
+        if frontier_rating is not None and anchor_rating is not None
+        else None
+    )
+    if (
+        frontier is not None
+        and frontier.get("identity") == anchor.get("identity")
+        and frontier_gain is not None
+    ):
+        frontier_gain_standard_error = 0.0
+    else:
+        frontier_gain_standard_error = (
+            anchor_standard_error + frontier_standard_error
+            if anchor_standard_error is not None and frontier_standard_error is not None
+            else None
+        )
+    frontier_lcb = (
+        frontier_gain - ONE_SIDED_95_NORMAL_QUANTILE * frontier_gain_standard_error
+        if frontier_gain is not None and frontier_gain_standard_error is not None
+        else None
+    )
+    point_score = (
+        frontier_gain / resource_wall_hours
+        if frontier_gain is not None and resource_wall_hours is not None
+        else None
+    )
+    ranking_score = (
+        frontier_lcb / resource_wall_hours
+        if frontier_lcb is not None and resource_wall_hours is not None
+        else None
+    )
+    payload["deployment_metric"] = {
+        "name": (
+            "guarded_champion_frontier_ring_10_elo_lcb_per_total_provisioned_wall_hour"
+        ),
+        "value": ranking_score,
+        "point_value": point_score,
+        "champion_frontier_ring_10_elo_gained": frontier_gain,
+        "champion_frontier_ring_10_elo_gain_conservative_standard_error": (
+            frontier_gain_standard_error
+        ),
+        "champion_frontier_ring_10_elo_one_sided_95_lower_bound": frontier_lcb,
+        "total_provisioned_wall_hours": resource_wall_hours,
+        "total_provisioned_gpu_hours": total_provisioned_gpu_hours,
+        "guardrail_status": guardrails.get("status"),
+        "time_basis": "measurement_started_ns_to_resource_released_ns",
+        "selection": "chronological_promotions_only",
+    }
     if ranking_score is None:
         _add_reason(
             reasons,
             "unavailable_ranking_metric",
-            "ring-10 Elo/hour lower bound could not be computed",
+            "guarded champion-frontier ring-10 Elo/hour lower bound "
+            "could not be computed",
         )
     return _Treatment(
         label,
@@ -1603,23 +2199,53 @@ def build_elo_ablation_comparison(
     )
     ordered = [*eligible_treatments, *ineligible_treatments]
     status = "complete" if len(eligible_treatments) == len(treatments) else "incomplete"
+    winner_snapshot = (
+        eligible_treatments[0].payload.get("verified_winner_snapshot")
+        if status == "complete" and eligible_treatments
+        else None
+    )
+    serialized_winner_snapshot = (
+        dict(winner_snapshot)
+        if isinstance(winner_snapshot, Mapping)
+        and winner_snapshot.get("status") == "verified"
+        else None
+    )
+    selector_verified = serialized_winner_snapshot is not None
+    selector = {
+        "status": "verified" if selector_verified else "unavailable",
+        "ranking_metric": (
+            "guarded_champion_frontier_ring_10_elo_lcb_per_total_provisioned_wall_hour"
+        ),
+        "winner_snapshot": serialized_winner_snapshot,
+        "reason": (
+            None
+            if selector_verified
+            else "all treatments must be eligible with a verified champion snapshot"
+        ),
+        "selection": "highest_ranked_chronological_champion_frontier",
+        "non_promoted_endpoints_are_diagnostic_only": True,
+    }
     return {
         "schema_version": SCHEMA_VERSION,
         "report": REPORT_NAME,
         "status": status,
-        "ranking_metric": "ring_10_elo_lcb_per_wall_hour",
+        "ranking_metric": (
+            "guarded_champion_frontier_ring_10_elo_lcb_per_total_provisioned_wall_hour"
+        ),
         "confidence": {
             "level": CONFIDENCE_LEVEL,
             "sidedness": "one-sided-lower",
             "method": (
-                "normal lower bound using the conservative sum of endpoint and "
+                "normal lower bound using the conservative sum of frontier and "
                 "common-anchor Bradley-Terry standard_error"
             ),
             "normal_quantile": ONE_SIDED_95_NORMAL_QUANTILE,
         },
         "compute_accounting": {
             "provisioned_gpus": provisioned_gpus,
-            "basis": "all provisioned GPUs over each full observed wall interval",
+            "basis": (
+                "all provisioned GPUs from measurement start through resource release"
+            ),
         },
         "guardrail_configuration": {
             "rings": list(parsed_rings),
@@ -1635,6 +2261,7 @@ def build_elo_ablation_comparison(
         },
         "run_count": len(treatments),
         "eligible_count": len(eligible_treatments),
+        "selector": selector,
         "errors": errors,
         "treatments": [treatment.payload for treatment in ordered],
     }

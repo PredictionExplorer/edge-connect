@@ -131,24 +131,254 @@ def _coordinator_owner_is_live(path: Path) -> bool:
     return True
 
 
+def _process_group_exists(process_group_id: int) -> bool:
+    try:
+        os.killpg(process_group_id, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
 def _terminate(
     process: subprocess.Popen[bytes],
     *,
-    grace_seconds: float,
-) -> bool:
-    if process.poll() is not None:
-        return False
+    terminate_grace_seconds: float,
+    kill_grace_seconds: float,
+) -> dict[str, object]:
+    """Stop the coordinator first and its isolated process group only on timeout."""
+
+    started_ns = time.time_ns()
+    initial_exit_code = process.poll()
+    term_sent = False
+    kill_sent = False
+    escalated = False
+    errors: list[str] = []
+    process_group_id = process.pid
+    terminate_deadline = time.monotonic() + terminate_grace_seconds
+    if initial_exit_code is None:
+        try:
+            os.kill(process.pid, signal.SIGTERM)
+            term_sent = True
+        except ProcessLookupError:
+            pass
+        except OSError as error:
+            errors.append(f"SIGTERM failed: {type(error).__name__}: {error}")
+        try:
+            process.wait(timeout=max(0.0, terminate_deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            pass
+        except OSError as error:
+            errors.append(f"wait after SIGTERM failed: {type(error).__name__}: {error}")
+
+    exit_code = process.poll()
+    group_exists = _process_group_exists(process_group_id)
+    while (
+        exit_code is not None and group_exists and time.monotonic() < terminate_deadline
+    ):
+        time.sleep(min(0.05, max(0.0, terminate_deadline - time.monotonic())))
+        group_exists = _process_group_exists(process.pid)
+    if exit_code is None or group_exists:
+        escalated = True
+        try:
+            os.killpg(process_group_id, signal.SIGKILL)
+            kill_sent = True
+        except ProcessLookupError:
+            pass
+        except OSError as error:
+            errors.append(f"SIGKILL failed: {type(error).__name__}: {error}")
+        kill_deadline = time.monotonic() + kill_grace_seconds
+        if exit_code is None:
+            try:
+                process.wait(timeout=max(0.0, kill_deadline - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                errors.append("coordinator did not exit before kill grace expired")
+            except OSError as error:
+                errors.append(
+                    f"wait after SIGKILL failed: {type(error).__name__}: {error}"
+                )
+        group_exists = _process_group_exists(process_group_id)
+        while group_exists and time.monotonic() < kill_deadline:
+            time.sleep(min(0.05, max(0.0, kill_deadline - time.monotonic())))
+            group_exists = _process_group_exists(process.pid)
+        if group_exists:
+            errors.append("process group did not exit before kill grace expired")
+
+    exit_code = process.poll()
+    completed_ns = time.time_ns()
+    process_group_released = not group_exists
+    resource_released_ns = (
+        completed_ns if exit_code is not None and process_group_released else None
+    )
+    if escalated:
+        status = "forced" if exit_code is not None else "failed"
+        clean = False
+    elif initial_exit_code is not None:
+        status = "already_exited"
+        clean = True
+    elif term_sent and exit_code in (0, -signal.SIGTERM) and not errors:
+        status = "graceful"
+        clean = True
+    elif exit_code is not None:
+        status = "unexpected_exit"
+        clean = False
+    else:
+        status = "failed"
+        clean = False
+    warning = None
+    if not clean:
+        detail = "; ".join(errors)
+        warning = f"orchestrator teardown was {status} (exit={exit_code!r})" + (
+            f": {detail}" if detail else ""
+        )
+    return {
+        "schema_version": 1,
+        "status": status,
+        "clean": clean,
+        "requested": initial_exit_code is None,
+        "coordinator_pid": process.pid,
+        "process_group_id": process_group_id,
+        "terminate_grace_seconds": terminate_grace_seconds,
+        "kill_grace_seconds": kill_grace_seconds,
+        "term_target": "coordinator_pid",
+        "term_sent": term_sent,
+        "kill_target": "process_group",
+        "kill_sent": kill_sent,
+        "escalated": escalated,
+        "process_group_released": process_group_released,
+        "initial_exit_code": initial_exit_code,
+        "exit_code": exit_code,
+        "started_ns": started_ns,
+        "completed_ns": completed_ns,
+        "resource_released_ns": resource_released_ns,
+        "warning": warning,
+        "errors": errors,
+    }
+
+
+def _inactive_teardown(*, cutoff_ns: int, status: str) -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "status": status,
+        "clean": True,
+        "requested": False,
+        "coordinator_pid": None,
+        "term_target": "coordinator_pid",
+        "term_sent": False,
+        "kill_target": "process_group",
+        "kill_sent": False,
+        "escalated": False,
+        "process_group_released": True,
+        "initial_exit_code": None,
+        "exit_code": None,
+        "started_ns": cutoff_ns,
+        "completed_ns": cutoff_ns,
+        "resource_released_ns": cutoff_ns,
+        "warning": None,
+        "errors": [],
+    }
+
+
+def _terminal_failure_context(root: Path, cutoff_ns: int) -> dict[str, object] | None:
+    candidates = (
+        (root / "status" / "fatal.json", None),
+        (root / "status" / "coordinator.json", "failure"),
+    )
+    for path, nested_key in candidates:
+        if not path.is_file():
+            continue
+        try:
+            payload = _read_json(path)
+        except (OSError, ValueError, json.JSONDecodeError):
+            return {
+                "artifact": str(path),
+                "phase": "unknown",
+                "timestamp_ns": None,
+                "failure": None,
+                "parse_error": True,
+            }
+        failure = payload.get(nested_key) if nested_key is not None else payload
+        if not isinstance(failure, dict):
+            continue
+        timestamp = failure.get("timestamp_ns")
+        occurred_ns = (
+            timestamp
+            if isinstance(timestamp, int)
+            and not isinstance(timestamp, bool)
+            and timestamp > 0
+            else None
+        )
+        return {
+            "artifact": str(path),
+            "phase": (
+                "unknown"
+                if occurred_ns is None
+                else ("pre_cutoff" if occurred_ns <= cutoff_ns else "post_cutoff")
+            ),
+            "timestamp_ns": occurred_ns,
+            "failure": failure,
+            "parse_error": False,
+        }
+    return None
+
+
+def _terminal_failure_domain(root: Path, cutoff_ns: int) -> str:
+    context = _terminal_failure_context(root, cutoff_ns)
+    failure = context.get("failure") if context is not None else None
+    terminal_reason = (
+        str(failure.get("terminal_reason", "")).casefold()
+        if isinstance(failure, dict)
+        else ""
+    )
+    if any(
+        marker in terminal_reason for marker in ("hardware", "gpu_health", "gpu-unsafe")
+    ):
+        return "host"
+    return "run"
+
+
+def _post_cutoff_integrity(
+    root: Path,
+    profile: Path,
+    *,
+    cutoff_ns: int,
+) -> dict[str, object]:
+    checked_ns = time.time_ns()
+    terminal_failure = _terminal_failure_context(root, cutoff_ns)
     try:
-        os.killpg(process.pid, signal.SIGTERM)
-    except ProcessLookupError:
-        process.wait(timeout=10)
-        return False
-    try:
-        process.wait(timeout=grace_seconds)
-    except subprocess.TimeoutExpired:
-        os.killpg(process.pid, signal.SIGKILL)
-        process.wait(timeout=10)
-    return True
+        state = run_state_preflight(root, profile, apply=False)
+    except Exception as error:
+        return {
+            "schema_version": 1,
+            "status": "failed",
+            "valid": False,
+            "checked_ns": checked_ns,
+            "failure": f"{type(error).__name__}: {error}",
+            "state_preflight": None,
+            "terminal_failure": terminal_failure,
+        }
+    terminal_phase = (
+        terminal_failure.get("phase") if terminal_failure is not None else None
+    )
+    valid = state.get("status") == "ok" and terminal_phase in {None, "post_cutoff"}
+    return {
+        "schema_version": 1,
+        "status": "valid" if valid else "failed",
+        "valid": valid,
+        "checked_ns": checked_ns,
+        "failure": (
+            None
+            if valid
+            else (
+                f"terminal failure phase is {terminal_phase!r}"
+                if terminal_phase not in {None, "post_cutoff"}
+                else f"state preflight returned status {state.get('status')!r}"
+            )
+        ),
+        "state_preflight": state,
+        "terminal_failure": terminal_failure,
+    }
 
 
 def _measurement_attempts(metadata: dict[str, Any]) -> list[dict[str, object]]:
@@ -204,35 +434,75 @@ def _finish_attempt(
     attempts: list[dict[str, object]],
     attempt: dict[str, object],
     measurement_started_ns: int,
-    stopped_ns: int,
+    measurement_cutoff_ns: int,
+    resource_released_ns: int | None,
+    teardown_status: dict[str, object],
     stop_reason: str,
     exit_code: int | None,
     evaluator_rows: int,
     outcome: str,
     status: str,
+    completion_status: str,
     failure: str | None,
+    warnings: list[str] | None = None,
+    integrity: dict[str, object] | None = None,
+    failure_domain: str | None = None,
+    failure_phase: str | None = None,
 ) -> dict[str, object]:
+    lifecycle_warnings = list(warnings or [])
+    teardown_state = (
+        "clean"
+        if teardown_status.get("clean") is True
+        else str(teardown_status.get("status", "failed"))
+    )
+    integrity_status = integrity.get("status") if integrity is not None else None
     attempt.update(
         {
-            "stopped_ns": stopped_ns,
+            "stopped_ns": measurement_cutoff_ns,
+            "measurement_cutoff_ns": measurement_cutoff_ns,
+            "resource_released_ns": resource_released_ns,
+            "teardown_status": teardown_state,
+            "teardown": teardown_status,
+            "integrity_status": integrity_status,
+            "integrity": integrity,
             "stop_reason": stop_reason,
             "exit_code": exit_code,
+            "resource_exit_code": teardown_status.get("exit_code"),
             "evaluator_rows": evaluator_rows,
             "outcome": outcome,
             "status": status,
+            "completion_status": completion_status,
             "failure": failure,
+            "failure_domain": failure_domain,
+            "failure_phase": failure_phase,
+            "warnings": lifecycle_warnings,
         }
     )
     metadata.update(
         {
             "measurement_started_ns": measurement_started_ns,
-            "measurement_stopped_ns": stopped_ns,
+            # Legacy readers treat measurement_stopped_ns as the evidence
+            # boundary. Keep it as an alias for the explicit cutoff.
+            "measurement_stopped_ns": measurement_cutoff_ns,
+            "measurement_cutoff_ns": measurement_cutoff_ns,
+            "resource_released_ns": resource_released_ns,
+            "measurement_teardown_status": teardown_state,
+            "measurement_teardown": teardown_status,
+            "teardown_status": teardown_state,
+            "teardown": teardown_status,
+            "integrity_status": integrity_status,
+            "integrity": integrity,
             "measurement_stop_reason": stop_reason,
             "measurement_exit_code": exit_code,
+            "measurement_resource_exit_code": teardown_status.get("exit_code"),
             "measurement_evaluator_rows": evaluator_rows,
             "measurement_status": status,
+            "measurement_completion_status": completion_status,
             "measurement_outcome": outcome,
             "measurement_failure": failure,
+            "failure_domain": failure_domain,
+            "failure_phase": failure_phase,
+            "measurement_warnings": lifecycle_warnings,
             "measurement_attempt_count": len(attempts),
             "measurement_attempts": attempts,
         }
@@ -247,13 +517,30 @@ def _finish_attempt(
         "run_root": str(metadata_path.parent),
         "started_ns": measurement_started_ns,
         "attempt_started_ns": attempt["started_ns"],
-        "stopped_ns": stopped_ns,
-        "wall_seconds": (stopped_ns - measurement_started_ns) / 1_000_000_000.0,
+        "stopped_ns": measurement_cutoff_ns,
+        "measurement_cutoff_ns": measurement_cutoff_ns,
+        "resource_released_ns": resource_released_ns,
+        "wall_seconds": (measurement_cutoff_ns - measurement_started_ns)
+        / 1_000_000_000.0,
+        "resource_release_seconds": (
+            None
+            if resource_released_ns is None
+            else (resource_released_ns - measurement_cutoff_ns) / 1_000_000_000.0
+        ),
         "stop_reason": stop_reason,
         "exit_code": exit_code,
+        "resource_exit_code": teardown_status.get("exit_code"),
+        "teardown_status": teardown_state,
+        "teardown": teardown_status,
+        "integrity_status": integrity_status,
+        "integrity": integrity,
+        "completion_status": completion_status,
         "evaluator_rows": evaluator_rows,
         "attempt": len(attempts),
         "failure": failure,
+        "failure_domain": failure_domain,
+        "failure_phase": failure_phase,
+        "warnings": lifecycle_warnings,
     }
 
 
@@ -308,12 +595,23 @@ def run_elo_ablation(
         "attempt": len(attempts) + 1,
         "started_ns": attempt_started_ns,
         "stopped_ns": None,
+        "measurement_cutoff_ns": None,
+        "resource_released_ns": None,
+        "teardown_status": None,
+        "teardown": None,
+        "integrity_status": None,
+        "integrity": None,
         "stop_reason": None,
         "exit_code": None,
+        "resource_exit_code": None,
         "evaluator_rows": None,
         "outcome": "running",
         "status": "running",
+        "completion_status": "running",
         "failure": None,
+        "failure_domain": None,
+        "failure_phase": None,
+        "warnings": [],
         "orchestrator_started": False,
     }
     attempts.append(attempt)
@@ -321,12 +619,25 @@ def run_elo_ablation(
         {
             "measurement_started_ns": started_ns,
             "measurement_stopped_ns": None,
+            "measurement_cutoff_ns": None,
+            "resource_released_ns": None,
+            "measurement_teardown_status": None,
+            "measurement_teardown": None,
+            "teardown_status": None,
+            "teardown": None,
+            "integrity_status": None,
+            "integrity": None,
             "measurement_stop_reason": None,
             "measurement_exit_code": None,
+            "measurement_resource_exit_code": None,
             "measurement_evaluator_rows": 0,
             "measurement_status": "running",
+            "measurement_completion_status": "running",
             "measurement_outcome": None,
             "measurement_failure": None,
+            "failure_domain": None,
+            "failure_phase": None,
+            "measurement_warnings": [],
             "measurement_attempt_count": len(attempts),
             "measurement_attempts": attempts,
         }
@@ -337,37 +648,51 @@ def run_elo_ablation(
     try:
         rows = tracker.refresh()
     except (json.JSONDecodeError, OSError, ValueError) as error:
-        stopped_ns = time.time_ns()
+        cutoff_ns = time.time_ns()
+        teardown_status = _inactive_teardown(
+            cutoff_ns=cutoff_ns,
+            status="not_started",
+        )
         return _finish_attempt(
             metadata_path=metadata_path,
             metadata=metadata,
             attempts=attempts,
             attempt=attempt,
             measurement_started_ns=started_ns,
-            stopped_ns=stopped_ns,
+            measurement_cutoff_ns=cutoff_ns,
+            resource_released_ns=cutoff_ns,
+            teardown_status=teardown_status,
             stop_reason="runner_error",
             exit_code=None,
             evaluator_rows=tracker.rows,
             outcome=RUNNER_ERROR,
             status="failed",
+            completion_status="failed",
             failure=f"{type(error).__name__}: {error}",
         )
     elapsed = (time.time_ns() - started_ns) / 1_000_000_000.0
     if rows >= leaf_budget or elapsed >= wall_budget_seconds:
         stop_reason = "leaf_budget" if rows >= leaf_budget else "wall_budget"
-        stopped_ns = time.time_ns()
+        cutoff_ns = time.time_ns()
+        teardown_status = _inactive_teardown(
+            cutoff_ns=cutoff_ns,
+            status="not_started",
+        )
         return _finish_attempt(
             metadata_path=metadata_path,
             metadata=metadata,
             attempts=attempts,
             attempt=attempt,
             measurement_started_ns=started_ns,
-            stopped_ns=stopped_ns,
+            measurement_cutoff_ns=cutoff_ns,
+            resource_released_ns=cutoff_ns,
+            teardown_status=teardown_status,
             stop_reason=stop_reason,
             exit_code=None,
             evaluator_rows=rows,
             outcome=BUDGET_COMPLETION,
             status="complete",
+            completion_status="complete",
             failure=None,
         )
 
@@ -378,7 +703,9 @@ def run_elo_ablation(
     process: subprocess.Popen[bytes] | None = None
     stop_reason = "process_exit"
     runner_failure: str | None = None
-    termination_requested = False
+    measurement_cutoff_ns: int | None = None
+    measurement_exit_code: int | None = None
+    teardown_status: dict[str, object]
     try:
         try:
             process = subprocess.Popen(
@@ -395,93 +722,223 @@ def run_elo_ablation(
             elapsed = (time.time_ns() - started_ns) / 1_000_000_000.0
             if latch.is_set():
                 stop_reason = f"signal_{latch.signal_number}"
+                measurement_cutoff_ns = time.time_ns()
+                measurement_exit_code = process.poll()
                 break
             if rows >= leaf_budget:
                 stop_reason = "leaf_budget"
+                measurement_cutoff_ns = time.time_ns()
+                measurement_exit_code = process.poll()
+                if measurement_exit_code is not None:
+                    stop_reason = "process_exit"
                 break
             if elapsed >= wall_budget_seconds:
                 stop_reason = "wall_budget"
+                measurement_cutoff_ns = time.time_ns()
+                measurement_exit_code = process.poll()
+                if measurement_exit_code is not None:
+                    stop_reason = "process_exit"
                 break
             time.sleep(poll_seconds)
-    except (json.JSONDecodeError, OSError, ValueError) as error:
-        stop_reason = "runner_error"
-        runner_failure = f"{type(error).__name__}: {error}"
-    finally:
-        try:
-            if process is not None:
-                grace = (
-                    experiment.orchestration.shutdown.terminate_grace_seconds
-                    + experiment.orchestration.shutdown.kill_grace_seconds
-                )
-                termination_requested = _terminate(process, grace_seconds=grace)
-        finally:
-            signal.signal(signal.SIGINT, previous_sigint)
-            signal.signal(signal.SIGTERM, previous_sigterm)
-    try:
-        rows = tracker.refresh()
+        if measurement_cutoff_ns is None:
+            try:
+                rows = tracker.refresh()
+            except (json.JSONDecodeError, OSError, ValueError) as error:
+                stop_reason = "runner_error"
+                runner_failure = f"{type(error).__name__}: {error}"
+                rows = tracker.rows
+            measurement_cutoff_ns = time.time_ns()
+            measurement_exit_code = process.poll() if process is not None else None
     except (json.JSONDecodeError, OSError, ValueError) as error:
         stop_reason = "runner_error"
         runner_failure = f"{type(error).__name__}: {error}"
         rows = tracker.rows
-    exit_code = process.returncode if process is not None else None
-    stopped_ns = time.time_ns()
-    if stop_reason in {"leaf_budget", "wall_budget"} and termination_requested:
-        outcome = BUDGET_COMPLETION
-        clean_shutdown = exit_code in (0, -signal.SIGTERM)
-        status = "complete" if clean_shutdown else "failed"
-        failure = (
-            None
-            if clean_shutdown
-            else f"orchestrator did not stop cleanly at budget (exit={exit_code!r})"
+        measurement_cutoff_ns = time.time_ns()
+        measurement_exit_code = process.poll() if process is not None else None
+    finally:
+        try:
+            if measurement_cutoff_ns is None:
+                measurement_cutoff_ns = time.time_ns()
+            if process is not None:
+                teardown_status = _terminate(
+                    process,
+                    terminate_grace_seconds=(
+                        experiment.orchestration.shutdown.terminate_grace_seconds
+                        + experiment.orchestration.hardware_health.probe_timeout_seconds
+                        + 2 * experiment.orchestration.shutdown.monitor_interval_seconds
+                    ),
+                    kill_grace_seconds=(
+                        experiment.orchestration.shutdown.kill_grace_seconds
+                    ),
+                )
+            else:
+                teardown_status = _inactive_teardown(
+                    cutoff_ns=measurement_cutoff_ns,
+                    status="not_started",
+                )
+        finally:
+            signal.signal(signal.SIGINT, previous_sigint)
+            signal.signal(signal.SIGTERM, previous_sigterm)
+    assert measurement_cutoff_ns is not None
+    if (
+        stop_reason in {"leaf_budget", "wall_budget"}
+        and measurement_exit_code is None
+        and teardown_status.get("exit_code") not in (0, -signal.SIGTERM)
+        and teardown_status.get("clean") is True
+    ):
+        teardown_status["status"] = "unexpected_exit"
+        teardown_status["clean"] = False
+        teardown_status["warning"] = (
+            "orchestrator teardown exited unexpectedly after measurement cutoff "
+            f"(exit={teardown_status.get('exit_code')!r})"
         )
-    elif not termination_requested and (
-        exit_code == TRANSIENT_WORKER_EXIT_CODE
-        or (exit_code is not None and exit_code < 0)
+    raw_resource_released_ns = teardown_status.get("resource_released_ns")
+    resource_released_ns = (
+        raw_resource_released_ns
+        if isinstance(raw_resource_released_ns, int)
+        and not isinstance(raw_resource_released_ns, bool)
+        else None
+    )
+    if resource_released_ns is None:
+        teardown_status["status"] = "resources_not_released"
+        teardown_status["clean"] = False
+        release_warning = "orchestrator process group release was not confirmed"
+        previous_warning = teardown_status.get("warning")
+        teardown_status["warning"] = (
+            f"{previous_warning}; {release_warning}"
+            if isinstance(previous_warning, str) and previous_warning
+            else release_warning
+        )
+    teardown_warning = teardown_status.get("warning")
+    warnings = [teardown_warning] if isinstance(teardown_warning, str) else []
+    integrity: dict[str, object] | None = None
+    failure_domain: str | None = None
+    failure_phase: str | None = None
+    if stop_reason in {"leaf_budget", "wall_budget"} and measurement_exit_code is None:
+        outcome = BUDGET_COMPLETION
+        if teardown_status.get("clean") is True and resource_released_ns is not None:
+            status = "complete"
+            completion_status = "complete"
+            failure = None
+        else:
+            integrity = _post_cutoff_integrity(
+                root,
+                profile,
+                cutoff_ns=measurement_cutoff_ns,
+            )
+            if integrity.get("valid") is True and resource_released_ns is not None:
+                status = "complete"
+                completion_status = "complete_with_warning"
+                failure = None
+                failure_domain = "orchestrator_teardown"
+                failure_phase = "post_cutoff"
+            else:
+                status = "failed"
+                completion_status = "failed"
+                terminal = integrity.get("terminal_failure")
+                terminal_phase = (
+                    terminal.get("phase") if isinstance(terminal, dict) else None
+                )
+                failure_domain = (
+                    "orchestrator"
+                    if terminal_phase in {"pre_cutoff", "unknown"}
+                    else (
+                        "process_cleanup"
+                        if resource_released_ns is None
+                        else "state_integrity"
+                    )
+                )
+                failure_phase = (
+                    str(terminal_phase)
+                    if terminal_phase in {"pre_cutoff", "unknown"}
+                    else "post_cutoff"
+                )
+                failure = (
+                    "post-cutoff teardown anomaly failed state integrity: "
+                    f"{integrity.get('failure')}"
+                )
+                warnings.append(failure)
+    elif measurement_exit_code == TRANSIENT_WORKER_EXIT_CODE or (
+        measurement_exit_code is not None and measurement_exit_code < 0
     ):
         outcome = TRANSIENT_CRASH
         status = "retryable"
+        completion_status = "retryable"
+        failure_domain = "orchestrator"
+        failure_phase = "measurement"
         failure = (
-            f"orchestrator reported a transient failure (exit={exit_code})"
-            if exit_code == TRANSIENT_WORKER_EXIT_CODE
-            else f"orchestrator was terminated by signal {-exit_code}"
+            f"orchestrator reported a transient failure (exit={measurement_exit_code})"
+            if measurement_exit_code == TRANSIENT_WORKER_EXIT_CODE
+            else f"orchestrator was terminated by signal {-measurement_exit_code}"
         )
-    elif not termination_requested and exit_code == FATAL_WORKER_EXIT_CODE:
+    elif measurement_exit_code == FATAL_WORKER_EXIT_CODE:
         outcome = FATAL_ORCHESTRATOR_EXIT
         status = "failed"
-        failure = f"orchestrator reported a fatal failure (exit={exit_code})"
-    elif not termination_requested and exit_code is not None:
+        completion_status = "failed"
+        failure_domain = _terminal_failure_domain(root, measurement_cutoff_ns)
+        failure_phase = "measurement"
+        failure = (
+            f"orchestrator reported a fatal failure (exit={measurement_exit_code})"
+        )
+    elif measurement_exit_code is not None:
         outcome = FATAL_ORCHESTRATOR_EXIT
         status = "failed"
-        failure = f"orchestrator exited before budget with code {exit_code!r}"
+        completion_status = "failed"
+        failure_domain = _terminal_failure_domain(root, measurement_cutoff_ns)
+        failure_phase = "measurement"
+        failure = (
+            f"orchestrator exited before budget with code {measurement_exit_code!r}"
+        )
     elif stop_reason.startswith("signal_"):
         outcome = TRANSIENT_CRASH
         status = "retryable"
+        completion_status = "retryable"
+        failure_domain = "runner_signal"
+        failure_phase = "measurement"
         failure = f"runner interrupted by {stop_reason}"
     elif stop_reason == "spawn_error":
         outcome = TRANSIENT_CRASH
         status = "retryable"
+        completion_status = "retryable"
+        failure_domain = "runner_spawn"
+        failure_phase = "measurement"
         failure = runner_failure
     elif stop_reason == "runner_error":
         outcome = RUNNER_ERROR
         status = "failed"
+        completion_status = "failed"
+        failure_domain = "runner"
+        failure_phase = "measurement"
         failure = runner_failure
     else:
         outcome = FATAL_ORCHESTRATOR_EXIT
         status = "failed"
-        failure = f"orchestrator exited before budget with code {exit_code!r}"
+        completion_status = "failed"
+        failure_domain = "orchestrator"
+        failure_phase = "measurement"
+        failure = (
+            f"orchestrator exited before budget with code {measurement_exit_code!r}"
+        )
     return _finish_attempt(
         metadata_path=metadata_path,
         metadata=metadata,
         attempts=attempts,
         attempt=attempt,
         measurement_started_ns=started_ns,
-        stopped_ns=stopped_ns,
+        measurement_cutoff_ns=measurement_cutoff_ns,
+        resource_released_ns=resource_released_ns,
+        teardown_status=teardown_status,
         stop_reason=stop_reason,
-        exit_code=exit_code,
+        exit_code=measurement_exit_code,
         evaluator_rows=rows,
         outcome=outcome,
         status=status,
+        completion_status=completion_status,
         failure=failure,
+        warnings=warnings,
+        integrity=integrity,
+        failure_domain=failure_domain,
+        failure_phase=failure_phase,
     )
 
 

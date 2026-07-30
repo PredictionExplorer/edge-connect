@@ -1,0 +1,35 @@
+[Unit]
+Description=EdgeConnect hash-pinned, host-locked StarTrain workload
+Wants=network-online.target
+After=network-online.target
+OnFailure=edgeconnect-startrain-continuity.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=notify
+NotifyAccess=main
+User=@USER@
+WorkingDirectory=@TRAINING_DIR@
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONPATH=@TRAINING_DIR@
+Environment=TORCH_NCCL_ASYNC_ERROR_HANDLING=1
+Environment=PATH=@TRAINING_DIR@/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStartPre=@TRAINING_DIR@/.venv/bin/python @TRAINING_DIR@/scripts/reconcile_training_continuity.py verify --manifest @CONTINUITY_MANIFEST@ --workload @WORKLOAD_ID@
+ExecStartPre=@TRAINING_DIR@/.venv/bin/python @TRAINING_DIR@/scripts/validate_continuous_profile.py --config @PROFILE@
+ExecStartPre=@TRAINING_DIR@/.venv/bin/python @TRAINING_DIR@/scripts/preflight_run_state.py --run-root @RUN_ROOT@ --profile @PROFILE@ --apply
+ExecCondition=@TRAINING_DIR@/.venv/bin/python @TRAINING_DIR@/scripts/hardware_health_preflight.py --config @PROFILE@ --output @RUN_ROOT@/status/hardware-health-startup.json
+ExecStartPre=@TRAINING_DIR@/.venv/bin/python @TRAINING_DIR@/scripts/replay_manifest_backup.py check-and-restore --run-root @RUN_ROOT@
+ExecStart=@TRAINING_DIR@/.venv/bin/python @TRAINING_DIR@/scripts/reconcile_training_continuity.py run-locked --manifest @CONTINUITY_MANIFEST@ --workload @WORKLOAD_ID@ --orchestrator @TRAINING_DIR@/.venv/bin/startrain-orchestrate
+Restart=no
+WatchdogSec=120
+WatchdogSignal=SIGTERM
+TimeoutStartSec=300
+TimeoutAbortSec=1000
+KillSignal=SIGTERM
+KillMode=mixed
+TimeoutStopSec=1000
+OOMPolicy=stop
+LimitNOFILE=1048576
+NoNewPrivileges=true
+UMask=0027

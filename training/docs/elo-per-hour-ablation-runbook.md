@@ -185,8 +185,9 @@ deployment on that host. On restart, a stale `running` arm is reconciled from
 
 The per-arm runner records one of these durable outcomes:
 
-- `budget_completion`: the wall or evaluator-row budget was reached and the
-  orchestrator stopped cleanly.
+- `budget_completion`: the wall or evaluator-row budget was reached. The
+  evidence cutoff is recorded before shutdown; teardown health and the final
+  resource-release time are recorded separately.
 - `transient_crash`: the orchestrator died from a signal or the queue was
   interrupted. The queue retries only up to its frozen transient retry limit.
 - `fatal_orchestrator_exit`: the orchestrator exited normally before its budget,
@@ -196,11 +197,19 @@ The original measurement start is retained across retries. Wall-clock downtime
 therefore remains charged to the arm, and a restart after the wall deadline
 records budget completion without starting a fresh measurement window.
 
-A fatal exit or exhausted transient retry budget marks that arm `failed` and
-stops the queue by default. The queue never advances silently. The only way to
-run later arms is to generate the deployment manifest with
-`--continue-after-fatal`; failed arms remain incomplete and ineligible even
-under that explicit policy.
+`measurement_cutoff_ns` limits which arena evidence is eligible.
+`resource_released_ns` includes graceful drain, forced cleanup, and idle
+recovery time in the provisioned-hour denominator. A non-clean exit after the
+cutoff is accepted only as `complete_with_warning` when state preflight passes
+and every terminal failure is proven to have occurred after the cutoff. A
+pre-cutoff or untimestamped fatal remains ineligible. Missing resource-release
+evidence blocks both queue advancement and automatic continuity handoff.
+
+An isolated fatal arm is quarantined by metadata; its files are preserved. The
+queue always finalizes the partial report and writes a continuity handoff
+request. The host continuity controller decides whether another arm is safe or
+whether to resume the immutable last-known-good workload. The queue itself
+never invokes `systemctl`.
 
 For a local diagnostic only, one arm can still be invoked directly:
 
@@ -228,6 +237,11 @@ The report always includes every configured arm. Pending and failed arms receive
 the `queue_arm_incomplete` ineligibility reason and are never ranked. An
 `incomplete` comparison is expected after a failed arm; it is evidence, not a
 successful experiment.
+
+Install
+`deploy/edgeconnect-startrain-continuity-trigger.conf.example` as a systemd
+drop-in for immediate handoff on queue success or failure. The periodic
+continuity timer is still required as an independent backstop.
 
 ## Throughput screening
 
@@ -266,10 +280,22 @@ python scripts/compare_elo_ablation.py \
   --output /absolute/path/to/elo-comparison.json
 ```
 
-The comparator uses `ablation.json` for the exact fixed-budget wall interval,
-requires one common champion anchor, honors the runner's durable outcome, and
-marks incomplete measurements, failed queue arms, parse failures, missing guard
-evidence, or ring-regression decisions ineligible.
+The comparator uses `ablation.json` for the exact evidence and resource
+intervals, requires one common champion anchor, honors the runner's durable
+outcome, and marks incomplete measurements, failed queue arms, parse failures,
+missing guard evidence, or ring-regression decisions ineligible. Its deployment
+metric is guarded champion-frontier ring-10 Elo lower bound per total
+provisioned wall hour. The latest terminal candidate remains a diagnostic and
+is never cherry-picked as the deployed winner.
+
+For dependent experiment stages, use `run_staged_elo_pipeline.py`. It accepts
+only a hash-verified upstream winner snapshot and refuses a downstream fork
+whose champion anchor or canonical stage specification is stale. Every
+downstream fork receives a new weights-only champion warm-start, recovery
+pointer, resume cutover, optimizer, scheduler, and cadence boundary at the
+selected champion; `resume_latest` must never select an inherited rejected
+checkpoint. Futility policies are pre-registered, stop-only, and require
+anytime-valid upper bounds; they never grant promotion authority.
 
 ## Rollback
 

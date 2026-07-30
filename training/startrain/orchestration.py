@@ -53,6 +53,7 @@ HARDWARE_HEALTH_INTERVAL_SECONDS = 60.0
 WORKER_FAILURE_PATH_ENV = "STARTRAIN_WORKER_FAILURE_PATH"
 WORKER_NAME_ENV = "STARTRAIN_WORKER_NAME"
 WORKER_ROLE_ENV = "STARTRAIN_WORKER_ROLE"
+LEARNER_DATA_WORKERS_ENV = "STARTRAIN_DATA_WORKERS_OVERRIDE"
 
 
 class FailureClass(StrEnum):
@@ -642,6 +643,10 @@ class Coordinator:
         self.next_hardware_health_at = 0.0
         self.hardware_health: dict[str, object] | None = None
         self.hardware_failure_reason: str | None = None
+        self.hardware_failure_class: FailureClass | None = None
+        self.hardware_failure_exit_code: int | None = None
+        self.hardware_probe_unavailable_count = 0
+        self.hardware_probe_unavailable_reason: str | None = None
         self.workers = {spec.name: ManagedWorker(spec) for spec in specs}
         self.lock = CoordinatorLock(directories.root / "coordinator.lock")
         self.metrics_path = directories.metrics / "coordinator.jsonl"
@@ -720,17 +725,10 @@ class Coordinator:
                     terminal_reason="coordinator_startup_validation",
                 )
                 return FATAL_WORKER_EXIT_CODE
-            if self._hardware_health_failed(self.clock(), force=True):
-                self._record_terminal_failure(
-                    failure_class=FailureClass.FATAL,
-                    reason=self.hardware_failure_reason or "GPU health gate failed",
-                    exception_type=None,
-                    worker=None,
-                    worker_exit_code=HARDWARE_HEALTH_EXIT_CODE,
-                    coordinator_exit_code=HARDWARE_HEALTH_EXIT_CODE,
-                    terminal_reason="hardware_health_failure",
-                )
-                return HARDWARE_HEALTH_EXIT_CODE
+            if not self._initial_hardware_health_ready(stop_requested):
+                if stop_requested() and self.hardware_failure_class is None:
+                    return 0
+                return self._record_hardware_health_terminal()
             if stop_requested():
                 return 0
             exhausted = False
@@ -741,17 +739,11 @@ class Coordinator:
             notifier.ready("StarTrain coordinator is running")
             while not stop_requested():
                 now = self.clock()
-                if self._hardware_health_failed(now):
-                    self._record_terminal_failure(
-                        failure_class=FailureClass.FATAL,
-                        reason=self.hardware_failure_reason or "GPU health gate failed",
-                        exception_type=None,
-                        worker=None,
-                        worker_exit_code=HARDWARE_HEALTH_EXIT_CODE,
-                        coordinator_exit_code=HARDWARE_HEALTH_EXIT_CODE,
-                        terminal_reason="hardware_health_failure",
-                    )
-                    exit_code = HARDWARE_HEALTH_EXIT_CODE
+                if self._hardware_health_failed(
+                    now,
+                    stop_requested=stop_requested,
+                ):
+                    exit_code = self._record_hardware_health_terminal()
                     break
                 self._reconcile_pause_lease(now)
                 exhausted = self.pause_failed
@@ -801,7 +793,60 @@ class Coordinator:
             self._write_status(final=True)
             self.lock.release()
 
-    def _hardware_health_failed(self, now: float, *, force: bool = False) -> bool:
+    def _initial_hardware_health_ready(
+        self,
+        stop_requested: Callable[[], bool],
+    ) -> bool:
+        if self.hardware_health_probe is None:
+            return True
+        retry_seconds = (
+            self.experiment.orchestration.hardware_health.transient_probe_retry_seconds
+        )
+        while not stop_requested():
+            if self._hardware_health_failed(
+                self.clock(),
+                force=True,
+                stop_requested=stop_requested,
+            ):
+                return False
+            report = self.hardware_health
+            if report is not None and report.get("probe_status") != "unavailable":
+                return True
+            if stop_requested():
+                return False
+            self.sleep(retry_seconds)
+        return False
+
+    def _record_hardware_health_terminal(self) -> int:
+        failure_class = self.hardware_failure_class or FailureClass.FATAL
+        exit_code = (
+            self.hardware_failure_exit_code
+            if self.hardware_failure_exit_code is not None
+            else HARDWARE_HEALTH_EXIT_CODE
+        )
+        terminal_reason = (
+            "hardware_health_failure"
+            if failure_class is FailureClass.FATAL
+            else "hardware_health_unavailable"
+        )
+        self._record_terminal_failure(
+            failure_class=failure_class,
+            reason=self.hardware_failure_reason or "GPU health gate failed",
+            exception_type=None,
+            worker=None,
+            worker_exit_code=exit_code,
+            coordinator_exit_code=exit_code,
+            terminal_reason=terminal_reason,
+        )
+        return exit_code
+
+    def _hardware_health_failed(
+        self,
+        now: float,
+        *,
+        force: bool = False,
+        stop_requested: Callable[[], bool] | None = None,
+    ) -> bool:
         probe = self.hardware_health_probe
         if probe is None or (not force and now < self.next_hardware_health_at):
             return False
@@ -811,21 +856,85 @@ class Coordinator:
         except Exception as exc:
             report = {
                 "schema_version": 1,
-                "healthy": False,
+                "probe_status": "unavailable",
+                "safety_status": "unknown",
+                "healthy": None,
                 "query_error": f"{type(exc).__name__}: {exc}",
                 "gpus": [],
             }
         report["observed_ns"] = time.time_ns()
+        unavailable = report.get("probe_status") == "unavailable"
+        shutdown_cancelled = (
+            unavailable and stop_requested is not None and bool(stop_requested())
+        )
+        if shutdown_cancelled:
+            report["shutdown_cancelled"] = True
         self.hardware_health = report
         atomic_json(self.directories.status / "hardware-health.json", report)
+        if shutdown_cancelled:
+            self.hardware_failure_reason = None
+            self.hardware_failure_class = None
+            self.hardware_failure_exit_code = None
+            append_jsonl(
+                self.metrics_path,
+                {
+                    "schema_version": 1,
+                    "timestamp_ns": time.time_ns(),
+                    "event": "hardware_health_probe_cancelled",
+                    "reason": report.get("query_error"),
+                    "report": report,
+                },
+                durable=True,
+            )
+            return False
         if report.get("healthy") is True:
             self.hardware_failure_reason = None
+            self.hardware_failure_class = None
+            self.hardware_failure_exit_code = None
+            self.hardware_probe_unavailable_count = 0
+            self.hardware_probe_unavailable_reason = None
             return False
+        if unavailable:
+            self.hardware_probe_unavailable_count += 1
+            reason = str(report.get("query_error", "GPU health probe is unavailable"))
+            self.hardware_probe_unavailable_reason = reason
+            attempts = (
+                self.experiment.orchestration.hardware_health.transient_probe_attempts
+            )
+            exhausted = self.hardware_probe_unavailable_count >= attempts
+            self.next_hardware_health_at = now + (
+                self.experiment.orchestration.hardware_health.transient_probe_retry_seconds
+            )
+            append_jsonl(
+                self.metrics_path,
+                {
+                    "schema_version": 1,
+                    "timestamp_ns": time.time_ns(),
+                    "event": "hardware_health_probe_unavailable",
+                    "failure_class": FailureClass.TRANSIENT.value,
+                    "reason": reason,
+                    "attempt": self.hardware_probe_unavailable_count,
+                    "max_attempts": attempts,
+                    "exhausted": exhausted,
+                    "report": report,
+                },
+                durable=True,
+            )
+            if not exhausted:
+                return False
+            self.hardware_failure_reason = reason
+            self.hardware_failure_class = FailureClass.TRANSIENT
+            self.hardware_failure_exit_code = TRANSIENT_WORKER_EXIT_CODE
+            return True
+        self.hardware_probe_unavailable_count = 0
+        self.hardware_probe_unavailable_reason = None
         reasons = unhealthy_reasons(report)
         reason = "; ".join(reasons) or str(
             report.get("query_error", "GPU health report is unhealthy")
         )
         self.hardware_failure_reason = reason
+        self.hardware_failure_class = FailureClass.FATAL
+        self.hardware_failure_exit_code = HARDWARE_HEALTH_EXIT_CODE
         append_jsonl(
             self.metrics_path,
             {
@@ -1512,6 +1621,28 @@ class Coordinator:
             return True
         return True
 
+    def _learner_data_workers_override(self, worker: ManagedWorker) -> int | None:
+        if (
+            worker.spec.role != "learner"
+            or worker.restart_count <= 0
+            or self.experiment.data.workers <= 0
+        ):
+            return None
+        reason = (worker.failure_reason or "").casefold()
+        if not any(
+            marker in reason
+            for marker in (
+                "dataloader",
+                "data loader",
+                "semaphore",
+                "resource_tracker",
+            )
+        ):
+            return None
+        if worker.restart_count == 1:
+            return self.experiment.data.workers // 2
+        return 0
+
     def _start(self, worker: ManagedWorker) -> None:
         if worker.process is not None:
             raise RuntimeError(
@@ -1534,12 +1665,23 @@ class Coordinator:
                 raise OSError("configured CPU affinity requires the taskset executable")
             cpu_list = ",".join(str(cpu) for cpu in worker.spec.cpu_affinity)
             command = [taskset, "--cpu-list", cpu_list, *command]
+        environment = dict(worker.spec.environment)
+        data_workers_override = self._learner_data_workers_override(worker)
+        if data_workers_override is not None:
+            environment[LEARNER_DATA_WORKERS_ENV] = str(data_workers_override)
+            self._event(
+                "learner_loader_degraded",
+                worker,
+                configured_workers=self.experiment.data.workers,
+                effective_workers=data_workers_override,
+                reason=worker.failure_reason,
+            )
         process = self.process_factory(
             command,
             stdin=subprocess.DEVNULL,
             stdout=worker.log_stream,
             stderr=subprocess.STDOUT,
-            env=dict(worker.spec.environment),
+            env=environment,
             close_fds=True,
             start_new_session=True,
         )
@@ -2100,6 +2242,17 @@ class Coordinator:
                 "draining": self.draining,
                 "hardware_health": self.hardware_health,
                 "hardware_failure_reason": self.hardware_failure_reason,
+                "hardware_failure_class": (
+                    self.hardware_failure_class.value
+                    if self.hardware_failure_class is not None
+                    else None
+                ),
+                "hardware_probe_unavailable_count": (
+                    self.hardware_probe_unavailable_count
+                ),
+                "hardware_probe_unavailable_reason": (
+                    self.hardware_probe_unavailable_reason
+                ),
                 "failure": self.terminal_failure,
                 "pause_sharing": (
                     {
@@ -2291,6 +2444,7 @@ def orchestrate_main(argv: list[str] | None = None) -> None:
                         fail_on_aggregate_uncorrectable=(
                             health.fail_on_aggregate_uncorrectable
                         ),
+                        timeout=health.probe_timeout_seconds,
                     )
                 )
                 if expected_gpu_indices

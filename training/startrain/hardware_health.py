@@ -31,6 +31,10 @@ class CompletedProcessProtocol(Protocol):
 CommandRunner = Callable[..., CompletedProcessProtocol]
 
 
+class GPUHealthProbeUnavailable(RuntimeError):
+    """The GPU safety state could not be queried or parsed."""
+
+
 @dataclass(frozen=True, slots=True)
 class GPUHealth:
     index: int
@@ -231,6 +235,8 @@ def parse_nvidia_smi_xml(
     healthy = not missing and all(item.healthy for item in selected)
     return {
         "schema_version": GPU_HEALTH_SCHEMA_VERSION,
+        "probe_status": "available",
+        "safety_status": "safe" if healthy else "unsafe",
         "driver_version": driver_version,
         "healthy": healthy,
         "expected_indices": expected,
@@ -261,16 +267,23 @@ def query_gpu_health(
             timeout=timeout,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
-        raise RuntimeError(f"nvidia-smi health query failed: {exc}") from exc
+        raise GPUHealthProbeUnavailable(
+            f"nvidia-smi health query failed: {exc}"
+        ) from exc
     if completed.returncode != 0:
         detail = completed.stderr.strip() or f"exit status {completed.returncode}"
-        raise RuntimeError(f"nvidia-smi health query failed: {detail}")
-    return parse_nvidia_smi_xml(
-        completed.stdout,
-        expected_indices=expected_indices,
-        require_gpu_model=require_gpu_model,
-        fail_on_aggregate_uncorrectable=fail_on_aggregate_uncorrectable,
-    )
+        raise GPUHealthProbeUnavailable(f"nvidia-smi health query failed: {detail}")
+    try:
+        return parse_nvidia_smi_xml(
+            completed.stdout,
+            expected_indices=expected_indices,
+            require_gpu_model=require_gpu_model,
+            fail_on_aggregate_uncorrectable=fail_on_aggregate_uncorrectable,
+        )
+    except ValueError as exc:
+        raise GPUHealthProbeUnavailable(
+            f"nvidia-smi health response was unavailable: {exc}"
+        ) from exc
 
 
 def unhealthy_reasons(report: dict[str, object]) -> tuple[str, ...]:

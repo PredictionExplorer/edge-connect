@@ -1,0 +1,6 @@
+[Unit]
+# Install as a drop-in for finite queues or other primary workload units.
+# Existing finalization dependencies remain in place; this adds an immediate
+# continuity reconciliation while the timer remains the independent backstop.
+OnSuccess=@CONTINUITY_UNIT@
+OnFailure=@CONTINUITY_UNIT@

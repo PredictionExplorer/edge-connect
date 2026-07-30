@@ -52,11 +52,20 @@ else:
 SCHEMA_VERSION = 1
 DEPLOYMENT_REPORT = "startrain-elo-ablation-deployment"
 QUEUE_REPORT = "startrain-elo-ablation-queue"
-_ARM_STATUSES = frozenset({"pending", "running", "completed", "failed"})
+CONTINUITY_HANDOFF_REPORT = "startrain-continuity-handoff-request"
+_ARM_STATUSES = frozenset({"pending", "running", "completed", "failed", "quarantined"})
+_ISOLATED_FAILURE_DOMAINS = frozenset({"arm", "run", "workload"})
+_VALID_INTEGRITY_STATUSES = frozenset(
+    {"ok", "pass", "passed", "valid", "verified", "healthy"}
+)
+_CLEAN_TEARDOWN_STATUSES = frozenset(
+    {"not_required", "clean", "complete", "completed", "released"}
+)
 _COMMIT_PATTERN = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 _SCRIPT_NAMES = (
     "run_elo_ablation_queue.py",
+    "run_staged_elo_pipeline.py",
     "run_elo_ablation.py",
     "compare_elo_ablation.py",
     "preflight_run_state.py",
@@ -101,6 +110,7 @@ def _parser() -> argparse.ArgumentParser:
     manifest.add_argument("--environment-file", type=Path, required=True)
     manifest.add_argument("--state", type=Path, required=True)
     manifest.add_argument("--comparison-output", type=Path, required=True)
+    manifest.add_argument("--continuity-handoff-output", type=Path)
     manifest.add_argument("--execution-lock", type=Path)
     manifest.add_argument("--source-commit")
     manifest.add_argument("--orchestrator", default="startrain-orchestrate")
@@ -314,6 +324,8 @@ def _profile_manifest_entry(
     treatment: Mapping[str, str],
     *,
     seed: Mapping[str, object],
+    source_winner_snapshot: object,
+    futility_policy: object,
 ) -> dict[str, object]:
     label = treatment["treatment"]
     plan_profile = Path(treatment["profile"])
@@ -358,6 +370,10 @@ def _profile_manifest_entry(
         for field in ("model_identity", "model_step")
     ):
         raise AblationQueueError(f"{label} anchor differs from the seed champion")
+    if metadata.get("source_winner_snapshot") != source_winner_snapshot:
+        raise AblationQueueError(f"{label} staged winner snapshot disagrees with plan")
+    if metadata.get("futility_policy") != futility_policy:
+        raise AblationQueueError(f"{label} futility policy disagrees with plan")
     installed = _artifact("installed_profile", profile)
     if installed["sha256"] != treatment["profile_sha256"]:
         raise AblationQueueError(f"{label} installed profile differs from the plan")
@@ -416,6 +432,8 @@ def _profile_manifest_entry(
             "source_run_id": metadata.get("source_run_id"),
             "source_generation_family": metadata.get("source_generation_family"),
             "source_created_ns": metadata.get("source_created_ns"),
+            "source_winner_snapshot": metadata.get("source_winner_snapshot"),
+            "futility_policy": metadata.get("futility_policy"),
             "anchor": metadata.get("anchor"),
         },
         "state_artifacts": state_artifacts,
@@ -432,6 +450,7 @@ def generate_deployment_manifest(
     environment_file: Path,
     state_path: Path,
     comparison_output: Path,
+    continuity_handoff_output: Path | None = None,
     execution_lock_path: Path | None = None,
     source_commit: str | None = None,
     orchestrator: str = "startrain-orchestrate",
@@ -460,7 +479,13 @@ def generate_deployment_manifest(
     )
     seed = _seed_snapshot(source_root)
     profiles = [
-        _profile_manifest_entry(treatment, seed=seed) for treatment in treatments
+        _profile_manifest_entry(
+            treatment,
+            seed=seed,
+            source_winner_snapshot=plan.get("source_winner_snapshot"),
+            futility_policy=plan.get("futility_policy"),
+        )
+        for treatment in treatments
     ]
     if source_commit is None:
         resolved_commit, clean = _git_revision(training)
@@ -488,24 +513,27 @@ def generate_deployment_manifest(
         raise AblationQueueError("provisioned GPUs must be a positive integer")
     resolved_state = state_path.expanduser().resolve()
     resolved_comparison = comparison_output.expanduser().resolve()
+    resolved_handoff = (
+        continuity_handoff_output.expanduser().resolve()
+        if continuity_handoff_output is not None
+        else resolved_state.with_name("continuity-handoff-request.json")
+    )
     resolved_execution_lock = (
         execution_lock_path.expanduser().resolve()
         if execution_lock_path is not None
         else resolved_state.parent.parent
         / "edgeconnect-startrain-ablation-execution.lock"
     )
-    if resolved_state == resolved_comparison or output in {
+    queue_outputs = {
         resolved_state,
         resolved_comparison,
+        resolved_handoff,
         resolved_execution_lock,
-    }:
+    }
+    if len(queue_outputs) != 4 or output in queue_outputs:
         raise AblationQueueError(
-            "manifest, queue state, comparison output, and execution lock "
-            "paths must be distinct"
-        )
-    if resolved_execution_lock in {resolved_state, resolved_comparison}:
-        raise AblationQueueError(
-            "queue state, comparison output, and execution lock paths must be distinct"
+            "manifest, queue state, comparison output, continuity handoff, "
+            "and execution lock paths must be distinct"
         )
     raw_guard_rings = plan.get("guard_rings", list(DEFAULT_GUARD_RINGS))
     guard_rings = _list(raw_guard_rings, "plan guard rings")
@@ -548,6 +576,7 @@ def generate_deployment_manifest(
         "queue": {
             "state_path": str(resolved_state),
             "comparison_output": str(resolved_comparison),
+            "continuity_handoff_output": str(resolved_handoff),
             "execution_lock_path": str(resolved_execution_lock),
             "orchestrator": orchestrator,
             "poll_seconds": poll,
@@ -734,6 +763,8 @@ def _verify_manifest_semantics(manifest: Mapping[str, object]) -> None:
             "source_run_id",
             "source_generation_family",
             "source_created_ns",
+            "source_winner_snapshot",
+            "futility_policy",
             "anchor",
         ):
             if metadata.get(field) != frozen_metadata.get(field):
@@ -825,6 +856,9 @@ def _queue_config(manifest: Mapping[str, object]) -> dict[str, Any]:
     queue = _mapping(manifest.get("queue"), "deployment queue")
     _string(queue.get("state_path"), "queue state path")
     _string(queue.get("comparison_output"), "comparison output")
+    handoff_output = queue.get("continuity_handoff_output")
+    if handoff_output is not None:
+        _string(handoff_output, "continuity handoff output")
     _string(queue.get("execution_lock_path"), "execution lock path")
     _string(queue.get("orchestrator"), "queue orchestrator")
     _positive_float(queue.get("poll_seconds"), "queue poll seconds")
@@ -909,6 +943,18 @@ def _initial_state(
             "last_outcome": None,
             "last_exit_code": None,
             "failure": None,
+            "failure_domain": None,
+            "failure_phase": None,
+            "structured_lifecycle": False,
+            "measurement_cutoff_ns": None,
+            "resource_released_ns": None,
+            "teardown_status": None,
+            "teardown": None,
+            "integrity_status": None,
+            "integrity": None,
+            "completion_status": None,
+            "lifecycle_warnings": [],
+            "quarantine": None,
         }
         for arm in _manifest_arms(manifest)
     ]
@@ -932,6 +978,17 @@ def _initial_state(
             "stopped_ns": None,
             "error": None,
         },
+        "continuity_handoff": {
+            "status": "not_requested",
+            "requested": False,
+            "action": None,
+            "requested_action": None,
+            "queue_status": None,
+            "path": str(_continuity_handoff_path(manifest)),
+            "requested_ns": None,
+            "reason": None,
+            "error": None,
+        },
     }
 
 
@@ -942,6 +999,14 @@ def _state_path(manifest: Mapping[str, object]) -> Path:
         .expanduser()
         .resolve()
     )
+
+
+def _continuity_handoff_path(manifest: Mapping[str, object]) -> Path:
+    queue = _queue_config(manifest)
+    configured = queue.get("continuity_handoff_output")
+    if configured is None:
+        return _state_path(manifest).with_name("continuity-handoff-request.json")
+    return Path(_string(configured, "continuity handoff output")).expanduser().resolve()
 
 
 def _load_or_create_state(
@@ -985,6 +1050,21 @@ def _load_or_create_state(
             arm.get("transient_failures"),
             f"queue arm {index} transient failures",
         )
+        for field in (
+            "failure_domain",
+            "failure_phase",
+            "structured_lifecycle",
+            "measurement_cutoff_ns",
+            "resource_released_ns",
+            "teardown_status",
+            "teardown",
+            "integrity_status",
+            "integrity",
+            "completion_status",
+            "lifecycle_warnings",
+            "quarantine",
+        ):
+            arm.setdefault(field, None)
     finalization = _mapping(state.get("finalization"), "queue finalization")
     if finalization.get("status") not in {"pending", "running", "completed", "failed"}:
         raise AblationQueueError("queue finalization has an invalid status")
@@ -992,6 +1072,32 @@ def _load_or_create_state(
         finalization.get("attempts"),
         "queue finalization attempts",
     )
+    raw_handoff = state.get("continuity_handoff")
+    if raw_handoff is None:
+        state["continuity_handoff"] = {
+            "status": "not_requested",
+            "requested": False,
+            "action": None,
+            "requested_action": None,
+            "queue_status": None,
+            "path": str(_continuity_handoff_path(manifest)),
+            "requested_ns": None,
+            "reason": None,
+            "error": None,
+        }
+    else:
+        handoff = _mapping(raw_handoff, "continuity handoff")
+        if handoff.get("status") not in {
+            "not_requested",
+            "pending",
+            "requested",
+            "blocked",
+            "failed",
+        }:
+            raise AblationQueueError("continuity handoff has an invalid status")
+        expected_handoff = str(_continuity_handoff_path(manifest))
+        if handoff.get("path") != expected_handoff:
+            raise AblationQueueError("continuity handoff path differs from deployment")
     return state
 
 
@@ -1044,24 +1150,286 @@ def _state_arms(state: Mapping[str, object]) -> list[dict[str, Any]]:
     ]
 
 
+def _nested_mapping(value: object) -> dict[str, object]:
+    return dict(value) if isinstance(value, Mapping) else {}
+
+
+def _first_present(
+    sources: tuple[Mapping[str, object], ...],
+    *names: str,
+) -> object:
+    for source in sources:
+        for name in names:
+            if name in source:
+                return source[name]
+    return None
+
+
+def _status_name(value: object) -> str | None:
+    if isinstance(value, str) and value:
+        return value.lower().replace("-", "_").replace(" ", "_")
+    return None
+
+
+def _lifecycle_view(payload: Mapping[str, object]) -> dict[str, object]:
+    lifecycle = _nested_mapping(payload.get("lifecycle"))
+    measurement = _nested_mapping(lifecycle.get("measurement"))
+    if not measurement:
+        measurement = _nested_mapping(payload.get("measurement"))
+    teardown = _nested_mapping(
+        _first_present(
+            (payload, lifecycle),
+            "teardown",
+            "measurement_teardown",
+        )
+    )
+    integrity = _nested_mapping(
+        _first_present(
+            (payload, lifecycle, teardown),
+            "integrity",
+            "post_cutoff_integrity",
+            "measurement_integrity",
+        )
+    )
+    measurement_sources = (measurement, payload, lifecycle)
+    status = _status_name(
+        _first_present(measurement_sources, "measurement_status", "status")
+    )
+    outcome = _status_name(
+        _first_present(measurement_sources, "measurement_outcome", "outcome")
+    )
+    cutoff_ns = _first_present(
+        measurement_sources,
+        "measurement_cutoff_ns",
+        "cutoff_ns",
+        "measurement_stopped_ns",
+        "stopped_ns",
+    )
+    resource_released_ns = _first_present(
+        (payload, lifecycle, teardown),
+        "resource_released_ns",
+        "released_ns",
+    )
+    raw_teardown_status = _first_present(
+        (payload, lifecycle),
+        "teardown_status",
+    )
+    if isinstance(raw_teardown_status, Mapping):
+        raw_teardown_status = raw_teardown_status.get("status")
+    if raw_teardown_status is None:
+        raw_teardown_status = teardown.get("status")
+    teardown_status = _status_name(raw_teardown_status)
+    raw_integrity_status = _first_present(
+        (payload, lifecycle, teardown),
+        "integrity_status",
+    )
+    if isinstance(raw_integrity_status, Mapping):
+        raw_integrity_status = raw_integrity_status.get("status")
+    if raw_integrity_status is None:
+        raw_integrity_status = integrity.get("status")
+    integrity_status = _status_name(raw_integrity_status)
+    failure_domain = _status_name(
+        _first_present(
+            measurement_sources,
+            "failure_domain",
+            "domain",
+        )
+    )
+    failure_phase = _status_name(
+        _first_present(
+            measurement_sources,
+            "failure_phase",
+            "phase",
+        )
+    )
+    structured = any(
+        name in payload
+        for name in (
+            "lifecycle",
+            "measurement",
+            "measurement_cutoff_ns",
+            "resource_released_ns",
+            "teardown",
+            "teardown_status",
+            "integrity",
+            "integrity_status",
+            "failure_domain",
+            "failure_phase",
+        )
+    ) or any((measurement, teardown, integrity))
+    return {
+        "structured": structured,
+        "status": status,
+        "outcome": outcome,
+        "cutoff_ns": cutoff_ns if type(cutoff_ns) is int else None,
+        "resource_released_ns": (
+            resource_released_ns if type(resource_released_ns) is int else None
+        ),
+        "stop_reason": _first_present(
+            measurement_sources,
+            "measurement_stop_reason",
+            "stop_reason",
+        ),
+        "exit_code": _first_present(
+            measurement_sources,
+            "measurement_exit_code",
+            "exit_code",
+        ),
+        "attempt_count": _first_present(
+            measurement_sources,
+            "measurement_attempt_count",
+            "attempt_count",
+            "attempt",
+        ),
+        "failure": _first_present(
+            measurement_sources,
+            "measurement_failure",
+            "failure",
+        ),
+        "completion_status": _status_name(
+            _first_present(
+                measurement_sources,
+                "measurement_completion_status",
+                "completion_status",
+            )
+        ),
+        "warnings": _first_present(
+            measurement_sources,
+            "measurement_warnings",
+            "warnings",
+        ),
+        "failure_domain": failure_domain,
+        "failure_phase": failure_phase,
+        "teardown_status": teardown_status,
+        "teardown": teardown or None,
+        "integrity_status": integrity_status,
+        "integrity": integrity or None,
+    }
+
+
+def _integrity_is_valid(lifecycle: Mapping[str, object]) -> bool:
+    integrity = _nested_mapping(lifecycle.get("integrity"))
+    explicit_valid = integrity.get("valid")
+    if type(explicit_valid) is bool:
+        return explicit_valid
+    status = _status_name(lifecycle.get("integrity_status"))
+    return status in _VALID_INTEGRITY_STATUSES
+
+
+def _teardown_has_warning(lifecycle: Mapping[str, object]) -> bool:
+    status = _status_name(lifecycle.get("teardown_status"))
+    return status is not None and status not in _CLEAN_TEARDOWN_STATUSES
+
+
+def _is_budget_completion(lifecycle: Mapping[str, object]) -> bool:
+    if lifecycle.get("outcome") != BUDGET_COMPLETION:
+        return False
+    if lifecycle.get("status") not in {
+        "complete",
+        "completed",
+        "completed_with_teardown_failure",
+        "completed_with_teardown_warning",
+    }:
+        return False
+    if lifecycle.get("completion_status") not in {
+        None,
+        "complete",
+        "completed",
+        "complete_with_warning",
+        "completed_with_teardown_failure",
+        "completed_with_teardown_warning",
+    }:
+        return False
+    if not lifecycle.get("structured"):
+        return True
+    cutoff_ns = lifecycle.get("cutoff_ns")
+    released_ns = lifecycle.get("resource_released_ns")
+    if (
+        isinstance(cutoff_ns, bool)
+        or not isinstance(cutoff_ns, int)
+        or isinstance(released_ns, bool)
+        or not isinstance(released_ns, int)
+        or released_ns < cutoff_ns
+    ):
+        return False
+    integrity_status = _status_name(lifecycle.get("integrity_status"))
+    if integrity_status is not None and not _integrity_is_valid(lifecycle):
+        return False
+    if _teardown_has_warning(lifecycle):
+        phase = _status_name(lifecycle.get("failure_phase"))
+        if phase in {"measurement", "pre_cutoff", "pre_budget"}:
+            return False
+        return _integrity_is_valid(lifecycle)
+    return True
+
+
+def _record_lifecycle(arm: dict[str, Any], lifecycle: Mapping[str, object]) -> None:
+    arm["last_outcome"] = lifecycle.get("outcome")
+    arm["last_exit_code"] = lifecycle.get("exit_code")
+    arm["measurement_cutoff_ns"] = lifecycle.get("cutoff_ns")
+    arm["resource_released_ns"] = lifecycle.get("resource_released_ns")
+    arm["last_stopped_ns"] = lifecycle.get("resource_released_ns") or lifecycle.get(
+        "cutoff_ns"
+    )
+    arm["failure"] = lifecycle.get("failure")
+    arm["failure_domain"] = lifecycle.get("failure_domain")
+    arm["failure_phase"] = lifecycle.get("failure_phase")
+    arm["structured_lifecycle"] = lifecycle.get("structured") is True
+    arm["teardown_status"] = lifecycle.get("teardown_status")
+    arm["teardown"] = lifecycle.get("teardown")
+    arm["integrity_status"] = lifecycle.get("integrity_status")
+    arm["integrity"] = lifecycle.get("integrity")
+    arm["completion_status"] = lifecycle.get("completion_status") or (
+        "complete_with_warning"
+        if _is_budget_completion(lifecycle) and _teardown_has_warning(lifecycle)
+        else ("complete" if _is_budget_completion(lifecycle) else None)
+    )
+    raw_warnings = lifecycle.get("warnings")
+    arm["lifecycle_warnings"] = (
+        list(raw_warnings) if isinstance(raw_warnings, list) else []
+    )
+
+
+def _quarantine_arm(
+    arm: dict[str, Any],
+    lifecycle: Mapping[str, object],
+) -> None:
+    recorded_ns = time.time_ns()
+    arm["status"] = "quarantined"
+    arm["quarantine"] = {
+        "schema_version": SCHEMA_VERSION,
+        "status": "quarantined",
+        "isolated": True,
+        "recorded_ns": recorded_ns,
+        "failure_domain": lifecycle.get("failure_domain"),
+        "failure_phase": lifecycle.get("failure_phase"),
+        "outcome": lifecycle.get("outcome"),
+        "reason": lifecycle.get("failure")
+        or lifecycle.get("outcome")
+        or "isolated arm failure",
+        "run_root": arm.get("run_root"),
+    }
+
+
 def _reconcile_arms(state: dict[str, Any]) -> None:
     for arm in _state_arms(state):
-        if arm.get("status") in {"completed", "failed"}:
+        if arm.get("status") in {"completed", "failed", "quarantined"}:
             continue
         metadata_path = Path(str(arm["run_root"])) / "ablation.json"
         metadata = _read_json(metadata_path)
-        outcome = metadata.get("measurement_outcome")
-        measurement_status = metadata.get("measurement_status")
-        attempt_count = metadata.get("measurement_attempt_count")
+        lifecycle = _lifecycle_view(metadata)
+        attempt_count = lifecycle.get("attempt_count")
         if type(attempt_count) is int:
             arm["attempts"] = max(int(arm.get("attempts", 0)), attempt_count)
-        arm["last_outcome"] = outcome
-        arm["last_exit_code"] = metadata.get("measurement_exit_code")
-        arm["last_stopped_ns"] = metadata.get("measurement_stopped_ns")
-        arm["failure"] = metadata.get("measurement_failure")
-        if measurement_status == "complete" and outcome == BUDGET_COMPLETION:
+        _record_lifecycle(arm, lifecycle)
+        if _is_budget_completion(lifecycle):
             arm["status"] = "completed"
-        elif measurement_status == "failed" or outcome in {
+        elif lifecycle.get("failure_domain") in _ISOLATED_FAILURE_DOMAINS and (
+            lifecycle.get("status") == "failed"
+            or lifecycle.get("outcome") in {FATAL_ORCHESTRATOR_EXIT, RUNNER_ERROR}
+        ):
+            _quarantine_arm(arm, lifecycle)
+        elif lifecycle.get("status") == "failed" or lifecycle.get("outcome") in {
             BUDGET_COMPLETION,
             FATAL_ORCHESTRATOR_EXIT,
             RUNNER_ERROR,
@@ -1076,6 +1444,9 @@ def _forced_ineligible(state: Mapping[str, object]) -> dict[str, str]:
     for arm in _state_arms(state):
         if arm.get("status") != "completed":
             detail = arm.get("failure") or arm.get("last_outcome") or "not completed"
+            quarantine = arm.get("quarantine")
+            if isinstance(quarantine, Mapping):
+                detail = quarantine.get("reason") or detail
             forced[str(arm["treatment"])] = (
                 f"queue arm is {arm.get('status')}: {detail}"
             )
@@ -1086,9 +1457,140 @@ def _reconciled_queue_status(state: Mapping[str, object]) -> str:
     statuses = {str(arm.get("status")) for arm in _state_arms(state)}
     if statuses == {"completed"}:
         return "completed"
-    if "failed" in statuses:
+    if statuses & {"failed", "quarantined"}:
         return "failed"
     return "pending"
+
+
+def _continuity_reason(state: Mapping[str, object]) -> str:
+    statuses = {str(arm.get("status")) for arm in _state_arms(state)}
+    if "quarantined" in statuses:
+        return "queue_completed_with_quarantined_arms"
+    if state.get("queue_status") == "completed":
+        return "queue_completed"
+    if state.get("queue_status") == "failed":
+        return "queue_failed"
+    return "queue_interrupted_or_pending"
+
+
+def _request_continuity_handoff(
+    *,
+    state_path: Path,
+    state: dict[str, Any],
+    manifest: Mapping[str, object],
+) -> dict[str, object]:
+    """Write a durable request; an external controller decides what to start."""
+    requested_ns = time.time_ns()
+    reason = _continuity_reason(state)
+    output = _continuity_handoff_path(manifest)
+    finalization = _mapping(state.get("finalization"), "queue finalization")
+    unreleased = [
+        {
+            "treatment": arm.get("treatment"),
+            "run_root": arm.get("run_root"),
+        }
+        for arm in _state_arms(state)
+        if arm.get("last_started_ns") is not None
+        and arm.get("structured_lifecycle") is True
+        and arm.get("resource_released_ns") is None
+    ]
+    if unreleased:
+        blocked = {
+            "schema_version": SCHEMA_VERSION,
+            "report": CONTINUITY_HANDOFF_REPORT,
+            "status": "blocked",
+            "requested": False,
+            "action": None,
+            "requested_action": None,
+            "requested_ns": requested_ns,
+            "reason": "resources_not_released",
+            "terminal_reason": "resources_not_released",
+            "failure_domain": "host",
+            "source": {
+                "kind": "elo_ablation_queue",
+                "manifest": state.get("manifest"),
+                "queue_state": str(state_path),
+            },
+            "queue_status": state.get("queue_status"),
+            "unreleased_arms": unreleased,
+            "requires_safe_workload": True,
+        }
+        output.parent.mkdir(parents=True, exist_ok=True)
+        atomic_json(output, blocked)
+        handoff = _mapping(state.get("continuity_handoff"), "continuity handoff")
+        handoff.update(
+            {
+                "status": "blocked",
+                "requested": False,
+                "action": None,
+                "requested_action": None,
+                "queue_status": state.get("queue_status"),
+                "path": str(output),
+                "requested_ns": requested_ns,
+                "reason": "resources_not_released",
+                "error": None,
+            }
+        )
+        _save_state(state_path, state)
+        return blocked
+    quarantined = []
+    for arm in _state_arms(state):
+        if arm.get("status") != "quarantined":
+            continue
+        quarantined.append(
+            {
+                "treatment": arm.get("treatment"),
+                "run_root": arm.get("run_root"),
+                "quarantine": arm.get("quarantine"),
+            }
+        )
+    request: dict[str, object] = {
+        "schema_version": SCHEMA_VERSION,
+        "report": CONTINUITY_HANDOFF_REPORT,
+        "status": "requested",
+        "requested": True,
+        "action": "request_fallback",
+        "requested_action": "reconcile_training_continuity",
+        "requested_ns": requested_ns,
+        "reason": reason,
+        "terminal_reason": reason,
+        "failure_domain": (
+            "run_failure" if state.get("queue_status") == "failed" else "queue_complete"
+        ),
+        "source": {
+            "kind": "elo_ablation_queue",
+            "manifest": state.get("manifest"),
+            "queue_state": str(state_path),
+            "queue_status": state.get("queue_status"),
+            "queue_error": state.get("queue_error"),
+        },
+        "finalization": {
+            "status": finalization.get("status"),
+            "comparison_status": finalization.get("comparison_status"),
+            "comparison_output": finalization.get("comparison_output"),
+            "error": finalization.get("error"),
+        },
+        "quarantined_arms": quarantined,
+        "requires_safe_workload": state.get("queue_status") != "running",
+    }
+    output.parent.mkdir(parents=True, exist_ok=True)
+    atomic_json(output, request)
+    handoff = _mapping(state.get("continuity_handoff"), "continuity handoff")
+    handoff.update(
+        {
+            "status": "requested",
+            "requested": True,
+            "action": "request_fallback",
+            "requested_action": "reconcile_training_continuity",
+            "queue_status": state.get("queue_status"),
+            "path": str(output),
+            "requested_ns": requested_ns,
+            "reason": reason,
+            "error": None,
+        }
+    )
+    _save_state(state_path, state)
+    return request
 
 
 def _finalize_locked(
@@ -1136,6 +1638,17 @@ def _finalize_locked(
                         "last_outcome",
                         "last_exit_code",
                         "failure",
+                        "failure_domain",
+                        "failure_phase",
+                        "measurement_cutoff_ns",
+                        "resource_released_ns",
+                        "teardown_status",
+                        "teardown",
+                        "integrity_status",
+                        "integrity",
+                        "completion_status",
+                        "lifecycle_warnings",
+                        "quarantine",
                     )
                 }
                 for arm in _state_arms(state)
@@ -1183,11 +1696,18 @@ def finalize_ablation_queue(manifest_path: Path) -> dict[str, object]:
         if state.get("queue_status") in {"pending", "running"}:
             state["queue_status"] = _reconciled_queue_status(state)
         _save_state(state_path, state)
-        return _finalize_locked(
-            state_path=state_path,
-            state=state,
-            manifest=manifest,
-        )
+        try:
+            return _finalize_locked(
+                state_path=state_path,
+                state=state,
+                manifest=manifest,
+            )
+        finally:
+            _request_continuity_handoff(
+                state_path=state_path,
+                state=state,
+                manifest=manifest,
+            )
 
 
 def _apply_arm_report(
@@ -1196,19 +1716,17 @@ def _apply_arm_report(
     *,
     policy: Mapping[str, object],
 ) -> str:
-    arm["last_stopped_ns"] = report.get("stopped_ns")
-    arm["last_outcome"] = report.get("outcome")
-    arm["last_exit_code"] = report.get("exit_code")
-    arm["failure"] = report.get("failure")
-    if (
-        report.get("status") == "complete"
-        and report.get("outcome") == BUDGET_COMPLETION
-    ):
+    lifecycle = _lifecycle_view(report)
+    _record_lifecycle(arm, lifecycle)
+    if _is_budget_completion(lifecycle):
         arm["status"] = "completed"
         return "completed"
-    if report.get("status") == "retryable" and report.get("outcome") == TRANSIENT_CRASH:
+    if (
+        lifecycle.get("status") == "retryable"
+        and lifecycle.get("outcome") == TRANSIENT_CRASH
+    ):
         arm["transient_failures"] = int(arm.get("transient_failures", 0)) + 1
-        if str(report.get("stop_reason", "")).startswith("signal_"):
+        if str(lifecycle.get("stop_reason", "")).startswith("signal_"):
             arm["status"] = "pending"
             return "interrupted"
         retries = _nonnegative_integer(
@@ -1224,6 +1742,9 @@ def _apply_arm_report(
             f"{arm['transient_failures']} failure(s): {arm.get('failure')}"
         )
         return "failed"
+    if lifecycle.get("failure_domain") in _ISOLATED_FAILURE_DOMAINS:
+        _quarantine_arm(arm, lifecycle)
+        return "quarantined"
     arm["status"] = "failed"
     return "failed"
 
@@ -1365,6 +1886,27 @@ def run_ablation_queue(
                 )
             except AblationQueueError:
                 pass
+            try:
+                _request_continuity_handoff(
+                    state_path=state_path,
+                    state=state,
+                    manifest=manifest,
+                )
+            except (OSError, TypeError, ValueError, AblationQueueError) as error:
+                handoff = _mapping(
+                    state.get("continuity_handoff"),
+                    "continuity handoff",
+                )
+                handoff.update(
+                    {
+                        "status": "failed",
+                        "error": f"{type(error).__name__}: {error}",
+                    }
+                )
+                try:
+                    _save_state(state_path, state)
+                except OSError:
+                    pass
 
 
 def _error_document(error: Exception) -> dict[str, object]:
@@ -1389,6 +1931,7 @@ def main(argv: list[str] | None = None) -> int:
                 environment_file=arguments.environment_file,
                 state_path=arguments.state,
                 comparison_output=arguments.comparison_output,
+                continuity_handoff_output=arguments.continuity_handoff_output,
                 execution_lock_path=arguments.execution_lock,
                 source_commit=arguments.source_commit,
                 orchestrator=arguments.orchestrator,

@@ -6,7 +6,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
@@ -50,6 +50,16 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--run-root-parent", type=Path, required=True)
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--source-run-root", type=Path, required=True)
+    parser.add_argument(
+        "--winner-snapshot",
+        type=Path,
+        help="verified upstream comparator snapshot required for staged preparation",
+    )
+    parser.add_argument(
+        "--futility-policy",
+        type=Path,
+        help="pre-registered stop-only anytime-valid futility policy",
+    )
     parser.add_argument("--prefix", default="ring10-elo")
     parser.add_argument("--seed", type=int, default=17)
     parser.add_argument("--wall-budget-hours", type=float, default=8.0)
@@ -232,6 +242,131 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _read_json(path: Path) -> dict[str, object]:
+    loaded = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(loaded, dict):
+        raise ValueError(f"{path} must contain a JSON object")
+    return loaded
+
+
+def winner_snapshot_from_document(document: Mapping[str, object]) -> dict[str, object]:
+    """Extract a direct snapshot or a comparator selector snapshot."""
+    if document.get("status") == "verified" and "champion" in document:
+        return dict(document)
+    selector = document.get("selector")
+    if not isinstance(selector, Mapping) or selector.get("status") != "verified":
+        raise ValueError("upstream selector has not emitted a verified winner")
+    snapshot = selector.get("winner_snapshot")
+    if not isinstance(snapshot, Mapping):
+        raise ValueError("verified upstream selector has no winner snapshot")
+    return dict(snapshot)
+
+
+def verify_winner_snapshot(
+    source_run_root: Path,
+    snapshot: Mapping[str, object],
+) -> dict[str, object]:
+    """Verify a staged source is still the selector's immutable winner."""
+    source = source_run_root.expanduser().resolve()
+    if snapshot.get("status") != "verified":
+        raise ValueError("winner snapshot status is not verified")
+    raw_root = snapshot.get("run_root")
+    if not isinstance(raw_root, str) or Path(raw_root).expanduser().resolve() != source:
+        raise ValueError("winner snapshot run root does not match staged source")
+    champion = snapshot.get("champion")
+    if not isinstance(champion, Mapping):
+        raise ValueError("winner snapshot champion is missing")
+    identity = champion.get("model_identity")
+    step = champion.get("model_step")
+    if (
+        not isinstance(identity, str)
+        or not identity
+        or type(step) is not int
+        or step < 0
+    ):
+        raise ValueError("winner snapshot champion identity is invalid")
+    run_identity = snapshot.get("run_identity")
+    if not isinstance(run_identity, Mapping):
+        raise ValueError("winner snapshot run identity is missing")
+    run_path = source / "run.json"
+    champion_path = source / "learner" / "champion.json"
+    run_artifact = snapshot.get("run_identity_artifact")
+    champion_artifact = snapshot.get("champion_pointer_artifact")
+    for name, artifact, expected_path in (
+        ("run identity", run_artifact, run_path),
+        ("champion pointer", champion_artifact, champion_path),
+    ):
+        if not isinstance(artifact, Mapping):
+            raise ValueError(f"winner snapshot {name} artifact is missing")
+        artifact_path = artifact.get("path")
+        digest = artifact.get("sha256")
+        if (
+            not isinstance(artifact_path, str)
+            or Path(artifact_path).expanduser().resolve() != expected_path
+            or not isinstance(digest, str)
+            or digest != _sha256(expected_path)
+        ):
+            raise ValueError(f"winner snapshot {name} artifact is stale")
+    current_run = _read_json(run_path)
+    current_champion = _read_json(champion_path)
+    if any(
+        current_run.get(field) != run_identity.get(field)
+        for field in ("run_id", "generation_family", "created_ns")
+    ):
+        raise ValueError("winner snapshot run identity is stale")
+    if (
+        current_champion.get("model_identity") != identity
+        or current_champion.get("model_step") != step
+    ):
+        raise ValueError("winner snapshot champion identity is stale")
+    return dict(snapshot)
+
+
+def validate_futility_policy(
+    policy: Mapping[str, object],
+    *,
+    guard_rings: Sequence[int],
+    guard_floor_elo: float,
+) -> dict[str, object]:
+    """Validate a stop-only policy without granting any promotion authority."""
+    if (
+        policy.get("schema_version") != 1
+        or policy.get("report") != "startrain-elo-futility-policy"
+    ):
+        raise ValueError("unsupported Elo futility policy")
+    if type(policy.get("enabled")) is not bool:
+        raise ValueError("futility policy enabled must be boolean")
+    if policy.get("decision_scope") != "stop_only":
+        raise ValueError("futility policy must be stop-only")
+    if policy.get("evidence") != "anytime_valid_confidence_sequences":
+        raise ValueError("futility policy must require anytime-valid evidence")
+    minimum_games = policy.get("minimum_decisive_games")
+    if type(minimum_games) is not int or minimum_games <= 0:
+        raise ValueError("futility minimum decisive games must be positive")
+    guard = policy.get("guard_regression")
+    if not isinstance(guard, Mapping):
+        raise ValueError("futility guard-regression policy is missing")
+    if guard.get("rings") != list(guard_rings):
+        raise ValueError("futility guard rings differ from the ablation guardrails")
+    if guard.get("floor_elo") != guard_floor_elo:
+        raise ValueError("futility guard floor differs from the ablation guardrail")
+    if guard.get("arm_upper_field") != "anytime_upper_elo":
+        raise ValueError("futility guard regression must use an anytime upper bound")
+    control = policy.get("control_comparison")
+    if not isinstance(control, Mapping):
+        raise ValueError("futility control-comparison policy is missing")
+    advantage = control.get("minimum_advantage_elo")
+    if isinstance(advantage, bool) or not isinstance(advantage, int | float):
+        raise ValueError("futility minimum control advantage must be numeric")
+    if (
+        control.get("ring") != 10
+        or control.get("arm_upper_field") != "anytime_upper_elo"
+        or control.get("control_lower_field") != "anytime_lower_elo"
+    ):
+        raise ValueError("futility control comparison must use ring-10 anytime bounds")
+    return json.loads(json.dumps(dict(policy), allow_nan=False))
+
+
 def _validate_inputs(
     *,
     prefix: str,
@@ -318,6 +453,8 @@ def prepare_elo_ablation(
     leaf_budget: int,
     guard_floor_elo: float,
     treatments: Sequence[str],
+    winner_snapshot: Mapping[str, object] | None = None,
+    futility_policy: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     _validate_inputs(
         prefix=prefix,
@@ -337,6 +474,20 @@ def prepare_elo_ablation(
         raise FileNotFoundError(f"base config does not exist: {base}")
     if not source.is_dir():
         raise FileNotFoundError(f"source run root does not exist: {source}")
+    verified_winner = (
+        verify_winner_snapshot(source, winner_snapshot)
+        if winner_snapshot is not None
+        else None
+    )
+    registered_futility = (
+        validate_futility_policy(
+            futility_policy,
+            guard_rings=GUARD_RINGS,
+            guard_floor_elo=guard_floor_elo,
+        )
+        if futility_policy is not None
+        else None
+    )
     destination.mkdir(parents=True)
     base_sha256 = _sha256(base)
     raw_base = _load_raw(base)
@@ -378,6 +529,8 @@ def prepare_elo_ablation(
         "base_config": str(base),
         "base_config_sha256": base_sha256,
         "source_run_root": str(source),
+        "source_winner_snapshot": verified_winner,
+        "futility_policy": registered_futility,
         "run_id": run_id,
         "prefix": prefix,
         "seed": seed,
@@ -398,6 +551,16 @@ def prepare_elo_ablation(
 def main(argv: list[str] | None = None) -> int:
     arguments = _parser().parse_args(argv)
     try:
+        winner_snapshot = (
+            winner_snapshot_from_document(_read_json(arguments.winner_snapshot))
+            if arguments.winner_snapshot is not None
+            else None
+        )
+        futility_policy = (
+            _read_json(arguments.futility_policy)
+            if arguments.futility_policy is not None
+            else None
+        )
         manifest = prepare_elo_ablation(
             base_config=arguments.base_config,
             output_dir=arguments.output_dir,
@@ -410,6 +573,8 @@ def main(argv: list[str] | None = None) -> int:
             leaf_budget=arguments.leaf_budget,
             guard_floor_elo=arguments.guard_floor_elo,
             treatments=arguments.treatments or DEFAULT_TREATMENTS,
+            winner_snapshot=winner_snapshot,
+            futility_policy=futility_policy,
         )
     except (FileExistsError, FileNotFoundError, OSError, ValueError) as error:
         print(

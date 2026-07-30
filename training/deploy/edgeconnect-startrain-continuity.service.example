@@ -1,0 +1,25 @@
+[Unit]
+Description=EdgeConnect host training continuity reconciler
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+# @TRAINING_DIR@ and @CONTINUITY_MANIFEST@ must be root-owned immutable
+# deployment artifacts because this unit starts only manifest-pinned units.
+User=root
+WorkingDirectory=@TRAINING_DIR@
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONPATH=@TRAINING_DIR@
+Environment=PATH=@TRAINING_DIR@/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStartPre=@TRAINING_DIR@/.venv/bin/python @TRAINING_DIR@/scripts/reconcile_training_continuity.py verify --manifest @CONTINUITY_MANIFEST@ --structure-only
+# Preserve the report and continue into reconciliation when this gate fails:
+# the controller must durably record the hardware block instead of silently
+# skipping the fallback decision.
+ExecStartPre=/usr/bin/rm -f @HARDWARE_REPORT@
+ExecStartPre=-@TRAINING_DIR@/.venv/bin/python @TRAINING_DIR@/scripts/hardware_health_preflight.py --config @HARDWARE_PROFILE@ --output @HARDWARE_REPORT@
+ExecStart=@TRAINING_DIR@/.venv/bin/python @TRAINING_DIR@/scripts/reconcile_training_continuity.py reconcile --manifest @CONTINUITY_MANIFEST@
+TimeoutStartSec=120
+NoNewPrivileges=true
+UMask=0022

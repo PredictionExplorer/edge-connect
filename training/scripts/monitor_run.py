@@ -20,6 +20,7 @@ from pathlib import Path
 import yaml
 
 SEVERITY = {"OK": 0, "WARN": 1, "ERROR": 2}
+CONTINUITY_STALE_SECONDS = 180.0
 _DIGEST_CACHE: dict[Path, tuple[int, int, int, str]] = {}
 _ARENA_RESULT_CACHE: dict[Path, tuple[int, int, dict[str, object]]] = {}
 
@@ -29,6 +30,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--run-root", type=Path, required=True)
     parser.add_argument("--profile", type=Path)
     parser.add_argument("--unit")
+    parser.add_argument(
+        "--continuity-state",
+        type=Path,
+        help="host-level continuity-state JSON outside the run root",
+    )
     parser.add_argument("--interval", type=float, default=60.0)
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--format", choices=("text", "jsonl"), default="text")
@@ -51,6 +57,67 @@ def _read_json(path: Path, *, attempts: int = 3) -> dict[str, object] | None:
             if attempt + 1 < attempts:
                 time.sleep(0.02)
     return None
+
+
+def _continuity_status(
+    path: Path | None,
+    *,
+    now_ns: int,
+) -> dict[str, object]:
+    if path is None:
+        return {"configured": False}
+    source = path.expanduser().resolve()
+    payload = _read_json(source)
+    if (
+        payload is None
+        or payload.get("format") != "startrain.training-continuity-state"
+        or payload.get("schema_version") != 1
+    ):
+        return {
+            "configured": True,
+            "valid": False,
+            "state_path": str(source),
+        }
+    idle_since = payload.get("productive_idle_since_ns")
+    idle_seconds = (
+        max(0.0, (now_ns - idle_since) / 1_000_000_000)
+        if isinstance(idle_since, int) and not isinstance(idle_since, bool)
+        else None
+    )
+    reconciled_ns = payload.get("last_reconciled_ns")
+    reconciliation_age_seconds = (
+        max(0.0, (now_ns - reconciled_ns) / 1_000_000_000)
+        if isinstance(reconciled_ns, int) and not isinstance(reconciled_ns, bool)
+        else None
+    )
+    return {
+        "configured": True,
+        "valid": True,
+        "state_path": str(source),
+        "manifest_sha256": payload.get("manifest_sha256"),
+        "revision": payload.get("revision"),
+        "updated_ns": payload.get("updated_ns"),
+        "last_reconciled_ns": reconciled_ns,
+        "reconciliation_age_seconds": reconciliation_age_seconds,
+        "phase": payload.get("phase"),
+        "primary_workload_id": payload.get("primary_workload_id"),
+        "desired_workload_id": payload.get("desired_workload_id"),
+        "active_workload_id": payload.get("active_workload_id"),
+        "selected_lkg_workload_id": payload.get("selected_lkg_workload_id"),
+        "active_profile_sha256": payload.get("active_profile_sha256"),
+        "active_run_root_sha256": payload.get("active_run_root_sha256"),
+        "fallback_attempts": payload.get("fallback_attempts"),
+        "productive_idle_since_ns": idle_since,
+        "productive_idle_seconds": idle_seconds,
+        "hardware": payload.get("hardware"),
+        "execution": payload.get("execution"),
+        "blocked_reason": payload.get("blocked_reason"),
+        "last_failure": payload.get("last_failure"),
+        "last_handoff": payload.get("last_handoff"),
+        "last_transition": payload.get("last_transition"),
+        "last_alert": payload.get("last_alert"),
+        "quarantine_records": payload.get("quarantine_records"),
+    }
 
 
 def _latest_jsonl(
@@ -734,6 +801,7 @@ def collect_snapshot(
     *,
     unit: str | None = None,
     profile_path: Path | None = None,
+    continuity_state_path: Path | None = None,
     now_ns: int | None = None,
 ) -> dict[str, object]:
     root = run_root.expanduser().resolve()
@@ -1512,6 +1580,40 @@ def collect_snapshot(
                 f"SRAM={aggregate_sram or 0:g} DRAM={aggregate_dram or 0:g}",
             )
 
+    continuity = _continuity_status(continuity_state_path, now_ns=now)
+    if continuity.get("configured") and continuity.get("valid") is not True:
+        _add_warning(
+            warnings,
+            "ERROR",
+            "continuity_state_invalid",
+            "host-level continuity state is missing or invalid",
+        )
+    reconciliation_age = continuity.get("reconciliation_age_seconds")
+    if (
+        continuity.get("configured")
+        and continuity.get("valid") is True
+        and (
+            not isinstance(reconciliation_age, int | float)
+            or float(reconciliation_age) > CONTINUITY_STALE_SECONDS
+        )
+    ):
+        _add_warning(
+            warnings,
+            "ERROR",
+            "continuity_reconciliation_stale",
+            "host-level continuity reconciliation heartbeat is stale",
+        )
+    phase = continuity.get("phase")
+    if (isinstance(phase, str) and phase.startswith("blocked_")) or continuity.get(
+        "blocked_reason"
+    ) is not None:
+        _add_warning(
+            warnings,
+            "ERROR",
+            "continuity_blocked",
+            f"host-level continuity phase is {phase}",
+        )
+
     status = max(
         (item["severity"] for item in warnings),
         key=lambda value: SEVERITY[value],
@@ -1545,6 +1647,7 @@ def collect_snapshot(
         "disk": disk,
         "gpus": gpus,
         "gpu_health": hardware_health,
+        "continuity": continuity,
         "warnings": warnings,
     }
 
@@ -1608,6 +1711,8 @@ def format_text(snapshot: Mapping[str, object]) -> str:
     segment_target = learner.get("utd_segment_target_updates_per_new_sample")
     if _number(segment_target) is None:
         segment_target = learner.get("target_updates_per_new_sample")
+    continuity = snapshot.get("continuity")
+    continuity = continuity if isinstance(continuity, Mapping) else {}
     return (
         f"{snapshot.get('timestamp')} {snapshot.get('status')} "
         f"learner={learner.get('step')}/{learner.get('target_steps')} "
@@ -1630,6 +1735,8 @@ def format_text(snapshot: Mapping[str, object]) -> str:
         f"crossplay_evals={arena_history.get('crossplay_evaluations', 0)} "
         f"elo={_compact(displayed_elo)} elo_source={elo_source or 'n/a'} "
         f"failure={failure.get('failure_class', '-')} "
+        f"continuity={continuity.get('phase', 'n/a')} "
+        f"active_workload={continuity.get('active_workload_id', 'n/a')} "
         f"warnings={warning_codes or '-'}"
     )
 
@@ -1679,14 +1786,24 @@ def run_monitor(
     once: bool,
     output_format: str,
     stop_requested: Callable[[], bool],
+    continuity_state_path: Path | None = None,
 ) -> None:
     next_tick = time.monotonic()
     while not stop_requested():
         try:
-            snapshot = collect_snapshot(
-                run_root,
-                unit=unit,
-                profile_path=profile_path,
+            snapshot = (
+                collect_snapshot(
+                    run_root,
+                    unit=unit,
+                    profile_path=profile_path,
+                )
+                if continuity_state_path is None
+                else collect_snapshot(
+                    run_root,
+                    unit=unit,
+                    profile_path=profile_path,
+                    continuity_state_path=continuity_state_path,
+                )
             )
         except Exception as error:  # monitor must report and continue
             snapshot = {
@@ -1737,6 +1854,7 @@ def main(argv: list[str] | None = None) -> int:
         once=arguments.once,
         output_format=arguments.format,
         stop_requested=lambda: stopped,
+        continuity_state_path=arguments.continuity_state,
     )
     return 0
 
