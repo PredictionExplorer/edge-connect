@@ -6,9 +6,11 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import time
 from collections import defaultdict
 from collections.abc import Iterable, Mapping
 from pathlib import Path
+from typing import cast
 
 from startrain.autonomous_elo import DecisiveMatch, fit_bradley_terry_elo
 
@@ -17,6 +19,8 @@ REPORT_NAME = "startrain-strength-efficiency"
 AUTONOMOUS_ELO_SCHEMA_VERSION = 1
 AUTONOMOUS_ELO_CONFIDENCE = 0.95
 PRIMARY_ELO_RING = 10
+MIGRATION_SCHEMA_VERSION = 1
+ARENA_RESULT_KINDS = ("promotion", "crossplay", "historical_crossplay")
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -32,6 +36,10 @@ def _number(value: object) -> float | None:
         return None
     converted = float(value)
     return converted if math.isfinite(converted) else None
+
+
+def _mapping(value: object) -> Mapping[str, object]:
+    return value if isinstance(value, Mapping) else {}
 
 
 def _read_jsonl(
@@ -74,6 +82,17 @@ def _sum(records: Iterable[Mapping[str, object]], name: str) -> float:
     return sum(
         value for record in records if (value := _number(record.get(name))) is not None
     )
+
+
+def _latest_value(
+    records: Iterable[Mapping[str, object]],
+    name: str,
+) -> object | None:
+    materialized = records if isinstance(records, list) else list(records)
+    for record in reversed(materialized):
+        if name in record:
+            return record[name]
+    return None
 
 
 def _timestamp(record: Mapping[str, object]) -> int | None:
@@ -154,6 +173,93 @@ def _learner_summary(records: list[dict[str, object]]) -> dict[str, object]:
         for record in records
         if (value := _number(record.get("step"))) is not None
     ]
+    latest_fields = {
+        name: _latest_value(records, name)
+        for name in (
+            "updates_per_new_sample",
+            "lifetime_updates_per_new_sample",
+            "segment_updates_per_new_sample",
+            "utd_segment_target_updates_per_new_sample",
+            "utd_segment_baseline_examples_consumed",
+            "utd_segment_baseline_committed_replay_samples",
+            "loader_workers_effective",
+            "window_setup_seconds",
+            "window_setup_amortized_seconds",
+            "window_batches_allocated",
+            "window_batches_consumed",
+            "window_batches_consumed_this_spin",
+            "window_batches_remaining",
+            "window_reuse",
+            "window_reuse_spins",
+            "window_refresh_reason",
+            "utd_wait_spins",
+        )
+    }
+    allocation_records = [
+        record for record in records if record.get("event") == "replay_window_allocated"
+    ]
+    consumption_records = [
+        record for record in records if record.get("event") == "replay_window_consumed"
+    ]
+    refresh_records = [
+        record for record in records if record.get("event") == "replay_window_refreshed"
+    ]
+    has_persistent_window_metrics = any(
+        record.get("event")
+        in (
+            "replay_window_allocated",
+            "replay_window_consumed",
+            "replay_window_refreshed",
+        )
+        or any(
+            name in record
+            for name in (
+                "loader_workers_effective",
+                "window_setup_amortized_seconds",
+                "window_reuse",
+                "window_reuse_spins",
+            )
+        )
+        for record in records
+    )
+    reused_consumption_records = sum(
+        record.get("window_reuse") is True for record in consumption_records
+    )
+    persistent_window = (
+        {
+            "allocation_records": len(allocation_records),
+            "consumption_records": len(consumption_records),
+            "refresh_records": len(refresh_records),
+            "reused_consumption_records": reused_consumption_records,
+            "reuse_fraction": (
+                reused_consumption_records / len(consumption_records)
+                if consumption_records
+                else None
+            ),
+            "consumed_batches": int(
+                _sum(consumption_records, "window_batches_consumed_this_spin")
+            ),
+            "setup_seconds": _sum(allocation_records, "window_setup_seconds") or None,
+            "latest": {
+                name: latest_fields[name]
+                for name in (
+                    "loader_workers_effective",
+                    "window_setup_seconds",
+                    "window_setup_amortized_seconds",
+                    "window_batches_allocated",
+                    "window_batches_consumed",
+                    "window_batches_consumed_this_spin",
+                    "window_batches_remaining",
+                    "window_reuse",
+                    "window_reuse_spins",
+                    "window_refresh_reason",
+                    "utd_wait_spins",
+                )
+            },
+        }
+        if has_persistent_window_metrics
+        else None
+    )
     return {
         "records": len(records),
         "first_step": min(step_values, default=None),
@@ -177,6 +283,442 @@ def _learner_summary(records: list[dict[str, object]]) -> dict[str, object]:
         ),
         "h2d_seconds": h2d_seconds or None,
         "window_setup_seconds": window_setup_seconds or None,
+        "updates_per_new_sample": latest_fields["updates_per_new_sample"],
+        "lifetime_updates_per_new_sample": latest_fields[
+            "lifetime_updates_per_new_sample"
+        ],
+        "segment_updates_per_new_sample": latest_fields[
+            "segment_updates_per_new_sample"
+        ],
+        "utd_segment_target_updates_per_new_sample": latest_fields[
+            "utd_segment_target_updates_per_new_sample"
+        ],
+        "utd_segment_baseline_examples_consumed": latest_fields[
+            "utd_segment_baseline_examples_consumed"
+        ],
+        "utd_segment_baseline_committed_replay_samples": latest_fields[
+            "utd_segment_baseline_committed_replay_samples"
+        ],
+        "loader_workers_effective": latest_fields["loader_workers_effective"],
+        "latest_window_setup_seconds": latest_fields["window_setup_seconds"],
+        "window_setup_amortized_seconds": latest_fields[
+            "window_setup_amortized_seconds"
+        ],
+        "window_batches_allocated": latest_fields["window_batches_allocated"],
+        "window_batches_consumed": latest_fields["window_batches_consumed"],
+        "window_batches_consumed_this_spin": latest_fields[
+            "window_batches_consumed_this_spin"
+        ],
+        "window_batches_remaining": latest_fields["window_batches_remaining"],
+        "window_reuse": latest_fields["window_reuse"],
+        "window_reuse_spins": latest_fields["window_reuse_spins"],
+        "window_refresh_reason": latest_fields["window_refresh_reason"],
+        "utd_wait_spins": latest_fields["utd_wait_spins"],
+        "persistent_window": persistent_window,
+    }
+
+
+def _sha256(value: object) -> str | None:
+    return (
+        value
+        if isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+        else None
+    )
+
+
+def _migration_field(
+    record: Mapping[str, object],
+    nested_name: str,
+    *names: str,
+) -> object | None:
+    nested = _mapping(record.get(nested_name))
+    for name in names:
+        if name in record:
+            return record[name]
+    for name in names:
+        if name in nested:
+            return nested[name]
+    return None
+
+
+def _migration_boundary(
+    record: Mapping[str, object],
+    *,
+    line_number: int,
+) -> dict[str, object] | None:
+    raw_boundary = record.get(
+        "boundary",
+        record.get("learner_boundary", record.get("utd_boundary")),
+    )
+    if raw_boundary is not None and not isinstance(raw_boundary, Mapping):
+        raise ValueError(
+            f"autonomous migration line {line_number} boundary must be an object"
+        )
+    utd_segment = _mapping(record.get("utd_segment"))
+    sources = [
+        _mapping(raw_boundary),
+        record,
+        utd_segment,
+    ]
+    aliases = {
+        "step": ("step", "learner_step"),
+        "examples_consumed": (
+            "examples_consumed",
+            "learner_examples_consumed",
+            "baseline_examples_consumed",
+        ),
+        "committed_replay_samples": (
+            "committed_replay_samples",
+            "total_replay_samples",
+            "replay_samples",
+            "baseline_committed_replay_samples",
+        ),
+    }
+    values: dict[str, object | None] = {}
+    for normalized, names in aliases.items():
+        values[normalized] = next(
+            (source[name] for source in sources for name in names if name in source),
+            None,
+        )
+    if all(value is None for value in values.values()):
+        return None
+    invalid = [
+        name
+        for name in ("step", "examples_consumed")
+        if type(values[name]) is not int or cast(int, values[name]) < 0
+    ]
+    replay_samples = values["committed_replay_samples"]
+    if replay_samples is not None and (
+        type(replay_samples) is not int or replay_samples < 0
+    ):
+        invalid.append("committed_replay_samples")
+    if invalid:
+        raise ValueError(
+            "autonomous migration line "
+            f"{line_number} has an incomplete or invalid boundary: "
+            + ", ".join(invalid)
+        )
+    target = next(
+        (
+            source[name]
+            for source in sources
+            for name in (
+                "target_updates_per_new_sample",
+                "utd_target_updates_per_new_sample",
+            )
+            if name in source
+        ),
+        None,
+    )
+    parsed_target = _number(target)
+    if target is not None and (parsed_target is None or parsed_target <= 0):
+        raise ValueError(
+            f"autonomous migration line {line_number} has an invalid UTD target"
+        )
+    return {
+        "step": values["step"],
+        "examples_consumed": values["examples_consumed"],
+        "committed_replay_samples": values["committed_replay_samples"],
+        "target_updates_per_new_sample": parsed_target,
+    }
+
+
+def _migration_summary(
+    root: Path,
+    *,
+    run: Mapping[str, object],
+    run_started_ns: int,
+    observed_until_ns: int,
+    provisioned_gpus: int,
+) -> dict[str, object]:
+    path = root / "autonomous-migrations.jsonl"
+    if not path.is_file():
+        return {
+            "schema_version": MIGRATION_SCHEMA_VERSION,
+            "record_count": 0,
+            "boundary_count": 0,
+            "ignored_record_count": 0,
+            "records": [],
+            "boundaries": [],
+            "segments": [
+                {
+                    "index": 0,
+                    "started_ns": run_started_ns,
+                    "ended_ns": observed_until_ns,
+                    "migration_id": None,
+                    "config_sha256": None,
+                    "start_boundary": None,
+                    "wall_seconds": max(
+                        0.0,
+                        (observed_until_ns - run_started_ns) / 1_000_000_000,
+                    ),
+                    "provisioned_gpu_hours": max(
+                        0.0,
+                        provisioned_gpus
+                        * (observed_until_ns - run_started_ns)
+                        / 3_600_000_000_000,
+                    ),
+                }
+            ],
+        }
+
+    active_run_id = run.get("run_id")
+    active_family = run.get("generation_family")
+    records: list[dict[str, object]] = []
+    ignored = 0
+    with path.open("r", encoding="utf-8") as stream:
+        for line_number, line in enumerate(stream, start=1):
+            if not line.strip():
+                continue
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError as error:
+                raise ValueError(
+                    "malformed autonomous migration record "
+                    f"at {path}:{line_number}: {error}"
+                ) from error
+            if not isinstance(payload, dict):
+                raise ValueError(
+                    "malformed autonomous migration record "
+                    f"at {path}:{line_number}: record is not an object"
+                )
+            record_run_id = payload.get("run_id")
+            if record_run_id is not None and record_run_id != active_run_id:
+                ignored += 1
+                continue
+            record_family = payload.get("generation_family")
+            if record_family is not None and record_family != active_family:
+                raise ValueError(
+                    f"autonomous migration line {line_number} generation "
+                    "family does not match the active run"
+                )
+            schema_version = payload.get("schema_version", MIGRATION_SCHEMA_VERSION)
+            if (
+                type(schema_version) is not int
+                or schema_version != MIGRATION_SCHEMA_VERSION
+            ):
+                raise ValueError(
+                    f"autonomous migration line {line_number} has unsupported "
+                    f"schema_version={schema_version!r}"
+                )
+            timestamp_ns = next(
+                (
+                    payload[name]
+                    for name in ("timestamp_ns", "created_ns", "applied_ns")
+                    if name in payload
+                ),
+                None,
+            )
+            if type(timestamp_ns) is not int or timestamp_ns <= 0:
+                raise ValueError(
+                    f"autonomous migration line {line_number} has an invalid timestamp"
+                )
+            from_sha256 = _migration_field(
+                payload,
+                "source",
+                "from_sha256",
+                "from_config_sha256",
+                "source_config_sha256",
+                "previous_config_sha256",
+                "old_config_sha256",
+                "config_sha256",
+            )
+            to_sha256 = _migration_field(
+                payload,
+                "target",
+                "to_sha256",
+                "to_config_sha256",
+                "target_config_sha256",
+                "new_config_sha256",
+                "config_sha256",
+            )
+            parsed_from = _sha256(from_sha256)
+            parsed_to = _sha256(to_sha256)
+            if parsed_from is None or parsed_to is None:
+                raise ValueError(
+                    f"autonomous migration line {line_number} has invalid "
+                    "source/target config hashes"
+                )
+            boundary = _migration_boundary(payload, line_number=line_number)
+            migration_id = payload.get(
+                "migration_id",
+                f"migration-{timestamp_ns}",
+            )
+            if not isinstance(migration_id, str) or not migration_id.strip():
+                raise ValueError(
+                    f"autonomous migration line {line_number} has an invalid "
+                    "migration_id"
+                )
+            reason = payload.get("reason")
+            if reason is not None and (
+                not isinstance(reason, str) or not reason.strip() or "\n" in reason
+            ):
+                raise ValueError(
+                    f"autonomous migration line {line_number} has an invalid reason"
+                )
+            records.append(
+                {
+                    **payload,
+                    "schema_version": MIGRATION_SCHEMA_VERSION,
+                    "timestamp_ns": timestamp_ns,
+                    "from_sha256": parsed_from,
+                    "to_sha256": parsed_to,
+                    "migration_id": migration_id,
+                    "boundary": boundary,
+                    "_line": line_number,
+                }
+            )
+
+    previous: Mapping[str, object] | None = None
+    for record in records:
+        line_number = record["_line"]
+        timestamp_ns = cast(int, record["timestamp_ns"])
+        if timestamp_ns < run_started_ns:
+            raise ValueError(
+                f"autonomous migration line {line_number} predates the active run"
+            )
+        if previous is not None:
+            if timestamp_ns <= cast(int, previous["timestamp_ns"]):
+                raise ValueError(
+                    "autonomous migration timestamps must be strictly increasing"
+                )
+            if record["from_sha256"] != previous["to_sha256"]:
+                raise ValueError(
+                    f"autonomous migration line {line_number} breaks the config hash chain"
+                )
+            for current_name, previous_name, description in (
+                ("from_profile", "to_profile", "profile"),
+                ("from_source_commit", "to_source_commit", "source commit"),
+            ):
+                current_value = record.get(current_name)
+                previous_value = previous.get(previous_name)
+                if (
+                    current_value is not None
+                    and previous_value is not None
+                    and current_value != previous_value
+                ):
+                    raise ValueError(
+                        f"autonomous migration line {line_number} breaks the "
+                        f"{description} chain"
+                    )
+            boundary = record.get("boundary")
+            previous_boundary = previous.get("boundary")
+            if isinstance(boundary, Mapping) and isinstance(previous_boundary, Mapping):
+                for name in (
+                    "step",
+                    "examples_consumed",
+                    "committed_replay_samples",
+                ):
+                    value = boundary.get(name)
+                    previous_value = previous_boundary.get(name)
+                    if (
+                        type(value) is int
+                        and type(previous_value) is int
+                        and value < previous_value
+                    ):
+                        raise ValueError(
+                            f"autonomous migration line {line_number} moves "
+                            f"{name} backwards"
+                        )
+        previous = record
+
+    provenance_path = root / "autonomous-provenance.json"
+    if records and provenance_path.is_file():
+        try:
+            provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as error:
+            raise ValueError(
+                f"cannot validate autonomous migration head against {provenance_path}: "
+                f"{error}"
+            ) from error
+        provenance_hash = (
+            _sha256(provenance.get("config_sha256"))
+            if isinstance(provenance, Mapping)
+            else None
+        )
+        if provenance_hash is None or provenance_hash != records[-1]["to_sha256"]:
+            raise ValueError(
+                "autonomous migration chain does not end at provenance config_sha256"
+            )
+
+    boundaries = []
+    for record in records:
+        boundary = record.get("boundary")
+        if not isinstance(boundary, Mapping):
+            continue
+        boundaries.append(
+            {
+                "migration_id": record["migration_id"],
+                "timestamp_ns": record["timestamp_ns"],
+                "from_sha256": record["from_sha256"],
+                "to_sha256": record["to_sha256"],
+                **boundary,
+            }
+        )
+    segment_observed_until_ns = max(
+        [
+            observed_until_ns,
+            *(cast(int, record["timestamp_ns"]) for record in records),
+        ]
+    )
+    segments = []
+    for index in range(len(records) + 1):
+        prior = records[index - 1] if index else None
+        following = records[index] if index < len(records) else None
+        started_ns = (
+            cast(int, prior["timestamp_ns"]) if prior is not None else run_started_ns
+        )
+        ended_ns = (
+            cast(int, following["timestamp_ns"])
+            if following is not None
+            else segment_observed_until_ns
+        )
+        start_boundary = prior.get("boundary") if prior is not None else None
+        start_boundary = start_boundary if isinstance(start_boundary, Mapping) else {}
+        segments.append(
+            {
+                "index": index,
+                "started_ns": started_ns,
+                "ended_ns": ended_ns,
+                "migration_id": (prior["migration_id"] if prior is not None else None),
+                "config_sha256": (
+                    prior["to_sha256"]
+                    if prior is not None
+                    else (records[0]["from_sha256"] if records else None)
+                ),
+                "start_boundary": (prior["boundary"] if prior is not None else None),
+                "started_step": start_boundary.get("step"),
+                "started_examples_consumed": start_boundary.get("examples_consumed"),
+                "started_committed_replay_samples": start_boundary.get(
+                    "committed_replay_samples"
+                ),
+                "target_updates_per_new_sample": start_boundary.get(
+                    "target_updates_per_new_sample"
+                ),
+                "wall_seconds": max(
+                    0.0,
+                    (ended_ns - started_ns) / 1_000_000_000,
+                ),
+                "provisioned_gpu_hours": max(
+                    0.0,
+                    provisioned_gpus * (ended_ns - started_ns) / 3_600_000_000_000,
+                ),
+            }
+        )
+    serialized_records = [
+        {key: value for key, value in record.items() if key != "_line"}
+        for record in records
+    ]
+    return {
+        "schema_version": MIGRATION_SCHEMA_VERSION,
+        "record_count": len(records),
+        "boundary_count": len(boundaries),
+        "ignored_record_count": ignored,
+        "records": serialized_records,
+        "boundaries": boundaries,
+        "segments": segments,
     }
 
 
@@ -300,6 +842,21 @@ def _actor_summary(records: list[dict[str, object]]) -> dict[str, object]:
     }
 
 
+def _arena_result_kind(result: Mapping[str, object]) -> str:
+    value = result.get("result_kind")
+    if value is None:
+        return "promotion"
+    return value if value in ARENA_RESULT_KINDS else "unknown"
+
+
+def _arena_result_category(result: Mapping[str, object]) -> str:
+    return (
+        "crossplay"
+        if _arena_result_kind(result) in ("crossplay", "historical_crossplay")
+        else _arena_result_kind(result)
+    )
+
+
 def _arena_results(
     root: Path,
     *,
@@ -354,6 +911,8 @@ def _arena_summary(
         )
         item = {
             "path": result["_path"],
+            "result_kind": _arena_result_kind(result),
+            "result_category": _arena_result_category(result),
             "candidate": result.get("candidate"),
             "baseline": baseline,
             "baseline_metadata": result.get("baseline_metadata"),
@@ -401,12 +960,24 @@ def _arena_summary(
                 else None
             ),
         }
+    result_kind_counts = {
+        kind: sum(item.get("result_kind") == kind for item in serialized)
+        for kind in (*ARENA_RESULT_KINDS, "unknown")
+    }
+    result_category_counts = {
+        kind: sum(item.get("result_category") == kind for item in serialized)
+        for kind in ("promotion", "crossplay", "unknown")
+    }
     return {
         "results": sorted(
             serialized,
             key=lambda item: _number(item.get("completed_ns")) or 0,
         ),
         "by_baseline": trends,
+        "result_kind_counts": result_kind_counts,
+        "result_category_counts": result_category_counts,
+        "promotion_result_count": result_category_counts["promotion"],
+        "crossplay_result_count": result_category_counts["crossplay"],
     }
 
 
@@ -450,9 +1021,17 @@ def _checkpoint_step_evidence(
     *,
     actor_records: list[dict[str, object]],
     arena_results: list[dict[str, object]],
-) -> tuple[dict[str, int], list[dict[str, object]]]:
+) -> tuple[dict[str, int], dict[str, int], list[dict[str, object]]]:
     evidence: dict[str, set[int]] = {}
+    publication_evidence: dict[str, set[int]] = {}
     metadata_failures: list[dict[str, object]] = []
+
+    def record_publication(identity: object, published_ns: object) -> None:
+        parsed_identity = _checkpoint_identity(identity)
+        parsed_ns = _nonnegative_integer(published_ns)
+        if parsed_identity is not None and parsed_ns is not None and parsed_ns > 0:
+            publication_evidence.setdefault(parsed_identity, set()).add(parsed_ns)
+
     for record in actor_records:
         _record_step_evidence(
             evidence,
@@ -491,6 +1070,10 @@ def _checkpoint_step_evidence(
             identity=record.get("model_identity"),
             step=record.get("model_step"),
         )
+        record_publication(
+            record.get("model_identity"),
+            record.get("published_ns"),
+        )
 
     metadata_paths = [
         *(root / "learner" / "manifests").glob("manifest-*.json"),
@@ -522,6 +1105,13 @@ def _checkpoint_step_evidence(
             ),
             step=payload.get("model_step", payload.get("candidate_step")),
         )
+        record_publication(
+            payload.get(
+                "model_identity",
+                payload.get("candidate_identity"),
+            ),
+            payload.get("published_ns"),
+        )
         _record_step_evidence(
             evidence,
             identity=payload.get("champion_identity"),
@@ -542,7 +1132,25 @@ def _checkpoint_step_evidence(
         for identity, steps in evidence.items()
         if len(steps) == 1
     }
-    return resolved, [*metadata_failures, *conflicts]
+    publication_conflicts = [
+        {
+            "identity": identity,
+            "published_ns": sorted(values),
+            "reason": "conflicting checkpoint publication evidence",
+        }
+        for identity, values in sorted(publication_evidence.items())
+        if len(values) > 1
+    ]
+    publications = {
+        identity: next(iter(values))
+        for identity, values in publication_evidence.items()
+        if len(values) == 1
+    }
+    return (
+        resolved,
+        publications,
+        [*metadata_failures, *conflicts, *publication_conflicts],
+    )
 
 
 def _baseline_kind(
@@ -717,6 +1325,63 @@ def _graph_components(matches: list[DecisiveMatch]) -> list[list[str]]:
     return sorted(components)
 
 
+def _saturated_one_sided_pairings(
+    inputs: list[dict[str, object]],
+    *,
+    included_identities: set[str] | None = None,
+) -> list[dict[str, object]]:
+    totals: dict[tuple[str, str], dict[str, object]] = {}
+    for item in inputs:
+        match = item.get("match")
+        if not isinstance(match, DecisiveMatch):
+            continue
+        first, second = sorted((match.candidate, match.baseline))
+        if included_identities is not None and (
+            first not in included_identities or second not in included_identities
+        ):
+            continue
+        total = totals.setdefault(
+            (first, second),
+            {
+                "first_identity": first,
+                "second_identity": second,
+                "first_wins": 0,
+                "second_wins": 0,
+                "result_count": 0,
+                "result_paths": [],
+            },
+        )
+        first_wins = match.wins if match.candidate == first else match.losses
+        second_wins = match.losses if match.candidate == first else match.wins
+        total["first_wins"] = cast(int, total["first_wins"]) + first_wins
+        total["second_wins"] = cast(int, total["second_wins"]) + second_wins
+        total["result_count"] = cast(int, total["result_count"]) + 1
+        path = item.get("path")
+        if isinstance(path, str):
+            paths = cast(list[str], total["result_paths"])
+            paths.append(path)
+    saturated = []
+    for total in totals.values():
+        first_wins = cast(int, total["first_wins"])
+        second_wins = cast(int, total["second_wins"])
+        if first_wins and second_wins:
+            continue
+        saturated.append(
+            {
+                **total,
+                "decisive_games": first_wins + second_wins,
+                "result_paths": sorted(set(cast(list[str], total["result_paths"]))),
+            }
+        )
+    return sorted(
+        saturated,
+        key=lambda item: (
+            str(item["first_identity"]),
+            str(item["second_identity"]),
+        ),
+    )
+
+
 def _unavailable_ladder(
     *,
     scope: str,
@@ -734,6 +1399,7 @@ def _unavailable_ladder(
     identities = sorted(
         {identity for component in components for identity in component}
     )
+    saturated_pairings = _saturated_one_sided_pairings(inputs)
     return {
         "status": "unavailable",
         "scope": scope,
@@ -746,6 +1412,8 @@ def _unavailable_ladder(
             "result_count": len(inputs),
             "identity_count": len(identities),
             "decisive_games": sum(match.wins + match.losses for match in matches),
+            "saturated_one_sided_pairing_count": len(saturated_pairings),
+            "saturated_one_sided_pairings": saturated_pairings,
         },
         "connectedness": {
             "connected": len(components) == 1 and bool(components),
@@ -766,6 +1434,7 @@ def _build_ladder(
     exclusions: list[dict[str, object]],
     anchor_identity: str | None,
     checkpoint_steps: Mapping[str, int],
+    checkpoint_publications: Mapping[str, int],
 ) -> dict[str, object]:
     if anchor_identity is None:
         return _unavailable_ladder(
@@ -831,6 +1500,8 @@ def _build_ladder(
             "standard_error": estimate.standard_error,
             "confidence_interval": list(estimate.confidence_interval),
             "decisive_games": estimate.decisive_games,
+            "last_observed_ns": last_seen.get(estimate.identity),
+            "published_ns": checkpoint_publications.get(estimate.identity),
         }
         for rank, estimate in enumerate(fit.estimates, start=1)
     ]
@@ -864,6 +1535,58 @@ def _build_ladder(
             or match.baseline in fit.excluded_identities
         )
     ]
+    fitted_identities = {estimate.identity for estimate in fit.estimates}
+    saturated_pairings = _saturated_one_sided_pairings(
+        inputs,
+        included_identities=fitted_identities,
+    )
+    ordered_steps = sorted(
+        stepped,
+        key=lambda item: (int(item["step"]), str(item["identity"])),
+    )
+    marginal_contrasts = []
+    for previous_step, current_step in zip(
+        ordered_steps,
+        ordered_steps[1:],
+        strict=False,
+    ):
+        contrast = fit.contrast(
+            str(current_step["identity"]),
+            str(previous_step["identity"]),
+        )
+        previous_ns = previous_step.get("published_ns")
+        current_ns = current_step.get("published_ns")
+        elapsed_hours = (
+            (current_ns - previous_ns) / 3_600_000_000_000
+            if isinstance(previous_ns, int)
+            and isinstance(current_ns, int)
+            and current_ns > previous_ns
+            else None
+        )
+        marginal_contrasts.append(
+            {
+                "from_identity": previous_step["identity"],
+                "from_step": previous_step["step"],
+                "to_identity": current_step["identity"],
+                "to_step": current_step["step"],
+                "delta_elo": contrast.difference,
+                "standard_error": contrast.standard_error,
+                "confidence_interval": list(contrast.confidence_interval),
+                "elapsed_wall_hours": elapsed_hours,
+                "elo_per_wall_hour": (
+                    contrast.difference / elapsed_hours if elapsed_hours else None
+                ),
+                "elo_per_wall_hour_confidence_interval": (
+                    [
+                        contrast.confidence_interval[0] / elapsed_hours,
+                        contrast.confidence_interval[1] / elapsed_hours,
+                    ]
+                    if elapsed_hours
+                    else None
+                ),
+                "time_basis": "checkpoint_publication",
+            }
+        )
     return {
         "status": "available",
         "scope": scope,
@@ -871,12 +1594,15 @@ def _build_ladder(
         "anchor_identity": anchor_identity,
         "ladder": ladder,
         "latest": latest,
+        "marginal_contrasts": marginal_contrasts,
         "input": {
             "result_count": len(inputs),
             "fitted_result_count": fit.observation_count,
             "unique_pairing_count": fit.unique_pairing_count,
             "decisive_games": fit.decisive_games,
             "continuity_corrected_pairings": (fit.continuity_corrected_pairings),
+            "saturated_one_sided_pairing_count": len(saturated_pairings),
+            "saturated_one_sided_pairings": saturated_pairings,
         },
         "fit": {
             "converged": fit.converged,
@@ -933,6 +1659,8 @@ def _frozen_baseline_results(
         serialized.append(
             {
                 "path": result.get("_path"),
+                "result_kind": _arena_result_kind(result),
+                "result_category": _arena_result_category(result),
                 "candidate": result.get("candidate"),
                 "baseline": result.get("baseline"),
                 "kind": evidence,
@@ -962,7 +1690,11 @@ def _autonomous_elo_summary(
     actor_summary: Mapping[str, object],
     provisioned_gpu_hours: float,
 ) -> dict[str, object]:
-    checkpoint_steps, metadata_exclusions = _checkpoint_step_evidence(
+    (
+        checkpoint_steps,
+        checkpoint_publications,
+        metadata_exclusions,
+    ) = _checkpoint_step_evidence(
         root,
         actor_records=actor_records,
         arena_results=arena_results,
@@ -988,6 +1720,7 @@ def _autonomous_elo_summary(
         exclusions=ring_exclusions,
         anchor_identity=anchor_identity,
         checkpoint_steps=checkpoint_steps,
+        checkpoint_publications=checkpoint_publications,
     )
     aggregate = _build_ladder(
         scope="aggregate",
@@ -995,6 +1728,7 @@ def _autonomous_elo_summary(
         exclusions=aggregate_exclusions,
         anchor_identity=anchor_identity,
         checkpoint_steps=checkpoint_steps,
+        checkpoint_publications=checkpoint_publications,
     )
     latest_source = None
     latest = None
@@ -1005,6 +1739,21 @@ def _autonomous_elo_summary(
         latest_source = "aggregate"
         latest = aggregate.get("latest")
     latest_elo = _number(latest.get("rating")) if isinstance(latest, Mapping) else None
+    aggregate_latest = (
+        aggregate.get("latest") if aggregate.get("status") == "available" else None
+    )
+    headline = (
+        {
+            "source": "aggregate",
+            "confidence_level": AUTONOMOUS_ELO_CONFIDENCE,
+            **aggregate_latest,
+        }
+        if isinstance(aggregate_latest, dict)
+        else None
+    )
+    headline_elo = (
+        _number(headline.get("rating")) if isinstance(headline, Mapping) else None
+    )
     leaf_evaluations = (
         _nonnegative_integer(actor_summary.get("evaluator_rows"))
         if actor_records
@@ -1021,7 +1770,8 @@ def _autonomous_elo_summary(
             "for one-sided pairings"
         ),
         "uncertainty_method": (
-            "marginal normal interval from raw observed-information Hessian"
+            "marginal and correlated-contrast normal intervals from the raw "
+            "observed-information Hessian"
         ),
         "confidence_level": AUTONOMOUS_ELO_CONFIDENCE,
         "primary_ring": PRIMARY_ELO_RING,
@@ -1039,6 +1789,8 @@ def _autonomous_elo_summary(
             {"source": latest_source, **latest} if isinstance(latest, dict) else None
         ),
         "latest_elo": latest_elo,
+        "headline": headline,
+        "headline_elo": headline_elo,
         "efficiency": {
             "leaf_evaluations": leaf_evaluations,
             "leaf_evaluation_source": "actors.evaluator_rows"
@@ -1056,12 +1808,84 @@ def _autonomous_elo_summary(
                 if latest_elo is not None and provisioned_gpu_hours
                 else None
             ),
+            "headline_elo_per_billion_leaf_evaluations": (
+                headline_elo / billion_leaf_evaluations
+                if headline_elo is not None and billion_leaf_evaluations
+                else None
+            ),
+            "headline_elo_per_provisioned_gpu_hour": (
+                headline_elo / provisioned_gpu_hours
+                if headline_elo is not None and provisioned_gpu_hours
+                else None
+            ),
+        },
+        "saturation": {
+            "aggregate": {
+                "saturated_one_sided_pairing_count": _nonnegative_integer(
+                    _mapping(aggregate.get("input")).get(
+                        "saturated_one_sided_pairing_count"
+                    )
+                ),
+                "saturated_one_sided_pairings": _mapping(aggregate.get("input")).get(
+                    "saturated_one_sided_pairings", []
+                ),
+            },
+            "primary_ring_10": {
+                "saturated_one_sided_pairing_count": _nonnegative_integer(
+                    _mapping(primary.get("input")).get(
+                        "saturated_one_sided_pairing_count"
+                    )
+                ),
+                "saturated_one_sided_pairings": _mapping(primary.get("input")).get(
+                    "saturated_one_sided_pairings", []
+                ),
+            },
         },
         "frozen_baselines": _frozen_baseline_results(
             arena_results,
             checkpoint_steps=checkpoint_steps,
         ),
         "step_metadata_exclusions": metadata_exclusions,
+    }
+
+
+def _coordinator_summary(records: list[dict[str, object]]) -> dict[str, object]:
+    ready_by_token: dict[str, int] = {}
+    pause_seconds = 0.0
+    completed_leases = 0
+    learner_pause_restarts = 0
+    hardware_failures = 0
+    for record in records:
+        event = record.get("event")
+        token = record.get("token")
+        timestamp = _timestamp(record)
+        if event == "pause_lease_ready" and isinstance(token, str) and timestamp:
+            ready_by_token[token] = timestamp
+        elif (
+            event in ("pause_lease_release_requested", "pause_lease_released")
+            and isinstance(token, str)
+            and timestamp
+            and token in ready_by_token
+        ):
+            pause_seconds += max(
+                0.0, (timestamp - ready_by_token.pop(token)) / 1_000_000_000
+            )
+            completed_leases += 1
+        if event == "pause_target_restarted" and record.get("target") == "learner":
+            learner_pause_restarts += 1
+        if event == "hardware_health_failure":
+            hardware_failures += 1
+    return {
+        "records": len(records),
+        "completed_pause_leases": completed_leases,
+        "pause_lease_seconds": pause_seconds,
+        "learner_pause_restarts": learner_pause_restarts,
+        "hardware_health_failures": hardware_failures,
+        "open_pause_lease_count": len(ready_by_token),
+        "efficiency_denominator_policy": (
+            "pause, cooldown, restart, and idle time remain included in total "
+            "wall time and provisioned GPU-hours"
+        ),
     }
 
 
@@ -1092,6 +1916,10 @@ def build_strength_efficiency_report(
         root / "learner" / "metrics.jsonl",
         failures=failures,
     )
+    coordinator_records = _read_jsonl(
+        root / "metrics" / "coordinator.jsonl",
+        failures=failures,
+    )
     actor_records: list[dict[str, object]] = []
     metrics_directory = root / "metrics"
     if metrics_directory.is_dir():
@@ -1100,14 +1928,48 @@ def build_strength_efficiency_report(
     arenas = _arena_results(root, failures=failures)
     observed_timestamps = [
         timestamp
-        for record in [*learner_records, *actor_records, *arenas]
+        for record in [*learner_records, *actor_records, *coordinator_records, *arenas]
         if (timestamp := _timestamp(record)) is not None
     ]
-    observed_until_ns = max(observed_timestamps, default=started_ns)
+    latest_metric_ns = max(observed_timestamps, default=started_ns)
+    coordinator_status_path = root / "status" / "coordinator.json"
+    coordinator_status = {}
+    if coordinator_status_path.is_file():
+        try:
+            loaded_status = json.loads(
+                coordinator_status_path.read_text(encoding="utf-8")
+            )
+            coordinator_status = (
+                loaded_status if isinstance(loaded_status, dict) else {}
+            )
+        except (OSError, json.JSONDecodeError):
+            coordinator_status = {}
+    coordinator_timestamp = coordinator_status.get("timestamp_ns")
+    if coordinator_status.get("state") == "running":
+        observed_until_ns = max(latest_metric_ns, time.time_ns())
+        observation_end_source = "report_capture_while_running"
+    elif (
+        coordinator_status.get("state") == "stopped"
+        and isinstance(coordinator_timestamp, int)
+        and not isinstance(coordinator_timestamp, bool)
+        and coordinator_timestamp > 0
+    ):
+        observed_until_ns = max(latest_metric_ns, coordinator_timestamp)
+        observation_end_source = "coordinator_terminal_timestamp"
+    else:
+        observed_until_ns = latest_metric_ns
+        observation_end_source = "latest_metric"
     wall_seconds = max(0.0, (observed_until_ns - started_ns) / 1_000_000_000)
     provisioned_gpu_hours = provisioned_gpus * wall_seconds / 3_600.0
     learner_summary = _learner_summary(learner_records)
     actor_summary = _actor_summary(actor_records)
+    migration_summary = _migration_summary(
+        root,
+        run=run,
+        run_started_ns=started_ns,
+        observed_until_ns=observed_until_ns,
+        provisioned_gpus=provisioned_gpus,
+    )
     return {
         "schema_version": SCHEMA_VERSION,
         "report": REPORT_NAME,
@@ -1117,9 +1979,14 @@ def build_strength_efficiency_report(
         "generation_family": run.get("generation_family"),
         "started_ns": started_ns,
         "observed_until_ns": observed_until_ns,
+        "observation_end_source": observation_end_source,
         "wall_seconds": wall_seconds,
         "provisioned_gpus": provisioned_gpus,
         "provisioned_gpu_hours": provisioned_gpu_hours,
+        "migrations": migration_summary,
+        "migration_boundaries": migration_summary["boundaries"],
+        "migration_segments": migration_summary["segments"],
+        "coordinator": _coordinator_summary(coordinator_records),
         "learner": learner_summary,
         "actors": actor_summary,
         "arena": _arena_summary(

@@ -14,9 +14,11 @@ Environment=PYTHONDONTWRITEBYTECODE=1
 Environment=PYTHONPATH=@TRAINING_DIR@
 Environment=TORCH_NCCL_ASYNC_ERROR_HANDLING=1
 Environment=PATH=@TRAINING_DIR@/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecCondition=@TRAINING_DIR@/.venv/bin/python @TRAINING_DIR@/scripts/hardware_health_preflight.py --config @PROFILE@ --output @RUN_ROOT@/status/hardware-health-startup.json
 ExecStartPre=@TRAINING_DIR@/.venv/bin/python @TRAINING_DIR@/scripts/replay_manifest_backup.py check-and-restore --run-root @RUN_ROOT@
 ExecStart=@TRAINING_DIR@/.venv/bin/startrain-orchestrate --config @PROFILE@
 Restart=on-failure
+RestartPreventExitStatus=78
 RestartSec=30
 WatchdogSec=120
 WatchdogSignal=SIGTERM

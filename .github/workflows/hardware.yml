@@ -48,6 +48,7 @@ jobs:
       - run: nvidia-smi -L
       - run: uv sync --extra test --extra serve --extra onnx --locked
       - run: uv run maturin develop --release --locked --manifest-path crates/star-py/Cargo.toml
+      - run: uv run python scripts/hardware_health_preflight.py --config "configs/${PROFILE}.yaml"
       - run: uv run pytest --require-native -m "cuda and not multi_gpu and not soak"
       - run: uv run python scripts/hardware_preflight.py --config "configs/${PROFILE}.yaml" --rings 6
       - run: uv run python scripts/hardware_preflight.py --config "configs/${PROFILE}.yaml" --rings 10

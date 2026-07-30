@@ -1,0 +1,80 @@
+{
+  "format": "startrain.training-continuity-manifest",
+  "schema_version": 1,
+  "state_root": "@STATE_ROOT@",
+  "locks": {
+    "transition": "@STATE_ROOT@/transition.lock",
+    "execution": "@EXECUTION_LOCK@"
+  },
+  "hardware": {
+    "report_path": "@HARDWARE_REPORT@",
+    "max_age_seconds": 180,
+    "probe_workload": "fallback-lkg"
+  },
+  "primary": "primary",
+  "workloads": [
+    {
+      "id": "primary",
+      "role": "primary",
+      "unit": "@PRIMARY_UNIT@",
+      "profile": {
+        "path": "@PRIMARY_PROFILE@",
+        "sha256": "@PRIMARY_PROFILE_SHA256@"
+      },
+      "run_root": {
+        "path": "@PRIMARY_RUN_ROOT@",
+        "sha256": "@PRIMARY_RUN_ROOT_SHA256@"
+      },
+      "runtime": {
+        "manifest": "@RELEASE_MANIFEST@",
+        "sha256": "@RELEASE_MANIFEST_SHA256@",
+        "training_dir": "@TRAINING_DIR@",
+        "orchestrator": "@ORCHESTRATOR@",
+        "orchestrator_sha256": "@ORCHESTRATOR_SHA256@",
+        "unit_path": "/etc/systemd/system/@PRIMARY_UNIT@",
+        "unit_sha256": "@PRIMARY_UNIT_SHA256@"
+      }
+    },
+    {
+      "id": "fallback-lkg",
+      "role": "fallback",
+      "unit": "@FALLBACK_UNIT@",
+      "profile": {
+        "path": "@FALLBACK_PROFILE@",
+        "sha256": "@FALLBACK_PROFILE_SHA256@"
+      },
+      "run_root": {
+        "path": "@FALLBACK_RUN_ROOT@",
+        "sha256": "@FALLBACK_RUN_ROOT_SHA256@"
+      },
+      "runtime": {
+        "manifest": "@RELEASE_MANIFEST@",
+        "sha256": "@RELEASE_MANIFEST_SHA256@",
+        "training_dir": "@TRAINING_DIR@",
+        "orchestrator": "@ORCHESTRATOR@",
+        "orchestrator_sha256": "@ORCHESTRATOR_SHA256@",
+        "unit_path": "/etc/systemd/system/@FALLBACK_UNIT@",
+        "unit_sha256": "@FALLBACK_UNIT_SHA256@"
+      },
+      "last_known_good": {
+        "verified_ns": @FALLBACK_VERIFIED_NS@,
+        "priority": 0
+      }
+    }
+  ],
+  "failure_artifacts": [
+    {
+      "type": "continuity_handoff",
+      "path": "@CONTINUITY_HANDOFF@"
+    }
+  ],
+  "policy": {
+    "automatic_start": true,
+    "maximum_start_attempts": 3,
+    "start_retry_seconds": 60,
+    "operator_hold_path": "@STATE_ROOT@/operator-hold"
+  },
+  "alerts": {
+    "timeout_seconds": 10
+  }
+}

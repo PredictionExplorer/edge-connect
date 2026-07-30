@@ -25,6 +25,12 @@ from .checkpoint import (
     save_checkpoint,
 )
 from .config import CONFIG_SCHEMA_VERSION, GameConfig, load_config
+from .device import (
+    enable_fast_math,
+    resolve_device_string,
+    resolve_precision,
+    seed_all,
+)
 from .contracts import (
     ACTION_LAYOUT_SCHEMA_ID,
     EXTERNAL_FEATURE_SCHEMA_ID,
@@ -114,8 +120,10 @@ class DistillationTrainConfig:
             raise DistillationConfigError("distillation batch_size must be positive")
         if self.learning_rate <= 0 or self.weight_decay < 0:
             raise DistillationConfigError("optimizer settings are invalid")
-        if self.precision not in ("fp32", "bf16"):
-            raise DistillationConfigError("distillation precision must be fp32 or bf16")
+        if self.precision not in ("fp32", "bf16", "auto"):
+            raise DistillationConfigError(
+                "distillation precision must be fp32, bf16, or auto"
+            )
         if not isinstance(self.device, str) or not self.device:
             raise DistillationConfigError("distillation device must be non-empty")
         if type(self.seed) is not int:
@@ -365,14 +373,10 @@ class DistillationRunner:
         samples = self._load_samples()
         train = self.config.train
         random.seed(train.seed)
-        torch.manual_seed(train.seed)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(train.seed)
-        device = torch.device(train.device)
-        if device.type == "cuda" and not torch.cuda.is_available():
-            raise RuntimeError(
-                f"configured CUDA device {train.device!r} is unavailable"
-            )
+        seed_all(train.seed)
+        device = torch.device(resolve_device_string(train.device))
+        train = replace(train, precision=resolve_precision(train.precision, device))
+        enable_fast_math(device)
 
         student = GraphResTNet(self.config.student).to(device)
         teacher, teacher_version = self._load_teacher(device)
@@ -539,9 +543,10 @@ class DistillationRunner:
     ) -> dict[str, float]:
         train = self.config.train
         optimizer.zero_grad(set_to_none=True)
-        autocast = train.precision == "bf16"
+        student_device = next(student.parameters()).device
+        autocast = resolve_precision(train.precision, student_device) == "bf16"
         with torch.autocast(
-            device_type=next(student.parameters()).device.type,
+            device_type=student_device.type,
             dtype=torch.bfloat16,
             enabled=autocast,
         ):

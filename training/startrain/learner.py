@@ -2,16 +2,18 @@
 
 from __future__ import annotations
 
-import json
 import hashlib
 import heapq
+import json
+import math
 import os
 import random
 import time
 from bisect import bisect_right
 from collections import OrderedDict, defaultdict
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from fractions import Fraction
 from pathlib import Path
 
 import torch
@@ -26,6 +28,7 @@ from .checkpoint import (
     ResumeCheckpoint,
     collect_model_garbage,
     collect_recovery_garbage,
+    inspect_checkpoint,
     load_checkpoint,
     load_model_manifest,
     save_checkpoint,
@@ -43,11 +46,24 @@ from .config import (
     TrainConfig,
 )
 from .contracts import FEATURE_SCHEMA_HASH, RULES_HASH_WIRE
+from .device import (
+    device_memory_snapshot,
+    empty_device_cache,
+    enable_fast_math,
+    resolve_compile,
+    resolve_device_string,
+    resolve_loader_workers,
+    resolve_pin_memory,
+    resolve_precision,
+    seed_all,
+    synchronize_device,
+)
 from .losses import LossWeights
 from .model import MODEL_SCHEMA_VERSION, GraphResTNet
 from .optim import build_optimizer
 from .replay import (
     DecodedReplayShard,
+    ReplayBatch,
     ReplaySample,
     augment_sample,
     collate_replay_samples,
@@ -63,6 +79,14 @@ from .training import (
     train_step,
     unwrap_model,
 )
+
+UTD_SEGMENT_SCHEMA_VERSION = 1
+UTD_SEGMENT_FILENAME = "utd-segment.json"
+STATE_REBASE_FORMAT = "startrain.learner-state-rebase"
+STATE_REBASE_SCHEMA_VERSION = 1
+STATE_REBASE_FILENAME = "state-rebase.json"
+STATE_REBASE_PENDING_FILENAME = "state-rebase.pending.json"
+_UNSET = object()
 
 
 class AugmentedReplayDataset(Dataset[ReplaySample]):
@@ -460,6 +484,134 @@ class JSONLMetrics:
             os.fsync(stream.fileno())
 
 
+@dataclass(frozen=True, slots=True)
+class UTDSegmentState:
+    run_id: str
+    generation_family: str
+    target_updates_per_new_sample: float
+    baseline_examples_consumed: int
+    baseline_committed_replay_samples: int
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "schema_version": UTD_SEGMENT_SCHEMA_VERSION,
+            "run_id": self.run_id,
+            "generation_family": self.generation_family,
+            "target_updates_per_new_sample": self.target_updates_per_new_sample,
+            "baseline_examples_consumed": self.baseline_examples_consumed,
+            "baseline_committed_replay_samples": (
+                self.baseline_committed_replay_samples
+            ),
+        }
+
+
+@dataclass(slots=True)
+class ReplayWindowSession:
+    selection: ReplaySelection
+    loader: DataLoader | None
+    prefetcher: DeviceBatchPrefetcher | None
+    batches_allocated: int
+    effective_workers: int
+    setup_seconds: float
+    refresh_reason: str
+    opened_step: int
+    opened_epoch: int
+    active_rings: tuple[int, ...]
+    ring_weights: tuple[tuple[int, float], ...] | None
+    recovery_boundary: int | None
+    ring_weight_boundary: int | None
+    batches_consumed: int = 0
+    reuse_spins: int = 0
+    utd_wait_spins: int = 0
+    pause_generation: int = 0
+    suspended: bool = False
+    closed: bool = False
+
+    @property
+    def batches_remaining(self) -> int:
+        return self.batches_allocated - self.batches_consumed
+
+    def next_batch(self) -> ReplayBatch:
+        if self.closed or self.prefetcher is None:
+            raise RuntimeError("replay window is closed")
+        if self.suspended:
+            raise RuntimeError("replay window is suspended")
+        return next(self.prefetcher)
+
+    def pop_copy_events(self) -> list[tuple[torch.cuda.Event, torch.cuda.Event]]:
+        if self.prefetcher is None:
+            return []
+        return self.prefetcher.pop_copy_events()
+
+    def shutdown(self, *, strict: bool = True) -> BaseException | None:
+        if self.closed:
+            return None
+        loader = self.loader
+        prefetcher = self.prefetcher
+        failure: BaseException | None = None
+        prefetcher_closed_iterator = False
+        try:
+            try:
+                if prefetcher is not None:
+                    close = getattr(prefetcher, "close", None)
+                    if callable(close):
+                        close_result = close(strict=False)
+                        if close_result is not None and not isinstance(
+                            close_result, BaseException
+                        ):
+                            raise TypeError(
+                                "device prefetcher close returned an invalid result"
+                            )
+                        failure = close_result
+                        prefetcher_closed_iterator = True
+                    else:
+                        stream = getattr(prefetcher, "_stream", None)
+                        if stream is not None:
+                            stream.synchronize()
+            except BaseException as exc:
+                failure = exc
+            if not prefetcher_closed_iterator:
+                try:
+                    iterator = getattr(loader, "_iterator", None)
+                    if iterator is None:
+                        iterator = getattr(prefetcher, "_batches", None)
+                    shutdown_workers = getattr(iterator, "_shutdown_workers", None)
+                    if callable(shutdown_workers):
+                        shutdown_workers()
+                except BaseException as exc:
+                    if failure is None:
+                        failure = exc
+        finally:
+            self.prefetcher = None
+            self.loader = None
+            self.suspended = False
+            self.closed = True
+        if failure is not None and strict:
+            raise failure
+        return failure
+
+    def suspend_for_gpu_pause(self) -> int:
+        if self.closed:
+            raise RuntimeError("cannot suspend a closed replay window")
+        if self.suspended:
+            return self.pause_generation
+        if self.prefetcher is not None:
+            self.prefetcher.suspend_device()
+        self.pause_generation += 1
+        self.suspended = True
+        return self.pause_generation
+
+    def resume_after_gpu_pause(self) -> int:
+        if self.closed:
+            raise RuntimeError("cannot resume a closed replay window")
+        if not self.suspended:
+            return self.pause_generation
+        if self.prefetcher is not None:
+            self.prefetcher.resume_device()
+        self.suspended = False
+        return self.pause_generation
+
+
 def plateau_policy_decision(
     *,
     lag_steps: int,
@@ -539,6 +691,7 @@ class ImmutableModelPublisher:
         config: dict[str, object],
         examples_consumed: int | None = None,
         global_batch_size: int | None = None,
+        utd_segment: Mapping[str, object] | None = None,
     ) -> ModelManifest:
         if self.candidate_path.is_file():
             try:
@@ -575,6 +728,7 @@ class ImmutableModelPublisher:
                     if examples_consumed is not None
                     else {}
                 ),
+                **({"utd_segment": dict(utd_segment)} if utd_segment else {}),
             },
         )
         checkpoint_sha256 = sha256_file(staged)
@@ -678,11 +832,29 @@ class LearnerLoop:
         if world_size <= 0 or rank < 0 or rank >= world_size:
             raise ValueError("invalid learner distributed rank")
         self.store = store
+        learner_config = replace(
+            learner_config,
+            device=resolve_device_string(learner_config.device),
+        )
         self.model = model.to(learner_config.device)
         self.optimizer = optimizer
         self.scheduler = scheduler
         self.ema = ema
         self.learner_config = learner_config
+        device = next(self.model.parameters()).device
+        enable_fast_math(device)
+        # "auto" precision/compile and CUDA-only dataloader features resolve
+        # against the device the model actually lives on.
+        train_config = replace(
+            train_config,
+            precision=resolve_precision(train_config.precision, device),
+            compile=resolve_compile(train_config.compile, device),
+        )
+        data_config = replace(
+            data_config,
+            pin_memory=resolve_pin_memory(data_config.pin_memory, device),
+            workers=resolve_loader_workers(data_config.workers),
+        )
         self.train_config = train_config
         self.data_config = data_config
         self.loss_weights = loss_weights
@@ -701,6 +873,11 @@ class LearnerLoop:
         self.world_size = world_size
         self.store.register_run(run_identity)
         output_root = Path(output_directory)
+        self.utd_segment_path = output_root / UTD_SEGMENT_FILENAME
+        self._utd_segment_state: UTDSegmentState | None = None
+        self._resume_utd_segment_state: UTDSegmentState | None = None
+        self._resume_utd_target: object = _UNSET
+        self._segment_baseline_examples = 0
         self.publisher = ImmutableModelPublisher(output_root, run_identity)
         self.selfplay_publisher = (
             ImmutableModelPublisher(output_root / "selfplay", run_identity)
@@ -708,6 +885,8 @@ class LearnerLoop:
             else None
         )
         self.cadence_path = output_root / "cadence.json"
+        self.state_rebase_path = output_root / STATE_REBASE_FILENAME
+        self.state_rebase_pending_path = output_root / STATE_REBASE_PENDING_FILENAME
         self._last_candidate_examples: int | None = None
         self._last_selfplay_examples: int | None = None
         self.metrics = JSONLMetrics(output_root / "metrics.jsonl")
@@ -726,6 +905,7 @@ class LearnerLoop:
         self.examples_consumed = 0
         self._last_recovery_step = 0
         self._latest_total_replay_samples = 0
+        self._gpu_pause_generation = 0
         # Replay batches are fixed-size and ring-homogeneous. Static compilation
         # avoids Inductor's dynamic backward reductions (which fail on variable
         # graph lengths) while allowing one cached graph per encountered ring.
@@ -765,10 +945,14 @@ class LearnerLoop:
         rank: int = 0,
         world_size: int = 1,
     ) -> "LearnerLoop":
-        torch.manual_seed(config.train.seed)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(config.train.seed)
-        model = GraphResTNet(config.model).to(config.learner.device)
+        seed_all(config.train.seed)
+        learner_device = resolve_device_string(config.learner.device)
+        if learner_device != config.learner.device:
+            config = replace(
+                config,
+                learner=replace(config.learner, device=learner_device),
+            )
+        model = GraphResTNet(config.model).to(learner_device)
         optimizer = build_optimizer(model, config.optimizer)
         scheduler = build_scheduler(optimizer, config.train.scheduler)
         ema = ExponentialMovingAverage(model, decay=config.train.ema_decay)
@@ -819,12 +1003,101 @@ class LearnerLoop:
             expected_generation_family=self.run_identity.generation_family,
             expected_sha256=expected_sha256,
             expected_bytes=expected_bytes,
-            metadata_validator=self._resume_examples_consumed,
+            metadata_validator=self._validate_resume_metadata,
         )
+        resume_utd_target = self._checkpoint_utd_target(metadata)
+        resume_utd_segment = self._checkpoint_utd_segment(metadata)
         self.step = int(metadata["step"])
         self.epoch = int(metadata["epoch"])
         self.examples_consumed = self._resume_examples_consumed(metadata)
+        self._segment_baseline_examples = self._checkpoint_segment_baseline(
+            metadata,
+            examples_consumed=self.examples_consumed,
+        )
+        self._resume_utd_target = resume_utd_target
+        self._resume_utd_segment_state = resume_utd_segment
         self._last_recovery_step = self.step
+
+    def _validate_resume_metadata(self, metadata: Mapping[str, object]) -> None:
+        examples_consumed = self._resume_examples_consumed(metadata)
+        self._checkpoint_segment_baseline(
+            metadata,
+            examples_consumed=examples_consumed,
+        )
+        checkpoint_target = self._checkpoint_utd_target(metadata)
+        segment = self._checkpoint_utd_segment(metadata)
+        if segment is not None and (
+            segment.run_id != self.run_identity.run_id
+            or segment.generation_family != self.run_identity.generation_family
+        ):
+            raise ValueError("checkpoint UTD segment run identity does not match")
+        if (
+            segment is not None
+            and checkpoint_target is not None
+            and segment.target_updates_per_new_sample != checkpoint_target
+        ):
+            raise ValueError("checkpoint UTD segment target does not match its profile")
+        if (
+            segment is not None
+            and segment.baseline_examples_consumed > examples_consumed
+        ):
+            raise ValueError(
+                "checkpoint examples_consumed precedes its UTD segment baseline"
+            )
+
+    @staticmethod
+    def _checkpoint_segment_baseline(
+        metadata: Mapping[str, object],
+        *,
+        examples_consumed: int,
+    ) -> int:
+        extra = metadata.get("extra")
+        training_segment = (
+            extra.get("training_segment") if isinstance(extra, Mapping) else None
+        )
+        if training_segment is None:
+            return 0
+        if not isinstance(training_segment, Mapping):
+            raise ValueError("checkpoint training segment must be a mapping")
+        baseline = training_segment.get("baseline_examples_consumed")
+        if (
+            isinstance(baseline, bool)
+            or not isinstance(baseline, int)
+            or baseline < 0
+            or baseline > examples_consumed
+        ):
+            raise ValueError("checkpoint training segment baseline is invalid")
+        return baseline
+
+    @staticmethod
+    def _checkpoint_utd_target(metadata: Mapping[str, object]) -> float | None:
+        config = metadata.get("config")
+        learner = config.get("learner") if isinstance(config, Mapping) else None
+        value = (
+            learner.get("target_updates_per_new_sample")
+            if isinstance(learner, Mapping)
+            else None
+        )
+        if value is None:
+            return None
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, int | float)
+            or not math.isfinite(float(value))
+            or value <= 0
+        ):
+            raise ValueError("checkpoint update-to-data target is invalid")
+        return float(value)
+
+    @staticmethod
+    def _checkpoint_utd_segment(
+        metadata: Mapping[str, object],
+    ) -> UTDSegmentState | None:
+        extra = metadata.get("extra")
+        payload = extra.get("utd_segment") if isinstance(extra, Mapping) else None
+        if payload is None:
+            return None
+        return LearnerLoop._parse_utd_segment_state(payload)
 
     def _resume_examples_consumed(self, metadata: Mapping[str, object]) -> int:
         extra = metadata.get("extra")
@@ -863,6 +1136,9 @@ class LearnerLoop:
             else (None if self.learner_config.unlimited else self.learner_config.steps)
         )
         completion_path = self.publisher.root / "learner-complete.json"
+        self._recover_pending_state_rebase()
+        if self.learner_config.target_updates_per_new_sample is not None:
+            self._ensure_utd_segment_state()
         if self.rank == 0 and (target is None or self.step < target):
             completion_path.unlink(missing_ok=True)
         if self.rank == 0 and not self.publisher.candidate_path.is_file():
@@ -878,228 +1154,387 @@ class LearnerLoop:
         interval_cpu_device_seconds = 0.0
         interval_device_events: list[tuple[torch.cuda.Event, torch.cuda.Event]] = []
         interval_copy_events: list[tuple[torch.cuda.Event, torch.cuda.Event]] = []
-        while target is None or self.step < target:
-            if self._collective_stop(stop_requested()):
-                break
-            if not self._gpu_pause_control(
-                stop_requested=stop_requested, progress=progress
-            ):
-                break
-            if not self._plateau_control(
-                stop_requested=stop_requested, progress=progress
-            ):
-                break
-            if progress is not None and self.rank == 0:
-                progress(phase="replay_wait", step=self.step, epoch=self.epoch)
-            if not self._wait_for_replay(
-                stop_requested=stop_requested, progress=progress
-            ):
-                break
-            selection = self._select_replay_spans()
-            maximum_batches = self._maximum_unique_batches(selection)
-            target_budget = (
-                self.learner_config.steps_per_window
-                if target is None
-                else target - self.step
-            )
-            next_weight_step = self.ring_mixture_config.next_weight_step(self.step)
-            weight_budget = (
-                self.learner_config.steps_per_window
-                if next_weight_step is None
-                else next_weight_step - self.step
-            )
-            recovery_interval = self.learner_config.recovery_interval_steps
-            recovery_budget = (
-                self.learner_config.steps_per_window
-                if recovery_interval is None
-                else max(
-                    1,
-                    self._last_recovery_step + recovery_interval - self.step,
+        window: ReplayWindowSession | None = None
+        next_refresh_reason = "initial"
+        exit_reason = "stop"
+
+        def close_active_window(reason: str) -> None:
+            nonlocal next_refresh_reason, window
+            if window is not None:
+                self._close_replay_window(window, reason=reason)
+                window = None
+            next_refresh_reason = reason
+
+        def suspend_active_window() -> int | None:
+            if window is None:
+                return None
+            started = time.perf_counter()
+            generation = window.suspend_for_gpu_pause()
+            if self.rank == 0:
+                self.metrics.append(
+                    {
+                        "schema_version": 1,
+                        "timestamp_ns": time.time_ns(),
+                        "worker": "learner",
+                        "event": "replay_window_suspended",
+                        "step": self.step,
+                        "epoch": self.epoch,
+                        "pause_generation": generation,
+                        "window_batches_allocated": window.batches_allocated,
+                        "window_batches_consumed": window.batches_consumed,
+                        "suspend_seconds": time.perf_counter() - started,
+                    }
                 )
-            )
-            batches = min(
-                self.learner_config.steps_per_window,
-                target_budget,
-                weight_budget,
-                recovery_budget,
-                maximum_batches,
-                self._plateau_step_budget(),
-                self._utd_step_budget(),
-            )
-            batches = self._collective_min_int(batches)
-            if batches <= 0:
-                if progress is not None and self.rank == 0:
-                    progress(
-                        phase="update_to_data_wait",
-                        step=self.step,
-                        examples_consumed=self.examples_consumed,
-                        replay_samples=self._latest_total_replay_samples,
-                        target_updates_per_new_sample=(
-                            self.learner_config.target_updates_per_new_sample
-                        ),
-                    )
-                time.sleep(self.learner_config.replay_poll_seconds)
-                continue
-            watermark_name = f"learner-{self.run_identity.run_id}"
+            return generation
+
+        def resume_active_window() -> int | None:
+            if window is None:
+                return None
+            started = time.perf_counter()
+            generation = window.resume_after_gpu_pause()
             if self.rank == 0:
-                self.store.set_gc_watermark(watermark_name, selection)
-            setup_started = time.perf_counter()
-            loader = self._loader(selection, batches=batches)
-            device = next(self.model.parameters()).device
-            prefetcher = DeviceBatchPrefetcher(
-                loader,
-                device=device,
-                enabled=self.data_config.pin_memory,
-            )
-            batch_iterator = iter(prefetcher)
-            if self.rank == 0:
-                interval_window_setup_seconds += time.perf_counter() - setup_started
-            while True:
-                data_wait_started = time.perf_counter()
-                try:
-                    batch = next(batch_iterator)
-                except StopIteration:
-                    break
-                if self.rank == 0:
-                    interval_data_wait_seconds += (
-                        time.perf_counter() - data_wait_started
-                    )
-                consumed_copy_events = prefetcher.pop_copy_events()
-                if self.rank == 0:
-                    interval_copy_events.extend(consumed_copy_events)
-                if not self._gpu_pause_control(
-                    stop_requested=stop_requested, progress=progress
-                ):
-                    break
+                self.metrics.append(
+                    {
+                        "schema_version": 1,
+                        "timestamp_ns": time.time_ns(),
+                        "worker": "learner",
+                        "event": "replay_window_resumed",
+                        "step": self.step,
+                        "epoch": self.epoch,
+                        "pause_generation": generation,
+                        "window_batches_allocated": window.batches_allocated,
+                        "window_batches_consumed": window.batches_consumed,
+                        "resume_seconds": time.perf_counter() - started,
+                    }
+                )
+            return generation
+
+        try:
+            while target is None or self.step < target:
                 if self._collective_stop(stop_requested()):
+                    exit_reason = "stop"
                     break
-                step_started = time.perf_counter()
-                device_events: tuple[torch.cuda.Event, torch.cuda.Event] | None = None
-                if self.rank == 0 and device.type == "cuda":
-                    device_events = (
-                        torch.cuda.Event(enable_timing=True),
-                        torch.cuda.Event(enable_timing=True),
-                    )
-                    device_events[0].record()
-                result = train_step(
-                    self.compiled_model,
-                    batch,
-                    self.optimizer,
-                    loss_weights=self.loss_weights,
-                    precision=self.train_config.precision,
-                    gradient_clip_norm=self.train_config.gradient_clip_norm,
-                    scheduler=self.scheduler,
-                    ema=self.ema,
-                    trusted_batch=True,
-                )
-                if device_events is not None:
-                    device_events[1].record()
-                    interval_device_events.append(device_events)
-                elif self.rank == 0:
-                    interval_cpu_device_seconds += time.perf_counter() - step_started
-                self.step += 1
-                self.examples_consumed += self.train_config.global_batch_size(
-                    self.world_size
-                )
-                if self.rank == 0:
-                    interval_steps += 1
-                if (
-                    self.rank == 0
-                    and self.step % self.learner_config.metrics_interval == 0
+                if not self._gpu_pause_control(
+                    stop_requested=stop_requested,
+                    progress=progress,
+                    on_pause=suspend_active_window,
+                    on_resume=resume_active_window,
                 ):
-                    host_metrics = result.to_host()
-                    h2d_seconds = (
-                        sum(
-                            started.elapsed_time(completed)
-                            for started, completed in interval_copy_events
+                    exit_reason = "stop"
+                    break
+                if not self._plateau_control(
+                    stop_requested=stop_requested,
+                    progress=progress,
+                    on_boundary=lambda: close_active_window("plateau"),
+                ):
+                    exit_reason = "stop"
+                    break
+                if target is not None and self.step >= target:
+                    exit_reason = "target"
+                    break
+
+                if window is not None:
+                    refresh_reason = self._window_refresh_reason(window, target=target)
+                    if refresh_reason is not None:
+                        close_active_window(refresh_reason)
+                        if refresh_reason == "target":
+                            exit_reason = "target"
+                            break
+                        continue
+
+                window_reused = window is not None
+                if window is None:
+                    if progress is not None and self.rank == 0:
+                        progress(
+                            phase="replay_wait",
+                            step=self.step,
+                            epoch=self.epoch,
                         )
-                        / 1_000.0
+                    if not self._wait_for_replay(
+                        stop_requested=stop_requested,
+                        progress=progress,
+                    ):
+                        exit_reason = "stop"
+                        break
+                    self._synchronize_last_recovery_step()
+                    selection = self._select_replay_spans()
+                    batches = self._window_allocation_budget(
+                        selection,
+                        target=target,
                     )
-                    device_seconds = (
-                        interval_cpu_device_seconds
-                        + sum(
-                            started.elapsed_time(completed)
-                            for started, completed in interval_device_events
+                    batches = self._collective_min_int(batches)
+                    if batches <= 0:
+                        if target is not None and self.step >= target:
+                            exit_reason = "target"
+                            break
+                        if progress is not None and self.rank == 0:
+                            progress(
+                                phase="replay_wait",
+                                step=self.step,
+                                epoch=self.epoch,
+                                reason="invalid_window_capacity",
+                            )
+                        time.sleep(self.learner_config.replay_poll_seconds)
+                        next_refresh_reason = "invalid_capacity"
+                        continue
+                    window = self._open_replay_window(
+                        selection,
+                        batches=batches,
+                        refresh_reason=next_refresh_reason,
+                    )
+                    if self.rank == 0:
+                        interval_window_setup_seconds += window.setup_seconds
+                    window_reused = False
+
+                spin_window = window
+                if window_reused:
+                    spin_window.reuse_spins += 1
+                consume_budget = self._window_consumption_budget(
+                    spin_window,
+                    target=target,
+                )
+                if consume_budget <= 0:
+                    refresh_reason = self._window_refresh_reason(
+                        spin_window,
+                        target=target,
+                    )
+                    if refresh_reason is not None:
+                        close_active_window(refresh_reason)
+                        if refresh_reason == "target":
+                            exit_reason = "target"
+                            break
+                        continue
+                    spin_window.utd_wait_spins += 1
+                    if progress is not None and self.rank == 0:
+                        progress(
+                            phase="update_to_data_wait",
+                            step=self.step,
+                            examples_consumed=self.examples_consumed,
+                            replay_samples=self._latest_total_replay_samples,
+                            target_updates_per_new_sample=(
+                                self.learner_config.target_updates_per_new_sample
+                            ),
+                            window_batches_allocated=(spin_window.batches_allocated),
+                            window_batches_consumed=(spin_window.batches_consumed),
+                            window_reuse=True,
                         )
-                        / 1_000.0
+                    time.sleep(self.learner_config.replay_poll_seconds)
+                    continue
+
+                consumed_this_spin = 0
+                stop_training = False
+                device = next(self.model.parameters()).device
+                for _ in range(consume_budget):
+                    if self._collective_stop(stop_requested()):
+                        exit_reason = "stop"
+                        stop_training = True
+                        break
+                    if not self._gpu_pause_control(
+                        stop_requested=stop_requested,
+                        progress=progress,
+                        on_pause=suspend_active_window,
+                        on_resume=resume_active_window,
+                    ):
+                        exit_reason = "stop"
+                        stop_training = True
+                        break
+                    if window is not spin_window or spin_window.closed:
+                        break
+                    data_wait_started = time.perf_counter()
+                    try:
+                        batch = spin_window.next_batch()
+                    except StopIteration as exc:
+                        if spin_window.batches_remaining:
+                            raise RuntimeError(
+                                "replay window iterator exhausted early"
+                            ) from exc
+                        break
+                    if self.rank == 0:
+                        interval_data_wait_seconds += (
+                            time.perf_counter() - data_wait_started
+                        )
+                        interval_copy_events.extend(spin_window.pop_copy_events())
+                    step_started = time.perf_counter()
+                    device_events: tuple[torch.cuda.Event, torch.cuda.Event] | None = (
+                        None
                     )
-                    measured_at = time.perf_counter()
-                    wall_seconds = measured_at - interval_started
-                    measured_steps = max(1, interval_steps)
-                    global_batch_size = self.train_config.global_batch_size(
+                    if self.rank == 0 and device.type == "cuda":
+                        device_events = (
+                            torch.cuda.Event(enable_timing=True),
+                            torch.cuda.Event(enable_timing=True),
+                        )
+                        device_events[0].record()
+                    result = train_step(
+                        self.compiled_model,
+                        batch,
+                        self.optimizer,
+                        loss_weights=self.loss_weights,
+                        precision=self.train_config.precision,
+                        gradient_clip_norm=self.train_config.gradient_clip_norm,
+                        scheduler=self.scheduler,
+                        ema=self.ema,
+                        trusted_batch=True,
+                    )
+                    if device_events is not None:
+                        device_events[1].record()
+                        interval_device_events.append(device_events)
+                    elif self.rank == 0:
+                        interval_cpu_device_seconds += (
+                            time.perf_counter() - step_started
+                        )
+                    self.step += 1
+                    spin_window.batches_consumed += 1
+                    consumed_this_spin += 1
+                    self.examples_consumed += self.train_config.global_batch_size(
                         self.world_size
                     )
-                    self.metrics.append(
-                        {
-                            "schema_version": 1,
-                            "timestamp_ns": time.time_ns(),
-                            "worker": "learner",
-                            "step": self.step,
-                            "epoch": self.epoch,
-                            "world_size": self.world_size,
-                            "losses": host_metrics.losses,
-                            "gradient_norm": host_metrics.gradient_norm,
-                            "learning_rates": host_metrics.learning_rates,
-                            "step_seconds": wall_seconds / measured_steps,
-                            "examples_per_second": (
-                                global_batch_size * measured_steps / wall_seconds
-                            ),
-                            "device_step_seconds": (device_seconds / measured_steps),
-                            "device_examples_per_second": (
-                                global_batch_size * measured_steps / device_seconds
-                                if device_seconds
-                                else None
-                            ),
-                            "data_wait_seconds": (
-                                interval_data_wait_seconds / measured_steps
-                            ),
-                            "h2d_seconds": h2d_seconds / measured_steps,
-                            "window_setup_seconds": (
-                                interval_window_setup_seconds / measured_steps
-                            ),
-                            "metrics_interval_steps": measured_steps,
-                            "metrics_interval_wall_seconds": wall_seconds,
-                            "examples_consumed": self.examples_consumed,
-                            "total_replay_samples": (self._latest_total_replay_samples),
-                            "updates_per_new_sample": (
-                                self.examples_consumed
-                                / self._latest_total_replay_samples
-                                if self._latest_total_replay_samples
-                                else None
-                            ),
-                            "feature_path": batch.feature_path,
-                            "replay_samples": selection.sample_count,
-                            "replay_samples_by_ring": selection.samples_by_ring,
-                            "ring_batch_weights": self._active_ring_weights(),
-                            "replay_max_shard_id": selection.max_shard_id,
-                            "effective_unique_samples": (
-                                batches
-                                * self.train_config.global_batch_size(self.world_size)
-                            ),
-                            "per_rank_batch_size": (
-                                self.train_config.per_rank_batch_size
-                            ),
-                            "global_batch_size": (
-                                self.train_config.global_batch_size(self.world_size)
-                            ),
-                        }
+                    if self.rank == 0:
+                        interval_steps += 1
+                    if (
+                        self.rank == 0
+                        and self.step % self.learner_config.metrics_interval == 0
+                    ):
+                        host_metrics = result.to_host()
+                        h2d_seconds = (
+                            sum(
+                                started.elapsed_time(completed)
+                                for started, completed in interval_copy_events
+                            )
+                            / 1_000.0
+                        )
+                        device_seconds = (
+                            interval_cpu_device_seconds
+                            + sum(
+                                started.elapsed_time(completed)
+                                for started, completed in interval_device_events
+                            )
+                            / 1_000.0
+                        )
+                        measured_at = time.perf_counter()
+                        wall_seconds = measured_at - interval_started
+                        measured_steps = max(1, interval_steps)
+                        global_batch_size = self.train_config.global_batch_size(
+                            self.world_size
+                        )
+                        self.metrics.append(
+                            {
+                                "schema_version": 1,
+                                "timestamp_ns": time.time_ns(),
+                                "worker": "learner",
+                                "step": self.step,
+                                "epoch": self.epoch,
+                                "world_size": self.world_size,
+                                "losses": host_metrics.losses,
+                                "gradient_norm": host_metrics.gradient_norm,
+                                "learning_rates": host_metrics.learning_rates,
+                                "step_seconds": wall_seconds / measured_steps,
+                                "examples_per_second": (
+                                    global_batch_size * measured_steps / wall_seconds
+                                ),
+                                "device_step_seconds": (
+                                    device_seconds / measured_steps
+                                ),
+                                "device_examples_per_second": (
+                                    global_batch_size * measured_steps / device_seconds
+                                    if device_seconds
+                                    else None
+                                ),
+                                "data_wait_seconds": (
+                                    interval_data_wait_seconds / measured_steps
+                                ),
+                                "h2d_seconds": h2d_seconds / measured_steps,
+                                "window_setup_seconds": (
+                                    interval_window_setup_seconds / measured_steps
+                                ),
+                                "window_setup_amortized_seconds": (
+                                    spin_window.setup_seconds
+                                    / spin_window.batches_allocated
+                                ),
+                                "window_batches_allocated": (
+                                    spin_window.batches_allocated
+                                ),
+                                "window_batches_consumed": (
+                                    spin_window.batches_consumed
+                                ),
+                                "window_batches_consumed_this_spin": (
+                                    consumed_this_spin
+                                ),
+                                "window_reuse": window_reused,
+                                "window_reuse_spins": spin_window.reuse_spins,
+                                "window_refresh_reason": (spin_window.refresh_reason),
+                                "loader_workers_effective": (
+                                    spin_window.effective_workers
+                                ),
+                                "utd_wait_spins": spin_window.utd_wait_spins,
+                                "metrics_interval_steps": measured_steps,
+                                "metrics_interval_wall_seconds": wall_seconds,
+                                "examples_consumed": self.examples_consumed,
+                                "total_replay_samples": (
+                                    self._latest_total_replay_samples
+                                ),
+                                **self._utd_metric_values(),
+                                "feature_path": batch.feature_path,
+                                "replay_samples": (spin_window.selection.sample_count),
+                                "replay_samples_by_ring": (
+                                    spin_window.selection.samples_by_ring
+                                ),
+                                "ring_batch_weights": (self._active_ring_weights()),
+                                "replay_max_shard_id": (
+                                    spin_window.selection.max_shard_id
+                                ),
+                                "effective_unique_samples": (
+                                    spin_window.batches_allocated * global_batch_size
+                                ),
+                                "per_rank_batch_size": (
+                                    self.train_config.per_rank_batch_size
+                                ),
+                                "global_batch_size": global_batch_size,
+                            }
+                        )
+                        interval_started = measured_at
+                        interval_steps = 0
+                        interval_data_wait_seconds = 0.0
+                        interval_window_setup_seconds = 0.0
+                        interval_cpu_device_seconds = 0.0
+                        interval_device_events.clear()
+                        interval_copy_events.clear()
+                    if self.rank == 0:
+                        self._publish_due_models()
+                    if progress is not None and self.rank == 0:
+                        progress(
+                            phase="training",
+                            step=self.step,
+                            epoch=self.epoch,
+                        )
+                    if target is not None and self.step >= target:
+                        break
+
+                if consumed_this_spin and self.rank == 0:
+                    self._record_window_consumption(
+                        spin_window,
+                        consumed=consumed_this_spin,
+                        reused=window_reused,
                     )
-                    interval_started = measured_at
-                    interval_steps = 0
-                    interval_data_wait_seconds = 0.0
-                    interval_window_setup_seconds = 0.0
-                    interval_cpu_device_seconds = 0.0
-                    interval_device_events.clear()
-                    interval_copy_events.clear()
-                if self.rank == 0:
-                    self._publish_due_models()
-                if progress is not None and self.rank == 0:
-                    progress(phase="training", step=self.step, epoch=self.epoch)
-            if self.rank == 0:
-                self.store.clear_gc_watermark(watermark_name)
-                self._maybe_write_recovery_checkpoint()
-                self._maybe_collect_replay_garbage()
-            self.epoch += 1
+                if stop_training:
+                    break
+                if window is spin_window:
+                    refresh_reason = self._window_completion_reason(
+                        spin_window,
+                        target=target,
+                    )
+                    if refresh_reason is not None:
+                        close_active_window(refresh_reason)
+                        if refresh_reason == "target":
+                            exit_reason = "target"
+                            break
+            else:
+                exit_reason = "target"
+        except BaseException:
+            exit_reason = "error"
+            raise
+        finally:
+            if window is not None:
+                close_active_window(exit_reason)
         if self.rank == 0:
             completed = target is not None and self.step >= target
             if completed:
@@ -1119,6 +1554,311 @@ class LearnerLoop:
                 self._maybe_write_recovery_checkpoint(force=True)
         self._distributed_barrier()
         return self.step
+
+    def _window_allocation_budget(
+        self,
+        selection: ReplaySelection,
+        *,
+        target: int | None,
+    ) -> int:
+        limit = self.learner_config.steps_per_window
+        target_budget = limit if target is None else max(0, target - self.step)
+        next_weight_step = self.ring_mixture_config.next_weight_step(self.step)
+        weight_budget = (
+            limit if next_weight_step is None else max(0, next_weight_step - self.step)
+        )
+        recovery_boundary = self._next_recovery_boundary()
+        recovery_budget = (
+            limit
+            if recovery_boundary is None
+            else max(0, recovery_boundary - self.step)
+        )
+        return min(
+            limit,
+            target_budget,
+            weight_budget,
+            recovery_budget,
+            self._maximum_unique_batches(selection),
+            self._plateau_step_budget(),
+        )
+
+    def _window_consumption_budget(
+        self,
+        window: ReplayWindowSession,
+        *,
+        target: int | None,
+    ) -> int:
+        limit = window.batches_remaining
+        target_budget = limit if target is None else max(0, target - self.step)
+        recovery_budget = (
+            limit
+            if window.recovery_boundary is None
+            else max(0, window.recovery_boundary - self.step)
+        )
+        weight_budget = (
+            limit
+            if window.ring_weight_boundary is None
+            else max(0, window.ring_weight_boundary - self.step)
+        )
+        budget = min(
+            limit,
+            target_budget,
+            recovery_budget,
+            weight_budget,
+            self._plateau_step_budget(),
+            self._utd_step_budget(),
+        )
+        return self._collective_min_int(budget)
+
+    def _open_replay_window(
+        self,
+        selection: ReplaySelection,
+        *,
+        batches: int,
+        refresh_reason: str,
+    ) -> ReplayWindowSession:
+        if batches <= 0:
+            raise ValueError("replay window batches must be positive")
+        watermark_name = self._watermark_name()
+        if self.rank == 0:
+            self.store.set_gc_watermark(watermark_name, selection)
+        setup_started = time.perf_counter()
+        loader: DataLoader | None = None
+        prefetcher: DeviceBatchPrefetcher | None = None
+        try:
+            loader = self._loader(selection, batches=batches)
+            if loader is None:
+                raise RuntimeError("replay loader construction returned no loader")
+            prefetcher = DeviceBatchPrefetcher(
+                loader,
+                device=next(self.model.parameters()).device,
+                enabled=self.data_config.pin_memory,
+            )
+            session = ReplayWindowSession(
+                selection=selection,
+                loader=loader,
+                prefetcher=prefetcher,
+                batches_allocated=batches,
+                effective_workers=loader.num_workers,
+                setup_seconds=time.perf_counter() - setup_started,
+                refresh_reason=refresh_reason,
+                opened_step=self.step,
+                opened_epoch=self.epoch,
+                active_rings=tuple(selection.samples_by_ring),
+                ring_weights=self._ring_weight_fingerprint(),
+                recovery_boundary=self._next_recovery_boundary(),
+                ring_weight_boundary=(
+                    self.ring_mixture_config.next_weight_step(self.step)
+                ),
+            )
+        except BaseException:
+            if loader is not None:
+                failed = ReplayWindowSession(
+                    selection=selection,
+                    loader=loader,
+                    prefetcher=prefetcher,
+                    batches_allocated=batches,
+                    effective_workers=loader.num_workers,
+                    setup_seconds=time.perf_counter() - setup_started,
+                    refresh_reason=refresh_reason,
+                    opened_step=self.step,
+                    opened_epoch=self.epoch,
+                    active_rings=tuple(selection.samples_by_ring),
+                    ring_weights=self._ring_weight_fingerprint(),
+                    recovery_boundary=self._next_recovery_boundary(),
+                    ring_weight_boundary=None,
+                )
+                failed.shutdown(strict=False)
+            if self.rank == 0:
+                self.store.clear_gc_watermark(watermark_name)
+            raise
+        if self.rank == 0:
+            self.metrics.append(
+                {
+                    "schema_version": 1,
+                    "timestamp_ns": time.time_ns(),
+                    "worker": "learner",
+                    "event": "replay_window_allocated",
+                    "step": self.step,
+                    "epoch": self.epoch,
+                    "window_batches_allocated": session.batches_allocated,
+                    "window_batches_consumed": 0,
+                    "loader_workers_effective": session.effective_workers,
+                    "window_refresh_reason": refresh_reason,
+                    "window_setup_seconds": session.setup_seconds,
+                    "window_setup_amortized_seconds": (
+                        session.setup_seconds / session.batches_allocated
+                    ),
+                    "replay_samples": selection.sample_count,
+                    "replay_max_shard_id": selection.max_shard_id,
+                }
+            )
+        return session
+
+    def _close_replay_window(
+        self,
+        window: ReplayWindowSession,
+        *,
+        reason: str,
+    ) -> None:
+        if window.closed:
+            return
+        failure = None
+        try:
+            failure = window.shutdown(strict=False)
+        finally:
+            if self.rank == 0:
+                self.store.clear_gc_watermark(self._watermark_name())
+        if failure is not None and self.rank == 0:
+            self.metrics.append(
+                {
+                    "schema_version": 1,
+                    "timestamp_ns": time.time_ns(),
+                    "worker": "learner",
+                    "event": "replay_window_shutdown_warning",
+                    "step": self.step,
+                    "epoch": self.epoch,
+                    "window_refresh_reason": reason,
+                    "error_type": type(failure).__name__,
+                    "error": str(failure),
+                }
+            )
+        if self.rank == 0:
+            self.metrics.append(
+                {
+                    "schema_version": 1,
+                    "timestamp_ns": time.time_ns(),
+                    "worker": "learner",
+                    "event": "replay_window_refreshed",
+                    "step": self.step,
+                    "epoch": self.epoch,
+                    "window_refresh_reason": reason,
+                    "window_batches_allocated": window.batches_allocated,
+                    "window_batches_consumed": window.batches_consumed,
+                    "window_batches_remaining": window.batches_remaining,
+                    "window_reuse_spins": window.reuse_spins,
+                    "utd_wait_spins": window.utd_wait_spins,
+                    "loader_workers_effective": window.effective_workers,
+                    "window_setup_seconds": window.setup_seconds,
+                    "window_setup_amortized_seconds": (
+                        window.setup_seconds / window.batches_allocated
+                    ),
+                }
+            )
+            self._maybe_write_recovery_checkpoint()
+            self._maybe_collect_replay_garbage()
+        self.epoch += 1
+
+    def _record_window_consumption(
+        self,
+        window: ReplayWindowSession,
+        *,
+        consumed: int,
+        reused: bool,
+    ) -> None:
+        self.metrics.append(
+            {
+                "schema_version": 1,
+                "timestamp_ns": time.time_ns(),
+                "worker": "learner",
+                "event": "replay_window_consumed",
+                "step": self.step,
+                "epoch": self.epoch,
+                "window_batches_allocated": window.batches_allocated,
+                "window_batches_consumed_this_spin": consumed,
+                "window_batches_consumed": window.batches_consumed,
+                "window_batches_remaining": window.batches_remaining,
+                "window_reuse": reused,
+                "window_reuse_spins": window.reuse_spins,
+                "utd_wait_spins": window.utd_wait_spins,
+                "loader_workers_effective": window.effective_workers,
+            }
+        )
+
+    def _window_completion_reason(
+        self,
+        window: ReplayWindowSession,
+        *,
+        target: int | None,
+    ) -> str | None:
+        reason = self._window_refresh_reason(window, target=target)
+        if reason is not None:
+            return reason
+        if window.batches_remaining <= 0:
+            return "window_exhausted"
+        return None
+
+    def _window_refresh_reason(
+        self,
+        window: ReplayWindowSession,
+        *,
+        target: int | None,
+    ) -> str | None:
+        if target is not None and self.step >= target:
+            return "target"
+        if self._ring_weight_fingerprint() != window.ring_weights:
+            return "ring_weight_change"
+        if (
+            window.ring_weight_boundary is not None
+            and self.step >= window.ring_weight_boundary
+        ):
+            return "ring_weight_change"
+        if (
+            window.recovery_boundary is not None
+            and self.step >= window.recovery_boundary
+        ):
+            return "recovery_boundary"
+        if self._plateau_step_budget() <= 0:
+            return "plateau"
+        status = None
+        if self.rank == 0:
+            counts = self._eligible_replay_counts()
+            status = {
+                "active_rings": self._active_replay_rings(counts),
+                "ready": self._replay_is_ready(counts),
+                "paths_present": all(
+                    span.record.path.is_file() for span in window.selection.spans
+                ),
+            }
+        status = self._broadcast_object(status)
+        if not isinstance(status, dict):
+            raise RuntimeError("distributed replay window status is invalid")
+        active_rings = status.get("active_rings")
+        if not isinstance(active_rings, tuple):
+            raise RuntimeError("distributed active replay rings are invalid")
+        if active_rings != window.active_rings:
+            return "curriculum_change"
+        if status.get("ready") is not True or status.get("paths_present") is not True:
+            return "invalid_capacity"
+        return None
+
+    def _ring_weight_fingerprint(
+        self,
+    ) -> tuple[tuple[int, float], ...] | None:
+        weights = self._active_ring_weights()
+        return tuple(sorted(weights.items())) if weights is not None else None
+
+    def _next_recovery_boundary(self) -> int | None:
+        interval = self.learner_config.recovery_interval_steps
+        return None if interval is None else self._last_recovery_step + interval
+
+    def _synchronize_last_recovery_step(self) -> None:
+        value = self._broadcast_object(
+            self._last_recovery_step if self.rank == 0 else None
+        )
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise RuntimeError("distributed recovery step is invalid")
+        self._last_recovery_step = value
+
+    def _watermark_name(self) -> str:
+        return f"learner-{self.run_identity.run_id}"
+
+    def _effective_loader_workers(self, batches: int) -> int:
+        if batches <= 0:
+            raise ValueError("replay window batches must be positive")
+        if batches < self.data_config.min_batches_for_workers:
+            return 0
+        return self.data_config.workers
 
     def _loader(self, selection: ReplaySelection, *, batches: int) -> DataLoader:
         dataset = LazyShardReplayDataset(
@@ -1140,12 +1880,13 @@ class LearnerLoop:
             rank=self.rank,
             world_size=self.world_size,
         )
-        if self.data_config.workers:
+        effective_workers = self._effective_loader_workers(batches)
+        if effective_workers:
             return DataLoader(
                 dataset=dataset,
                 batch_sampler=batch_sampler,
                 collate_fn=collate_replay_samples,
-                num_workers=self.data_config.workers,
+                num_workers=effective_workers,
                 pin_memory=self.data_config.pin_memory,
                 prefetch_factor=self.data_config.prefetch_factor,
                 persistent_workers=True,
@@ -1163,6 +1904,7 @@ class LearnerLoop:
         return self._publish_to(self.publisher)
 
     def _publish_to(self, publisher: ImmutableModelPublisher) -> ModelManifest:
+        utd_segment = self._ensure_utd_segment_state()
         return publisher.publish(
             model=unwrap_model(self.compiled_model),
             optimizer=self.optimizer,
@@ -1173,6 +1915,7 @@ class LearnerLoop:
             config=self.serialized_config,
             examples_consumed=self.examples_consumed,
             global_batch_size=self.train_config.global_batch_size(self.world_size),
+            utd_segment=utd_segment.as_dict() if utd_segment is not None else None,
         )
 
     def _load_cadence_state(self) -> None:
@@ -1207,8 +1950,17 @@ class LearnerLoop:
                 )
             ):
                 raise ValueError("learner cadence counters are invalid")
+            if candidate_examples > self.examples_consumed or (
+                selfplay_examples is not None
+                and selfplay_examples > self.examples_consumed
+            ):
+                raise ValueError(
+                    "learner cadence counters are ahead of restored examples"
+                )
             self._last_candidate_examples = candidate_examples
             self._last_selfplay_examples = selfplay_examples
+            if self.selfplay_publisher is not None and selfplay_examples is None:
+                self._migrate_null_selfplay_cadence(candidate_examples)
             return
 
         self._last_candidate_examples = self._pointer_examples(
@@ -1227,8 +1979,49 @@ class LearnerLoop:
             )
         self._write_cadence_state()
 
+    def _migrate_null_selfplay_cadence(self, candidate_examples: int) -> None:
+        """Idempotently enable self-play snapshots on an existing cadence."""
+
+        if self.selfplay_publisher is None:
+            raise RuntimeError("self-play cadence migration has no publisher")
+        candidate = load_model_manifest(self.publisher.candidate_path)
+        if (
+            candidate.run_id != self.run_identity.run_id
+            or candidate.generation_family != self.run_identity.generation_family
+        ):
+            raise ValueError("candidate pointer belongs to another run")
+        pointer = self.selfplay_publisher.candidate_path
+        if pointer.is_file():
+            existing = load_model_manifest(pointer)
+            if (
+                existing.run_id != self.run_identity.run_id
+                or existing.generation_family != self.run_identity.generation_family
+            ):
+                raise ValueError("self-play pointer belongs to another run")
+        else:
+            write_model_pointer(pointer, candidate, role="candidate")
+        self._last_selfplay_examples = candidate_examples
+        self._write_cadence_state()
+
     def _pointer_examples(self, pointer: Path) -> int:
         manifest = load_model_manifest(pointer)
+        metadata = inspect_checkpoint(
+            manifest.checkpoint,
+            expected_run_id=manifest.run_id,
+            expected_generation_family=manifest.generation_family,
+            expected_sha256=manifest.checkpoint_sha256,
+            expected_bytes=manifest.checkpoint_bytes,
+        )
+        extra = metadata.get("extra")
+        examples = (
+            extra.get("examples_consumed") if isinstance(extra, Mapping) else None
+        )
+        if (
+            isinstance(examples, int)
+            and not isinstance(examples, bool)
+            and examples >= 0
+        ):
+            return examples
         return manifest.model_step * self.train_config.global_batch_size(
             self.world_size
         )
@@ -1236,6 +2029,11 @@ class LearnerLoop:
     def _write_cadence_state(self) -> None:
         if self._last_candidate_examples is None:
             raise RuntimeError("candidate cadence was not initialized")
+        if self._last_candidate_examples > self.examples_consumed or (
+            self._last_selfplay_examples is not None
+            and self._last_selfplay_examples > self.examples_consumed
+        ):
+            raise ValueError("cannot persist cadence ahead of learner examples")
         atomic_json(
             self.cadence_path,
             {
@@ -1255,7 +2053,7 @@ class LearnerLoop:
         warmup = self.learner_config.selfplay_snapshot_warmup_interval_examples
         if (
             warmup is not None
-            and self.examples_consumed
+            and self.examples_consumed - self._segment_baseline_examples
             < self.learner_config.selfplay_snapshot_warmup_examples
         ):
             return warmup
@@ -1365,6 +2163,7 @@ class LearnerLoop:
             or self.step - self._last_recovery_step < interval
         ):
             return None
+        utd_segment = self._ensure_utd_segment_state()
         recovery = write_recovery_checkpoint(
             self.publisher.root,
             model=unwrap_model(self.compiled_model),
@@ -1378,6 +2177,7 @@ class LearnerLoop:
             generation_family=self.run_identity.generation_family,
             examples_consumed=self.examples_consumed,
             global_batch_size=self.train_config.global_batch_size(self.world_size),
+            utd_segment=utd_segment.as_dict() if utd_segment is not None else None,
         )
         self._last_recovery_step = self.step
         self.metrics.append(
@@ -1545,6 +2345,427 @@ class LearnerLoop:
             return sum(count // batch for count in counts.values())
         return sum(counts.values()) // batch
 
+    def _recover_pending_state_rebase(self) -> None:
+        outcome: dict[str, object] | None = None
+        if self.rank == 0:
+            try:
+                if self.state_rebase_pending_path.is_file():
+                    payload = json.loads(
+                        self.state_rebase_pending_path.read_text(encoding="utf-8")
+                    )
+                    state, candidate, selfplay = self._parse_state_rebase(payload)
+                    self._rank_zero_complete_state_rebase(
+                        payload,
+                        state=state,
+                        candidate_examples=candidate,
+                        selfplay_examples=selfplay,
+                    )
+                    outcome = {"recovered": True, "state": payload}
+                else:
+                    outcome = {"recovered": False}
+            except (OSError, ValueError, json.JSONDecodeError) as exc:
+                outcome = {"error": str(exc)}
+        broadcast = self._broadcast_object(outcome)
+        if not isinstance(broadcast, dict):
+            raise RuntimeError("distributed state-rebase recovery is invalid")
+        error = broadcast.get("error")
+        if isinstance(error, str):
+            raise ValueError(f"cannot recover learner state rebase: {error}")
+        if broadcast.get("recovered") is not True:
+            return
+        state_payload = broadcast.get("state")
+        state, candidate, selfplay = self._parse_state_rebase(state_payload)
+        self._utd_segment_state = state
+        self._resume_utd_segment_state = state
+        self._last_candidate_examples = candidate
+        self._last_selfplay_examples = selfplay
+        to_examples = (
+            state_payload.get("to_examples_consumed")
+            if isinstance(state_payload, Mapping)
+            else None
+        )
+        if isinstance(to_examples, bool) or not isinstance(to_examples, int):
+            raise ValueError("recovered state rebase examples are invalid")
+        self._segment_baseline_examples = to_examples
+
+    def _rebase_state_after_rewind(
+        self,
+        *,
+        previous_step: int,
+        previous_examples: int,
+        reason: str,
+    ) -> None:
+        """Start a new cadence/UTD segment after a checkpoint rewind."""
+
+        if self.examples_consumed >= previous_examples:
+            return
+        outcome: dict[str, object] | None = None
+        if self.rank == 0:
+            try:
+                target = self.learner_config.target_updates_per_new_sample
+                state = None
+                committed_samples = 0
+                if target is not None:
+                    if not self.store.committed_sample_history_is_complete(
+                        run_id=self.run_identity.run_id,
+                        generation_family=self.run_identity.generation_family,
+                    ):
+                        raise ValueError(
+                            "cannot rebase UTD without complete committed-sample "
+                            "history"
+                        )
+                    committed_samples = self.store.total_committed_sample_count(
+                        run_id=self.run_identity.run_id,
+                        generation_family=self.run_identity.generation_family,
+                    )
+                    state = UTDSegmentState(
+                        run_id=self.run_identity.run_id,
+                        generation_family=self.run_identity.generation_family,
+                        target_updates_per_new_sample=float(target),
+                        baseline_examples_consumed=self.examples_consumed,
+                        baseline_committed_replay_samples=committed_samples,
+                    )
+                candidate_examples = self.examples_consumed
+                selfplay_examples = (
+                    self.examples_consumed
+                    if self.selfplay_publisher is not None
+                    else None
+                )
+                created_ns = time.time_ns()
+                payload: dict[str, object] = {
+                    "format": STATE_REBASE_FORMAT,
+                    "schema_version": STATE_REBASE_SCHEMA_VERSION,
+                    "run_id": self.run_identity.run_id,
+                    "generation_family": self.run_identity.generation_family,
+                    "reason": reason,
+                    "from_step": previous_step,
+                    "to_step": self.step,
+                    "from_examples_consumed": previous_examples,
+                    "to_examples_consumed": self.examples_consumed,
+                    "committed_replay_samples": committed_samples,
+                    "utd_segment": state.as_dict() if state is not None else None,
+                    "cadence": {
+                        "candidate_examples": candidate_examples,
+                        "selfplay_examples": selfplay_examples,
+                    },
+                    "created_ns": created_ns,
+                }
+                atomic_json(self.state_rebase_pending_path, payload)
+                self._rank_zero_complete_state_rebase(
+                    payload,
+                    state=state,
+                    candidate_examples=candidate_examples,
+                    selfplay_examples=selfplay_examples,
+                )
+                outcome = {"state": payload}
+            except (OSError, ValueError) as exc:
+                outcome = {"error": str(exc)}
+        broadcast = self._broadcast_object(outcome)
+        if not isinstance(broadcast, dict):
+            raise RuntimeError("distributed state rebase is invalid")
+        error = broadcast.get("error")
+        if isinstance(error, str):
+            raise ValueError(f"learner rewind state rebase failed: {error}")
+        state_payload = broadcast.get("state")
+        state, candidate, selfplay = self._parse_state_rebase(state_payload)
+        self._utd_segment_state = state
+        self._resume_utd_segment_state = state
+        self._resume_utd_target = (
+            state.target_updates_per_new_sample if state is not None else None
+        )
+        self._last_candidate_examples = candidate
+        self._last_selfplay_examples = selfplay
+        self._segment_baseline_examples = self.examples_consumed
+
+    def _rank_zero_complete_state_rebase(
+        self,
+        payload: Mapping[str, object],
+        *,
+        state: UTDSegmentState | None,
+        candidate_examples: int,
+        selfplay_examples: int | None,
+    ) -> None:
+        created_ns = payload.get("created_ns")
+        if isinstance(created_ns, bool) or not isinstance(created_ns, int):
+            raise ValueError("learner state rebase created_ns is invalid")
+        if state is not None:
+            atomic_json(self.utd_segment_path, state.as_dict())
+        atomic_json(
+            self.cadence_path,
+            {
+                "schema_version": 1,
+                "run_id": self.run_identity.run_id,
+                "generation_family": self.run_identity.generation_family,
+                "candidate_examples": candidate_examples,
+                "selfplay_examples": selfplay_examples,
+                "updated_ns": created_ns,
+            },
+        )
+        atomic_json(self.state_rebase_path, payload)
+        self.state_rebase_pending_path.unlink(missing_ok=True)
+        descriptor = os.open(self.publisher.root, os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+    def _parse_state_rebase(
+        self,
+        payload: object,
+    ) -> tuple[UTDSegmentState | None, int, int | None]:
+        if (
+            not isinstance(payload, dict)
+            or payload.get("format") != STATE_REBASE_FORMAT
+            or payload.get("schema_version") != STATE_REBASE_SCHEMA_VERSION
+            or payload.get("run_id") != self.run_identity.run_id
+            or payload.get("generation_family") != self.run_identity.generation_family
+        ):
+            raise ValueError("learner state rebase is incompatible")
+        for name in (
+            "from_step",
+            "to_step",
+            "from_examples_consumed",
+            "to_examples_consumed",
+            "committed_replay_samples",
+        ):
+            value = payload.get(name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"learner state rebase {name} is invalid")
+        created_ns = payload.get("created_ns")
+        if (
+            isinstance(created_ns, bool)
+            or not isinstance(created_ns, int)
+            or created_ns <= 0
+        ):
+            raise ValueError("learner state rebase created_ns is invalid")
+        if (
+            payload["to_step"] != self.step
+            or payload["to_examples_consumed"] != self.examples_consumed
+        ):
+            raise ValueError("learner state rebase does not match restored state")
+        cadence = payload.get("cadence")
+        if not isinstance(cadence, dict):
+            raise ValueError("learner state rebase cadence is invalid")
+        candidate = cadence.get("candidate_examples")
+        selfplay = cadence.get("selfplay_examples")
+        if (
+            isinstance(candidate, bool)
+            or not isinstance(candidate, int)
+            or candidate < 0
+            or candidate > self.examples_consumed
+            or (
+                selfplay is not None
+                and (
+                    isinstance(selfplay, bool)
+                    or not isinstance(selfplay, int)
+                    or selfplay < 0
+                    or selfplay > self.examples_consumed
+                )
+            )
+        ):
+            raise ValueError("learner state rebase cadence counters are invalid")
+        raw_state = payload.get("utd_segment")
+        state = None if raw_state is None else self._parse_utd_segment_state(raw_state)
+        if state is not None:
+            if (
+                state.run_id != self.run_identity.run_id
+                or state.generation_family != self.run_identity.generation_family
+                or state.baseline_examples_consumed != self.examples_consumed
+                or state.baseline_committed_replay_samples
+                != payload["committed_replay_samples"]
+            ):
+                raise ValueError("learner state rebase UTD boundary is invalid")
+        assert isinstance(candidate, int)
+        assert selfplay is None or isinstance(selfplay, int)
+        return state, candidate, selfplay
+
+    def _state_rebase_authorizes(self, state: UTDSegmentState) -> bool:
+        if not self.state_rebase_path.is_file():
+            return False
+        try:
+            payload = json.loads(self.state_rebase_path.read_text(encoding="utf-8"))
+            expected, _, _ = self._parse_state_rebase(payload)
+        except (OSError, ValueError, json.JSONDecodeError):
+            return False
+        return expected == state
+
+    def _ensure_utd_segment_state(self) -> UTDSegmentState | None:
+        configured_target = self.learner_config.target_updates_per_new_sample
+        if configured_target is None:
+            return None
+        if self._utd_segment_state is not None:
+            if self._utd_segment_state.target_updates_per_new_sample != float(
+                configured_target
+            ):
+                raise ValueError(
+                    "configured update-to-data target does not match "
+                    "the persisted UTD segment state"
+                )
+            self._validate_utd_segment_boundary(self._utd_segment_state)
+            return self._utd_segment_state
+
+        outcome = None
+        if self.rank == 0:
+            try:
+                state = self._rank_zero_load_or_initialize_utd_segment(
+                    float(configured_target)
+                )
+                outcome = {"state": state.as_dict()}
+            except (OSError, ValueError, json.JSONDecodeError) as exc:
+                outcome = {"error": str(exc)}
+        outcome = self._broadcast_object(outcome)
+        if not isinstance(outcome, dict):
+            raise RuntimeError("distributed UTD segment state is invalid")
+        error = outcome.get("error")
+        if isinstance(error, str):
+            raise ValueError(f"update-to-data segment state is incompatible: {error}")
+        payload = outcome.get("state")
+        state = self._parse_utd_segment_state(payload)
+        if state.run_id != self.run_identity.run_id or (
+            state.generation_family != self.run_identity.generation_family
+        ):
+            raise ValueError("update-to-data segment run identity does not match")
+        if state.target_updates_per_new_sample != float(configured_target):
+            raise ValueError(
+                "configured update-to-data target does not match "
+                "the persisted UTD segment state"
+            )
+        if (
+            self._resume_utd_segment_state is not None
+            and state != self._resume_utd_segment_state
+            and self._resume_utd_target == float(configured_target)
+            and not self._state_rebase_authorizes(state)
+        ):
+            raise ValueError(
+                "persisted UTD segment state disagrees with the resume checkpoint"
+            )
+        self._validate_utd_segment_boundary(state)
+        self._utd_segment_state = state
+        return state
+
+    def _rank_zero_load_or_initialize_utd_segment(
+        self,
+        configured_target: float,
+    ) -> UTDSegmentState:
+        if self.utd_segment_path.is_file():
+            try:
+                payload = json.loads(self.utd_segment_path.read_text(encoding="utf-8"))
+            except OSError as exc:
+                raise ValueError(f"cannot read UTD segment state: {exc}") from exc
+            return self._parse_utd_segment_state(payload)
+        if self._resume_utd_segment_state is not None:
+            state = self._resume_utd_segment_state
+            if state.target_updates_per_new_sample != configured_target:
+                raise ValueError(
+                    "checkpoint UTD segment target does not match the active profile"
+                )
+            atomic_json(self.utd_segment_path, state.as_dict())
+            return state
+        if not self._can_initialize_utd_origin(configured_target):
+            raise ValueError(
+                "an existing run changed its update-to-data target without "
+                "a compatible prepared UTD segment state"
+            )
+        state = UTDSegmentState(
+            run_id=self.run_identity.run_id,
+            generation_family=self.run_identity.generation_family,
+            target_updates_per_new_sample=configured_target,
+            baseline_examples_consumed=0,
+            baseline_committed_replay_samples=0,
+        )
+        atomic_json(self.utd_segment_path, state.as_dict())
+        return state
+
+    def _validate_utd_segment_boundary(self, state: UTDSegmentState) -> None:
+        if state.baseline_examples_consumed > self.examples_consumed:
+            raise ValueError("learner examples precede the UTD segment baseline")
+
+    def _can_initialize_utd_origin(self, configured_target: float) -> bool:
+        if self._resume_utd_target is not _UNSET:
+            return (
+                isinstance(self._resume_utd_target, float)
+                and self._resume_utd_target == configured_target
+                and configured_target == 1.0
+            )
+        return (
+            self.step == 0
+            and self.examples_consumed == 0
+            and not self._learner_history_exists()
+        )
+
+    def _learner_history_exists(self) -> bool:
+        root = self.publisher.root
+        if any(
+            (root / name).exists()
+            for name in (
+                "candidate.json",
+                "cadence.json",
+                "learner-complete.json",
+                "model-history.jsonl",
+                "recovery.json",
+                "resume-cutover.json",
+            )
+        ):
+            return True
+        checkpoint_directory = root / "checkpoints"
+        return checkpoint_directory.is_dir() and any(checkpoint_directory.glob("*.pt"))
+
+    @staticmethod
+    def _parse_utd_segment_state(payload: object) -> UTDSegmentState:
+        if not isinstance(payload, dict):
+            raise ValueError("UTD segment state must be a JSON object")
+        required = {
+            "schema_version",
+            "run_id",
+            "generation_family",
+            "target_updates_per_new_sample",
+            "baseline_examples_consumed",
+            "baseline_committed_replay_samples",
+        }
+        allowed = required | {"created_ns"}
+        if set(payload) - allowed or not required <= set(payload):
+            raise ValueError("UTD segment state fields are invalid")
+        if payload.get("schema_version") != UTD_SEGMENT_SCHEMA_VERSION:
+            raise ValueError("UTD segment schema version is incompatible")
+        run_id = payload.get("run_id")
+        generation_family = payload.get("generation_family")
+        target = payload.get("target_updates_per_new_sample")
+        baseline_examples = payload.get("baseline_examples_consumed")
+        baseline_samples = payload.get("baseline_committed_replay_samples")
+        if not isinstance(run_id, str) or not run_id:
+            raise ValueError("UTD segment run_id is invalid")
+        if not isinstance(generation_family, str) or not generation_family:
+            raise ValueError("UTD segment generation_family is invalid")
+        if (
+            isinstance(target, bool)
+            or not isinstance(target, int | float)
+            or not math.isfinite(float(target))
+            or target <= 0
+        ):
+            raise ValueError("UTD segment target is invalid")
+        for name, value in (
+            ("baseline examples", baseline_examples),
+            ("baseline committed replay samples", baseline_samples),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"UTD segment {name} is invalid")
+        created_ns = payload.get("created_ns")
+        if created_ns is not None and (
+            isinstance(created_ns, bool)
+            or not isinstance(created_ns, int)
+            or created_ns <= 0
+        ):
+            raise ValueError("UTD segment created_ns is invalid")
+        assert isinstance(baseline_examples, int)
+        assert isinstance(baseline_samples, int)
+        return UTDSegmentState(
+            run_id=run_id,
+            generation_family=generation_family,
+            target_updates_per_new_sample=float(target),
+            baseline_examples_consumed=baseline_examples,
+            baseline_committed_replay_samples=baseline_samples,
+        )
+
     def _utd_step_budget(self) -> int:
         self._latest_total_replay_samples = self.store.total_committed_sample_count(
             run_id=self.run_identity.run_id,
@@ -1560,9 +2781,54 @@ class LearnerLoop:
             raise ValueError(
                 "update-to-data control requires a complete committed-sample history"
             )
-        allowed_examples = int(target * self._latest_total_replay_samples)
+        state = self._ensure_utd_segment_state()
+        if state is None:
+            raise RuntimeError("update-to-data segment state was not initialized")
+        if self._latest_total_replay_samples < state.baseline_committed_replay_samples:
+            raise ValueError(
+                "committed replay samples precede the UTD segment baseline"
+            )
+        if self.examples_consumed < state.baseline_examples_consumed:
+            raise ValueError("learner examples precede the UTD segment baseline")
+        segment_samples = (
+            self._latest_total_replay_samples - state.baseline_committed_replay_samples
+        )
+        ratio = Fraction(str(state.target_updates_per_new_sample))
+        segment_allowance = ratio.numerator * segment_samples // ratio.denominator
+        allowed_examples = state.baseline_examples_consumed + segment_allowance
         remaining = max(0, allowed_examples - self.examples_consumed)
         return remaining // self.train_config.global_batch_size(self.world_size)
+
+    def _utd_metric_values(self) -> dict[str, object]:
+        lifetime = (
+            self.examples_consumed / self._latest_total_replay_samples
+            if self._latest_total_replay_samples
+            else None
+        )
+        state = self._utd_segment_state
+        segment = None
+        if state is not None:
+            segment_samples = (
+                self._latest_total_replay_samples
+                - state.baseline_committed_replay_samples
+            )
+            segment_examples = self.examples_consumed - state.baseline_examples_consumed
+            if segment_samples > 0 and segment_examples >= 0:
+                segment = segment_examples / segment_samples
+        return {
+            "updates_per_new_sample": lifetime,
+            "lifetime_updates_per_new_sample": lifetime,
+            "segment_updates_per_new_sample": segment,
+            "utd_segment_target_updates_per_new_sample": (
+                state.target_updates_per_new_sample if state is not None else None
+            ),
+            "utd_segment_baseline_examples_consumed": (
+                state.baseline_examples_consumed if state is not None else None
+            ),
+            "utd_segment_baseline_committed_replay_samples": (
+                state.baseline_committed_replay_samples if state is not None else None
+            ),
+        }
 
     def _plateau_step_budget(self) -> int:
         configured = self._plateau_config()
@@ -1603,10 +2869,12 @@ class LearnerLoop:
         *,
         stop_requested: Callable[[], bool],
         progress: Callable[..., None] | None,
+        on_boundary: Callable[[], None] | None = None,
     ) -> bool:
         configured = self._plateau_config()
         if not configured.enabled or self.promotion_status_path is None:
             return True
+        boundary_applied = False
         while True:
             action = (
                 self._rank_zero_plateau_action(configured) if self.rank == 0 else None
@@ -1617,9 +2885,13 @@ class LearnerLoop:
             kind = action.get("kind")
             if kind == "proceed":
                 return True
+            if not boundary_applied and on_boundary is not None:
+                on_boundary()
+                boundary_applied = True
             if kind == "reset":
                 checkpoint = Path(str(action["checkpoint"]))
                 previous_step = self.step
+                previous_examples = self.examples_consumed
                 champion_manifest = None
                 if self.rank == 0:
                     champion_manifest = load_model_manifest(
@@ -1632,6 +2904,11 @@ class LearnerLoop:
                     expected_bytes=int(action["bytes"]),
                 )
                 self._scale_learning_rates(configured.reset_learning_rate_scale)
+                self._rebase_state_after_rewind(
+                    previous_step=previous_step,
+                    previous_examples=previous_examples,
+                    reason="plateau_reset",
+                )
                 if self.rank == 0:
                     assert champion_manifest is not None
                     self._last_recovery_step = max(0, self.step - 1)
@@ -1653,6 +2930,12 @@ class LearnerLoop:
                         champion_manifest,
                         role="candidate",
                     )
+                    if self.selfplay_publisher is not None:
+                        write_model_pointer(
+                            self.selfplay_publisher.candidate_path,
+                            champion_manifest,
+                            role="candidate",
+                        )
                     if self.promotion_status_path is not None:
                         atomic_json(
                             self.promotion_status_path,
@@ -1703,9 +2986,16 @@ class LearnerLoop:
                 return True
             if kind == "recover":
                 previous_step = self.step
+                previous_examples = getattr(self, "examples_consumed", None)
                 self._scale_learning_rates(configured.reset_learning_rate_scale)
                 if configured.clear_optimizer_state_on_recovery:
                     self._clear_optimizer_state()
+                if previous_examples is not None:
+                    self._rebase_state_after_rewind(
+                        previous_step=previous_step,
+                        previous_examples=previous_examples,
+                        reason="plateau_recovery",
+                    )
                 if self.rank == 0:
                     self._last_recovery_step = max(0, self.step - 1)
                     recovery = self._maybe_write_recovery_checkpoint(force=True)
@@ -1792,20 +3082,128 @@ class LearnerLoop:
         *,
         stop_requested: Callable[[], bool],
         progress: Callable[..., None] | None,
+        on_pause: Callable[[], object] | None = None,
+        on_resume: Callable[[], object] | None = None,
     ) -> bool:
         if self.gpu_pause_path is None:
             return True
+        pause_applied = False
+        cuda_cache_released = False
+        pause_checkpoint_step: int | None = None
+        pause_started = 0.0
         while True:
             active = self._rank_zero_gpu_pause_active() if self.rank == 0 else None
             active = self._broadcast_object(active)
             if active is False:
+                if pause_applied:
+                    resume_error = None
+                    try:
+                        if on_resume is not None:
+                            on_resume()
+                    except BaseException as exc:
+                        resume_error = f"{type(exc).__name__}: {exc}"
+                    resume_errors = self._collective_error_messages(resume_error)
+                    if resume_errors:
+                        raise RuntimeError(
+                            "distributed GPU pause resume failed: "
+                            + "; ".join(resume_errors)
+                        )
+                    self._distributed_barrier()
+                    if self.rank == 0:
+                        self.metrics.append(
+                            {
+                                "schema_version": 1,
+                                "timestamp_ns": time.time_ns(),
+                                "worker": "learner",
+                                "event": "gpu_pause_resumed",
+                                "step": self.step,
+                                "pause_generation": self._gpu_pause_generation,
+                                "pause_seconds": time.perf_counter() - pause_started,
+                            }
+                        )
                 return True
             if active is not True:
                 raise RuntimeError("distributed GPU pause state is invalid")
+            if not pause_applied:
+                pause_started = time.perf_counter()
+                checkpoint_outcome = None
+                if self.rank == 0:
+                    try:
+                        recovery = self._maybe_write_recovery_checkpoint(force=True)
+                        checkpoint_outcome = {
+                            "ok": True,
+                            "step": recovery.step
+                            if recovery is not None
+                            else self.step,
+                        }
+                    except BaseException as exc:
+                        checkpoint_outcome = {
+                            "ok": False,
+                            "error": f"{type(exc).__name__}: {exc}",
+                        }
+                checkpoint_payload = self._broadcast_object(checkpoint_outcome)
+                if (
+                    not isinstance(checkpoint_payload, dict)
+                    or checkpoint_payload.get("ok") is not True
+                    or isinstance(checkpoint_payload.get("step"), bool)
+                    or not isinstance(checkpoint_payload.get("step"), int)
+                ):
+                    detail = (
+                        checkpoint_payload.get("error")
+                        if isinstance(checkpoint_payload, dict)
+                        else "invalid checkpoint outcome"
+                    )
+                    raise RuntimeError(
+                        f"GPU pause recovery checkpoint failed: {detail}"
+                    )
+                pause_checkpoint_step = int(checkpoint_payload["step"])
+                device = next(self.model.parameters()).device
+                pause_error = None
+                try:
+                    synchronize_device(device)
+                    if on_pause is not None:
+                        on_pause()
+                    empty_device_cache(device)
+                    if device.type in ("cuda", "mps"):
+                        cuda_cache_released = True
+                except BaseException as exc:
+                    pause_error = f"{type(exc).__name__}: {exc}"
+                pause_errors = self._collective_error_messages(pause_error)
+                if pause_errors:
+                    raise RuntimeError(
+                        "distributed GPU pause preparation failed: "
+                        + "; ".join(pause_errors)
+                    )
+                self._distributed_barrier()
+                self._gpu_pause_generation += 1
+                pause_applied = True
+                if self.rank == 0:
+                    self.metrics.append(
+                        {
+                            "schema_version": 1,
+                            "timestamp_ns": time.time_ns(),
+                            "worker": "learner",
+                            "event": "gpu_pause_ready",
+                            "step": self.step,
+                            "pause_generation": self._gpu_pause_generation,
+                            "pause_checkpoint_step": pause_checkpoint_step,
+                            "cuda_cache_released": cuda_cache_released,
+                        }
+                    )
             if self._collective_stop(stop_requested()):
                 return False
             if progress is not None and self.rank == 0:
-                progress(phase="arena_gpu_pause", step=self.step)
+                device = next(self.model.parameters()).device
+                allocated_bytes, reserved_bytes = device_memory_snapshot(device)
+                progress(
+                    phase="arena_gpu_pause",
+                    step=self.step,
+                    cuda_cache_released=cuda_cache_released,
+                    pause_generation=self._gpu_pause_generation,
+                    pause_checkpoint_step=pause_checkpoint_step,
+                    cuda_memory_allocated_bytes=allocated_bytes,
+                    cuda_memory_reserved_bytes=reserved_bytes,
+                )
             time.sleep(self._plateau_config().poll_seconds)
 
     def _rank_zero_gpu_pause_active(self) -> bool:
@@ -2000,6 +3398,15 @@ class LearnerLoop:
         tensor = torch.tensor(value, device=device, dtype=torch.int64)
         torch.distributed.all_reduce(tensor, op=torch.distributed.ReduceOp.MIN)
         return int(tensor.item())
+
+    def _collective_error_messages(self, local_error: str | None) -> tuple[str, ...]:
+        if self.world_size == 1:
+            return (local_error,) if local_error is not None else ()
+        if not torch.distributed.is_initialized():
+            raise RuntimeError("distributed learner process group is not initialized")
+        gathered: list[object] = [None] * self.world_size
+        torch.distributed.all_gather_object(gathered, local_error)
+        return tuple(str(error) for error in gathered if error is not None)
 
     def _broadcast_object(self, value: object) -> object:
         if self.world_size == 1:

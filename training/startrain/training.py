@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
-from typing import cast
+from typing import Any, cast
 
 import torch
 from torch import nn
@@ -13,6 +13,7 @@ from torch import nn
 from .checkpoint import ExponentialMovingAverage
 from .config import SchedulerConfig
 from .contracts import SCORE_MARGIN_MAX, SCORE_MARGIN_MIN
+from .device import resolve_compile
 from .features import EncodedBatch
 from .losses import LossWeights, compute_losses
 from .replay import ReplayBatch
@@ -69,11 +70,10 @@ class DeviceBatchPrefetcher(Iterator[ReplayBatch]):
     ) -> None:
         self._batches = iter(batches)
         self.device = torch.device(device)
-        self._stream = (
-            torch.cuda.Stream(device=self.device)
-            if enabled and self.device.type == "cuda"
-            else None
-        )
+        self._enabled = enabled and self.device.type == "cuda"
+        self._suspended = False
+        self._closed = False
+        self._stream = torch.cuda.Stream(device=self.device) if self._enabled else None
         self._consumed_copy_events: list[tuple[torch.cuda.Event, torch.cuda.Event]] = []
         self._next_copy_event: tuple[torch.cuda.Event, torch.cuda.Event] | None = None
         self._topology_cache: dict[
@@ -89,6 +89,10 @@ class DeviceBatchPrefetcher(Iterator[ReplayBatch]):
         return self
 
     def __next__(self) -> ReplayBatch:
+        if getattr(self, "_closed", False):
+            raise RuntimeError("device prefetcher is closed")
+        if getattr(self, "_suspended", False):
+            raise RuntimeError("device prefetcher is suspended")
         if self._stream is None:
             source = next(self._batches)
             return source.to(self.device)
@@ -115,6 +119,10 @@ class DeviceBatchPrefetcher(Iterator[ReplayBatch]):
             self._next_source = None
             self._next_copy_event = None
             return
+        self._stage_source(source)
+
+    def _stage_source(self, source: ReplayBatch) -> None:
+        assert self._stream is not None
         self._next_source = source
         with torch.cuda.stream(self._stream):
             started = torch.cuda.Event(enable_timing=True)
@@ -123,6 +131,71 @@ class DeviceBatchPrefetcher(Iterator[ReplayBatch]):
             self._next_batch = self._to_device(source)
             completed.record(self._stream)
             self._next_copy_event = (started, completed)
+
+    @property
+    def suspended(self) -> bool:
+        return self._suspended
+
+    def suspend_device(self) -> None:
+        """Release all CUDA-owned prefetch state without advancing the iterator."""
+
+        if self._closed or self._suspended:
+            return
+        if self._stream is not None:
+            self._stream.synchronize()
+        self._next_batch = None
+        self._next_copy_event = None
+        self._consumed_copy_events.clear()
+        self._topology_cache.clear()
+        self._stream = None
+        self._suspended = True
+
+    def resume_device(self) -> None:
+        """Restore CUDA prefetch state for the exact retained CPU source batch."""
+
+        if self._closed:
+            raise RuntimeError("cannot resume a closed device prefetcher")
+        if not self._suspended:
+            return
+        self._suspended = False
+        if not self._enabled:
+            return
+        self._stream = torch.cuda.Stream(device=self.device)
+        source = self._next_source
+        if source is None:
+            self._preload()
+        else:
+            self._stage_source(source)
+
+    def close(self, *, strict: bool = True) -> BaseException | None:
+        """Release CUDA state and stop the exact iterator owned by this prefetcher."""
+
+        if self._closed:
+            return None
+        failure: BaseException | None = None
+        try:
+            if self._stream is not None:
+                self._stream.synchronize()
+        except BaseException as exc:
+            failure = exc
+        self._next_batch = None
+        self._next_source = None
+        self._next_copy_event = None
+        self._consumed_copy_events.clear()
+        self._topology_cache.clear()
+        self._stream = None
+        try:
+            shutdown_workers = getattr(self._batches, "_shutdown_workers", None)
+            if callable(shutdown_workers):
+                shutdown_workers()
+        except BaseException as exc:
+            if failure is None:
+                failure = exc
+        self._closed = True
+        self._suspended = False
+        if strict and failure is not None:
+            raise failure
+        return failure
 
     def pop_copy_events(self) -> list[tuple[torch.cuda.Event, torch.cuda.Event]]:
         """Transfer ownership of events for batches already yielded."""
@@ -217,18 +290,25 @@ def unwrap_model(model: nn.Module) -> nn.Module:
 def maybe_compile_model(
     model: nn.Module,
     *,
-    enabled: bool,
+    enabled: bool | str,
     dynamic: bool = True,
     fullgraph: bool = True,
     backend: str | None = None,
+    mode: str | None = None,
     recompile_limit: int | None = None,
     isolate_recompiles: bool = False,
 ) -> nn.Module:
+    if enabled == "auto":
+        enabled = resolve_compile("auto", next(model.parameters()).device)
+    elif not isinstance(enabled, bool):
+        raise ValueError("compile enabled must be a boolean or 'auto'")
     if not enabled:
         return model
     if recompile_limit is not None and recompile_limit <= 0:
         raise ValueError("compile recompile_limit must be positive")
-    options = {
+    if mode not in (None, "default", "reduce-overhead", "max-autotune"):
+        raise ValueError("compile mode is invalid")
+    options: dict[str, Any] = {
         "dynamic": dynamic,
         "fullgraph": fullgraph,
         "recompile_limit": recompile_limit,
@@ -236,6 +316,8 @@ def maybe_compile_model(
     }
     if backend is not None:
         options["backend"] = backend
+    if mode not in (None, "default"):
+        options["mode"] = mode
     return cast(
         nn.Module,
         torch.compile(model, **options),

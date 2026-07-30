@@ -50,6 +50,8 @@ The following switches are deliberately first-class and recorded in metrics:
   snapshot for promotion.
 - `data.shards_per_batch`, which mixes positions from several same-ring shards
   while retaining homogeneous tensor shapes.
+- `arena.continuation_pairs_per_ring`, which increases GPU occupancy only after
+  the unchanged minimum anytime-valid promotion look.
 - `orchestration.plateau.action: reduce_lr_keep_weights`, which clears stale
   optimizer moments and lowers rates without discarding the learner branch.
 
@@ -92,6 +94,12 @@ Each report must retain:
   provisioned GPU-hour;
 - peak memory, replay I/O, restarts, and failed/quarantined shards; and
 - final strength divided by GPU-hours and leaf evaluations.
+
+Fleet throughput must come from completed counter deltas over explicit wall
+intervals, merged by physical GPU when lanes overlap. Never sum stale
+latest-batch gauges. The primary Elo-efficiency denominator includes every
+provisioned GPU-hour, including arena pauses, cooldowns, restarts, and idle
+capacity; active-device time is diagnostic only.
 
 Generate `scripts/strength_efficiency_report.py` for every treatment and control.
 Count every provisioned GPU-hour, including learner stalls and arena pause intervals,

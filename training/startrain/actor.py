@@ -14,8 +14,18 @@ from typing import Literal
 
 import torch
 
-from .checkpoint import ModelManifest, load_ema_checkpoint, load_model_manifest
+from .checkpoint import (
+    ModelManifest,
+    load_ema_checkpoint,
+    load_model_manifest,
+    load_resume_cutover,
+)
 from .config import ExperimentConfig, GPUWorkerConfig, RingMixtureConfig
+from .device import (
+    empty_device_cache,
+    peak_memory_stats,
+    reset_peak_memory_stats,
+)
 from .inference import GraphInferenceAdapter, InferenceConfig
 from .model import GraphResTNet
 from .replay_store import ReplayStore
@@ -55,7 +65,7 @@ class RingMixtureScheduler:
 
 
 class ManifestModelProvider:
-    """Owns one immutable evaluator and swaps it only on explicit refresh calls."""
+    """Owns one evaluator whose weights refresh only at explicit boundaries."""
 
     def __init__(
         self,
@@ -73,7 +83,9 @@ class ManifestModelProvider:
         self.expected_role = expected_role
         self.manifest: ModelManifest | None = None
         self.evaluator: GraphInferenceAdapter | None = None
+        self._raw_model: GraphResTNet | None = None
         self._pointer_signature: tuple[int, int, int] | None = None
+        self._reload_failed = False
 
     def wait_for_initial(
         self,
@@ -96,6 +108,10 @@ class ManifestModelProvider:
         return None
 
     def refresh(self) -> GraphInferenceAdapter:
+        if self._reload_failed:
+            raise RuntimeError(
+                "model provider is unusable after a failed in-place refresh"
+            )
         stat = self.manifest_path.stat()
         signature = (stat.st_mtime_ns, stat.st_size, stat.st_ino)
         if self._pointer_signature == signature and self.evaluator is not None:
@@ -104,15 +120,77 @@ class ManifestModelProvider:
         if manifest.role != self.expected_role:
             raise ValueError(f"self-play expected a {self.expected_role} model pointer")
         if (
+            manifest.run_id != self.run_identity.run_id
+            or manifest.generation_family != self.run_identity.generation_family
+        ):
+            raise ValueError("model manifest and checkpoint identity disagree")
+        if (
             self.manifest is not None
             and manifest.model_version == self.manifest.model_version
+            and manifest.model_identity == self.manifest.model_identity
             and manifest.model_step == self.manifest.model_step
             and manifest.checkpoint == self.manifest.checkpoint
+            and manifest.checkpoint_sha256 == self.manifest.checkpoint_sha256
+            and manifest.checkpoint_bytes == self.manifest.checkpoint_bytes
         ):
             assert self.evaluator is not None
             self._pointer_signature = signature
             return self.evaluator
-        model = GraphResTNet(self.config.model).to(self.device)
+
+        if self._raw_model is None:
+            model = GraphResTNet(self.config.model).to(self.device)
+            self._load_weights(model, manifest)
+            model.eval()
+            refresh = self.config.orchestration.model_refresh
+            inference_model = maybe_compile_model(
+                model,
+                enabled=self.config.train.compile,
+                dynamic=refresh.inference_compile_dynamic,
+                fullgraph=True,
+                mode=refresh.inference_compile_mode,
+                recompile_limit=(
+                    None
+                    if refresh.inference_compile_dynamic
+                    else len(self.config.game.rings)
+                ),
+                isolate_recompiles=not refresh.inference_compile_dynamic,
+            )
+            evaluator = GraphInferenceAdapter(
+                inference_model,
+                device=self.device,
+                config=InferenceConfig(
+                    precision=self.config.train.precision,
+                    score_utility_weight=self.config.selfplay.score_utility_weight,
+                ),
+                model_version=manifest.model_version,
+                model_step=manifest.model_step,
+                model_identity=manifest.model_identity,
+            )
+            self._raw_model = model
+            self.evaluator = evaluator
+        else:
+            assert self.evaluator is not None
+            try:
+                self._load_weights(self._raw_model, manifest)
+                self._raw_model.eval()
+                self.evaluator.model_version = manifest.model_version
+                self.evaluator.model_step = manifest.model_step
+                self.evaluator.model_identity = manifest.model_identity
+            except Exception:
+                # A checkpoint loader may have copied only part of a state dict
+                # before rejecting it. Never expose that evaluator again.
+                self._reload_failed = True
+                raise
+
+        self.manifest = manifest
+        self._pointer_signature = signature
+        return self.evaluator
+
+    def _load_weights(
+        self,
+        model: GraphResTNet,
+        manifest: ModelManifest,
+    ) -> None:
         metadata = load_ema_checkpoint(
             manifest.checkpoint,
             model=model,
@@ -124,33 +202,8 @@ class ManifestModelProvider:
             expected_sha256=manifest.checkpoint_sha256,
             expected_bytes=manifest.checkpoint_bytes,
         )
-        if (
-            int(metadata["step"]) != manifest.model_step
-            or manifest.run_id != self.run_identity.run_id
-            or manifest.generation_family != self.run_identity.generation_family
-        ):
+        if int(metadata["step"]) != manifest.model_step:
             raise ValueError("model manifest and checkpoint identity disagree")
-        model.eval()
-        inference_model = maybe_compile_model(
-            model,
-            enabled=self.config.train.compile,
-            dynamic=True,
-            fullgraph=True,
-        )
-        self.evaluator = GraphInferenceAdapter(
-            inference_model,
-            device=self.device,
-            config=InferenceConfig(
-                precision=self.config.train.precision,
-                score_utility_weight=self.config.selfplay.score_utility_weight,
-            ),
-            model_version=manifest.model_version,
-            model_step=manifest.model_step,
-            model_identity=manifest.model_identity,
-        )
-        self.manifest = manifest
-        self._pointer_signature = signature
-        return self.evaluator
 
 
 class HistoricalModelPool:
@@ -166,6 +219,7 @@ class HistoricalModelPool:
         pool_size: int,
         evaluator_cache_size: int = 2,
         additional_manifest_directories: Sequence[str | Path] = (),
+        cutover_path: str | Path | None = None,
     ) -> None:
         if pool_size <= 0 or evaluator_cache_size <= 0:
             raise ValueError("historical model pool sizes must be positive")
@@ -183,6 +237,7 @@ class HistoricalModelPool:
         self.pool_size = pool_size
         self.evaluator_cache_size = min(pool_size, evaluator_cache_size)
         self.providers: OrderedDict[str, ManifestModelProvider] = OrderedDict()
+        self.cutover_path = Path(cutover_path) if cutover_path is not None else None
 
     def select(
         self,
@@ -191,6 +246,7 @@ class HistoricalModelPool:
         exclude: set[str],
     ) -> ManifestModelProvider | None:
         by_identity: dict[str, ModelManifest] = {}
+        cutover_ns = self._cutover_created_ns()
         for directory in self.manifest_directories:
             for path in sorted(directory.glob("manifest-*.json")):
                 try:
@@ -202,6 +258,7 @@ class HistoricalModelPool:
                     and manifest.run_id == self.run_identity.run_id
                     and manifest.generation_family
                     == self.run_identity.generation_family
+                    and manifest.published_ns >= cutover_ns
                     and manifest.model_identity not in exclude
                 ):
                     by_identity[manifest.model_identity] = manifest
@@ -225,6 +282,28 @@ class HistoricalModelPool:
         while len(self.providers) > self.evaluator_cache_size:
             self.providers.popitem(last=False)
         return provider
+
+    def _cutover_created_ns(self) -> int:
+        if self.cutover_path is None or not self.cutover_path.is_file():
+            return 0
+        load_resume_cutover(
+            self.cutover_path,
+            expected_run_id=self.run_identity.run_id,
+            expected_generation_family=self.run_identity.generation_family,
+            verify_artifact=False,
+        )
+        try:
+            payload = json.loads(self.cutover_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError(f"cannot read history cutover: {exc}") from exc
+        created_ns = payload.get("created_ns") if isinstance(payload, dict) else None
+        if (
+            isinstance(created_ns, bool)
+            or not isinstance(created_ns, int)
+            or created_ns <= 0
+        ):
+            raise ValueError("history cutover created_ns is invalid")
+        return created_ns
 
     def _spaced_candidates(
         self,
@@ -302,16 +381,21 @@ class ActorSupervisor:
             if source != "champion"
             else None
         )
+        candidate_root = self.candidate_manifest_path.parent
+        learner_root = (
+            candidate_root.parent
+            if candidate_root.name == "selfplay"
+            else candidate_root
+        )
         self.history_pool = (
             HistoricalModelPool(
                 experiment,
-                self.candidate_manifest_path.parent / "manifests",
+                candidate_root / "manifests",
                 device=device,
                 run_identity=run_identity,
                 pool_size=experiment.orchestration.model_refresh.history_pool_size,
-                additional_manifest_directories=(
-                    self.candidate_manifest_path.parent.parent / "manifests",
-                ),
+                additional_manifest_directories=(learner_root / "manifests",),
+                cutover_path=learner_root / "resume-cutover.json",
             )
             if source == "candidate_champion_history_mix"
             else None
@@ -342,6 +426,11 @@ class ActorSupervisor:
 
     def run(self, *, stop_requested: Callable[[], bool]) -> int:
         batches = 0
+        process_started_ns = time.time_ns()
+        cumulative_games = 0
+        cumulative_samples = 0
+        cumulative_evaluator_rows = 0
+        cumulative_batch_wall_seconds = 0.0
         self.heartbeat.start()
         final_phase = "stopped"
         try:
@@ -530,6 +619,10 @@ class ActorSupervisor:
                         peak_cuda_reserved_memory_bytes,
                     ) = self._peak_cuda_memory()
                     batch_completed_ns = time.time_ns()
+                    cumulative_games += len(summaries)
+                    cumulative_samples += samples
+                    cumulative_evaluator_rows += evaluator_rows
+                    cumulative_batch_wall_seconds += elapsed
                     append_jsonl(
                         self.metrics_path,
                         {
@@ -544,6 +637,8 @@ class ActorSupervisor:
                             "generation_family": (self.run_identity.generation_family),
                             "generation": generation,
                             "batch": batches,
+                            "record_sequence": batches,
+                            "process_started_ns": process_started_ns,
                             "ring": ring,
                             "scheduling_step": scheduling_step,
                             "scheduling_step_source": scheduling_step_source,
@@ -560,6 +655,12 @@ class ActorSupervisor:
                             ),
                             "evaluator_calls": evaluator_calls,
                             "evaluator_rows": evaluator_rows,
+                            "cumulative_games": cumulative_games,
+                            "cumulative_samples": cumulative_samples,
+                            "cumulative_evaluator_rows": cumulative_evaluator_rows,
+                            "cumulative_batch_wall_seconds": (
+                                cumulative_batch_wall_seconds
+                            ),
                             "evaluator_rows_per_second": (
                                 evaluator_rows / elapsed if elapsed else 0.0
                             ),
@@ -654,6 +755,11 @@ class ActorSupervisor:
                         games=len(summaries),
                         samples=samples,
                         evaluator_rows=evaluator_rows,
+                        process_started_ns=process_started_ns,
+                        cumulative_games=cumulative_games,
+                        cumulative_samples=cumulative_samples,
+                        cumulative_evaluator_rows=cumulative_evaluator_rows,
+                        cumulative_batch_wall_seconds=cumulative_batch_wall_seconds,
                     )
             return batches
         except Exception:
@@ -661,20 +767,13 @@ class ActorSupervisor:
             raise
         finally:
             self.heartbeat.close(final_phase=final_phase)
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            empty_device_cache(self.device)
 
     def _reset_peak_cuda_memory(self) -> None:
-        if self.device.type == "cuda" and torch.cuda.is_available():
-            torch.cuda.reset_peak_memory_stats(self.device)
+        reset_peak_memory_stats(self.device)
 
     def _peak_cuda_memory(self) -> tuple[int | None, int | None]:
-        if self.device.type != "cuda" or not torch.cuda.is_available():
-            return None, None
-        return (
-            int(torch.cuda.max_memory_allocated(self.device)),
-            int(torch.cuda.max_memory_reserved(self.device)),
-        )
+        return peak_memory_stats(self.device)
 
     def _select_model_provider(
         self,

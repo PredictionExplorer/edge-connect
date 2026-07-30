@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -69,7 +70,11 @@ def _payload(*, passed: bool = True, throughput: float = 8_000.0) -> dict[str, o
 
 
 def test_preflight_command_is_explicit_and_bounded(tmp_path: Path) -> None:
-    settings = _settings(tmp_path)
+    settings = replace(
+        _settings(tmp_path),
+        compile_dynamic=False,
+        compile_mode="reduce-overhead",
+    )
 
     command = benchmark.build_preflight_command(
         settings,
@@ -81,6 +86,8 @@ def test_preflight_command_is_explicit_and_bounded(tmp_path: Path) -> None:
     assert command[command.index("--config") + 1] == str(settings.config)
     assert command[command.index("--warmup") + 1] == "2"
     assert command[command.index("--iterations") + 1] == "4"
+    assert "--no-compile-dynamic" in command
+    assert command[command.index("--compile-mode") + 1] == "reduce-overhead"
     assert "startrain-orchestrate" not in command
     assert "startrain-train" not in command
 

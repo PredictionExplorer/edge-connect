@@ -9,6 +9,11 @@ from typing import Any, Literal, TypeVar, cast
 
 import yaml
 
+from .device import (
+    detect_accelerators,
+    generate_auto_topology,
+    resolve_device_string,
+)
 from .losses import LossWeights
 from .model import ModelConfig
 from .optim import OptimizerConfig
@@ -82,8 +87,8 @@ class SchedulerConfig:
 @dataclass(frozen=True, slots=True)
 class TrainConfig:
     per_rank_batch_size: int = 32
-    precision: Literal["fp32", "bf16"] = "fp32"
-    compile: bool = False
+    precision: Literal["fp32", "bf16", "auto"] = "fp32"
+    compile: bool | Literal["auto"] = False
     seed: int = 17
     ema_decay: float = 0.999
     gradient_clip_norm: float = 1.0
@@ -94,8 +99,10 @@ class TrainConfig:
             raise ConfigError(
                 "per_rank_batch_size and gradient_clip_norm must be positive"
             )
-        if self.precision not in ("fp32", "bf16"):
-            raise ConfigError("precision must be fp32 or bf16")
+        if self.precision not in ("fp32", "bf16", "auto"):
+            raise ConfigError("precision must be fp32, bf16, or auto")
+        if type(self.compile) is not bool and self.compile != "auto":
+            raise ConfigError("compile must be boolean or 'auto'")
         if not 0 <= self.ema_decay < 1:
             raise ConfigError("ema_decay must be in [0, 1)")
 
@@ -111,6 +118,7 @@ class DataConfig:
     ring_stratified: bool = True
     d5_augmentation: bool = True
     workers: int = 0
+    min_batches_for_workers: int = 32
     prefetch_factor: int = 2
     pin_memory: bool = False
     shard_cache_size: int = 2
@@ -121,6 +129,9 @@ class DataConfig:
             raise ConfigError("data schema_version must be 4")
         if (
             self.workers < 0
+            or isinstance(self.min_batches_for_workers, bool)
+            or not isinstance(self.min_batches_for_workers, int)
+            or self.min_batches_for_workers <= 0
             or self.prefetch_factor <= 0
             or self.shard_cache_size <= 0
             or isinstance(self.shards_per_batch, bool)
@@ -425,6 +436,10 @@ class ModelRefreshConfig:
     manifest_poll_seconds: float = 2.0
     startup_timeout_seconds: float = 600.0
     refresh_only_between_batches: bool = True
+    inference_compile_dynamic: bool = True
+    inference_compile_mode: Literal["default", "reduce-overhead", "max-autotune"] = (
+        "default"
+    )
     selfplay_source: Literal[
         "champion",
         "candidate",
@@ -436,10 +451,19 @@ class ModelRefreshConfig:
     history_pool_size: int = 8
 
     def __post_init__(self) -> None:
-        if type(self.refresh_only_between_batches) is not bool:
-            raise ConfigError("refresh_only_between_batches must be boolean")
+        if (
+            type(self.refresh_only_between_batches) is not bool
+            or type(self.inference_compile_dynamic) is not bool
+        ):
+            raise ConfigError("model refresh compile settings must use booleans")
         if self.manifest_poll_seconds <= 0 or self.startup_timeout_seconds <= 0:
             raise ConfigError("model refresh intervals must be positive")
+        if self.inference_compile_mode not in (
+            "default",
+            "reduce-overhead",
+            "max-autotune",
+        ):
+            raise ConfigError("inference_compile_mode is invalid")
         if self.selfplay_source not in (
             "champion",
             "candidate",
@@ -573,6 +597,53 @@ class DistributedConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class HardwareHealthConfig:
+    """Gates for the coordinator's periodic ``nvidia-smi`` health probe.
+
+    ``require_gpu_model`` is a substring matched against the reported product
+    name (for example ``"H100"``). ``None`` accepts any NVIDIA GPU. The probe
+    itself only runs when orchestrated workers use CUDA devices.
+    """
+
+    require_gpu_model: str | None = None
+    fail_on_aggregate_uncorrectable: bool = True
+    transient_probe_attempts: int = 3
+    transient_probe_retry_seconds: float = 5.0
+    probe_timeout_seconds: float = 30.0
+
+    def __post_init__(self) -> None:
+        if self.require_gpu_model is not None and (
+            not isinstance(self.require_gpu_model, str)
+            or not self.require_gpu_model.strip()
+        ):
+            raise ConfigError("require_gpu_model must be a non-empty string or null")
+        if type(self.fail_on_aggregate_uncorrectable) is not bool:
+            raise ConfigError("fail_on_aggregate_uncorrectable must be boolean")
+        if (
+            isinstance(self.transient_probe_attempts, bool)
+            or not isinstance(self.transient_probe_attempts, int)
+            or self.transient_probe_attempts <= 0
+        ):
+            raise ConfigError("transient_probe_attempts must be a positive integer")
+        if (
+            isinstance(self.transient_probe_retry_seconds, bool)
+            or not isinstance(self.transient_probe_retry_seconds, int | float)
+            or not math.isfinite(float(self.transient_probe_retry_seconds))
+            or self.transient_probe_retry_seconds <= 0
+        ):
+            raise ConfigError(
+                "transient_probe_retry_seconds must be finite and positive"
+            )
+        if (
+            isinstance(self.probe_timeout_seconds, bool)
+            or not isinstance(self.probe_timeout_seconds, int | float)
+            or not math.isfinite(float(self.probe_timeout_seconds))
+            or self.probe_timeout_seconds <= 0
+        ):
+            raise ConfigError("probe_timeout_seconds must be finite and positive")
+
+
+@dataclass(frozen=True, slots=True)
 class PromotionConfig:
     enabled: bool = False
     gpu_id: int = 0
@@ -584,12 +655,16 @@ class PromotionConfig:
     pause_ready_timeout_seconds: float = 1_200.0
     pause_release_timeout_seconds: float = 120.0
     final_drain_timeout_seconds: float = 7_200.0
+    max_waves_per_lease: int | None = None
+    inter_wave_cooldown_seconds: float = 0.0
+    finish_inflight_candidate: bool = False
 
     def __post_init__(self) -> None:
         if (
             type(self.enabled) is not bool
             or type(self.bootstrap_initial_champion) is not bool
             or type(self.pause_sharing_mode) is not bool
+            or type(self.finish_inflight_candidate) is not bool
         ):
             raise ConfigError("promotion booleans must be boolean")
         if (
@@ -601,12 +676,54 @@ class PromotionConfig:
             or self.pause_ready_timeout_seconds <= 0
             or self.pause_release_timeout_seconds <= 0
             or self.final_drain_timeout_seconds <= 0
+            or (
+                self.max_waves_per_lease is not None
+                and (
+                    isinstance(self.max_waves_per_lease, bool)
+                    or not isinstance(self.max_waves_per_lease, int)
+                    or self.max_waves_per_lease <= 0
+                )
+            )
+            or isinstance(self.inter_wave_cooldown_seconds, bool)
+            or not isinstance(self.inter_wave_cooldown_seconds, int | float)
+            or not math.isfinite(float(self.inter_wave_cooldown_seconds))
+            or self.inter_wave_cooldown_seconds < 0
         ):
             raise ConfigError(
                 "promotion GPU, CPU, poll, and pause timeout settings are invalid"
             )
         if not isinstance(self.device, str) or not self.device:
             raise ConfigError("promotion device must be non-empty")
+        if self.inter_wave_cooldown_seconds and self.max_waves_per_lease is None:
+            raise ConfigError("promotion inter-wave cooldown requires a bounded lease")
+
+
+@dataclass(frozen=True, slots=True)
+class HistoricalEvaluationConfig:
+    enabled: bool = False
+    every_promotions: int = 2
+    anchors_per_evaluation: int = 1
+    pairs_per_ring: int = 5
+    max_pairs_per_ring: int = 10
+
+    def __post_init__(self) -> None:
+        if type(self.enabled) is not bool:
+            raise ConfigError("historical evaluation enabled must be boolean")
+        values = (
+            self.every_promotions,
+            self.anchors_per_evaluation,
+            self.pairs_per_ring,
+            self.max_pairs_per_ring,
+        )
+        if any(
+            isinstance(value, bool) or not isinstance(value, int) or value <= 0
+            for value in values
+        ):
+            raise ConfigError("historical evaluation counts must be positive integers")
+        if self.max_pairs_per_ring < self.pairs_per_ring:
+            raise ConfigError(
+                "historical evaluation maximum must cover one evaluation wave"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -705,6 +822,8 @@ class OrchestrationConfig:
     enabled: bool = False
     run_id: str | None = None
     gpus: tuple[GPUWorkerConfig, ...] = ()
+    device: str = "cuda"
+    allow_colocated_workers: bool = False
     actor_games_per_batch: int = 256
     ring_mixture: RingMixtureConfig = RingMixtureConfig()
     model_refresh: ModelRefreshConfig = ModelRefreshConfig()
@@ -713,6 +832,8 @@ class OrchestrationConfig:
     shutdown: ShutdownConfig = ShutdownConfig()
     distributed: DistributedConfig = DistributedConfig()
     promotion: PromotionConfig = PromotionConfig()
+    hardware_health: HardwareHealthConfig = HardwareHealthConfig()
+    historical_evaluation: HistoricalEvaluationConfig = HistoricalEvaluationConfig()
     plateau: PlateauConfig = PlateauConfig()
     autonomous: AutonomousConfig = AutonomousConfig()
     retention: RetentionConfig = RetentionConfig()
@@ -720,6 +841,13 @@ class OrchestrationConfig:
     def __post_init__(self) -> None:
         if type(self.enabled) is not bool:
             raise ConfigError("orchestration.enabled must be boolean")
+        if type(self.allow_colocated_workers) is not bool:
+            raise ConfigError("allow_colocated_workers must be boolean")
+        if self.device not in ("cuda", "mps", "cpu", "auto"):
+            raise ConfigError(
+                "orchestration.device must be cuda, mps, cpu, or auto; per-worker "
+                "CUDA pinning uses gpu_id, so device indexes are not accepted"
+            )
         if self.run_id is not None:
             from .runtime import validate_identifier
 
@@ -732,7 +860,18 @@ class OrchestrationConfig:
             raise ConfigError("actor_games_per_batch must be positive")
         ids = [gpu.gpu_id for gpu in self.gpus]
         if len(ids) != len(set(ids)):
-            raise ConfigError("a physical GPU may have only one configured role")
+            if not self.allow_colocated_workers:
+                raise ConfigError(
+                    "a physical GPU may have only one configured role; set "
+                    "allow_colocated_workers to share one GPU between the "
+                    "learner and an actor"
+                )
+            role_ids = [(gpu.gpu_id, gpu.role) for gpu in self.gpus]
+            if len(role_ids) != len(set(role_ids)):
+                raise ConfigError(
+                    "colocated workers on one GPU must have distinct roles; "
+                    "use actor_lanes for multiple actors per GPU"
+                )
         learners = [gpu for gpu in self.gpus if gpu.role == "learner"]
         actors = [gpu for gpu in self.gpus if gpu.role == "actor"]
         if any(
@@ -774,6 +913,8 @@ class OrchestrationConfig:
             )
         if not self.distributed.enabled and len(learners) > 1:
             raise ConfigError("multiple learner GPUs require distributed.enabled")
+        if self.distributed.enabled and self.device not in ("cuda", "auto"):
+            raise ConfigError("distributed training requires CUDA worker devices")
         if self.distributed.enabled and len(learners) < 2:
             raise ConfigError("distributed training requires at least two learner GPUs")
         if self.distributed.enabled and len({gpu.cpu_threads for gpu in learners}) != 1:
@@ -801,6 +942,8 @@ class OrchestrationConfig:
 class ArenaConfig:
     rings: tuple[int, ...] = SUPPORTED_RINGS
     pairs_per_ring: int = 20
+    continuation_pairs_per_ring: int | None = None
+    pair_chunk_size: int | None = None
     simulations: int = 1_024
     max_considered: int = 32
     c_visit: float = 50.0
@@ -830,9 +973,29 @@ class ArenaConfig:
             raise ConfigError(
                 "arena rings must be a sorted unique subset of (4, 6, 8, 10)"
             )
-        if self.pairs_per_ring < 2 or self.simulations <= 0:
+        if (
+            self.pairs_per_ring < 2
+            or (
+                self.continuation_pairs_per_ring is not None
+                and (
+                    isinstance(self.continuation_pairs_per_ring, bool)
+                    or not isinstance(self.continuation_pairs_per_ring, int)
+                    or self.continuation_pairs_per_ring < 2
+                )
+            )
+            or self.simulations <= 0
+        ):
             raise ConfigError(
-                "arena requires at least two pairs per ring and positive simulations"
+                "arena requires at least two initial/continuation pairs per ring "
+                "and positive simulations"
+            )
+        if self.pair_chunk_size is not None and (
+            isinstance(self.pair_chunk_size, bool)
+            or not isinstance(self.pair_chunk_size, int)
+            or self.pair_chunk_size <= 0
+        ):
+            raise ConfigError(
+                "arena pair_chunk_size must be null or a positive integer"
             )
         if self.max_considered <= 0 or self.c_visit <= 0 or self.c_scale <= 0:
             raise ConfigError("arena search settings must be positive")
@@ -850,6 +1013,12 @@ class ArenaConfig:
             self.pairs_per_ring > 0
             and self.minimum_pairs_per_ring >= self.pairs_per_ring
             and self.max_pairs_per_ring >= self.minimum_pairs_per_ring
+            and self.max_pairs_per_ring
+            >= (
+                self.continuation_pairs_per_ring
+                if self.continuation_pairs_per_ring is not None
+                else self.pairs_per_ring
+            )
         ):
             raise ConfigError(
                 "arena pair round/minimum/maximum settings are inconsistent"
@@ -940,6 +1109,56 @@ def _curriculum_values(values: object) -> dict[str, Any]:
     return output
 
 
+class _HostInventory:
+    """One lazy hardware-detection snapshot shared by a single config load."""
+
+    def __init__(self) -> None:
+        self._inventory = None
+
+    def get(self):
+        if self._inventory is None:
+            self._inventory = detect_accelerators()
+        return self._inventory
+
+    def resolve(self, requested: str) -> str:
+        return resolve_device_string(requested, inventory=self.get())
+
+
+def _resolve_auto_orchestration(
+    values: dict[str, Any],
+    host: _HostInventory,
+) -> dict[str, Any]:
+    """Materialize ``gpus: auto`` into a host-matched worker topology.
+
+    Detection is deterministic per host, so the coordinator and standalone
+    CLIs resolve identical topologies. Orchestrated child processes never
+    re-detect: the coordinator hands them a fully resolved config file.
+    Explicit keys in the operator's YAML always win over generated values.
+    """
+
+    if values.get("gpus") != "auto":
+        if values.get("device") == "auto":
+            values["device"] = host.resolve("auto")
+        return values
+    autonomous = values.get("autonomous")
+    if isinstance(autonomous, dict) and autonomous.get("enabled"):
+        raise ConfigError(
+            "autonomous runs require a frozen explicit GPU topology; "
+            "'gpus: auto' cannot be combined with autonomous.enabled"
+        )
+    fragment = generate_auto_topology(host.get())
+    values["gpus"] = fragment["gpus"]
+    for key in ("device", "actor_games_per_batch", "allow_colocated_workers"):
+        if key in fragment and key not in values:
+            values[key] = fragment[key]
+    generated_promotion = dict(cast(dict[str, Any], fragment["promotion"]))
+    generated_promotion.update(_mapping("promotion", values.get("promotion", {})))
+    values["promotion"] = generated_promotion
+    if values.get("device") == "auto":
+        values["device"] = host.resolve("auto")
+    return values
+
+
 def _ring_weight_values(values: object) -> dict[str, Any]:
     output = _mapping("ring weight stage", values)
     output["weights"] = tuple(output.get("weights", ()))
@@ -982,7 +1201,9 @@ def load_config(path: str | Path) -> ExperimentConfig:
     )
     game_values = _mapping("game", raw["game"])
     game_values["rings"] = tuple(game_values.get("rings", SUPPORTED_RINGS))
+    host = _HostInventory()
     orchestration_values = _mapping("orchestration", raw.get("orchestration", {}))
+    orchestration_values = _resolve_auto_orchestration(orchestration_values, host)
     orchestration_values["gpus"] = tuple(
         _construct(GPUWorkerConfig, value)
         for value in orchestration_values.get("gpus", ())
@@ -1007,6 +1228,10 @@ def load_config(path: str | Path) -> ExperimentConfig:
         for value in ring_values.get("step_weights", ())
     )
     orchestration_values["ring_mixture"] = _construct(RingMixtureConfig, ring_values)
+    promotion_values = _mapping("promotion", orchestration_values.get("promotion", {}))
+    if promotion_values.get("device") == "auto":
+        promotion_values["device"] = host.resolve("auto")
+    orchestration_values["promotion"] = promotion_values
     for key, cls in (
         ("model_refresh", ModelRefreshConfig),
         ("restart", RestartPolicyConfig),
@@ -1014,11 +1239,16 @@ def load_config(path: str | Path) -> ExperimentConfig:
         ("shutdown", ShutdownConfig),
         ("distributed", DistributedConfig),
         ("promotion", PromotionConfig),
+        ("hardware_health", HardwareHealthConfig),
+        ("historical_evaluation", HistoricalEvaluationConfig),
         ("plateau", PlateauConfig),
         ("autonomous", AutonomousConfig),
         ("retention", RetentionConfig),
     ):
         orchestration_values[key] = _construct(cls, orchestration_values.get(key, {}))
+    learner_values = _mapping("learner", raw["learner"])
+    if learner_values.get("device") == "auto":
+        learner_values["device"] = host.resolve("auto")
     arena_values = _mapping("arena", raw.get("arena", {}))
     arena_values["rings"] = tuple(arena_values.get("rings", SUPPORTED_RINGS))
     arena_values["per_ring_regression_floor_elo"] = {
@@ -1037,7 +1267,7 @@ def load_config(path: str | Path) -> ExperimentConfig:
         train=_construct(TrainConfig, train_values),
         data=_construct(DataConfig, raw["data"]),
         selfplay=_construct(SelfPlayConfig, raw["selfplay"]),
-        learner=_construct(LearnerConfig, raw["learner"]),
+        learner=_construct(LearnerConfig, learner_values),
         orchestration=_construct(OrchestrationConfig, orchestration_values),
         arena=_construct(ArenaConfig, arena_values),
         profile=raw.get("profile", "standalone-smoke"),

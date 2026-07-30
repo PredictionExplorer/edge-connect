@@ -20,6 +20,7 @@ from pathlib import Path
 import yaml
 
 SEVERITY = {"OK": 0, "WARN": 1, "ERROR": 2}
+CONTINUITY_STALE_SECONDS = 180.0
 _DIGEST_CACHE: dict[Path, tuple[int, int, int, str]] = {}
 _ARENA_RESULT_CACHE: dict[Path, tuple[int, int, dict[str, object]]] = {}
 
@@ -29,6 +30,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--run-root", type=Path, required=True)
     parser.add_argument("--profile", type=Path)
     parser.add_argument("--unit")
+    parser.add_argument(
+        "--continuity-state",
+        type=Path,
+        help="host-level continuity-state JSON outside the run root",
+    )
     parser.add_argument("--interval", type=float, default=60.0)
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--format", choices=("text", "jsonl"), default="text")
@@ -51,6 +57,67 @@ def _read_json(path: Path, *, attempts: int = 3) -> dict[str, object] | None:
             if attempt + 1 < attempts:
                 time.sleep(0.02)
     return None
+
+
+def _continuity_status(
+    path: Path | None,
+    *,
+    now_ns: int,
+) -> dict[str, object]:
+    if path is None:
+        return {"configured": False}
+    source = path.expanduser().resolve()
+    payload = _read_json(source)
+    if (
+        payload is None
+        or payload.get("format") != "startrain.training-continuity-state"
+        or payload.get("schema_version") != 1
+    ):
+        return {
+            "configured": True,
+            "valid": False,
+            "state_path": str(source),
+        }
+    idle_since = payload.get("productive_idle_since_ns")
+    idle_seconds = (
+        max(0.0, (now_ns - idle_since) / 1_000_000_000)
+        if isinstance(idle_since, int) and not isinstance(idle_since, bool)
+        else None
+    )
+    reconciled_ns = payload.get("last_reconciled_ns")
+    reconciliation_age_seconds = (
+        max(0.0, (now_ns - reconciled_ns) / 1_000_000_000)
+        if isinstance(reconciled_ns, int) and not isinstance(reconciled_ns, bool)
+        else None
+    )
+    return {
+        "configured": True,
+        "valid": True,
+        "state_path": str(source),
+        "manifest_sha256": payload.get("manifest_sha256"),
+        "revision": payload.get("revision"),
+        "updated_ns": payload.get("updated_ns"),
+        "last_reconciled_ns": reconciled_ns,
+        "reconciliation_age_seconds": reconciliation_age_seconds,
+        "phase": payload.get("phase"),
+        "primary_workload_id": payload.get("primary_workload_id"),
+        "desired_workload_id": payload.get("desired_workload_id"),
+        "active_workload_id": payload.get("active_workload_id"),
+        "selected_lkg_workload_id": payload.get("selected_lkg_workload_id"),
+        "active_profile_sha256": payload.get("active_profile_sha256"),
+        "active_run_root_sha256": payload.get("active_run_root_sha256"),
+        "fallback_attempts": payload.get("fallback_attempts"),
+        "productive_idle_since_ns": idle_since,
+        "productive_idle_seconds": idle_seconds,
+        "hardware": payload.get("hardware"),
+        "execution": payload.get("execution"),
+        "blocked_reason": payload.get("blocked_reason"),
+        "last_failure": payload.get("last_failure"),
+        "last_handoff": payload.get("last_handoff"),
+        "last_transition": payload.get("last_transition"),
+        "last_alert": payload.get("last_alert"),
+        "quarantine_records": payload.get("quarantine_records"),
+    }
 
 
 def _latest_jsonl(
@@ -82,6 +149,221 @@ def _latest_jsonl(
     return None
 
 
+def _recent_jsonl(path: Path, *, maximum_bytes: int = 2 * 1024 * 1024):
+    try:
+        with path.open("rb") as stream:
+            size = stream.seek(0, 2)
+            start = max(0, size - maximum_bytes)
+            stream.seek(start)
+            data = stream.read(size - start)
+    except OSError:
+        return []
+    if start and b"\n" in data:
+        data = data.split(b"\n", 1)[1]
+    lines = data.splitlines()
+    if data and not data.endswith(b"\n") and lines:
+        lines.pop()
+    output = []
+    for line in lines:
+        try:
+            payload = json.loads(line)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        if isinstance(payload, dict):
+            output.append(payload)
+    return output
+
+
+def _merge_interval_seconds(intervals: list[tuple[int, int]]) -> float:
+    merged = 0
+    end = 0
+    for started, completed in sorted(intervals):
+        if completed <= started:
+            continue
+        if started >= end:
+            merged += completed - started
+        elif completed > end:
+            merged += completed - end
+        end = max(end, completed)
+    return merged / 1_000_000_000
+
+
+def _actor_throughput_window(
+    metrics_root: Path,
+    *,
+    now_ns: int,
+    window_seconds: float = 3_600.0,
+) -> dict[str, object]:
+    cutoff_ns = now_ns - int(window_seconds * 1_000_000_000)
+    all_records = []
+
+    def required_int(row: Mapping[str, object], name: str) -> int:
+        value = row.get(name)
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(f"actor metric {name} is not an integer")
+        return value
+
+    def counter_int(row: Mapping[str, object], name: str) -> int:
+        value = row.get(name, 0)
+        return value if isinstance(value, int) and not isinstance(value, bool) else 0
+
+    for path in sorted(metrics_root.glob("actor-gpu-*.jsonl")):
+        for row in _recent_jsonl(path):
+            started = row.get("batch_started_ns")
+            completed = row.get("batch_completed_ns")
+            if (
+                isinstance(started, int)
+                and not isinstance(started, bool)
+                and isinstance(completed, int)
+                and not isinstance(completed, bool)
+                and completed <= now_ns
+                and completed > started
+            ):
+                all_records.append(row)
+
+    counter_names = ("games", "samples", "evaluator_rows")
+    cumulative_names = tuple(f"cumulative_{name}" for name in counter_names)
+    groups: dict[tuple[str, int], list[dict[str, object]]] = {}
+    legacy_records = []
+    for row in all_records:
+        process_started = row.get("process_started_ns")
+        if (
+            isinstance(process_started, int)
+            and not isinstance(process_started, bool)
+            and all(
+                isinstance(row.get(name), int) and not isinstance(row.get(name), bool)
+                for name in cumulative_names
+            )
+        ):
+            groups.setdefault(
+                (str(row.get("worker")), process_started),
+                [],
+            ).append(row)
+        elif required_int(row, "batch_completed_ns") >= cutoff_ns:
+            legacy_records.append(row)
+
+    totals = {name: 0 for name in counter_names}
+    totals_by_gpu: dict[int, dict[str, int]] = {}
+    workers_by_gpu: dict[int, set[str]] = {}
+    partial_processes = []
+    contributing_starts = []
+    contributing_records = []
+
+    def add_values(row: Mapping[str, object], values: Mapping[str, int]) -> None:
+        gpu_id = row.get("gpu_id")
+        for name, value in values.items():
+            totals[name] += value
+        if isinstance(gpu_id, int) and not isinstance(gpu_id, bool):
+            gpu_totals = totals_by_gpu.setdefault(
+                gpu_id, {name: 0 for name in counter_names}
+            )
+            for name, value in values.items():
+                gpu_totals[name] += value
+            workers_by_gpu.setdefault(gpu_id, set()).add(str(row.get("worker")))
+
+    for (worker, process_started), rows in sorted(groups.items()):
+        ordered = sorted(rows, key=lambda row: required_int(row, "batch_completed_ns"))
+        end = ordered[-1]
+        if required_int(end, "batch_completed_ns") < cutoff_ns:
+            continue
+        baselines = [
+            row
+            for row in ordered
+            if required_int(row, "batch_completed_ns") <= cutoff_ns
+        ]
+        if baselines:
+            baseline = baselines[-1]
+            values = {
+                name: required_int(end, f"cumulative_{name}")
+                - required_int(baseline, f"cumulative_{name}")
+                for name in counter_names
+            }
+            start_ns = cutoff_ns
+        elif process_started >= cutoff_ns:
+            values = {
+                name: required_int(end, f"cumulative_{name}") for name in counter_names
+            }
+            start_ns = process_started
+        else:
+            selected = [
+                row
+                for row in ordered
+                if required_int(row, "batch_completed_ns") >= cutoff_ns
+            ]
+            values = {
+                name: sum(counter_int(row, name) for row in selected)
+                for name in counter_names
+            }
+            start_ns = max(
+                cutoff_ns,
+                min(required_int(row, "batch_started_ns") for row in selected),
+            )
+            partial_processes.append(worker)
+        if any(value < 0 for value in values.values()):
+            partial_processes.append(worker)
+            continue
+        add_values(end, values)
+        contributing_starts.append(start_ns)
+        contributing_records.extend(
+            row
+            for row in ordered
+            if required_int(row, "batch_completed_ns") >= cutoff_ns
+        )
+
+    for row in legacy_records:
+        values = {name: counter_int(row, name) for name in counter_names}
+        add_values(row, values)
+        contributing_starts.append(
+            max(cutoff_ns, required_int(row, "batch_started_ns"))
+        )
+        contributing_records.append(row)
+        partial_processes.append(str(row.get("worker")))
+
+    observation_start_ns = (
+        max(cutoff_ns, min(contributing_starts)) if contributing_starts else cutoff_ns
+    )
+    fleet_seconds = max(0.0, (now_ns - observation_start_ns) / 1_000_000_000)
+    active_seconds = _merge_interval_seconds(
+        [
+            (
+                max(cutoff_ns, required_int(row, "batch_started_ns")),
+                min(now_ns, required_int(row, "batch_completed_ns")),
+            )
+            for row in contributing_records
+        ]
+    )
+    by_gpu = {}
+    for gpu_id, gpu_totals in sorted(totals_by_gpu.items()):
+        by_gpu[str(gpu_id)] = {
+            "wall_seconds": fleet_seconds,
+            **gpu_totals,
+            **{
+                f"{name}_per_second": value / fleet_seconds if fleet_seconds else None
+                for name, value in gpu_totals.items()
+            },
+            "workers": sorted(workers_by_gpu.get(gpu_id, set())),
+        }
+    return {
+        "schema_version": 1,
+        "method": "cumulative_counter_wall_window_v1",
+        "requested_window_seconds": window_seconds,
+        "observation_start_ns": observation_start_ns,
+        "observation_end_ns": now_ns,
+        "record_count": len(contributing_records),
+        "partial_processes": sorted(set(partial_processes)),
+        "active_interval_seconds": active_seconds,
+        "fleet": {
+            "wall_seconds": fleet_seconds,
+            **totals,
+            **{
+                f"{key}_per_second": value / fleet_seconds if fleet_seconds else None
+                for key, value in totals.items()
+            },
+        },
+        "by_gpu": by_gpu,
+    }
+
+
 def _run_command(command: Sequence[str], *, timeout: float = 10.0):
     try:
         return subprocess.run(
@@ -104,6 +386,22 @@ def _number(value: object) -> float | None:
 
 def _mapping(value: object) -> Mapping[str, object]:
     return value if isinstance(value, dict) else {}
+
+
+def _arena_result_kind(result: Mapping[str, object]) -> str:
+    value = result.get("result_kind")
+    if value is None:
+        return "promotion"
+    return (
+        value
+        if value in ("promotion", "crossplay", "historical_crossplay")
+        else "unknown"
+    )
+
+
+def _arena_result_category(result: Mapping[str, object]) -> str:
+    kind = _arena_result_kind(result)
+    return "crossplay" if kind in ("crossplay", "historical_crossplay") else kind
 
 
 def _configured_ring_weights(
@@ -218,6 +516,8 @@ def _gpu_status() -> tuple[list[dict[str, object]], str | None]:
         "temperature.gpu",
         "power.draw",
         "ecc.errors.uncorrected.volatile.total",
+        "ecc.errors.uncorrected.aggregate.sram",
+        "ecc.errors.uncorrected.aggregate.dram",
     )
     completed = _run_command(
         [
@@ -320,6 +620,8 @@ def _arena_history(run_root: Path, *, limit: int = 5) -> dict[str, object]:
             promotion = _mapping(result.get("promotion"))
             aggregate = _mapping(result.get("aggregate"))
             summary = {
+                "result_kind": _arena_result_kind(result),
+                "result_category": _arena_result_category(result),
                 "candidate": result.get("candidate"),
                 "baseline": result.get("baseline"),
                 "decision": promotion.get("decision"),
@@ -363,6 +665,8 @@ def _arena_history(run_root: Path, *, limit: int = 5) -> dict[str, object]:
                 lower_elo = 400 * math.log10(lower_score / (1 - lower_score))
         completed.append(
             {
+                "result_kind": summary.get("result_kind", "promotion"),
+                "result_category": summary.get("result_category", "promotion"),
                 "completed_ns": completed_ns,
                 "candidate_step": steps.get(str(summary.get("candidate"))),
                 "baseline_step": steps.get(str(summary.get("baseline"))),
@@ -378,8 +682,26 @@ def _arena_history(run_root: Path, *, limit: int = 5) -> dict[str, object]:
     for stale_path in set(_ARENA_RESULT_CACHE) - existing_paths:
         _ARENA_RESULT_CACHE.pop(stale_path, None)
     completed.sort(key=lambda row: _number(row.get("completed_ns")) or 0.0)
+    result_kind_counts = {
+        kind: sum(row.get("result_kind") == kind for row in completed)
+        for kind in ("promotion", "crossplay", "historical_crossplay", "unknown")
+    }
+    result_category_counts = {
+        kind: sum(row.get("result_category") == kind for row in completed)
+        for kind in ("promotion", "crossplay", "unknown")
+    }
+    completed_superseded = sum(
+        row.get("result_category") == "promotion"
+        and row.get("decision") == "superseded"
+        for row in completed
+    )
+    promotion_evaluations = result_category_counts["promotion"]
     return {
         "completed_evaluations": len(completed),
+        "result_kind_counts": result_kind_counts,
+        "result_category_counts": result_category_counts,
+        "promotion_evaluations": promotion_evaluations,
+        "crossplay_evaluations": result_category_counts["crossplay"],
         "promotions": sum(row.get("decision") == "promote" for row in completed),
         "rejections": sum(
             row.get("decision")
@@ -387,7 +709,50 @@ def _arena_history(run_root: Path, *, limit: int = 5) -> dict[str, object]:
             for row in completed
         ),
         "superseded_candidates": superseded,
+        "completed_superseded_evaluations": completed_superseded,
+        "completed_superseded_fraction": (
+            completed_superseded / promotion_evaluations
+            if promotion_evaluations
+            else None
+        ),
         "recent": completed[-limit:],
+    }
+
+
+def _strength_efficiency_status(run_root: Path) -> dict[str, object]:
+    report = _read_json(run_root / "strength-efficiency.json", attempts=1)
+    if report is None:
+        return {"available": False}
+    autonomous = _mapping(report.get("autonomous_elo"))
+    headline = _mapping(autonomous.get("headline"))
+    headline_elo = _number(autonomous.get("headline_elo"))
+    source = headline.get("source")
+    if headline_elo is None:
+        headline_elo = _number(headline.get("rating"))
+    if headline_elo is None:
+        aggregate = _mapping(autonomous.get("aggregate"))
+        aggregate_latest = _mapping(aggregate.get("latest"))
+        headline_elo = _number(aggregate_latest.get("rating"))
+        if headline_elo is not None:
+            headline = {
+                "source": "aggregate",
+                **aggregate_latest,
+            }
+            source = "aggregate"
+    confidence_interval = headline.get("confidence_interval")
+    if not (
+        isinstance(confidence_interval, list)
+        and len(confidence_interval) == 2
+        and all(_number(value) is not None for value in confidence_interval)
+    ):
+        confidence_interval = None
+    return {
+        "available": True,
+        "status": report.get("status"),
+        "headline": dict(headline) if headline else None,
+        "headline_elo": headline_elo,
+        "headline_source": source if isinstance(source, str) else None,
+        "headline_confidence_interval": confidence_interval,
     }
 
 
@@ -436,6 +801,7 @@ def collect_snapshot(
     *,
     unit: str | None = None,
     profile_path: Path | None = None,
+    continuity_state_path: Path | None = None,
     now_ns: int | None = None,
 ) -> dict[str, object]:
     root = run_root.expanduser().resolve()
@@ -496,6 +862,16 @@ def collect_snapshot(
         _add_warning(warnings, "WARN", "service_restarted", "systemd restart observed")
 
     coordinator = _read_json(root / "status" / "coordinator.json") or {}
+    fatal = _read_json(root / "status" / "fatal.json")
+    if fatal is not None:
+        failure_class = fatal.get("failure_class")
+        reason = fatal.get("reason")
+        _add_warning(
+            warnings,
+            "ERROR",
+            "coordinator_fatal",
+            f"{failure_class or 'unknown'} failure: {reason or 'reason unavailable'}",
+        )
     if coordinator.get("state") not in ("running", "draining"):
         _add_warning(
             warnings,
@@ -559,6 +935,9 @@ def collect_snapshot(
                     "state": state,
                     "pid": worker.get("pid"),
                     "restart_count": restart_count,
+                    "failure_class": worker.get("failure_class"),
+                    "failure_reason": worker.get("failure_reason"),
+                    "last_exit_code": worker.get("last_exit_code"),
                     "phase": heartbeat.get("phase"),
                     "progress": heartbeat.get("progress"),
                     "active_ring_weights": heartbeat.get("active_ring_weights"),
@@ -604,17 +983,34 @@ def collect_snapshot(
             f"learner data wait is {data_wait_fraction:.1%} of wall step time",
         )
     updates_per_new_sample = _number(learner_metric.get("updates_per_new_sample"))
-    target_updates = _number(learner_config.get("target_updates_per_new_sample"))
+    lifetime_updates = _number(learner_metric.get("lifetime_updates_per_new_sample"))
+    if lifetime_updates is None:
+        lifetime_updates = updates_per_new_sample
+    segment_updates = _number(learner_metric.get("segment_updates_per_new_sample"))
+    configured_target_updates = _number(
+        learner_config.get("target_updates_per_new_sample")
+    )
+    segment_target_updates = _number(
+        learner_metric.get("utd_segment_target_updates_per_new_sample")
+    )
+    effective_updates = (
+        segment_updates if segment_updates is not None else updates_per_new_sample
+    )
+    effective_target_updates = (
+        segment_target_updates
+        if segment_updates is not None and segment_target_updates is not None
+        else configured_target_updates
+    )
     if (
-        target_updates is not None
-        and updates_per_new_sample is not None
-        and updates_per_new_sample > target_updates * 1.05
+        effective_target_updates is not None
+        and effective_updates is not None
+        and effective_updates > effective_target_updates * 1.05
     ):
         _add_warning(
             warnings,
             "WARN",
             "update_to_data_high",
-            f"UTD={updates_per_new_sample:.3f} target={target_updates:.3f}",
+            f"UTD={effective_updates:.3f} target={effective_target_updates:.3f}",
         )
     learner = {
         "step": learner_heartbeat.get("step", learner_metric.get("step")),
@@ -629,7 +1025,30 @@ def collect_snapshot(
         "data_wait_fraction": data_wait_fraction,
         "h2d_seconds": learner_metric.get("h2d_seconds"),
         "updates_per_new_sample": updates_per_new_sample,
-        "target_updates_per_new_sample": target_updates,
+        "target_updates_per_new_sample": configured_target_updates,
+        "lifetime_updates_per_new_sample": lifetime_updates,
+        "segment_updates_per_new_sample": segment_updates,
+        "utd_segment_target_updates_per_new_sample": segment_target_updates,
+        "utd_segment_baseline_examples_consumed": learner_metric.get(
+            "utd_segment_baseline_examples_consumed"
+        ),
+        "utd_segment_baseline_committed_replay_samples": learner_metric.get(
+            "utd_segment_baseline_committed_replay_samples"
+        ),
+        "loader_workers_effective": learner_metric.get("loader_workers_effective"),
+        "window_setup_seconds": learner_metric.get("window_setup_seconds"),
+        "window_setup_amortized_seconds": learner_metric.get(
+            "window_setup_amortized_seconds"
+        ),
+        "window_batches_allocated": learner_metric.get("window_batches_allocated"),
+        "window_batches_consumed": learner_metric.get("window_batches_consumed"),
+        "window_batches_consumed_this_spin": learner_metric.get(
+            "window_batches_consumed_this_spin"
+        ),
+        "window_reuse": learner_metric.get("window_reuse"),
+        "window_reuse_spins": learner_metric.get("window_reuse_spins"),
+        "window_refresh_reason": learner_metric.get("window_refresh_reason"),
+        "utd_wait_spins": learner_metric.get("utd_wait_spins"),
         "learning_rates": learner_metric.get("learning_rates"),
         "replay_samples_by_ring": learner_metric.get("replay_samples_by_ring"),
         "ring_batch_weights": learner_metric.get("ring_batch_weights"),
@@ -717,8 +1136,24 @@ def collect_snapshot(
             "policy_supervision_low",
             "low actor policy supervision: " + ",".join(low_policy_workers),
         )
+    actor_throughput = _actor_throughput_window(
+        root / "metrics",
+        now_ns=now,
+    )
+    if (
+        active_actor_rows
+        and any(isinstance(row.get("batch_completed_ns"), int) for row in actors)
+        and actor_throughput.get("record_count") == 0
+    ):
+        _add_warning(
+            warnings,
+            "WARN",
+            "actor_throughput_stale",
+            "no completed actor batches are available in the throughput window",
+        )
     actor_fleet = {
         "workers": len(actors),
+        "throughput": actor_throughput,
         "policy_supervision_rate": policy_supervision_rate,
         "active_ring_weights": (
             list(next(iter(weight_variants))) if len(weight_variants) == 1 else None
@@ -741,6 +1176,7 @@ def collect_snapshot(
                 _number(row.get("evaluator_rows_per_second")) or 0.0 for row in actors
             ),
         },
+        "latest_batch_rate_sum_deprecated": True,
         "latest": [
             {
                 "worker": row.get("worker"),
@@ -1033,6 +1469,34 @@ def collect_snapshot(
 
     arena = _read_json(root / "arena" / "promotion-status.json") or {}
     arena_history = _arena_history(root)
+    arena_config = _mapping(profile.get("arena"))
+    promotion_config = _mapping(orchestration.get("promotion"))
+    finish_inflight = promotion_config.get("finish_inflight_candidate") is True
+    pairs_per_ring = _number(arena_config.get("pairs_per_ring"))
+    minimum_pairs = _number(arena_config.get("minimum_pairs_per_ring"))
+    maximum_pairs = _number(arena_config.get("max_pairs_per_ring"))
+    continuation_pairs = _number(arena_config.get("continuation_pairs_per_ring"))
+    if (
+        pairs_per_ring is not None
+        and minimum_pairs is not None
+        and maximum_pairs is not None
+        and maximum_pairs > minimum_pairs
+    ):
+        continuation = continuation_pairs or pairs_per_ring
+        if continuation > 0:
+            continuation_waves = math.ceil(
+                (maximum_pairs - minimum_pairs) / continuation
+            )
+            if continuation_waves > 1 and not finish_inflight:
+                _add_warning(
+                    warnings,
+                    "WARN",
+                    "arena_continuation_fragmented",
+                    "arena needs "
+                    f"{continuation_waves} post-minimum waves; newer candidates may "
+                    "supersede completed evaluation work",
+                )
+    strength_efficiency = _strength_efficiency_status(root)
     pause_request = _read_json(root / "status" / "arena-gpu-pause.json")
     pause_ack = _read_json(root / "status" / "arena-gpu-pause.ack.json")
     if (
@@ -1061,11 +1525,31 @@ def collect_snapshot(
         _add_warning(warnings, "WARN", "disk_high", "disk or inode use >=85%")
 
     gpus, gpu_error = _gpu_status()
+    hardware_health = (
+        _read_json(root / "status" / "hardware-health.json")
+        or _read_json(root / "status" / "hardware-health-startup.json")
+        or {}
+    )
     if gpu_error:
         _add_warning(warnings, "WARN", gpu_error, "GPU telemetry is unavailable")
+    if hardware_health and hardware_health.get("healthy") is not True:
+        reasons = []
+        hardware_rows = hardware_health.get("gpus")
+        for row in hardware_rows if isinstance(hardware_rows, list) else []:
+            if isinstance(row, dict):
+                reasons.extend(
+                    f"GPU {row.get('index')}: {reason}"
+                    for reason in row.get("reasons", [])
+                )
+        detail = "; ".join(reasons) or str(
+            hardware_health.get("query_error", "hardware health gate failed")
+        )
+        _add_warning(warnings, "ERROR", "gpu_health_gate", detail)
     for gpu in gpus:
         temperature = _number(gpu.get("temperature.gpu"))
         ecc = _number(gpu.get("ecc.errors.uncorrected.volatile.total"))
+        aggregate_sram = _number(gpu.get("ecc.errors.uncorrected.aggregate.sram"))
+        aggregate_dram = _number(gpu.get("ecc.errors.uncorrected.aggregate.dram"))
         if temperature is not None and temperature >= 90:
             _add_warning(
                 warnings,
@@ -1087,6 +1571,48 @@ def collect_snapshot(
                 "gpu_ecc",
                 f"GPU {gpu['index']} volatile uncorrected ECC={ecc:g}",
             )
+        if (aggregate_sram or 0.0) > 0 or (aggregate_dram or 0.0) > 0:
+            _add_warning(
+                warnings,
+                "ERROR",
+                "gpu_ecc_aggregate",
+                f"GPU {gpu['index']} aggregate uncorrected "
+                f"SRAM={aggregate_sram or 0:g} DRAM={aggregate_dram or 0:g}",
+            )
+
+    continuity = _continuity_status(continuity_state_path, now_ns=now)
+    if continuity.get("configured") and continuity.get("valid") is not True:
+        _add_warning(
+            warnings,
+            "ERROR",
+            "continuity_state_invalid",
+            "host-level continuity state is missing or invalid",
+        )
+    reconciliation_age = continuity.get("reconciliation_age_seconds")
+    if (
+        continuity.get("configured")
+        and continuity.get("valid") is True
+        and (
+            not isinstance(reconciliation_age, int | float)
+            or float(reconciliation_age) > CONTINUITY_STALE_SECONDS
+        )
+    ):
+        _add_warning(
+            warnings,
+            "ERROR",
+            "continuity_reconciliation_stale",
+            "host-level continuity reconciliation heartbeat is stale",
+        )
+    phase = continuity.get("phase")
+    if (isinstance(phase, str) and phase.startswith("blocked_")) or continuity.get(
+        "blocked_reason"
+    ) is not None:
+        _add_warning(
+            warnings,
+            "ERROR",
+            "continuity_blocked",
+            f"host-level continuity phase is {phase}",
+        )
 
     status = max(
         (item["severity"] for item in warnings),
@@ -1107,6 +1633,7 @@ def collect_snapshot(
             "state": coordinator.get("state"),
             "draining": coordinator.get("draining"),
             "pause_lease": coordinator.get("pause_lease"),
+            "failure": fatal or coordinator.get("failure"),
         },
         "workers": workers_output,
         "learner": learner,
@@ -1115,19 +1642,28 @@ def collect_snapshot(
         "recovery": recovery,
         "arena": arena,
         "arena_history": arena_history,
+        "strength_efficiency": strength_efficiency,
         "pause": pause,
         "disk": disk,
         "gpus": gpus,
+        "gpu_health": hardware_health,
+        "continuity": continuity,
         "warnings": warnings,
     }
 
 
 def format_text(snapshot: Mapping[str, object]) -> str:
+    coordinator = snapshot.get("coordinator")
+    coordinator = coordinator if isinstance(coordinator, Mapping) else {}
+    failure = coordinator.get("failure")
+    failure = failure if isinstance(failure, Mapping) else {}
     learner = snapshot.get("learner")
     learner = learner if isinstance(learner, Mapping) else {}
     actors = snapshot.get("actors")
     actors = actors if isinstance(actors, Mapping) else {}
-    rates = actors.get("latest_batch_rate_sum")
+    throughput = actors.get("throughput")
+    throughput = throughput if isinstance(throughput, Mapping) else {}
+    rates = throughput.get("fleet")
     rates = rates if isinstance(rates, Mapping) else {}
     replay = snapshot.get("replay")
     replay = replay if isinstance(replay, Mapping) else {}
@@ -1141,6 +1677,10 @@ def format_text(snapshot: Mapping[str, object]) -> str:
     recovery = recovery if isinstance(recovery, Mapping) else {}
     arena_history = snapshot.get("arena_history")
     arena_history = arena_history if isinstance(arena_history, Mapping) else {}
+    strength_efficiency = snapshot.get("strength_efficiency")
+    strength_efficiency = (
+        strength_efficiency if isinstance(strength_efficiency, Mapping) else {}
+    )
     recent_evaluations = arena_history.get("recent")
     recent_evaluations = (
         recent_evaluations if isinstance(recent_evaluations, list) else []
@@ -1157,10 +1697,31 @@ def format_text(snapshot: Mapping[str, object]) -> str:
         for item in warnings
         if isinstance(item, Mapping) and item.get("code")
     )
+    headline_elo = _number(strength_efficiency.get("headline_elo"))
+    displayed_elo = (
+        headline_elo
+        if headline_elo is not None
+        else latest_evaluation.get("elo_difference")
+    )
+    elo_source = (
+        strength_efficiency.get("headline_source")
+        if headline_elo is not None
+        else "latest_arena"
+    )
+    segment_target = learner.get("utd_segment_target_updates_per_new_sample")
+    if _number(segment_target) is None:
+        segment_target = learner.get("target_updates_per_new_sample")
+    continuity = snapshot.get("continuity")
+    continuity = continuity if isinstance(continuity, Mapping) else {}
     return (
         f"{snapshot.get('timestamp')} {snapshot.get('status')} "
         f"learner={learner.get('step')}/{learner.get('target_steps')} "
         f"phase={learner.get('phase')} eps={_compact(learner.get('examples_per_second'))} "
+        f"utd_segment={_compact(learner.get('segment_updates_per_new_sample'))}/"
+        f"{_compact(segment_target)} "
+        f"loader_workers={_count(learner.get('loader_workers_effective'))} "
+        f"window_reuse={_flag(learner.get('window_reuse'))} "
+        f"window_setup={_seconds(learner.get('window_setup_amortized_seconds'))} "
         f"actors={actors.get('workers')} "
         f"policy={_percent(actors.get('policy_supervision_rate'))} "
         f"games/s={_compact(rates.get('games_per_second'))} "
@@ -1170,7 +1731,12 @@ def format_text(snapshot: Mapping[str, object]) -> str:
         f"models={recovery.get('selfplay_step')}/"
         f"{recovery.get('candidate_step')}/{arena.get('champion_step')} "
         f"arena={arena.get('decision', arena.get('phase', 'waiting'))} "
-        f"elo={_compact(latest_evaluation.get('elo_difference'))} "
+        f"promotion_evals={arena_history.get('promotion_evaluations', 0)} "
+        f"crossplay_evals={arena_history.get('crossplay_evaluations', 0)} "
+        f"elo={_compact(displayed_elo)} elo_source={elo_source or 'n/a'} "
+        f"failure={failure.get('failure_class', '-')} "
+        f"continuity={continuity.get('phase', 'n/a')} "
+        f"active_workload={continuity.get('active_workload_id', 'n/a')} "
         f"warnings={warning_codes or '-'}"
     )
 
@@ -1191,6 +1757,26 @@ def _percent(value: object) -> str:
     return f"{number:.0%}" if number is not None else "n/a"
 
 
+def _count(value: object) -> str:
+    number = _number(value)
+    return str(int(number)) if number is not None and number.is_integer() else "n/a"
+
+
+def _flag(value: object) -> str:
+    if value is True:
+        return "yes"
+    if value is False:
+        return "no"
+    return "n/a"
+
+
+def _seconds(value: object) -> str:
+    number = _number(value)
+    if number is None:
+        return "n/a"
+    return f"{number:.4f}s" if abs(number) < 0.01 else f"{_compact(number)}s"
+
+
 def run_monitor(
     run_root: Path,
     *,
@@ -1200,14 +1786,24 @@ def run_monitor(
     once: bool,
     output_format: str,
     stop_requested: Callable[[], bool],
+    continuity_state_path: Path | None = None,
 ) -> None:
     next_tick = time.monotonic()
     while not stop_requested():
         try:
-            snapshot = collect_snapshot(
-                run_root,
-                unit=unit,
-                profile_path=profile_path,
+            snapshot = (
+                collect_snapshot(
+                    run_root,
+                    unit=unit,
+                    profile_path=profile_path,
+                )
+                if continuity_state_path is None
+                else collect_snapshot(
+                    run_root,
+                    unit=unit,
+                    profile_path=profile_path,
+                    continuity_state_path=continuity_state_path,
+                )
             )
         except Exception as error:  # monitor must report and continue
             snapshot = {
@@ -1258,6 +1854,7 @@ def main(argv: list[str] | None = None) -> int:
         once=arguments.once,
         output_format=arguments.format,
         stop_requested=lambda: stopped,
+        continuity_state_path=arguments.continuity_state,
     )
     return 0
 

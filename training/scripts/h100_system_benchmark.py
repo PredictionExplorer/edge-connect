@@ -71,6 +71,8 @@ class BenchmarkSettings:
     minimum_leaves_per_second: float = 5_000.0
     timeout_seconds: float = 900.0
     metrics_root: Path | None = None
+    compile_dynamic: bool | None = None
+    compile_mode: str | None = None
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -89,6 +91,15 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iterations", type=int, default=50)
     parser.add_argument("--device", default="cuda:0")
+    parser.add_argument(
+        "--compile-dynamic",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
+    parser.add_argument(
+        "--compile-mode",
+        choices=("default", "reduce-overhead", "max-autotune"),
+    )
     parser.add_argument(
         "--minimum-leaves-per-second",
         type=float,
@@ -129,6 +140,8 @@ def _settings(arguments: argparse.Namespace) -> BenchmarkSettings:
         minimum_leaves_per_second=arguments.minimum_leaves_per_second,
         timeout_seconds=arguments.timeout_seconds,
         metrics_root=metrics_root,
+        compile_dynamic=arguments.compile_dynamic,
+        compile_mode=arguments.compile_mode,
     )
 
 
@@ -180,6 +193,13 @@ def validate_settings(settings: BenchmarkSettings) -> None:
         raise BenchmarkHarnessError("timeout seconds must be finite and positive")
     if not settings.device.strip():
         raise BenchmarkHarnessError("device must not be empty")
+    if settings.compile_mode not in (
+        None,
+        "default",
+        "reduce-overhead",
+        "max-autotune",
+    ):
+        raise BenchmarkHarnessError("compile mode is invalid")
     if settings.metrics_root is not None:
         if not settings.metrics_root.exists():
             raise BenchmarkHarnessError(
@@ -363,6 +383,8 @@ def collect_run_metadata(
                 if settings.metrics_root is not None
                 else None
             ),
+            "compile_dynamic": settings.compile_dynamic,
+            "compile_mode": settings.compile_mode,
         },
         "artifacts": {
             "summary_json": str(output_directory / "summary.json"),
@@ -377,7 +399,7 @@ def build_preflight_command(
     rings: int,
     batch_size: int,
 ) -> list[str]:
-    return [
+    command = [
         sys.executable,
         str(PREFLIGHT_SCRIPT),
         "--config",
@@ -395,6 +417,13 @@ def build_preflight_command(
         "--minimum-leaves-per-second",
         str(settings.minimum_leaves_per_second),
     ]
+    if settings.compile_dynamic is not None:
+        command.append(
+            "--compile-dynamic" if settings.compile_dynamic else "--no-compile-dynamic"
+        )
+    if settings.compile_mode is not None:
+        command.extend(("--compile-mode", settings.compile_mode))
+    return command
 
 
 def _execute_preflight(

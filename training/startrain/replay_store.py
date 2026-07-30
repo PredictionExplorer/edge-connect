@@ -83,6 +83,143 @@ class ReplayCursor:
     sample_offset: int = 0
 
 
+@dataclass(frozen=True, slots=True)
+class CommittedSampleHistoryProof:
+    """Evidence that an incomplete legacy counter still covers every shard."""
+
+    run_id: str
+    generation_family: str
+    shard_count: int
+    shard_samples: int
+    expected_games: int
+    recorded_games: int
+    maximum_shard_id: int
+    sqlite_sequence: int
+    complete: bool
+    failures: tuple[str, ...]
+
+
+def prove_legacy_committed_sample_history(
+    connection: sqlite3.Connection,
+    *,
+    run_id: str,
+    generation_family: str,
+) -> CommittedSampleHistoryProof:
+    """Prove a legacy cumulative count from loss-detecting manifest tallies.
+
+    A sum of the surviving shards alone is not evidence of complete history:
+    replay GC can delete old rows.  SQLite's AUTOINCREMENT high-water mark and
+    the independently retained game ledger make those deletions detectable.
+    """
+
+    run_id = validate_identifier("run_id", run_id)
+    family = validate_identifier("generation_family", generation_family)
+    run = connection.execute(
+        """
+        SELECT 1 FROM runs
+        WHERE run_id = ? AND generation_family = ?
+        """,
+        (run_id, family),
+    ).fetchone()
+    failures: list[str] = []
+    if run is None:
+        failures.append("run is not registered to this generation family")
+
+    global_row = connection.execute(
+        """
+        SELECT
+            COUNT(*) AS shard_count,
+            COALESCE(MIN(id), 0) AS minimum_shard_id,
+            COALESCE(MAX(id), 0) AS maximum_shard_id
+        FROM shards
+        """
+    ).fetchone()
+    sequence_row = connection.execute(
+        "SELECT seq FROM sqlite_sequence WHERE name = 'shards'"
+    ).fetchone()
+    global_count = int(global_row["shard_count"])
+    minimum_shard_id = int(global_row["minimum_shard_id"])
+    maximum_shard_id = int(global_row["maximum_shard_id"])
+    sqlite_sequence = int(sequence_row["seq"]) if sequence_row is not None else 0
+    if global_count == 0:
+        if sqlite_sequence != 0:
+            failures.append("shard sequence records deleted history")
+    elif (
+        minimum_shard_id != 1
+        or global_count != maximum_shard_id
+        or maximum_shard_id != sqlite_sequence
+    ):
+        failures.append("shard identifiers contain deleted history")
+
+    shard_row = connection.execute(
+        """
+        SELECT
+            COUNT(*) AS shard_count,
+            COALESCE(SUM(sample_count), 0) AS shard_samples,
+            COALESCE(SUM(game_count), 0) AS expected_games
+        FROM shards
+        WHERE run_id = ? AND generation_family = ?
+        """,
+        (run_id, family),
+    ).fetchone()
+    shard_count = int(shard_row["shard_count"])
+    shard_samples = int(shard_row["shard_samples"])
+    expected_games = int(shard_row["expected_games"])
+    game_row = connection.execute(
+        """
+        SELECT COUNT(*) AS recorded_games
+        FROM games
+        WHERE run_id = ? AND generation_family = ?
+        """,
+        (run_id, family),
+    ).fetchone()
+    recorded_games = int(game_row["recorded_games"])
+    if recorded_games != expected_games:
+        failures.append("game ledger tally does not match shard game counts")
+
+    orphan_games = int(
+        connection.execute(
+            """
+            SELECT COUNT(*)
+            FROM games
+            LEFT JOIN shards ON shards.id = games.shard_id
+            WHERE shards.id IS NULL
+               OR shards.run_id != games.run_id
+               OR shards.generation_family != games.generation_family
+            """
+        ).fetchone()[0]
+    )
+    if orphan_games:
+        failures.append("game ledger references missing or mismatched shards")
+    unregistered_shards = int(
+        connection.execute(
+            """
+            SELECT COUNT(*)
+            FROM shards
+            LEFT JOIN runs
+              ON runs.run_id = shards.run_id
+             AND runs.generation_family = shards.generation_family
+            WHERE runs.run_id IS NULL
+            """
+        ).fetchone()[0]
+    )
+    if unregistered_shards:
+        failures.append("shards reference unregistered run identities")
+
+    return CommittedSampleHistoryProof(
+        run_id=run_id,
+        generation_family=family,
+        shard_count=shard_count,
+        shard_samples=shard_samples,
+        expected_games=expected_games,
+        recorded_games=recorded_games,
+        maximum_shard_id=maximum_shard_id,
+        sqlite_sequence=sqlite_sequence,
+        complete=not failures,
+        failures=tuple(failures),
+    )
+
+
 class ReplayStore:
     def __init__(self, root: str | Path) -> None:
         self.root = Path(root)
@@ -239,6 +376,7 @@ class ReplayStore:
         except Exception:
             self.connection.execute("ROLLBACK")
             raise
+        legacy_history_reconciled = 0
         if not counter_table_preexisting:
             self.connection.execute(
                 """
@@ -261,7 +399,22 @@ class ReplayStore:
                 """,
                 (time.time_ns(),),
             )
+            for row in self.connection.execute(
+                "SELECT run_id, generation_family FROM runs"
+            ).fetchall():
+                try:
+                    proof = self.reconcile_legacy_committed_sample_history(
+                        run_id=str(row["run_id"]),
+                        generation_family=str(row["generation_family"]),
+                    )
+                except ValueError:
+                    continue
+                if proof.complete:
+                    legacy_history_reconciled += 1
         self.reconciliation_metrics = self.reconcile_orphans()
+        self.reconciliation_metrics["legacy_history_reconciled"] = (
+            legacy_history_reconciled
+        )
 
     def close(self) -> None:
         self.connection.close()
@@ -912,6 +1065,86 @@ class ReplayStore:
             ),
         ).fetchone()
         return bool(row is not None and int(row["history_complete"]) == 1)
+
+    def reconcile_legacy_committed_sample_history(
+        self,
+        *,
+        run_id: str,
+        generation_family: str,
+        dry_run: bool = False,
+    ) -> CommittedSampleHistoryProof:
+        """Mark an incomplete legacy counter complete only with full proof."""
+
+        run_id = validate_identifier("run_id", run_id)
+        family = validate_identifier("generation_family", generation_family)
+        row = self.connection.execute(
+            """
+            SELECT committed_samples, history_complete
+            FROM run_counters
+            WHERE run_id = ? AND generation_family = ?
+            """,
+            (run_id, family),
+        ).fetchone()
+        if row is None:
+            raise ValueError("replay ledger has no committed-sample counter")
+        proof = prove_legacy_committed_sample_history(
+            self.connection,
+            run_id=run_id,
+            generation_family=family,
+        )
+        if int(row["history_complete"]) == 1:
+            return proof
+        if not proof.complete:
+            detail = "; ".join(proof.failures)
+            raise ValueError(
+                f"legacy committed-sample history cannot be proven complete: {detail}"
+            )
+        if int(row["committed_samples"]) != proof.shard_samples:
+            raise ValueError(
+                "legacy committed-sample counter does not equal the proven shard tally"
+            )
+        if dry_run:
+            return proof
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            current = self.connection.execute(
+                """
+                SELECT committed_samples, history_complete
+                FROM run_counters
+                WHERE run_id = ? AND generation_family = ?
+                """,
+                (run_id, family),
+            ).fetchone()
+            if (
+                current is None
+                or int(current["committed_samples"]) != proof.shard_samples
+            ):
+                raise ValueError(
+                    "committed-sample counter changed during reconciliation"
+                )
+            if int(current["history_complete"]) == 0:
+                current_proof = prove_legacy_committed_sample_history(
+                    self.connection,
+                    run_id=run_id,
+                    generation_family=family,
+                )
+                if not current_proof.complete or current_proof != proof:
+                    raise ValueError(
+                        "replay shard tallies changed during reconciliation"
+                    )
+                self.connection.execute(
+                    """
+                    UPDATE run_counters
+                    SET history_complete = 1, updated_ns = ?
+                    WHERE run_id = ? AND generation_family = ?
+                    """,
+                    (time.time_ns(), run_id, family),
+                )
+            self.connection.execute("COMMIT")
+        except Exception:
+            self.connection.execute("ROLLBACK")
+            raise
+        return proof
 
     def eligible_sample_counts(
         self,

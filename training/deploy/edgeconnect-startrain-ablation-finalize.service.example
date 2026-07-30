@@ -1,0 +1,17 @@
+[Unit]
+Description=EdgeConnect Elo ablation final comparison
+After=@QUEUE_UNIT@
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+User=@USER@
+WorkingDirectory=@TRAINING_DIR@
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONPATH=@TRAINING_DIR@
+Environment=PATH=@TRAINING_DIR@/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+EnvironmentFile=@ENVIRONMENT_FILE@
+ExecStart=@TRAINING_DIR@/.venv/bin/python @TRAINING_DIR@/scripts/run_elo_ablation_queue.py finalize --manifest @DEPLOYMENT_MANIFEST@
+NoNewPrivileges=true
+UMask=0027

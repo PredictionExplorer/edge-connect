@@ -11,9 +11,12 @@ from typing import Any
 
 import torch
 import pytest
+import yaml
 
+import startrain.config as config_module
 import startrain.orchestration as orchestration_module
 from startrain.actor import ActorSupervisor, RingMixtureScheduler
+from startrain.device import AcceleratorInventory
 from startrain.checkpoint import (
     ExponentialMovingAverage,
     latest_checkpoint,
@@ -39,7 +42,12 @@ from startrain.model import GraphResTNet, ModelConfig
 from startrain.optim import OptimizerConfig, build_optimizer
 from startrain.orchestration import (
     Coordinator,
+    FATAL_WORKER_EXIT_CODE,
+    HARDWARE_HEALTH_EXIT_CODE,
+    LEARNER_DATA_WORKERS_ENV,
     RunDirectories,
+    TRANSIENT_WORKER_EXIT_CODE,
+    WORKER_FAILURE_PATH_ENV,
     build_worker_specs,
     ensure_autonomous_provenance,
     gpu_pause_ack_path,
@@ -66,8 +74,19 @@ def test_finite_and_continuous_systemd_restart_policies_are_distinct() -> None:
     assert "Restart=always" not in finite
     assert "Restart=always" in continuous
     assert "validate_continuous_profile.py" in continuous
+    assert "hardware_health_preflight.py" in continuous
+    assert "ExecCondition=" in continuous
+    assert "RestartPreventExitStatus=78" in continuous
+    assert "hardware_health_preflight.py" in finite
+    assert "ExecCondition=" in finite
+    assert "RestartPreventExitStatus=78" in finite
     assert "WatchdogSignal=SIGTERM" in finite
     assert "WatchdogSignal=SIGTERM" in continuous
+    ablation = (
+        DEPLOY / "edgeconnect-startrain-ablation-queue.service.example"
+    ).read_text()
+    assert "KillMode=mixed" in ablation
+    assert "KillMode=control-group" not in ablation
     report_service = (
         DEPLOY / "edgeconnect-startrain-report.service.example"
     ).read_text()
@@ -76,6 +95,55 @@ def test_finite_and_continuous_systemd_restart_policies_are_distinct() -> None:
     assert "@PROVISIONED_GPUS@" in report_service
     assert "OnUnitActiveSec=15min" in report_timer
     assert "edgeconnect-startrain-@RUN_ID@-report.service" in report_timer
+
+
+def test_coordinator_fails_closed_before_starting_workers_on_bad_hardware(
+    tmp_path,
+) -> None:
+    experiment = load_config(CONFIGS / "h100-4gpu.yaml")
+    experiment = replace(
+        experiment,
+        orchestration=replace(
+            experiment.orchestration,
+            directories=RunDirectoryConfig(root=str(tmp_path / "hardware-failure")),
+        ),
+    )
+    directories = RunDirectories.from_experiment(experiment)
+    specs = build_worker_specs(
+        experiment,
+        config_path=CONFIGS / "h100-4gpu.yaml",
+        directories=directories,
+        base_environment={},
+    )
+    launches = 0
+
+    def process_factory(*_args, **_kwargs):
+        nonlocal launches
+        launches += 1
+        return FakeProcess(exit_immediately=False)
+
+    coordinator = Coordinator(
+        experiment=experiment,
+        specs=specs,
+        directories=directories,
+        process_factory=process_factory,
+        hardware_health_probe=lambda: {
+            "schema_version": 1,
+            "healthy": False,
+            "gpus": [
+                {
+                    "index": 0,
+                    "reasons": ["sram_threshold_exceeded"],
+                }
+            ],
+        },
+    )
+
+    assert coordinator.run(stop_requested=lambda: False) == HARDWARE_HEALTH_EXIT_CODE
+    assert launches == 0
+    status = json.loads(coordinator.status_path.read_text(encoding="utf-8"))
+    assert status["state"] == "stopped"
+    assert "sram_threshold_exceeded" in status["hardware_failure_reason"]
 
 
 def test_graceful_stop_signals_only_worker_leader_before_group_kill(
@@ -238,9 +306,21 @@ def test_autonomous_run_provenance_rejects_imports_and_profile_drift(
     actor = next(spec for spec in specs if spec.role == "actor")
     actor_candidate = actor.command[actor.command.index("--candidate-manifest") + 1]
     assert actor_candidate.endswith("/learner/selfplay/candidate.json")
+    learner = next(spec for spec in specs if spec.role == "learner")
+    assert learner.gpu_ids == (0,)
+    assert "--gpu-pause" in learner.command
+    actor_specs = [spec for spec in specs if spec.role == "actor"]
+    assert len(actor_specs) == 14
+    gpu_seven = [spec for spec in actor_specs if spec.gpu_ids == (7,)]
+    assert [spec.name for spec in gpu_seven] == [
+        "actor-gpu-7-lane-0",
+        "actor-gpu-7-lane-1",
+    ]
     promotion = next(spec for spec in specs if spec.role == "arena")
     promotion_candidate = promotion.command[promotion.command.index("--candidate") + 1]
     assert promotion_candidate.endswith("/learner/candidate.json")
+    assert promotion.gpu_ids == (0,)
+    assert promotion.environment["CUDA_VISIBLE_DEVICES"] == "0"
     (directories.learner / "candidate.json").write_text("{}", encoding="utf-8")
     with pytest.raises(ValueError, match="imported artifacts"):
         validate_autonomous_run_root(configured, directories)
@@ -431,6 +511,7 @@ class FakeProcess:
         self,
         *,
         exit_immediately: bool,
+        exit_code: int = 7,
         exit_on_terminate: bool = True,
         exit_on_kill: bool = True,
     ) -> None:
@@ -438,6 +519,7 @@ class FakeProcess:
         FakeProcess.next_pid += 1
         self.returncode: int | None = None
         self.exit_immediately = exit_immediately
+        self.exit_code = exit_code
         self.exit_on_terminate = exit_on_terminate
         self.exit_on_kill = exit_on_kill
         self.terminate_calls = 0
@@ -445,7 +527,7 @@ class FakeProcess:
 
     def poll(self) -> int | None:
         if self.returncode is None and self.exit_immediately:
-            self.returncode = 7
+            self.returncode = self.exit_code
         return self.returncode
 
     def terminate(self) -> None:
@@ -468,6 +550,112 @@ class FakeClock:
 
     def sleep(self, seconds: float) -> None:
         self.value += seconds
+
+
+def test_hardware_probe_unavailability_exhausts_as_transient(
+    tmp_path: Path,
+) -> None:
+    experiment = load_config(CONFIGS / "h100-4gpu.yaml")
+    health = replace(
+        experiment.orchestration.hardware_health,
+        transient_probe_attempts=3,
+        transient_probe_retry_seconds=0.1,
+    )
+    experiment = replace(
+        experiment,
+        orchestration=replace(
+            experiment.orchestration,
+            directories=RunDirectoryConfig(root=str(tmp_path / "health-unavailable")),
+            hardware_health=health,
+        ),
+    )
+    directories = RunDirectories.from_experiment(experiment)
+    specs = build_worker_specs(
+        experiment,
+        config_path=CONFIGS / "h100-4gpu.yaml",
+        directories=directories,
+        base_environment={},
+    )
+    probes = 0
+    launches = 0
+
+    def unavailable() -> dict[str, object]:
+        nonlocal probes
+        probes += 1
+        raise RuntimeError("nvidia-smi health query failed: driver unavailable")
+
+    def process_factory(*_args, **_kwargs):
+        nonlocal launches
+        launches += 1
+        return FakeProcess(exit_immediately=False)
+
+    clock = FakeClock()
+    coordinator = Coordinator(
+        experiment=experiment,
+        specs=specs,
+        directories=directories,
+        process_factory=process_factory,
+        hardware_health_probe=unavailable,
+        clock=clock,
+        sleep=clock.sleep,
+    )
+
+    assert coordinator.run(stop_requested=lambda: False) == TRANSIENT_WORKER_EXIT_CODE
+    assert probes == 3
+    assert launches == 0
+    fatal = json.loads(coordinator.fatal_path.read_text(encoding="utf-8"))
+    assert fatal["failure_class"] == "transient"
+    assert fatal["terminal_reason"] == "hardware_health_unavailable"
+    assert fatal["coordinator_exit_code"] == TRANSIENT_WORKER_EXIT_CODE
+
+
+def test_shutdown_cancellation_cannot_create_hardware_fatal(
+    tmp_path: Path,
+) -> None:
+    experiment = load_config(CONFIGS / "h100-4gpu.yaml")
+    experiment = replace(
+        experiment,
+        orchestration=replace(
+            experiment.orchestration,
+            directories=RunDirectoryConfig(root=str(tmp_path / "health-cancelled")),
+        ),
+    )
+    directories = RunDirectories.from_experiment(experiment)
+    specs = build_worker_specs(
+        experiment,
+        config_path=CONFIGS / "h100-4gpu.yaml",
+        directories=directories,
+        base_environment={},
+    )
+    stopping = False
+    launches = 0
+
+    def cancelled_probe() -> dict[str, object]:
+        nonlocal stopping
+        stopping = True
+        raise RuntimeError("nvidia-smi health query failed: exit status -15")
+
+    def process_factory(*_args, **_kwargs):
+        nonlocal launches
+        launches += 1
+        return FakeProcess(exit_immediately=False)
+
+    coordinator = Coordinator(
+        experiment=experiment,
+        specs=specs,
+        directories=directories,
+        process_factory=process_factory,
+        hardware_health_probe=cancelled_probe,
+    )
+
+    assert coordinator.run(stop_requested=lambda: stopping) == 0
+    assert launches == 0
+    assert not coordinator.fatal_path.exists()
+    health = json.loads(
+        (directories.status / "hardware-health.json").read_text(encoding="utf-8")
+    )
+    assert health["probe_status"] == "unavailable"
+    assert health["shutdown_cancelled"] is True
 
 
 def test_coordinator_applies_configured_cpu_affinity(
@@ -608,6 +796,61 @@ def coordinator_events(directories: RunDirectories) -> list[dict[str, object]]:
     ]
 
 
+def recovery_experiment(
+    tmp_path: Path,
+    *,
+    max_restarts: int,
+):
+    experiment = load_config(CONFIGS / "h100-4gpu.yaml")
+    return replace(
+        experiment,
+        orchestration=replace(
+            experiment.orchestration,
+            directories=RunDirectoryConfig(root=str(tmp_path / "recovery-run")),
+            restart=RestartPolicyConfig(
+                max_restarts=max_restarts,
+                initial_backoff_seconds=0.01,
+                maximum_backoff_seconds=0.02,
+                stable_reset_seconds=100.0,
+            ),
+            shutdown=ShutdownConfig(
+                monitor_interval_seconds=0.01,
+                heartbeat_interval_seconds=1.0,
+                stale_heartbeat_seconds=100.0,
+                stall_timeout_seconds=200.0,
+                terminate_grace_seconds=0.01,
+                kill_grace_seconds=0.01,
+            ),
+        ),
+    )
+
+
+def write_worker_failure(
+    options: dict[str, Any],
+    *,
+    failure_class: str,
+    exit_code: int,
+    reason: str,
+    exception_type: str,
+) -> None:
+    environment = options["env"]
+    atomic_json(
+        Path(environment[WORKER_FAILURE_PATH_ENV]),
+        {
+            "format": "startrain.worker-failure",
+            "schema_version": 1,
+            "timestamp_ns": time.time_ns(),
+            "pid": 123,
+            "worker": environment["STARTRAIN_WORKER_NAME"],
+            "role": environment["STARTRAIN_WORKER_ROLE"],
+            "failure_class": failure_class,
+            "exit_code": exit_code,
+            "exception_type": exception_type,
+            "reason": reason,
+        },
+    )
+
+
 def test_coordinator_restarts_failed_actor_without_duplicate(tmp_path) -> None:
     experiment = load_config(CONFIGS / "h100-4gpu.yaml")
     orchestration = replace(
@@ -685,6 +928,333 @@ def test_coordinator_restarts_failed_actor_without_duplicate(tmp_path) -> None:
     )
     assert status["state"] == "stopped"
     assert not (directories.root / "coordinator.lock").exists()
+
+
+def test_fatal_worker_exit_is_not_retried_and_persists_reason(tmp_path) -> None:
+    experiment = recovery_experiment(tmp_path, max_restarts=3)
+    directories = RunDirectories.from_experiment(experiment)
+    specs = build_worker_specs(
+        experiment,
+        config_path=CONFIGS / "h100-4gpu.yaml",
+        directories=directories,
+        base_environment={},
+    )
+    launches: dict[str, int] = {}
+    reason = "checkpoint schema is incompatible"
+
+    def process_factory(command: list[str], **options: Any) -> FakeProcess:
+        name = worker_name(command)
+        launches[name] = launches.get(name, 0) + 1
+        if name == "learner":
+            write_worker_failure(
+                options,
+                failure_class="fatal",
+                exit_code=FATAL_WORKER_EXIT_CODE,
+                reason=reason,
+                exception_type="ValueError",
+            )
+            return FakeProcess(
+                exit_immediately=True,
+                exit_code=FATAL_WORKER_EXIT_CODE,
+            )
+        return FakeProcess(exit_immediately=False)
+
+    clock = FakeClock()
+    coordinator = Coordinator(
+        experiment=experiment,
+        specs=specs,
+        directories=directories,
+        process_factory=process_factory,
+        clock=clock,
+        sleep=clock.sleep,
+    )
+
+    assert coordinator.run(stop_requested=lambda: False) == FATAL_WORKER_EXIT_CODE
+    assert launches["learner"] == 1
+    assert coordinator.workers["learner"].restart_count == 0
+    fatal = json.loads(coordinator.fatal_path.read_text(encoding="utf-8"))
+    assert fatal["failure_class"] == "fatal"
+    assert fatal["reason"] == reason
+    assert fatal["terminal_reason"] == "fatal_worker_failure"
+    events = coordinator_events(directories)
+    assert any(
+        event["event"] == "worker_exited"
+        and event["failure_class"] == "fatal"
+        and event["reason"] == reason
+        and event["restart_in_seconds"] is None
+        for event in events
+    )
+
+
+def test_transient_learner_exit_retries_with_bounded_jitter(tmp_path) -> None:
+    experiment = recovery_experiment(tmp_path, max_restarts=2)
+    directories = RunDirectories.from_experiment(experiment)
+    specs = build_worker_specs(
+        experiment,
+        config_path=CONFIGS / "h100-4gpu.yaml",
+        directories=directories,
+        base_environment={},
+    )
+    launches: dict[str, int] = {}
+    learner_environments: list[dict[str, str]] = []
+    reason = "DataLoader worker exited unexpectedly"
+
+    def process_factory(command: list[str], **options: Any) -> FakeProcess:
+        name = worker_name(command)
+        launches[name] = launches.get(name, 0) + 1
+        if name == "learner":
+            learner_environments.append(dict(options["env"]))
+        if name == "learner" and launches[name] == 1:
+            write_worker_failure(
+                options,
+                failure_class="transient",
+                exit_code=TRANSIENT_WORKER_EXIT_CODE,
+                reason=reason,
+                exception_type="RuntimeError",
+            )
+            return FakeProcess(
+                exit_immediately=True,
+                exit_code=TRANSIENT_WORKER_EXIT_CODE,
+            )
+        return FakeProcess(exit_immediately=False)
+
+    clock = FakeClock()
+    coordinator = Coordinator(
+        experiment=experiment,
+        specs=specs,
+        directories=directories,
+        process_factory=process_factory,
+        clock=clock,
+        sleep=clock.sleep,
+        random_fraction=lambda: 0.0,
+    )
+
+    assert (
+        coordinator.run(
+            stop_requested=lambda: False,
+            max_monitor_cycles=3,
+        )
+        == 0
+    )
+    assert launches["learner"] == 2
+    assert LEARNER_DATA_WORKERS_ENV not in learner_environments[0]
+    assert learner_environments[1][LEARNER_DATA_WORKERS_ENV] == str(
+        experiment.data.workers // 2
+    )
+    assert not coordinator.fatal_path.exists()
+    events = coordinator_events(directories)
+    learner_exit = next(
+        event
+        for event in events
+        if event["event"] == "worker_exited" and event["worker"] == "learner"
+    )
+    assert learner_exit["failure_class"] == "transient"
+    assert learner_exit["reason"] == reason
+    assert learner_exit["restart_in_seconds"] == pytest.approx(0.008)
+    assert any(
+        event["event"] == "learner_loader_degraded"
+        and event["effective_workers"] == experiment.data.workers // 2
+        for event in events
+    )
+
+
+def test_repeated_dataloader_failure_retries_once_with_zero_workers(tmp_path) -> None:
+    experiment = recovery_experiment(tmp_path, max_restarts=3)
+    directories = RunDirectories.from_experiment(experiment)
+    specs = build_worker_specs(
+        experiment,
+        config_path=CONFIGS / "h100-4gpu.yaml",
+        directories=directories,
+        base_environment={},
+    )
+    learner_environments: list[dict[str, str]] = []
+
+    def process_factory(command: list[str], **options: Any) -> FakeProcess:
+        name = worker_name(command)
+        if name != "learner":
+            return FakeProcess(exit_immediately=False)
+        learner_environments.append(dict(options["env"]))
+        if len(learner_environments) <= 2:
+            write_worker_failure(
+                options,
+                failure_class="transient",
+                exit_code=TRANSIENT_WORKER_EXIT_CODE,
+                reason="DataLoader worker exited unexpectedly",
+                exception_type="RuntimeError",
+            )
+            return FakeProcess(
+                exit_immediately=True,
+                exit_code=TRANSIENT_WORKER_EXIT_CODE,
+            )
+        return FakeProcess(exit_immediately=False)
+
+    clock = FakeClock()
+    coordinator = Coordinator(
+        experiment=experiment,
+        specs=specs,
+        directories=directories,
+        process_factory=process_factory,
+        clock=clock,
+        sleep=clock.sleep,
+        random_fraction=lambda: 0.0,
+    )
+
+    assert (
+        coordinator.run(
+            stop_requested=lambda: False,
+            max_monitor_cycles=5,
+        )
+        == 0
+    )
+    assert len(learner_environments) == 3
+    assert LEARNER_DATA_WORKERS_ENV not in learner_environments[0]
+    assert learner_environments[1][LEARNER_DATA_WORKERS_ENV] == str(
+        experiment.data.workers // 2
+    )
+    assert learner_environments[2][LEARNER_DATA_WORKERS_ENV] == "0"
+
+
+def test_transient_learner_exhausts_bounded_restart_budget(tmp_path) -> None:
+    experiment = recovery_experiment(tmp_path, max_restarts=1)
+    directories = RunDirectories.from_experiment(experiment)
+    specs = build_worker_specs(
+        experiment,
+        config_path=CONFIGS / "h100-4gpu.yaml",
+        directories=directories,
+        base_environment={},
+    )
+    launches: dict[str, int] = {}
+    reason = "CUDA out of memory during DataLoader startup"
+
+    def process_factory(command: list[str], **options: Any) -> FakeProcess:
+        name = worker_name(command)
+        launches[name] = launches.get(name, 0) + 1
+        if name == "learner":
+            write_worker_failure(
+                options,
+                failure_class="transient",
+                exit_code=TRANSIENT_WORKER_EXIT_CODE,
+                reason=reason,
+                exception_type="RuntimeError",
+            )
+            return FakeProcess(
+                exit_immediately=True,
+                exit_code=TRANSIENT_WORKER_EXIT_CODE,
+            )
+        return FakeProcess(exit_immediately=False)
+
+    clock = FakeClock()
+    coordinator = Coordinator(
+        experiment=experiment,
+        specs=specs,
+        directories=directories,
+        process_factory=process_factory,
+        clock=clock,
+        sleep=clock.sleep,
+        random_fraction=lambda: 0.0,
+    )
+
+    assert coordinator.run(stop_requested=lambda: False) == 1
+    assert launches["learner"] == 2
+    learner = coordinator.workers["learner"]
+    assert learner.state == "exhausted"
+    assert learner.restart_count == 2
+    fatal = json.loads(coordinator.fatal_path.read_text(encoding="utf-8"))
+    assert fatal["failure_class"] == "transient"
+    assert fatal["reason"] == reason
+    assert fatal["terminal_reason"] == "restart_budget_exhausted"
+    assert any(
+        event["event"] == "worker_restart_exhausted"
+        and event["failure_class"] == "transient"
+        and event["reason"] == reason
+        for event in coordinator_events(directories)
+    )
+
+
+def test_process_group_is_reaped_before_worker_restart(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    experiment = recovery_experiment(tmp_path, max_restarts=2)
+    directories = RunDirectories.from_experiment(experiment)
+    directories.create()
+    specs = build_worker_specs(
+        experiment,
+        config_path=CONFIGS / "h100-4gpu.yaml",
+        directories=directories,
+        base_environment={},
+    )
+    actions: list[tuple[str, int]] = []
+    process_group_id = 42_424
+    live_groups = {process_group_id}
+
+    class SessionProcess:
+        pid = process_group_id
+        returncode = TRANSIENT_WORKER_EXIT_CODE
+
+        def poll(self) -> int:
+            return self.returncode
+
+        def wait(self, *, timeout: float) -> int:
+            assert timeout == 0
+            actions.append(("wait", self.pid))
+            return self.returncode
+
+        def terminate(self) -> None:
+            raise AssertionError("exited process leader was terminated again")
+
+        def kill(self) -> None:
+            raise AssertionError("exited process leader was killed directly")
+
+    def kill_process_group(pgid: int, sent: int) -> None:
+        actions.append(("killpg", sent))
+        if sent == 0:
+            if pgid not in live_groups:
+                raise ProcessLookupError
+            return
+        assert sent == signal.SIGKILL
+        live_groups.discard(pgid)
+
+    def process_factory(*_args: Any, **_kwargs: Any) -> FakeProcess:
+        actions.append(("launch", 0))
+        return FakeProcess(exit_immediately=False)
+
+    monkeypatch.setattr(orchestration_module.subprocess, "Popen", SessionProcess)
+    monkeypatch.setattr(orchestration_module.os, "killpg", kill_process_group)
+    clock = FakeClock()
+    coordinator = Coordinator(
+        experiment=experiment,
+        specs=specs,
+        directories=directories,
+        process_factory=process_factory,
+        clock=clock,
+        sleep=clock.sleep,
+        random_fraction=lambda: 0.5,
+    )
+    worker = coordinator.workers["learner"]
+    worker.process = SessionProcess()
+    worker.process_group_id = process_group_id
+    worker.last_pid = process_group_id
+    worker.started_at = 0.0
+    worker.state = "running"
+
+    assert (
+        coordinator._handle_worker_exit(
+            worker,
+            code=TRANSIENT_WORKER_EXIT_CODE,
+            now=1.0,
+        )
+        is False
+    )
+    clock.value = worker.next_start_at
+    assert coordinator._monitor_worker(worker, clock()) is False
+
+    wait_index = actions.index(("wait", process_group_id))
+    kill_index = actions.index(("killpg", signal.SIGKILL))
+    launch_index = actions.index(("launch", 0))
+    assert wait_index < kill_index < launch_index
+    assert live_groups == set()
+    coordinator._close_worker_process(worker)
 
 
 def test_pause_lease_reaps_actor_before_ready_and_restarts_once(tmp_path) -> None:
@@ -1157,6 +1727,9 @@ def test_learner_pause_sharing_waits_for_fresh_progress_ack(tmp_path) -> None:
                     "phase": "arena_gpu_pause",
                     "progress": 1,
                     "progress_ns": max(time.time_ns(), request["requested_ns"]),
+                    "pause_generation": 1,
+                    "pause_checkpoint_step": 0,
+                    "cuda_cache_released": True,
                 },
             )
             phase = "ready"
@@ -1443,3 +2016,238 @@ def test_evaluation_loader_requires_and_applies_ema_with_config_checks(
         assert "byte length" in str(error) or "SHA-256" in str(error)
     else:
         raise AssertionError("tampered checkpoint was accepted")
+
+
+def _patched_inventory(monkeypatch, inventory: AcceleratorInventory) -> None:
+    monkeypatch.setattr(config_module, "detect_accelerators", lambda: inventory)
+
+
+def _auto_experiment(monkeypatch, tmp_path, inventory: AcceleratorInventory):
+    _patched_inventory(monkeypatch, inventory)
+    experiment = load_config(CONFIGS / "auto.yaml")
+    return replace(
+        experiment,
+        orchestration=replace(
+            experiment.orchestration,
+            directories=RunDirectoryConfig(root=str(tmp_path / "auto-run")),
+        ),
+    )
+
+
+def test_auto_profile_resolves_eight_gpu_topology(monkeypatch, tmp_path) -> None:
+    inventory = AcceleratorInventory(
+        cuda_device_count=8, mps_available=False, cpu_count=208
+    )
+    experiment = _auto_experiment(monkeypatch, tmp_path, inventory)
+    orchestration = experiment.orchestration
+    assert orchestration.device == "cuda"
+    assert [gpu.gpu_id for gpu in orchestration.learner_gpus] == [0]
+    assert [gpu.gpu_id for gpu in orchestration.actor_gpus] == list(range(1, 7))
+    assert orchestration.promotion.gpu_id == 7
+    assert orchestration.promotion.bootstrap_initial_champion is True
+    assert not orchestration.promotion.pause_sharing_mode
+    assert experiment.learner.device == "cuda"
+
+    directories = RunDirectories.from_experiment(experiment)
+    specs = build_worker_specs(
+        experiment,
+        config_path=CONFIGS / "auto.yaml",
+        directories=directories,
+        python_executable="/test/python",
+        base_environment={},
+    )
+    learner = specs[0]
+    assert learner.environment["CUDA_VISIBLE_DEVICES"] == "0"
+    device_flag = learner.command[learner.command.index("--device") + 1]
+    assert device_flag == "cuda"
+
+
+def test_auto_profile_single_gpu_colocates_and_pause_shares(
+    monkeypatch, tmp_path
+) -> None:
+    inventory = AcceleratorInventory(
+        cuda_device_count=1, mps_available=False, cpu_count=16
+    )
+    experiment = _auto_experiment(monkeypatch, tmp_path, inventory)
+    orchestration = experiment.orchestration
+    assert orchestration.allow_colocated_workers is True
+    assert [(gpu.gpu_id, gpu.role) for gpu in orchestration.gpus] == [
+        (0, "learner"),
+        (0, "actor"),
+    ]
+    assert orchestration.promotion.gpu_id == 0
+    assert orchestration.promotion.pause_sharing_mode is True
+
+    directories = RunDirectories.from_experiment(experiment)
+    specs = build_worker_specs(
+        experiment,
+        config_path=CONFIGS / "auto.yaml",
+        directories=directories,
+        python_executable="/test/python",
+        base_environment={},
+    )
+    assert [spec.role for spec in specs] == ["learner", "actor", "arena"]
+    assert all(spec.environment["CUDA_VISIBLE_DEVICES"] == "0" for spec in specs)
+    coordinator = Coordinator(
+        experiment=experiment,
+        specs=specs,
+        directories=directories,
+        process_factory=lambda *args, **kwargs: FakeProcess(exit_immediately=False),
+    )
+    assert coordinator.pause_target is not None
+    assert coordinator.pause_target.spec.role == "actor"
+    assert coordinator.pause_owner is not None
+    assert coordinator.pause_owner.spec.role == "arena"
+
+
+def test_auto_profile_mps_host_runs_without_cuda_pinning(monkeypatch, tmp_path) -> None:
+    inventory = AcceleratorInventory(
+        cuda_device_count=0, mps_available=True, cpu_count=10
+    )
+    experiment = _auto_experiment(monkeypatch, tmp_path, inventory)
+    orchestration = experiment.orchestration
+    assert orchestration.device == "mps"
+    assert orchestration.promotion.device == "mps"
+    assert experiment.learner.device == "mps"
+
+    directories = RunDirectories.from_experiment(experiment)
+    specs = build_worker_specs(
+        experiment,
+        config_path=CONFIGS / "auto.yaml",
+        directories=directories,
+        python_executable="/test/python",
+        base_environment={},
+    )
+    for spec in specs:
+        assert "CUDA_VISIBLE_DEVICES" not in spec.environment
+        assert spec.environment["PYTORCH_ENABLE_MPS_FALLBACK"] == "1"
+        device_flag = spec.command[spec.command.index("--device") + 1]
+        assert device_flag == "mps"
+        assert spec.environment["RAYON_NUM_THREADS"] == str(spec.cpu_threads)
+
+
+def test_auto_profile_cpu_host_topology(monkeypatch, tmp_path) -> None:
+    inventory = AcceleratorInventory(
+        cuda_device_count=0, mps_available=False, cpu_count=8
+    )
+    experiment = _auto_experiment(monkeypatch, tmp_path, inventory)
+    assert experiment.orchestration.device == "cpu"
+    assert experiment.learner.device == "cpu"
+    directories = RunDirectories.from_experiment(experiment)
+    specs = build_worker_specs(
+        experiment,
+        config_path=CONFIGS / "auto.yaml",
+        directories=directories,
+        python_executable="/test/python",
+        base_environment={},
+    )
+    assert [spec.role for spec in specs] == ["learner", "actor", "arena"]
+    for spec in specs:
+        assert "CUDA_VISIBLE_DEVICES" not in spec.environment
+
+
+def test_materialized_config_round_trips_without_auto_markers(
+    monkeypatch, tmp_path
+) -> None:
+    inventory = AcceleratorInventory(
+        cuda_device_count=2, mps_available=False, cpu_count=32
+    )
+    experiment = _auto_experiment(monkeypatch, tmp_path, inventory)
+    directories = RunDirectories.from_experiment(experiment)
+    resolved_path = orchestration_module.materialize_worker_config(
+        CONFIGS / "auto.yaml",
+        experiment,
+        directories,
+    )
+    assert resolved_path == directories.root / "resolved-config.yaml"
+    raw = resolved_path.read_text(encoding="utf-8")
+    parsed = yaml.safe_load(raw)
+    assert parsed["orchestration"]["gpus"] != "auto"
+    assert parsed["orchestration"]["device"] == "cuda"
+    assert parsed["learner"]["device"] == "cuda"
+    assert parsed["train"]["precision"] == "auto"  # resolved per worker device
+    # Reload with detection forced to a different host: the frozen file must
+    # win, proving children never re-detect hardware.
+    _patched_inventory(
+        monkeypatch,
+        AcceleratorInventory(cuda_device_count=0, mps_available=False, cpu_count=2),
+    )
+    reloaded = load_config(resolved_path)
+    assert reloaded.orchestration.device == "cuda"
+    assert [(gpu.gpu_id, gpu.role) for gpu in reloaded.orchestration.gpus] == [
+        (0, "learner"),
+        (1, "actor"),
+    ]
+    assert reloaded.orchestration.promotion.gpu_id == 1
+    assert reloaded.orchestration.promotion.pause_sharing_mode is True
+    assert reloaded.learner.device == "cuda"
+    assert "# Materialized by startrain-orchestrate" in raw
+
+
+def test_materialize_worker_config_passthrough_for_explicit_profiles(
+    tmp_path,
+) -> None:
+    experiment = load_config(CONFIGS / "h100-4gpu.yaml")
+    experiment = replace(
+        experiment,
+        orchestration=replace(
+            experiment.orchestration,
+            directories=RunDirectoryConfig(root=str(tmp_path / "explicit")),
+        ),
+    )
+    directories = RunDirectories.from_experiment(experiment)
+    resolved = orchestration_module.materialize_worker_config(
+        CONFIGS / "h100-4gpu.yaml",
+        experiment,
+        directories,
+    )
+    assert resolved == CONFIGS / "h100-4gpu.yaml"
+    assert not (directories.root / "resolved-config.yaml").exists()
+
+
+def test_colocated_workers_require_explicit_opt_in() -> None:
+    experiment = load_config(CONFIGS / "h100-4gpu.yaml")
+    with pytest.raises(ConfigError, match="allow_colocated_workers"):
+        replace(
+            experiment.orchestration,
+            gpus=(
+                GPUWorkerConfig(0, "learner", 8),
+                GPUWorkerConfig(0, "actor", 4, 32),
+            ),
+        )
+    colocated = replace(
+        experiment.orchestration,
+        allow_colocated_workers=True,
+        gpus=(
+            GPUWorkerConfig(0, "learner", 8),
+            GPUWorkerConfig(0, "actor", 4, 32),
+        ),
+        promotion=replace(
+            experiment.orchestration.promotion,
+            gpu_id=0,
+            pause_sharing_mode=True,
+        ),
+    )
+    assert colocated.allow_colocated_workers is True
+    with pytest.raises(ConfigError, match="distinct roles"):
+        replace(
+            colocated,
+            gpus=(
+                GPUWorkerConfig(0, "actor", 8, 32),
+                GPUWorkerConfig(0, "actor", 4, 32),
+            ),
+        )
+
+
+def test_auto_topology_rejects_autonomous_scratch_profiles(tmp_path) -> None:
+    source = (CONFIGS / "auto.yaml").read_text(encoding="utf-8")
+    mutated = source.replace(
+        "orchestration:\n  enabled: true\n  gpus: auto\n",
+        "orchestration:\n  enabled: true\n  gpus: auto\n"
+        "  autonomous:\n    enabled: true\n",
+    )
+    assert mutated != source
+    target = tmp_path / "auto-autonomous.yaml"
+    target.write_text(mutated, encoding="utf-8")
+    with pytest.raises(ConfigError, match="frozen explicit GPU topology"):
+        load_config(target)

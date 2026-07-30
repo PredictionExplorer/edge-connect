@@ -70,6 +70,27 @@ def _validate_autonomous_config(config: ExperimentConfig) -> None:
     retention = config.orchestration.retention
     if retention.candidate_manifests < 2 * refresh.history_pool_size:
         raise ValueError("autonomous retention cannot protect the history pool")
+    historical = config.orchestration.historical_evaluation
+    if historical.enabled and (
+        historical.every_promotions < 4
+        or historical.anchors_per_evaluation > 1
+        or historical.pairs_per_ring > 10
+        or historical.max_pairs_per_ring > 10
+    ):
+        raise ValueError("autonomous historical evaluation exceeds its compute budget")
+    promotion = config.orchestration.promotion
+    learner_gpu_ids = {
+        gpu.gpu_id for gpu in config.orchestration.gpus if gpu.role == "learner"
+    }
+    if promotion.gpu_id in learner_gpu_ids and (
+        promotion.max_waves_per_lease != 1
+        or promotion.inter_wave_cooldown_seconds < 1_800
+        or historical.enabled
+    ):
+        raise ValueError(
+            "autonomous learner-shared promotion requires one-wave leases, "
+            "a 30-minute catch-up interval, and disabled historical evaluation"
+        )
     if config.arena.max_considered < 48:
         raise ValueError("autonomous arena must evaluate a broad action set")
 
@@ -122,6 +143,16 @@ def _validate_throughput_config(config: ExperimentConfig) -> None:
         or plateau.reset_learning_rate_scale > 0.5
     ):
         raise ValueError("continuous service requires bounded lower-LR champion resets")
+    arena = config.arena
+    continuation = arena.continuation_pairs_per_ring or arena.pairs_per_ring
+    if (
+        not config.orchestration.promotion.finish_inflight_candidate
+        or continuation > max(1, arena.pairs_per_ring // 2)
+    ):
+        raise ValueError(
+            "continuous service requires resumable in-flight candidates and "
+            "bounded continuation waves"
+        )
 
 
 def validate_continuous_config(config: ExperimentConfig) -> None:

@@ -49,6 +49,7 @@ data:
   ring_stratified: true
   d5_augmentation: true
   workers: 16
+  min_batches_for_workers: 32
   prefetch_factor: 4
   pin_memory: true
   shard_cache_size: 16
@@ -143,7 +144,7 @@ orchestration:
     role: actor
     cpu_threads: 8
     actor_batch_size: 128
-    actor_lanes: 1
+    actor_lanes: 2
     cpu_affinity: 104-207
   actor_games_per_batch: 128
   ring_mixture:
@@ -164,6 +165,8 @@ orchestration:
     manifest_poll_seconds: 2.0
     startup_timeout_seconds: 900.0
     refresh_only_between_batches: true
+    inference_compile_dynamic: true
+    inference_compile_mode: default
     selfplay_source: candidate_champion_history_mix
     candidate_probability: 0.5
     history_probability: 0.25
@@ -190,9 +193,11 @@ orchestration:
   distributed:
     enabled: false
     backend: nccl
+  hardware_health:
+    require_gpu_model: H100
   promotion:
     enabled: true
-    gpu_id: 7
+    gpu_id: 0
     cpu_threads: 8
     poll_seconds: 10.0
     bootstrap_initial_champion: true
@@ -201,6 +206,14 @@ orchestration:
     pause_ready_timeout_seconds: 930.0
     pause_release_timeout_seconds: 120.0
     final_drain_timeout_seconds: 57600.0
+    max_waves_per_lease: 1
+    inter_wave_cooldown_seconds: 1800.0
+  historical_evaluation:
+    enabled: false
+    every_promotions: 4
+    anchors_per_evaluation: 1
+    pairs_per_ring: 10
+    max_pairs_per_ring: 10
   plateau:
     enabled: true
     max_learner_champion_lag_steps: 80000
@@ -225,7 +238,8 @@ orchestration:
     gc_interval_windows: 10
 arena:
   rings: [4, 6, 8, 10]
-  pairs_per_ring: 50
+  pairs_per_ring: 15
+  continuation_pairs_per_ring: 50
   simulations: 1024
   max_considered: 64
   c_visit: 50.0
@@ -240,5 +254,5 @@ arena:
   confidence: 0.95
   bootstrap_samples: 2000
   unforced_opening_fraction: 0.2
-  minimum_pairs_per_ring: 50
+  minimum_pairs_per_ring: 15
   max_pairs_per_ring: 200

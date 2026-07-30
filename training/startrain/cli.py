@@ -8,6 +8,7 @@ import json
 import os
 import sys
 import time
+import traceback
 from dataclasses import asdict, replace
 from pathlib import Path
 
@@ -23,11 +24,21 @@ from .checkpoint import (
     write_model_pointer,
 )
 from .config import load_config
+from .device import resolve_device_string
 from .distill import distill_main
 from .inference import GraphInferenceAdapter, InferenceConfig
 from .learner import LearnerLoop
 from .model import GraphResTNet
 from .native import load_star_native
+from .orchestration import (
+    FATAL_WORKER_EXIT_CODE,
+    LEARNER_DATA_WORKERS_ENV,
+    TRANSIENT_WORKER_EXIT_CODE,
+    WORKER_FAILURE_PATH_ENV,
+    WORKER_NAME_ENV,
+    WORKER_ROLE_ENV,
+    FailureClass,
+)
 from .promotion import load_manifest_evaluator, promotion_main
 from .publish import publish_browser_main
 from .replay_store import ReplayStore
@@ -45,13 +56,14 @@ def selfplay_main(argv: list[str] | None = None) -> None:
     parser.add_argument("--config", required=True)
     parser.add_argument("--replay-store", required=True)
     parser.add_argument("--checkpoint")
-    parser.add_argument("--device", default="cpu")
+    parser.add_argument("--device", default="cpu", help="cpu, cuda, mps, or auto")
     parser.add_argument("--games", type=int)
     parser.add_argument("--rings", type=int)
     parser.add_argument("--cpu-smoke", action="store_true")
     parser.add_argument("--run-identity", required=True)
     parser.add_argument("--actor-id", default="standalone-selfplay")
     arguments = parser.parse_args(argv)
+    arguments.device = resolve_device_string(arguments.device)
 
     experiment = load_config(arguments.config)
     selfplay_config = experiment.selfplay
@@ -142,6 +154,20 @@ def train_main(argv: list[str] | None = None) -> None:
     arguments = parser.parse_args(argv)
 
     experiment = load_config(arguments.config)
+    raw_data_workers = os.environ.get(LEARNER_DATA_WORKERS_ENV)
+    if raw_data_workers is not None:
+        try:
+            data_workers = int(raw_data_workers)
+        except ValueError as exc:
+            raise ValueError(f"{LEARNER_DATA_WORKERS_ENV} must be an integer") from exc
+        if data_workers < 0 or data_workers > experiment.data.workers:
+            raise ValueError(
+                f"{LEARNER_DATA_WORKERS_ENV} must be in [0, {experiment.data.workers}]"
+            )
+        experiment = replace(
+            experiment,
+            data=replace(experiment.data, workers=data_workers),
+        )
     run_identity = load_run_identity(arguments.run_identity)
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     rank = int(os.environ.get("RANK", "0"))
@@ -156,11 +182,11 @@ def train_main(argv: list[str] | None = None) -> None:
             not distributed.enabled
             or arguments.distributed_backend != distributed.backend
         ):
-            raise RuntimeError(
+            raise ValueError(
                 "DDP requires explicitly enabled matching distributed configuration"
             )
         if arguments.device not in (None, "cuda"):
-            raise RuntimeError("DDP learner device must be cuda")
+            raise ValueError("DDP learner device must be cuda")
         device = f"cuda:{local_rank}"
         torch.cuda.set_device(local_rank)
         torch.distributed.init_process_group(
@@ -168,15 +194,13 @@ def train_main(argv: list[str] | None = None) -> None:
         )
     else:
         if arguments.distributed_backend is not None:
-            raise RuntimeError("distributed backend was set without a DDP launch")
+            raise ValueError("distributed backend was set without a DDP launch")
         if (
             experiment.orchestration.distributed.enabled
             and len(experiment.orchestration.learner_gpus) > 1
         ):
-            raise RuntimeError(
-                "configured DDP learner must be launched through torchrun"
-            )
-        device = arguments.device or experiment.learner.device
+            raise ValueError("configured DDP learner must be launched through torchrun")
+        device = resolve_device_string(arguments.device or experiment.learner.device)
     if device:
         experiment = replace(
             experiment,
@@ -281,7 +305,7 @@ def train_main(argv: list[str] | None = None) -> None:
                 if resumed_from is None and (
                     candidates or discovery_failures or persisted_artifacts
                 ):
-                    raise RuntimeError(
+                    raise ValueError(
                         "all automatic resume checkpoints were rejected: "
                         + "; ".join((*discovery_failures, *resume_failures))
                     )
@@ -360,8 +384,9 @@ def actor_main(argv: list[str] | None = None) -> None:
     parser.add_argument("--heartbeat", required=True)
     parser.add_argument("--learner-heartbeat")
     parser.add_argument("--metrics", required=True)
-    parser.add_argument("--device", default="cuda")
+    parser.add_argument("--device", default="auto", help="cuda, mps, cpu, or auto")
     arguments = parser.parse_args(argv)
+    arguments.device = resolve_device_string(arguments.device)
 
     experiment = load_config(arguments.config)
     matches = [
@@ -412,7 +437,7 @@ def arena_main(argv: list[str] | None = None) -> None:
         help="checkpoint (default) or a versioned frozen non-human opponent",
     )
     parser.add_argument("--output", required=True)
-    parser.add_argument("--device", default="cuda")
+    parser.add_argument("--device", default="auto", help="cuda, mps, cpu, or auto")
     parser.add_argument(
         "--target-elo-lcb",
         type=float,
@@ -431,6 +456,7 @@ def arena_main(argv: list[str] | None = None) -> None:
         parser.error("--baseline cannot be combined with a frozen --baseline-kind")
     if arguments.target_rings and arguments.target_elo_lcb is None:
         parser.error("--target-rings requires --target-elo-lcb")
+    arguments.device = resolve_device_string(arguments.device)
 
     experiment = load_config(arguments.config)
     candidate_manifest = load_model_manifest(arguments.candidate)
@@ -524,7 +550,49 @@ def main(argv: list[str] | None = None) -> None:
         entrypoint = commands[command]
     except KeyError:
         raise SystemExit(f"unknown startrain command: {command}") from None
-    entrypoint(command_arguments)
+    try:
+        entrypoint(command_arguments)
+    except ValueError as error:
+        _exit_for_worker_failure(error, failure_class=FailureClass.FATAL)
+    except Exception as error:
+        _exit_for_worker_failure(error, failure_class=FailureClass.TRANSIENT)
+
+
+def _exit_for_worker_failure(
+    error: Exception,
+    *,
+    failure_class: FailureClass,
+) -> None:
+    exit_code = (
+        FATAL_WORKER_EXIT_CODE
+        if failure_class is FailureClass.FATAL
+        else TRANSIENT_WORKER_EXIT_CODE
+    )
+    failure_path = os.environ.get(WORKER_FAILURE_PATH_ENV)
+    if failure_path:
+        try:
+            atomic_json(
+                failure_path,
+                {
+                    "format": "startrain.worker-failure",
+                    "schema_version": 1,
+                    "timestamp_ns": time.time_ns(),
+                    "pid": os.getpid(),
+                    "worker": os.environ.get(WORKER_NAME_ENV),
+                    "role": os.environ.get(WORKER_ROLE_ENV),
+                    "failure_class": failure_class.value,
+                    "exit_code": exit_code,
+                    "exception_type": type(error).__name__,
+                    "reason": str(error),
+                },
+            )
+        except OSError as report_error:
+            print(
+                f"could not persist worker failure status: {report_error}",
+                file=sys.stderr,
+            )
+    traceback.print_exception(type(error), error, error.__traceback__)
+    raise SystemExit(exit_code) from None
 
 
 def _model_state_identity(model: torch.nn.Module) -> str:

@@ -12,7 +12,14 @@ from startrain.checkpoint import (
     load_checkpoint,
     save_checkpoint,
 )
-from startrain.config import ConfigError, SchedulerConfig, load_config
+from startrain.config import (
+    ConfigError,
+    DataConfig,
+    HistoricalEvaluationConfig,
+    ModelRefreshConfig,
+    SchedulerConfig,
+    load_config,
+)
 from startrain.export import ONNX_INPUT_NAMES, ONNXStarModel, export_onnx
 from startrain.features import DoubleStarPosition, encode_batch
 from startrain.model import GraphResTNet, ModelConfig
@@ -106,6 +113,8 @@ def test_yaml_configs_load_strictly() -> None:
     assert h100.train.global_batch_size(4) == (h100.train.per_rank_batch_size * 4)
     assert h100.profile == "standalone-smoke"
     assert h100.data.ring_stratified is False
+    assert small.data.min_batches_for_workers == 32
+    assert small.as_dict()["data"]["min_batches_for_workers"] == 32
     continuous = load_config(CONFIGS / "h100-8gpu.yaml")
     assert continuous.profile == "continuous"
     assert continuous.data.ring_stratified is True
@@ -150,7 +159,38 @@ def test_yaml_configs_load_strictly() -> None:
     )
     assert throughput.orchestration.plateau.consecutive_terminal_rejections == 2
     assert throughput.orchestration.plateau.reset_learning_rate_scale == 0.5
+    assert throughput.learner.candidate_interval == 28_000
+    assert throughput.learner.max_replay_lag_steps == 60_000
+    assert throughput.orchestration.plateau.max_learner_champion_lag_steps == 60_000
+    assert throughput.orchestration.promotion.finish_inflight_candidate is True
+    assert throughput.arena.continuation_pairs_per_ring == 25
     validate_continuous_config(throughput)
+    with pytest.raises(ValueError, match="resumable in-flight"):
+        validate_continuous_config(
+            replace(
+                throughput,
+                orchestration=replace(
+                    throughput.orchestration,
+                    promotion=replace(
+                        throughput.orchestration.promotion,
+                        finish_inflight_candidate=False,
+                    ),
+                ),
+            )
+        )
+    warmstart = load_config(CONFIGS / "h100-8gpu-champion-warmstart.yaml")
+    assert warmstart.optimizer.adamw_lr == pytest.approx(1.5e-4)
+    assert warmstart.optimizer.muon_lr == pytest.approx(1e-2)
+    assert warmstart.learner.target_updates_per_new_sample == 1.0
+    assert warmstart.learner.candidate_interval_examples == 5_000_000
+    assert warmstart.learner.minimum_unique_samples_per_ring == 8_192
+    assert warmstart.orchestration.model_refresh.selfplay_source == "champion"
+    assert warmstart.arena.per_ring_regression_floor_elo == {
+        4: -35.0,
+        6: -35.0,
+        8: -35.0,
+    }
+    validate_continuous_config(warmstart)
     autonomous = load_config(CONFIGS / "h100-8gpu-autonomous.yaml")
     assert autonomous.orchestration.autonomous.enabled is True
     assert autonomous.orchestration.model_refresh.selfplay_source == (
@@ -164,6 +204,15 @@ def test_yaml_configs_load_strictly() -> None:
     assert autonomous.learner.selfplay_snapshot_warmup_examples == 20_000_000
     assert autonomous.learner.selfplay_snapshot_warmup_interval_examples == 1_000_000
     assert autonomous.data.shards_per_batch == 4
+    assert autonomous.arena.pairs_per_ring == 15
+    assert autonomous.arena.minimum_pairs_per_ring == 15
+    assert autonomous.orchestration.historical_evaluation.enabled is False
+    assert autonomous.orchestration.historical_evaluation.every_promotions == 4
+    assert autonomous.orchestration.historical_evaluation.pairs_per_ring == 10
+    assert autonomous.orchestration.promotion.gpu_id == 0
+    assert autonomous.orchestration.promotion.max_waves_per_lease == 1
+    assert autonomous.orchestration.promotion.inter_wave_cooldown_seconds == 1_800
+    assert sum(gpu.actor_lanes for gpu in autonomous.orchestration.actor_gpus) == 14
     assert replace(autonomous.selfplay, rings=10).considered_actions() == 53
     validate_continuous_config(autonomous)
 
@@ -184,6 +233,88 @@ def test_yaml_configs_load_strictly() -> None:
                 ),
             )
         )
+    with pytest.raises(ValueError, match="historical evaluation"):
+        validate_continuous_config(
+            replace(
+                autonomous,
+                orchestration=replace(
+                    autonomous.orchestration,
+                    historical_evaluation=replace(
+                        autonomous.orchestration.historical_evaluation,
+                        enabled=True,
+                        max_pairs_per_ring=15,
+                    ),
+                ),
+            )
+        )
+    with pytest.raises(ValueError, match="learner-shared promotion"):
+        validate_continuous_config(
+            replace(
+                autonomous,
+                orchestration=replace(
+                    autonomous.orchestration,
+                    promotion=replace(
+                        autonomous.orchestration.promotion,
+                        max_waves_per_lease=2,
+                    ),
+                ),
+            )
+        )
+
+
+def test_data_worker_window_threshold_loads_and_validates_strictly(
+    tmp_path,
+) -> None:
+    source = (CONFIGS / "small.yaml").read_text(encoding="utf-8")
+    configured = tmp_path / "worker-threshold.yaml"
+    configured.write_text(
+        source.replace(
+            "  workers: 0\n",
+            "  workers: 2\n  min_batches_for_workers: 17\n",
+            1,
+        ),
+        encoding="utf-8",
+    )
+
+    experiment = load_config(configured)
+
+    assert experiment.data.workers == 2
+    assert experiment.data.min_batches_for_workers == 17
+    assert experiment.as_dict()["data"]["min_batches_for_workers"] == 17
+    for invalid in (0, -1, True, 2.5, "32"):
+        with pytest.raises(ConfigError, match="worker settings"):
+            DataConfig(min_batches_for_workers=invalid)  # type: ignore[arg-type]
+
+
+def test_inference_compile_and_historical_evaluation_settings_load_strictly(
+    tmp_path,
+) -> None:
+    source = (CONFIGS / "h100-8gpu-autonomous.yaml").read_text(encoding="utf-8")
+    configured = tmp_path / "inference-evaluation.yaml"
+    configured.write_text(
+        source.replace(
+            "    inference_compile_dynamic: true\n"
+            "    inference_compile_mode: default\n",
+            "    inference_compile_dynamic: false\n"
+            "    inference_compile_mode: reduce-overhead\n",
+            1,
+        ),
+        encoding="utf-8",
+    )
+
+    experiment = load_config(configured)
+
+    assert experiment.orchestration.model_refresh.inference_compile_dynamic is False
+    assert (
+        experiment.orchestration.model_refresh.inference_compile_mode
+        == "reduce-overhead"
+    )
+    assert experiment.orchestration.historical_evaluation.enabled is False
+    assert experiment.orchestration.historical_evaluation.max_pairs_per_ring == 10
+    with pytest.raises(ConfigError, match="inference_compile_mode"):
+        ModelRefreshConfig(inference_compile_mode="fastest")  # type: ignore[arg-type]
+    with pytest.raises(ConfigError, match="maximum"):
+        HistoricalEvaluationConfig(pairs_per_ring=5, max_pairs_per_ring=4)
 
 
 def test_yaml_parses_opt_in_learner_ring_mixture_curriculum(tmp_path) -> None:
@@ -292,6 +423,7 @@ def test_compile_forwards_isolated_recompile_budget(
         dynamic=False,
         fullgraph=True,
         backend="eager",
+        mode="reduce-overhead",
         recompile_limit=10,
         isolate_recompiles=True,
     )
@@ -301,12 +433,15 @@ def test_compile_forwards_isolated_recompile_budget(
             "dynamic": False,
             "fullgraph": True,
             "backend": "eager",
+            "mode": "reduce-overhead",
             "recompile_limit": 10,
             "isolate_recompiles": True,
         }
     ]
     with pytest.raises(ValueError, match="recompile_limit"):
         maybe_compile_model(model, enabled=True, recompile_limit=0)
+    with pytest.raises(ValueError, match="compile mode"):
+        maybe_compile_model(model, enabled=True, mode="fastest")
 
 
 def test_bf16_compiled_train_step_scheduler_and_checkpoint(tmp_path) -> None:

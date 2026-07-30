@@ -53,6 +53,8 @@ Research inspirations:
 Use the [training ablation protocol](docs/training-ablation-protocol.md) before
 changing shipped self-play sources, target retention, candidate scaling, precision or
 search settings.
+For fixed-budget ring-10 optimization on a stopped production snapshot, follow the
+[Elo-per-hour ablation runbook](docs/elo-per-hour-ablation-runbook.md).
 
 ## Prerequisites
 
@@ -67,6 +69,10 @@ The documented baseline is:
 - Node.js/npm for the web application, and `wasm-pack` plus the
   `wasm32-unknown-unknown` target for browser publication.
 
+Other machines (fewer GPUs, non-H100 NVIDIA GPUs, Apple Silicon, CPU-only)
+are supported through the hardware-adaptive profile described in
+[Run on any machine](#run-on-any-machine-auto-profile).
+
 Use fast durable local storage for `runs/`. Replay uses immutable compressed shards and
 a SQLite WAL manifest, while checkpoints and manifests are immutable and
 content-addressed.
@@ -78,9 +84,10 @@ The supplied layouts are single-host profiles:
 - `configs/h100-8gpu-throughput.yaml`: GPU 0 learner, two actor lanes on
   GPUs 1–6, one pause-shared actor/arena lane on GPU 7, and target-host NUMA
   affinity.
-- `configs/h100-8gpu-autonomous.yaml`: the same physical layout with enforced
-  random initialization, self-play-only provenance, a bounded update-to-data
-  ratio, candidate/champion/history self-play, cross-shard replay batches,
+- `configs/h100-8gpu-autonomous.yaml`: two actor lanes on GPUs 1–7 with
+  learner/arena pause-sharing on GPU 0, enforced random initialization,
+  self-play-only provenance, a bounded update-to-data ratio,
+  candidate/champion/history self-play, cross-shard replay batches,
   policy-surprise weighting, and non-destructive plateau recovery.
 - `configs/h100.yaml`: one-board-size standalone smoke/tuning profile, not a continuous
   all-ring run.
@@ -185,6 +192,75 @@ Choose a new directory and run ID for a clean repeat. Outside `--cpu-smoke`,
 `startrain-selfplay --checkpoint` expects an immutable champion model manifest, not a
 raw `.pt` file.
 
+## Run on any machine (auto profile)
+
+The pipeline no longer assumes an H100 host. Device policy lives in
+`startrain/device.py`; every worker accepts `--device auto` and resolves
+`cuda` > `mps` > `cpu` with clear errors when an explicit device is
+unavailable.
+
+First inspect what this host offers and what a profile resolves to on it:
+
+```bash
+startrain-preflight --exercise
+startrain-preflight --config configs/auto.yaml --exercise
+```
+
+`--exercise` proves each resolved device with a tiny forward/backward pass.
+
+Then start the hardware-adaptive continuous profile:
+
+```bash
+startrain-orchestrate --config configs/auto.yaml
+```
+
+`orchestration.gpus: auto` detects the host at launch and generates the
+worker layout:
+
+| Host | Layout |
+| --- | --- |
+| 4+ CUDA GPUs | learner on GPU 0, actors on GPUs 1..N-2, dedicated arena on GPU N-1 |
+| 2-3 CUDA GPUs | learner on GPU 0, actors on the rest, arena pause-sharing the last actor GPU |
+| 1 CUDA GPU | learner and one actor colocated on GPU 0 (`allow_colocated_workers`), arena pause-sharing |
+| Apple Silicon (MPS) | one learner, one actor, one arena process on `mps` |
+| CPU-only | the same three workers on `cpu` |
+
+The coordinator freezes the resolution into `<run-root>/resolved-config.yaml`
+and passes that file to every child, so workers running under
+`CUDA_VISIBLE_DEVICES` masking never re-detect hardware. The file is
+regenerated at each coordinator start; edit the source profile, not the
+materialized copy.
+
+Per-device policy is applied automatically:
+
+- `train.precision: auto` selects bf16 on CUDA and fp32 on MPS/CPU. An
+  explicit `bf16` on MPS is rejected at startup with an actionable error.
+- `train.compile: auto` enables `torch.compile` on CUDA only.
+- `data.pin_memory` and the pinned-transfer prefetcher engage on CUDA only;
+  `data.workers` is clamped to the host CPU count.
+- TF32 tensor-core matmuls are enabled on CUDA workers
+  (`torch.set_float32_matmul_precision("high")`), which the fp32 Muon
+  Newton-Schulz iterations rely on for H100-class throughput.
+- On MPS, workers run with `PYTORCH_ENABLE_MPS_FALLBACK=1` so unsupported
+  operators fall back to CPU instead of aborting.
+
+The coordinator's `nvidia-smi` health gate runs only when workers use CUDA.
+`orchestration.hardware_health.require_gpu_model` controls the product-name
+gate: the shipped `h100-*.yaml` profiles pin `H100` (unchanged fail-closed
+behavior), while `auto.yaml` accepts any healthy NVIDIA GPU. ECC, MIG,
+row-remap and repair checks stay fail-closed everywhere; fields a consumer
+GPU reports as `N/A` are treated as absent features, not failures.
+An unqueryable probe is distinct from proven unsafe hardware: the coordinator
+retries it with the configured short transient budget and exits with the
+transient code only after that budget is exhausted. A probe canceled by a
+latched graceful shutdown cannot create a hardware-fatal record.
+
+MPS and CPU hosts are development-scale: they run the full contract
+(self-play, replay, learner, arena, promotion) but are orders of magnitude
+slower than CUDA hosts. Multi-GPU DDP for the learner remains CUDA-only and
+opt-in via `orchestration.distributed`. `gpus: auto` cannot be combined with
+`autonomous.enabled`, which requires a frozen explicit topology.
+
 ## Start a 4- or 8-H100 run
 
 This section is a command summary. The complete installation, driver-selection,
@@ -239,7 +315,34 @@ startrain-orchestrate --config configs/h100-8gpu-throughput.yaml
 It combines decode-once replay loading, real pinned asynchronous learner transfers,
 truthful wall-step telemetry, two independent actor lanes on GPUs 1–6, compiled
 concurrent arena search, and NUMA affinity. GPU 7 remains single-lane so the
-coordinator's actor/arena pause lease still has exactly one target.
+coordinator's actor/arena pause lease still has exactly one target. Promotion
+candidates are spaced far enough apart for a complete arena decision, and the
+active candidate keeps its evidence when a newer checkpoint appears. Small
+post-minimum continuation waves persist frequently and can terminate as soon as
+the anytime-valid gate resolves.
+
+Before changing the learner batch on an initialized run, stop the coordinator and
+benchmark the verified recovery checkpoint against read-only replay:
+
+```bash
+python scripts/benchmark_learner_batches.py \
+  --config "$PROFILE" \
+  --checkpoint "$RECOVERY_CHECKPOINT" \
+  --replay-root "$RUN_ROOT/replay" \
+  --device cuda:0 \
+  --batch-sizes 512 768 1024 \
+  --warmups 2 \
+  --repeats 5 \
+  --output "$RUN_ROOT/learner-batch-benchmark.json"
+```
+
+The benchmark reloads the same model/optimizer state for every candidate, isolates
+OOM failures, never opens replay writable, and recommends a larger batch only after
+a 15% end-to-end throughput gain with peak allocation at or below 72 GiB.
+Apply an accepted treatment change to a stopped non-autonomous run with
+`scripts/migrate_continuous_profile.py`; dry-run first, then repeat with `--apply`.
+The utility writes a new frozen profile and append-only migration boundary rather
+than modifying the active profile.
 
 For a new self-contained research run that must learn without imported weights,
 replay, positions, or human data, start from a frozen copy of:
@@ -252,9 +355,10 @@ The coordinator refuses pre-populated training artifacts before creating the
 run identity and writes `autonomous-provenance.json`. Resumes must match the
 same frozen profile fingerprint. This profile uses a fixed update-to-data cap,
 frequent self-play snapshots decoupled from the slower promotion-candidate
-cadence, historical checkpoints generated by the same run, four-shard learner
-batches, and policy-surprise sample weights. Historical models and deterministic
-heuristic opponents never import data into replay.
+cadence, bounded one-wave learner/arena leases with catch-up intervals, and no
+automatic historical cross-play. Self-play still mixes historical checkpoints
+generated by the same run with four-shard learner batches and policy-surprise
+sample weights. Historical models never import external data into replay.
 
 The orchestrator has no `--run-id` or `--run-identity` option. It atomically creates
 `<run-root>/run.json`, then passes that required identity path to every learner, actor
@@ -303,17 +407,20 @@ For the 8-GPU profile, `runs/h100-8gpu/` contains:
 At startup the learner publishes an initial candidate. The shipped H100 profiles
 explicitly allow the promotion supervisor to bootstrap that first candidate as
 champion, which releases actors waiting for `champion.json`. Later candidates are
-immutable EMA checkpoints emitted at the configured cadence (15,000 learner
+immutable EMA checkpoints emitted at the configured cadence (28,000 learner
 steps in the continuous throughput profile). The autonomous profile publishes
 promotion candidates every five million examples and separate actor snapshots
 every one million warmup examples, then every three million.
 
 The arena compares each candidate with the current champion using reversed-role pairs,
 all rings, forced and unforced openings, a pair-level mixture-betting e-process and
-anytime-valid per-ring regression checks. The continuous gate takes 50 new pairs per ring
-per look, requires at least 50, allows at most 200, tests a +35 Elo alternative against
-0 Elo, and rejects a material ring regression. Only a `promote` result atomically
-advances `champion.json`; inconclusive results accumulate more non-overlapping pairs.
+anytime-valid per-ring regression checks. The continuous gate starts with 50 pairs per
+ring, requires at least 50, allows at most 200, and persists 25-pair continuation
+waves when the first look is inconclusive. Newer checkpoints may queue, but cannot
+supersede an evaluation after it has durable pairs. This changes only scheduling:
+the +35 Elo alternative, 0 Elo null, error levels, opening schedule, and per-ring
+regression floors are unchanged. Only a `promote` result atomically advances
+`champion.json`.
 The shipped `model_refresh.selfplay_source: champion` means rejected candidates never
 feed self-play. Research ablations may select `candidate` or
 `candidate_champion_mix`; the selected role and policy-supervision rate are written to

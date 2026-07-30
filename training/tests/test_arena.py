@@ -173,6 +173,62 @@ def test_arena_records_only_binary_results() -> None:
     assert evaluation["evaluator_rows_per_second"] > 0
 
 
+def test_arena_stop_returns_only_complete_role_reversed_chunks() -> None:
+    stopping = False
+
+    def progress(**details: object) -> None:
+        nonlocal stopping
+        if details.get("phase") == "arena":
+            stopping = True
+
+    result = ArenaRunner(
+        native_module=FakeNative,
+        candidate=RoleEvaluator("candidate", selected_action=1),
+        baseline=RoleEvaluator("baseline", selected_action=0),
+        config=arena_config(
+            pairs_per_ring=4,
+            minimum_pairs_per_ring=4,
+            max_pairs_per_ring=4,
+            pair_chunk_size=1,
+        ),
+    ).run(
+        progress=progress,
+        stop_requested=lambda: stopping,
+    )
+
+    assert result["interrupted"] is True
+    assert result["evaluation_metrics"]["requested_pairs"] == 4
+    assert result["evaluation_metrics"]["completed_pairs"] == 1
+    assert [pair["pair"] for pair in result["pairs"]] == [0]
+    assert len(result["games"]) == 2
+    assert {game["candidate_player"] for game in result["games"]} == {0, 1}
+    assert result["promotion"]["decision"] == "continue"
+
+
+def test_arena_discards_pair_interrupted_during_first_game() -> None:
+    stopping = False
+
+    class StoppingEvaluator(RoleEvaluator):
+        def evaluate(self, requests: FakeRequests) -> InferenceResponse:
+            nonlocal stopping
+            response = super().evaluate(requests)
+            stopping = True
+            return response
+
+    result = ArenaRunner(
+        native_module=FakeNative,
+        candidate=StoppingEvaluator("candidate", selected_action=1),
+        baseline=RoleEvaluator("baseline", selected_action=0),
+        config=arena_config(pair_chunk_size=1),
+    ).run(stop_requested=lambda: stopping)
+
+    assert result["interrupted"] is True
+    assert result["pairs"] == []
+    assert result["games"] == []
+    assert result["evaluation_metrics"]["completed_pairs"] == 0
+    assert result["promotion"]["reason"] == "stopped_before_complete_pair"
+
+
 def test_arena_rejects_terminal_ties() -> None:
     FakeStateBatch.tied = True
     try:

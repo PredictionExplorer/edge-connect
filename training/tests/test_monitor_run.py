@@ -6,6 +6,7 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
+import pytest
 import yaml
 
 from scripts import monitor_run as monitor
@@ -212,6 +213,57 @@ def test_collect_snapshot_reports_healthy_run(tmp_path, monkeypatch) -> None:
     assert "elo=42.00" in monitor.format_text(snapshot)
 
 
+def test_snapshot_warns_about_fragmented_arena_continuation(
+    tmp_path, monkeypatch
+) -> None:
+    now_ns = 10_000_000_000
+    root = _fixture(tmp_path, now_ns=now_ns)
+    profile = yaml.safe_load((root / "profile.yaml").read_text(encoding="utf-8"))
+    profile["arena"] = {
+        "pairs_per_ring": 50,
+        "minimum_pairs_per_ring": 50,
+        "max_pairs_per_ring": 200,
+    }
+    (root / "profile.yaml").write_text(
+        yaml.safe_dump(profile, sort_keys=False),
+        encoding="utf-8",
+    )
+    _write_json(
+        root / "arena" / "superseded.json",
+        {
+            "schema_version": 3,
+            "candidate": "candidate",
+            "baseline": "baseline",
+            "completed_ns": now_ns,
+            "promotion": {"decision": "superseded"},
+            "aggregate": {
+                "elo_difference": 10.0,
+                "games": 400,
+                "wins": 210,
+                "losses": 190,
+            },
+        },
+    )
+    _healthy_dependencies(monkeypatch)
+
+    snapshot: Any = monitor.collect_snapshot(root, now_ns=now_ns)
+
+    warning_codes = {item["code"] for item in snapshot["warnings"]}
+    assert "arena_continuation_fragmented" in warning_codes
+    assert snapshot["arena_history"]["completed_superseded_evaluations"] == 1
+    assert snapshot["arena_history"]["completed_superseded_fraction"] == 1.0
+
+    profile["orchestration"]["promotion"] = {"finish_inflight_candidate": True}
+    profile["arena"]["continuation_pairs_per_ring"] = 25
+    (root / "profile.yaml").write_text(
+        yaml.safe_dump(profile, sort_keys=False),
+        encoding="utf-8",
+    )
+    migrated: Any = monitor.collect_snapshot(root, now_ns=now_ns)
+    migrated_codes = {item["code"] for item in migrated["warnings"]}
+    assert "arena_continuation_fragmented" not in migrated_codes
+
+
 def test_collect_snapshot_reports_unlimited_recovery_state(
     tmp_path, monkeypatch
 ) -> None:
@@ -360,6 +412,183 @@ def test_snapshot_surfaces_stale_restart_quarantine_and_hardware(
     } <= codes
 
 
+def test_snapshot_surfaces_persistent_sram_threshold_with_zero_volatile(
+    tmp_path, monkeypatch
+) -> None:
+    now_ns = 300_000_000_000
+    root = _fixture(tmp_path, now_ns=now_ns)
+    _healthy_dependencies(monkeypatch)
+    _write_json(
+        root / "status" / "hardware-health.json",
+        {
+            "schema_version": 1,
+            "healthy": False,
+            "gpus": [
+                {
+                    "index": 0,
+                    "volatile_sram_uncorrectable_parity": 0,
+                    "aggregate_sram_uncorrectable_parity": 65_535,
+                    "sram_threshold_exceeded": True,
+                    "reasons": [
+                        "aggregate_uncorrectable_ecc",
+                        "sram_threshold_exceeded",
+                    ],
+                }
+            ],
+        },
+    )
+
+    snapshot: Any = monitor.collect_snapshot(root, now_ns=now_ns)
+
+    assert snapshot["status"] == "ERROR"
+    assert "gpu_health_gate" in {warning["code"] for warning in snapshot["warnings"]}
+
+
+def test_snapshot_and_text_surface_durable_coordinator_failure(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    now_ns = 300_000_000_000
+    root = _fixture(tmp_path, now_ns=now_ns)
+    reason = "checkpoint schema is incompatible"
+    _write_json(
+        root / "status" / "fatal.json",
+        {
+            "format": "startrain.coordinator-fatal",
+            "schema_version": 1,
+            "timestamp_ns": now_ns,
+            "terminal_reason": "fatal_worker_failure",
+            "failure_class": "fatal",
+            "reason": reason,
+            "exception_type": "ValueError",
+            "worker": "learner",
+            "role": "learner",
+            "worker_exit_code": 78,
+            "coordinator_exit_code": 78,
+            "restart_count": 0,
+        },
+    )
+    coordinator_path = root / "status" / "coordinator.json"
+    coordinator = json.loads(coordinator_path.read_text(encoding="utf-8"))
+    coordinator["workers"]["learner"].update(
+        {
+            "state": "fatal",
+            "failure_class": "fatal",
+            "failure_reason": reason,
+            "last_exit_code": 78,
+        }
+    )
+    _write_json(coordinator_path, coordinator)
+    _healthy_dependencies(monkeypatch)
+
+    snapshot: Any = monitor.collect_snapshot(root, now_ns=now_ns)
+    text = monitor.format_text(snapshot)
+
+    assert snapshot["status"] == "ERROR"
+    assert snapshot["coordinator"]["failure"]["failure_class"] == "fatal"
+    assert snapshot["coordinator"]["failure"]["reason"] == reason
+    learner = next(
+        worker for worker in snapshot["workers"] if worker["name"] == "learner"
+    )
+    assert learner["failure_class"] == "fatal"
+    assert learner["failure_reason"] == reason
+    warnings = {warning["code"]: warning["message"] for warning in snapshot["warnings"]}
+    assert reason in warnings["coordinator_fatal"]
+    assert "failure=fatal" in text
+
+
+def test_actor_throughput_uses_completed_counters_and_merged_wall_intervals(
+    tmp_path,
+) -> None:
+    metrics = tmp_path / "metrics"
+    metrics.mkdir()
+    for lane in range(2):
+        (metrics / f"actor-gpu-1-lane-{lane}.jsonl").write_text(
+            json.dumps(
+                {
+                    "worker": f"actor-gpu-1-lane-{lane}",
+                    "gpu_id": 1,
+                    "batch_started_ns": 10_000_000_000,
+                    "batch_completed_ns": 20_000_000_000,
+                    "games": 10,
+                    "samples": 100,
+                    "evaluator_rows": 1_000,
+                    "samples_per_second": 999_999,
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+    throughput = monitor._actor_throughput_window(
+        metrics,
+        now_ns=20_000_000_000,
+        window_seconds=60,
+    )
+
+    assert throughput["fleet"]["wall_seconds"] == 10
+    assert throughput["fleet"]["samples"] == 200
+    assert throughput["fleet"]["samples_per_second"] == 20
+    assert throughput["by_gpu"]["1"]["wall_seconds"] == 10
+
+
+def test_actor_throughput_handles_window_baseline_and_process_restart(
+    tmp_path,
+) -> None:
+    metrics = tmp_path / "metrics"
+    metrics.mkdir()
+    (metrics / "actor-gpu-1-lane-0.jsonl").write_text(
+        "\n".join(
+            json.dumps(row)
+            for row in [
+                {
+                    "worker": "actor-gpu-1-lane-0",
+                    "gpu_id": 1,
+                    "process_started_ns": 1,
+                    "batch_started_ns": 50_000_000_000,
+                    "batch_completed_ns": 60_000_000_000,
+                    "cumulative_games": 10,
+                    "cumulative_samples": 100,
+                    "cumulative_evaluator_rows": 1_000,
+                },
+                {
+                    "worker": "actor-gpu-1-lane-0",
+                    "gpu_id": 1,
+                    "process_started_ns": 1,
+                    "batch_started_ns": 110_000_000_000,
+                    "batch_completed_ns": 120_000_000_000,
+                    "cumulative_games": 30,
+                    "cumulative_samples": 300,
+                    "cumulative_evaluator_rows": 3_000,
+                },
+                {
+                    "worker": "actor-gpu-1-lane-0",
+                    "gpu_id": 1,
+                    "process_started_ns": 90_000_000_000,
+                    "batch_started_ns": 100_000_000_000,
+                    "batch_completed_ns": 115_000_000_000,
+                    "cumulative_games": 5,
+                    "cumulative_samples": 50,
+                    "cumulative_evaluator_rows": 500,
+                },
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    throughput = monitor._actor_throughput_window(
+        metrics,
+        now_ns=120_000_000_000,
+        window_seconds=60,
+    )
+
+    assert throughput["fleet"]["wall_seconds"] == 60
+    assert throughput["fleet"]["samples"] == 250
+    assert throughput["fleet"]["samples_per_second"] == pytest.approx(250 / 60)
+    assert throughput["partial_processes"] == []
+
+
 def test_latest_jsonl_ignores_partial_tail(tmp_path) -> None:
     path = tmp_path / "metrics.jsonl"
     path.write_bytes(b'{"step":1}\n{"step":2')
@@ -401,3 +630,134 @@ def test_run_monitor_once_emits_one_json_record(tmp_path, monkeypatch, capsys) -
     lines = capsys.readouterr().out.splitlines()
     assert len(lines) == 1
     assert json.loads(lines[0])["status"] == "OK"
+
+
+def test_monitor_shows_headline_segment_loader_and_result_kind_counts(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    now_ns = 10_000_000_000
+    root = _fixture(tmp_path, now_ns=now_ns)
+    learner_metric_path = root / "learner" / "metrics.jsonl"
+    learner_metric = json.loads(learner_metric_path.read_text(encoding="utf-8"))
+    learner_metric.update(
+        {
+            "updates_per_new_sample": 1.05,
+            "lifetime_updates_per_new_sample": 1.05,
+            "segment_updates_per_new_sample": 1.2,
+            "utd_segment_target_updates_per_new_sample": 1.25,
+            "loader_workers_effective": 8,
+            "window_reuse": True,
+            "window_reuse_spins": 3,
+            "window_setup_seconds": 0.02,
+            "window_setup_amortized_seconds": 0.004,
+        }
+    )
+    learner_metric_path.write_text(
+        json.dumps(learner_metric) + "\n",
+        encoding="utf-8",
+    )
+    _write_json(
+        root / "strength-efficiency.json",
+        {
+            "status": "complete",
+            "autonomous_elo": {
+                "headline": {
+                    "source": "aggregate",
+                    "rating": 321.5,
+                    "confidence_interval": [300.0, 343.0],
+                },
+                "headline_elo": 321.5,
+            },
+        },
+    )
+    common = {
+        "schema_version": 3,
+        "candidate": "candidate",
+        "baseline": "baseline",
+        "aggregate": {
+            "elo_difference": 10.0,
+            "wins": 6,
+            "losses": 4,
+            "games": 10,
+        },
+        "per_ring": {},
+    }
+    _write_json(
+        root / "arena" / "legacy-promotion.json",
+        {
+            **common,
+            "completed_ns": now_ns - 1,
+            "promotion": {"decision": "reject"},
+        },
+    )
+    _write_json(
+        root / "arena" / "crossplay.json",
+        {
+            **common,
+            "candidate": "candidate-new",
+            "completed_ns": now_ns,
+            "result_kind": "historical_crossplay",
+        },
+    )
+    _healthy_dependencies(monkeypatch)
+
+    snapshot: Any = monitor.collect_snapshot(root, now_ns=now_ns)
+    text = monitor.format_text(snapshot)
+
+    assert snapshot["strength_efficiency"]["headline_elo"] == 321.5
+    assert snapshot["strength_efficiency"]["headline_source"] == "aggregate"
+    assert snapshot["arena_history"]["promotion_evaluations"] == 1
+    assert snapshot["arena_history"]["crossplay_evaluations"] == 1
+    assert snapshot["arena_history"]["result_kind_counts"]["historical_crossplay"] == 1
+    assert snapshot["learner"]["segment_updates_per_new_sample"] == 1.2
+    assert snapshot["learner"]["loader_workers_effective"] == 8
+    assert "utd_segment=1.20/1.25" in text
+    assert "loader_workers=8" in text
+    assert "window_reuse=yes" in text
+    assert "window_setup=0.0040s" in text
+    assert "promotion_evals=1" in text
+    assert "crossplay_evals=1" in text
+    assert "elo=321.50" in text
+    assert "elo_source=aggregate" in text
+
+
+def test_monitor_softly_ignores_malformed_strength_report(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    now_ns = 10_000_000_000
+    root = _fixture(tmp_path, now_ns=now_ns)
+    (root / "strength-efficiency.json").write_text("{partial", encoding="utf-8")
+    _healthy_dependencies(monkeypatch)
+
+    snapshot: Any = monitor.collect_snapshot(root, now_ns=now_ns)
+
+    assert snapshot["strength_efficiency"] == {"available": False}
+    assert "elo=n/a" in monitor.format_text(snapshot)
+
+
+def test_monitor_derives_aggregate_headline_from_legacy_report(tmp_path) -> None:
+    _write_json(
+        tmp_path / "strength-efficiency.json",
+        {
+            "status": "complete",
+            "autonomous_elo": {
+                "latest": {"source": "ring_10", "rating": 500.0},
+                "latest_elo": 500.0,
+                "aggregate": {
+                    "status": "available",
+                    "latest": {
+                        "rating": 300.0,
+                        "confidence_interval": [250.0, 350.0],
+                    },
+                },
+            },
+        },
+    )
+
+    status = monitor._strength_efficiency_status(tmp_path)
+
+    assert status["headline_elo"] == 300.0
+    assert status["headline_source"] == "aggregate"
+    assert status["headline_confidence_interval"] == [250.0, 350.0]
