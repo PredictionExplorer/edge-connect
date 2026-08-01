@@ -328,17 +328,24 @@ def prepare_champion_warm_start(
         candidate = _read_json(marker_path)
         old_identity = candidate.get("source_model_identity")
         old_profile_sha256 = candidate.get("profile_sha256")
-        if not isinstance(old_identity, str) or not isinstance(old_profile_sha256, str):
+        if (
+            candidate.get("format") != WARM_START_FORMAT
+            or candidate.get("schema_version") != WARM_START_SCHEMA_VERSION
+            or candidate.get("run_id") != identity.run_id
+            or candidate.get("generation_family") != identity.generation_family
+            or candidate.get("status") != "active"
+            or not isinstance(old_identity, str)
+            or not isinstance(old_profile_sha256, str)
+        ):
             raise WarmStartError(
                 "existing champion warm-start marker cannot be safely replaced"
             ) from None
-        replaced_marker = _existing_warm_start(
-            marker_path,
-            run_id=identity.run_id,
-            generation_family=identity.generation_family,
-            champion_identity=old_identity,
-            profile_sha256=old_profile_sha256,
-        )
+        # A prior active marker can legitimately disagree with the current
+        # cutover after later promotions or a plateau reset. The run-state
+        # preflight above already verified the current recovery/cutover chain;
+        # archive the historical marker and build a new segment from the
+        # current champion.
+        replaced_marker = candidate
         existing = None
     if existing is not None:
         if existing.get("status") == "prepared" and apply:

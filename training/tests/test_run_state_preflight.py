@@ -483,3 +483,36 @@ def test_champion_warm_start_uses_champion_examples_not_later_recovery(
     assert planned["source_model_step"] == 10
     assert planned["examples_consumed"] == 100
     assert planned["initial_replay_credit"] == 0
+
+
+def test_champion_warm_start_replaces_stale_active_marker_after_valid_preflight(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture(tmp_path)
+    prepare_champion_warm_start(
+        fixture.root,
+        fixture.profile,
+        apply=True,
+    )
+    marker_path = fixture.root / "learner" / "champion-warm-start.json"
+    stale = json.loads(marker_path.read_text(encoding="utf-8"))
+    stale["source_model_identity"] = "stale-prior-champion"
+    _write_json(marker_path, stale)
+
+    replaced = prepare_champion_warm_start(
+        fixture.root,
+        fixture.profile,
+        apply=True,
+        replace_existing=True,
+    )
+    current = json.loads(marker_path.read_text(encoding="utf-8"))
+    champion = load_model_manifest(fixture.root / "learner" / "champion.json")
+    history = list(
+        (fixture.root / "learner" / "champion-warm-start-history").glob("*.json")
+    )
+
+    assert replaced["mode"] == "apply"
+    assert current["status"] == "active"
+    assert current["source_model_identity"] == champion.model_identity
+    assert len(history) == 1
+    assert json.loads(history[0].read_text(encoding="utf-8")) == stale
