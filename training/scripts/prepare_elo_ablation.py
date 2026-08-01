@@ -37,7 +37,16 @@ CLEAN_TREATMENTS = (
     "hard-replay",
     "fresh-hard",
 )
+WEIGHTED_TREATMENTS = (
+    "weighted-control",
+    "ring10-65-weighted",
+    "ring10-70-weighted",
+)
 GUARD_RINGS = (4, 6, 8)
+WEIGHTED_PROMOTION_PAIR_RATIOS = {4: 1, 6: 1, 8: 1, 10: 7}
+WEIGHTED_INITIAL_BLOCKS = 15
+WEIGHTED_CONTINUATION_BLOCKS = 10
+WEIGHTED_MAX_BLOCKS = 50
 
 RawConfig = dict[str, Any]
 Treatment = Callable[[RawConfig], None]
@@ -68,7 +77,12 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--treatment",
         action="append",
-        choices=(*DEFAULT_TREATMENTS, *SYSTEM_TREATMENTS, *CLEAN_TREATMENTS),
+        choices=(
+            *DEFAULT_TREATMENTS,
+            *SYSTEM_TREATMENTS,
+            *CLEAN_TREATMENTS,
+            *WEIGHTED_TREATMENTS,
+        ),
         dest="treatments",
     )
     return parser
@@ -118,6 +132,38 @@ def _freshness_mix(config: RawConfig) -> None:
 def _ring_ten_seventy(config: RawConfig) -> None:
     mixture = _mapping(_mapping(config, "orchestration"), "ring_mixture")
     mixture["step_weights"] = [{"from_step": 0, "weights": [0.10, 0.10, 0.10, 0.70]}]
+
+
+def _weighted_promotion_objective(config: RawConfig) -> None:
+    arena = _mapping(config, "arena")
+    arena.update(
+        {
+            "promotion_pair_ratios": dict(WEIGHTED_PROMOTION_PAIR_RATIOS),
+            "required_regression_rings": [],
+            "weighted_initial_blocks": WEIGHTED_INITIAL_BLOCKS,
+            "weighted_continuation_blocks": WEIGHTED_CONTINUATION_BLOCKS,
+            "weighted_max_blocks": WEIGHTED_MAX_BLOCKS,
+            # The arena still emits every per-ring confidence sequence. An empty
+            # map removes the ablation's hard -35 Elo overrides; the explicit
+            # required_regression_rings list controls whether diagnostics gate.
+            "per_ring_regression_floor_elo": {},
+        }
+    )
+
+
+def _weighted_control(config: RawConfig) -> None:
+    _weighted_promotion_objective(config)
+
+
+def _ring_ten_sixty_five_weighted(config: RawConfig) -> None:
+    mixture = _mapping(_mapping(config, "orchestration"), "ring_mixture")
+    mixture["step_weights"] = [{"from_step": 0, "weights": [0.10, 0.10, 0.15, 0.65]}]
+    _weighted_promotion_objective(config)
+
+
+def _ring_ten_seventy_weighted(config: RawConfig) -> None:
+    _ring_ten_seventy(config)
+    _weighted_promotion_objective(config)
 
 
 def _search_quality(config: RawConfig) -> None:
@@ -224,6 +270,9 @@ TREATMENTS: dict[str, Treatment] = {
     "fresh-source": _fresh_source,
     "hard-replay": _hard_replay,
     "fresh-hard": _fresh_hard,
+    "weighted-control": _weighted_control,
+    "ring10-65-weighted": _ring_ten_sixty_five_weighted,
+    "ring10-70-weighted": _ring_ten_seventy_weighted,
 }
 
 
@@ -358,13 +407,34 @@ def validate_futility_policy(
     advantage = control.get("minimum_advantage_elo")
     if isinstance(advantage, bool) or not isinstance(advantage, int | float):
         raise ValueError("futility minimum control advantage must be numeric")
+    objective = control.get("objective", "ring_10")
+    if objective not in {"ring_10", "weighted_aggregate"}:
+        raise ValueError("futility control objective is unsupported")
+    if objective == "ring_10" and control.get("ring") != 10:
+        raise ValueError("futility ring-10 control comparison must use ring 10")
+    selected_ring = control.get("ring")
     if (
-        control.get("ring") != 10
-        or control.get("arm_upper_field") != "anytime_upper_elo"
+        objective == "weighted_aggregate"
+        and selected_ring is not None
+        and (selected_ring != "weighted")
+    ):
+        raise ValueError("weighted futility comparison cannot select one ring")
+    if (
+        control.get("arm_upper_field") != "anytime_upper_elo"
         or control.get("control_lower_field") != "anytime_lower_elo"
     ):
-        raise ValueError("futility control comparison must use ring-10 anytime bounds")
+        raise ValueError("futility control comparison must use anytime Elo bounds")
     return json.loads(json.dumps(dict(policy), allow_nan=False))
+
+
+def blocking_guard_rings(treatments: Sequence[str]) -> tuple[int, ...]:
+    """Return the one pre-registered guard policy shared by an ablation matrix."""
+    weighted = [name in WEIGHTED_TREATMENTS for name in treatments]
+    if any(weighted) and not all(weighted):
+        raise ValueError(
+            "weighted-objective and legacy treatments require separate ablation plans"
+        )
+    return () if weighted and all(weighted) else GUARD_RINGS
 
 
 def _validate_inputs(
@@ -424,6 +494,7 @@ def _validate_profile(
     expected_run_id: str,
     expected_seed: int,
     guard_floor_elo: float,
+    weighted_objective: bool,
 ) -> ExperimentConfig:
     loaded = load_config(path)
     if loaded.profile != "continuous" or not loaded.orchestration.enabled:
@@ -434,9 +505,23 @@ def _validate_profile(
         raise ValueError("generated run ID did not round-trip")
     if loaded.train.seed != expected_seed or loaded.selfplay.seed != expected_seed:
         raise ValueError("generated treatment seeds did not round-trip")
-    for ring in GUARD_RINGS:
-        if loaded.arena.per_ring_regression_floor_elo.get(ring) != guard_floor_elo:
-            raise ValueError(f"ring {ring} guard floor did not round-trip")
+    if weighted_objective:
+        if loaded.arena.per_ring_regression_floor_elo:
+            raise ValueError("weighted objective retained blocking per-ring floors")
+        if loaded.arena.required_regression_rings != ():
+            raise ValueError("weighted objective retained required regression rings")
+        if loaded.arena.promotion_pair_ratios != WEIGHTED_PROMOTION_PAIR_RATIOS:
+            raise ValueError("weighted promotion pair ratios did not round-trip")
+        if (
+            loaded.arena.weighted_initial_blocks != WEIGHTED_INITIAL_BLOCKS
+            or loaded.arena.weighted_continuation_blocks != WEIGHTED_CONTINUATION_BLOCKS
+            or loaded.arena.weighted_max_blocks != WEIGHTED_MAX_BLOCKS
+        ):
+            raise ValueError("weighted promotion block limits did not round-trip")
+    else:
+        for ring in GUARD_RINGS:
+            if loaded.arena.per_ring_regression_floor_elo.get(ring) != guard_floor_elo:
+                raise ValueError(f"ring {ring} guard floor did not round-trip")
     return loaded
 
 
@@ -455,6 +540,7 @@ def prepare_elo_ablation(
     treatments: Sequence[str],
     winner_snapshot: Mapping[str, object] | None = None,
     futility_policy: Mapping[str, object] | None = None,
+    guard_rings: Sequence[int] | None = None,
 ) -> dict[str, object]:
     _validate_inputs(
         prefix=prefix,
@@ -474,6 +560,14 @@ def prepare_elo_ablation(
         raise FileNotFoundError(f"base config does not exist: {base}")
     if not source.is_dir():
         raise FileNotFoundError(f"source run root does not exist: {source}")
+    inferred_guard_rings = blocking_guard_rings(treatments)
+    configured_guard_rings = (
+        inferred_guard_rings if guard_rings is None else tuple(guard_rings)
+    )
+    if configured_guard_rings != inferred_guard_rings:
+        raise ValueError(
+            "guard rings do not match the treatments' pre-registered objective"
+        )
     verified_winner = (
         verify_winner_snapshot(source, winner_snapshot)
         if winner_snapshot is not None
@@ -482,7 +576,7 @@ def prepare_elo_ablation(
     registered_futility = (
         validate_futility_policy(
             futility_policy,
-            guard_rings=GUARD_RINGS,
+            guard_rings=configured_guard_rings,
             guard_floor_elo=guard_floor_elo,
         )
         if futility_policy is not None
@@ -514,6 +608,7 @@ def prepare_elo_ablation(
             expected_run_id=run_id,
             expected_seed=seed,
             guard_floor_elo=guard_floor_elo,
+            weighted_objective=treatment_name in WEIGHTED_TREATMENTS,
         )
         generated.append(
             {
@@ -536,8 +631,12 @@ def prepare_elo_ablation(
         "seed": seed,
         "wall_budget_seconds": wall_budget_hours * 3600.0,
         "leaf_budget": leaf_budget,
-        "guard_rings": list(GUARD_RINGS),
+        "guard_rings": list(configured_guard_rings),
         "guard_floor_elo": guard_floor_elo,
+        "promotion_objective": (
+            "weighted_aggregate" if not configured_guard_rings else "ring_10_guarded"
+        ),
+        "per_ring_guarantees": bool(configured_guard_rings),
         "treatments": generated,
     }
     manifest_path = destination / "ablation-plan.json"

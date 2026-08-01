@@ -291,6 +291,23 @@ def test_manifest_pins_revision_and_all_launch_inputs(tmp_path: Path) -> None:
         )
 
 
+def test_manifest_accepts_empty_guard_rings_for_weighted_objective(
+    tmp_path: Path,
+) -> None:
+    deployment = _deployment(tmp_path)
+    manifest = json.loads(deployment.manifest.read_text(encoding="utf-8"))
+    manifest["queue"]["comparison"]["guard_rings"] = []
+    deployment.manifest.write_text(json.dumps(manifest), encoding="utf-8")
+
+    report = verify_deployment_manifest(
+        deployment.manifest,
+        current_source_commit=SOURCE_COMMIT,
+        source_tree_clean=True,
+    )
+
+    assert report["status"] == "verified"
+
+
 def test_manifest_pins_active_champion_warm_start_artifacts(tmp_path: Path) -> None:
     deployment = _deployment(tmp_path, warm_start=True)
 

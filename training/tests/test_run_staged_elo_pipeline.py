@@ -77,6 +77,7 @@ def _pipeline(
     *,
     selector_status: str = "verified",
     expected_anchor: str = "selected-champion",
+    weighted: bool = False,
 ) -> tuple[Path, Path, Path]:
     _source, snapshot = _selected_source(tmp_path)
     comparison = tmp_path / "upstream-comparison.json"
@@ -126,8 +127,16 @@ def _pipeline(
                         "wall_budget_hours": 1,
                         "leaf_budget": 10,
                         "guard_floor_elo": -35,
-                        "treatments": ["control"],
+                        "treatments": ["weighted-control" if weighted else "control"],
                         "expected_anchor_identity": expected_anchor,
+                        **(
+                            {
+                                "guard_rings": [],
+                                "promotion_objective": "weighted_aggregate",
+                            }
+                            if weighted
+                            else {}
+                        ),
                     },
                 },
             ],
@@ -235,6 +244,29 @@ def test_staged_pipeline_rejects_stale_anchor_before_preparation(
     assert not output.exists()
 
 
+def test_staged_pipeline_prepares_weighted_objective_without_guard_rings(
+    tmp_path: Path,
+) -> None:
+    pipeline, output, _comparison = _pipeline(tmp_path, weighted=True)
+
+    state = advance_staged_elo_pipeline(
+        pipeline,
+        stage_index=0,
+        queue_runner=_completed_queue,
+        warm_starter=_winner_warm_start,
+    )
+    plan = json.loads((output / "ablation-plan.json").read_text(encoding="utf-8"))
+
+    assert state["status"] == "downstream_prepared"
+    assert plan["guard_rings"] == []
+    assert plan["promotion_objective"] == "weighted_aggregate"
+    assert plan["futility_policy"]["guard_regression"]["rings"] == []
+    assert plan["futility_policy"]["control_comparison"]["objective"] == (
+        "weighted_aggregate"
+    )
+    assert plan["futility_policy"]["minimum_decisive_games"] == 15
+
+
 def test_staged_pipeline_rejects_unverified_selector(tmp_path: Path) -> None:
     pipeline, output, _comparison = _pipeline(
         tmp_path,
@@ -329,3 +361,29 @@ def test_futility_evaluator_is_stop_only_and_requires_anytime_evidence() -> None
         result["promotion_allowed"] is False
         for result in (keep, regression, no_anytime, fixed_time, cannot_beat)
     )
+
+
+def test_weighted_futility_accepts_empty_guards_and_aggregate_evidence() -> None:
+    policy = build_futility_policy(
+        guard_rings=(),
+        guard_floor_elo=-35,
+        minimum_decisive_games=15,
+        control_objective="weighted_aggregate",
+    )
+    evidence = {
+        "anytime_valid": True,
+        "method": "anytime_valid_confidence_sequence",
+        "weighted_aggregate": {
+            "complete_blocks": 15,
+            "anytime_elo_interval": [-20, -1],
+            "control_anytime_elo_interval": [0, 20],
+        },
+    }
+
+    result = evaluate_futility(policy, evidence)
+
+    assert policy["guard_regression"]["rings"] == []
+    assert result["decision"] == "stop_for_futility"
+    assert result["reason"] == "cannot_beat_control"
+    assert result["control_objective"] == "weighted_aggregate"
+    assert result["promotion_allowed"] is False

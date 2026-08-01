@@ -955,6 +955,11 @@ class ArenaConfig:
     beta: float = 0.05
     regression_floor_elo: float = -100.0
     per_ring_regression_floor_elo: dict[int, float] = field(default_factory=dict)
+    promotion_pair_ratios: dict[int, int] = field(default_factory=dict)
+    required_regression_rings: tuple[int, ...] | None = None
+    weighted_initial_blocks: int = 0
+    weighted_continuation_blocks: int = 0
+    weighted_max_blocks: int = 0
     confidence: float = 0.95
     bootstrap_samples: int = 2_000
     unforced_opening_fraction: float = 0.2
@@ -1028,6 +1033,53 @@ class ArenaConfig:
             for ring in self.per_ring_regression_floor_elo
         ):
             raise ConfigError("arena regression floor has an unknown ring")
+        if self.required_regression_rings is not None and (
+            type(self.required_regression_rings) is not tuple
+            or any(
+                type(ring) is not int or ring not in self.rings
+                for ring in self.required_regression_rings
+            )
+            or len(set(self.required_regression_rings))
+            != len(self.required_regression_rings)
+        ):
+            raise ConfigError(
+                "arena required regression rings must be a unique subset "
+                "of configured rings"
+            )
+        if not isinstance(self.promotion_pair_ratios, dict):
+            raise ConfigError("arena promotion_pair_ratios must be a mapping")
+        weighted_counts = (
+            self.weighted_initial_blocks,
+            self.weighted_continuation_blocks,
+            self.weighted_max_blocks,
+        )
+        if any(type(value) is not int for value in weighted_counts):
+            raise ConfigError("arena weighted block counts must be integers")
+        if not self.promotion_pair_ratios:
+            if any(value != 0 for value in weighted_counts):
+                raise ConfigError(
+                    "arena weighted block counts must be zero without promotion ratios"
+                )
+        else:
+            if set(self.promotion_pair_ratios) != set(self.rings) or any(
+                type(ring) is not int or type(ratio) is not int or ratio <= 0
+                for ring, ratio in self.promotion_pair_ratios.items()
+            ):
+                raise ConfigError(
+                    "arena promotion ratios must assign every configured ring "
+                    "a positive integer"
+                )
+            if math.gcd(*self.promotion_pair_ratios.values()) != 1:
+                raise ConfigError("arena promotion ratios must be reduced by their gcd")
+            if (
+                min(weighted_counts) <= 0
+                or self.weighted_max_blocks < self.weighted_initial_blocks
+                or self.weighted_max_blocks < self.weighted_continuation_blocks
+            ):
+                raise ConfigError(
+                    "arena weighted initial/continuation/maximum block counts "
+                    "are inconsistent"
+                )
 
 
 @dataclass(frozen=True, slots=True)
@@ -1258,6 +1310,21 @@ def load_config(path: str | Path) -> ExperimentConfig:
             arena_values.get("per_ring_regression_floor_elo", {}),
         ).items()
     }
+    arena_values["promotion_pair_ratios"] = {
+        int(ring): ratio
+        for ring, ratio in _mapping(
+            "promotion_pair_ratios",
+            arena_values.get("promotion_pair_ratios", {}),
+        ).items()
+    }
+    required_regression_rings = arena_values.get("required_regression_rings")
+    if required_regression_rings is not None:
+        try:
+            arena_values["required_regression_rings"] = tuple(required_regression_rings)
+        except TypeError as exc:
+            raise ConfigError(
+                "required_regression_rings must be a sequence or null"
+            ) from exc
     return ExperimentConfig(
         schema_version=CONFIG_SCHEMA_VERSION,
         game=_construct(GameConfig, game_values),

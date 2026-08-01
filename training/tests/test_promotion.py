@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+import startrain.arena as arena_module
 import startrain.promotion as promotion_module
 from startrain.checkpoint import (
     ExponentialMovingAverage,
@@ -595,12 +596,14 @@ def _promotion_wave_case(
         evaluator_loads=[],
         runner_instances=0,
         wave_starts=[],
+        wave_counts=[],
         persisted_pairs=[],
         runner_stop_callbacks=[],
         wave_calls=0,
         stop=False,
         stop_after_wave=None,
         after_wave=None,
+        completed_pair_counts=None,
     )
 
     @contextmanager
@@ -632,6 +635,7 @@ def _promotion_wave_case(
             else:
                 state.persisted_pairs.append([])
             state.wave_starts.append(dict(pair_starts))
+            state.wave_counts.append(dict(pair_counts))
             pairs = [
                 ArenaPair(
                     ring,
@@ -642,7 +646,15 @@ def _promotion_wave_case(
                     (1, -1),
                 )
                 for ring, count in pair_counts.items()
-                for pair in range(pair_starts[ring], pair_starts[ring] + count)
+                for pair in range(
+                    pair_starts[ring],
+                    pair_starts[ring]
+                    + (
+                        min(count, state.completed_pair_counts.get(ring, count))
+                        if state.completed_pair_counts is not None
+                        else count
+                    ),
+                )
             ]
             state.wave_calls += 1
             if state.stop_after_wave == state.wave_calls:
@@ -855,6 +867,307 @@ def test_promotion_wave_fills_minimum_without_overshooting() -> None:
     starts, counts = supervisor._wave_plan(accumulated)
     assert starts == {4: 15}
     assert counts == {4: 50}
+
+
+WEIGHTED_PAIR_RATIOS = {4: 1, 6: 1, 8: 1, 10: 7}
+
+
+def _weighted_experiment(
+    experiment,
+    *,
+    initial_blocks: int = 2,
+    continuation_blocks: int = 1,
+    max_blocks: int = 4,
+    pair_chunk_size: int | None = None,
+):
+    return replace(
+        experiment,
+        arena=replace(
+            experiment.arena,
+            rings=(4, 6, 8, 10),
+            pair_chunk_size=pair_chunk_size,
+            promotion_pair_ratios=dict(WEIGHTED_PAIR_RATIOS),
+            required_regression_rings=(),
+            weighted_initial_blocks=initial_blocks,
+            weighted_continuation_blocks=continuation_blocks,
+            weighted_max_blocks=max_blocks,
+        ),
+    )
+
+
+def _pairs_for_ring_counts(
+    counts: dict[int, int],
+    *,
+    seed: int,
+) -> list[ArenaPair]:
+    return [
+        ArenaPair(
+            ring,
+            pair,
+            arena_module._opening_seed(seed, ring, pair),
+            None,
+            False,
+            (1, -1),
+        )
+        for ring, count in counts.items()
+        for pair in range(count)
+    ]
+
+
+def test_weighted_wave_plan_allocates_initial_and_continuation_blocks() -> None:
+    experiment = _weighted_experiment(
+        load_config(Path(__file__).parents[1] / "configs" / "small.yaml"),
+        initial_blocks=15,
+        continuation_blocks=10,
+        max_blocks=50,
+    )
+    supervisor = object.__new__(PromotionSupervisor)
+    supervisor.experiment = experiment
+
+    starts, counts = supervisor._wave_plan([])
+    assert starts == {4: 0, 6: 0, 8: 0, 10: 0}
+    assert counts == {4: 15, 6: 15, 8: 15, 10: 105}
+
+    accumulated = _pairs_for_ring_counts(counts, seed=experiment.arena.seed)
+    starts, counts = supervisor._wave_plan(accumulated)
+    assert starts == {4: 15, 6: 15, 8: 15, 10: 105}
+    assert counts == {4: 10, 6: 10, 8: 10, 10: 70}
+
+
+def test_weighted_wave_plan_repairs_only_uneven_block_deficits() -> None:
+    experiment = _weighted_experiment(
+        load_config(Path(__file__).parents[1] / "configs" / "small.yaml")
+    )
+    supervisor = object.__new__(PromotionSupervisor)
+    supervisor.experiment = experiment
+    existing_counts = {4: 2, 6: 1, 8: 2, 10: 10}
+    accumulated = _pairs_for_ring_counts(
+        existing_counts,
+        seed=experiment.arena.seed,
+    )
+
+    starts, counts = supervisor._wave_plan(accumulated)
+
+    assert starts == existing_counts
+    assert counts == {4: 0, 6: 1, 8: 0, 10: 4}
+    accumulated.extend(
+        ArenaPair(
+            ring,
+            pair,
+            arena_module._opening_seed(experiment.arena.seed, ring, pair),
+            None,
+            False,
+            (1, -1),
+        )
+        for ring, count in counts.items()
+        for pair in range(starts[ring], starts[ring] + count)
+    )
+    resumed_starts, resumed_counts = supervisor._wave_plan(accumulated)
+    assert resumed_starts == {4: 2, 6: 2, 8: 2, 10: 14}
+    assert resumed_counts == WEIGHTED_PAIR_RATIOS
+    for ring in experiment.arena.rings:
+        ring_pairs = [pair for pair in accumulated if pair.ring == ring]
+        assert [pair.pair for pair in ring_pairs] == list(range(len(ring_pairs)))
+        assert [pair.opening_seed for pair in ring_pairs] == [
+            arena_module._opening_seed(experiment.arena.seed, ring, pair)
+            for pair in range(len(ring_pairs))
+        ]
+
+
+def test_weighted_resume_starts_after_max_pair_with_stable_opening_seeds() -> None:
+    experiment = _weighted_experiment(
+        load_config(Path(__file__).parents[1] / "configs" / "small.yaml")
+    )
+    supervisor = object.__new__(PromotionSupervisor)
+    supervisor.experiment = experiment
+    accumulated = [
+        ArenaPair(
+            ring,
+            pair,
+            arena_module._opening_seed(experiment.arena.seed, ring, pair),
+            None,
+            False,
+            (1, -1),
+        )
+        for ring, ratio in WEIGHTED_PAIR_RATIOS.items()
+        for pair in range(10, 10 + ratio)
+    ]
+
+    starts, counts = supervisor._wave_plan(accumulated)
+
+    assert starts == {4: 11, 6: 11, 8: 11, 10: 17}
+    assert counts == WEIGHTED_PAIR_RATIOS
+    resumed = [
+        ArenaPair(
+            ring,
+            pair,
+            arena_module._opening_seed(experiment.arena.seed, ring, pair),
+            None,
+            False,
+            (1, -1),
+        )
+        for ring, count in counts.items()
+        for pair in range(starts[ring], starts[ring] + count)
+    ]
+    for ring in experiment.arena.rings:
+        ring_pairs = [pair for pair in [*accumulated, *resumed] if pair.ring == ring]
+        assert len({pair.pair for pair in ring_pairs}) == len(ring_pairs)
+        assert [pair.opening_seed for pair in ring_pairs] == [
+            arena_module._opening_seed(
+                experiment.arena.seed,
+                ring,
+                pair.pair,
+            )
+            for pair in ring_pairs
+        ]
+
+
+def test_weighted_pair_chunks_end_only_on_complete_block_targets() -> None:
+    starts = {ring: 0 for ring in WEIGHTED_PAIR_RATIOS}
+    counts = {ring: ratio * 2 for ring, ratio in WEIGHTED_PAIR_RATIOS.items()}
+
+    chunks = PromotionSupervisor._pair_chunks(
+        starts,
+        counts,
+        chunk_size=1,
+        pair_ratios=WEIGHTED_PAIR_RATIOS,
+        existing_counts=starts,
+    )
+
+    assert chunks == [
+        (
+            {4: 0, 6: 0, 8: 0, 10: 0},
+            {4: 1, 6: 1, 8: 1, 10: 7},
+        ),
+        (
+            {4: 1, 6: 1, 8: 1, 10: 7},
+            {4: 1, 6: 1, 8: 1, 10: 7},
+        ),
+    ]
+
+
+def test_weighted_promotion_persists_partial_pairs_and_resumes_deficits(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    case = _promotion_wave_case(tmp_path, monkeypatch)
+    case.experiment = _weighted_experiment(case.experiment)
+    case.supervisor.experiment = case.experiment
+    case.state.completed_pair_counts = {4: 1, 6: 1, 8: 1, 10: 3}
+    case.state.stop_after_wave = 1
+
+    assert case.supervisor.run(stop_requested=lambda: case.state.stop) == 1
+    partial = json.loads(case.result_path.read_text(encoding="utf-8"))
+    assert {
+        ring: [int(pair["pair"]) for pair in partial["pairs"] if pair["ring"] == ring]
+        for ring in WEIGHTED_PAIR_RATIOS
+    } == {4: [0], 6: [0], 8: [0], 10: [0, 1, 2]}
+    assert partial["terminal"] is False
+    assert partial["promotion"]["decision"] == "continue"
+    assert partial["weighted_aggregate"]["complete_blocks"] == 0
+    assert partial["weighted_aggregate"]["incomplete_pair_counts"] == {
+        "4": 1,
+        "6": 1,
+        "8": 1,
+        "10": 3,
+    }
+    assert partial["wave_plan"] == {
+        "schema_version": 1,
+        "wave_index": 0,
+        "lease_wave_index": 0,
+        "phase": "initial",
+        "pair_starts": {"4": 0, "6": 0, "8": 0, "10": 0},
+        "pair_counts": {"4": 2, "6": 2, "8": 2, "10": 14},
+        "allocation_mode": "weighted_complete_blocks",
+        "pair_ratios": {"4": 1, "6": 1, "8": 1, "10": 7},
+        "complete_blocks_before": 0,
+        "target_complete_blocks": 2,
+        "pair_counts_before": {"4": 0, "6": 0, "8": 0, "10": 0},
+        "pair_count_targets": {"4": 2, "6": 2, "8": 2, "10": 14},
+        "pair_deficits": {"4": 2, "6": 2, "8": 2, "10": 14},
+        "pair_counts_completed": {"4": 1, "6": 1, "8": 1, "10": 3},
+        "complete_blocks_after": 0,
+        "pair_counts_after": {"4": 1, "6": 1, "8": 1, "10": 3},
+    }
+
+    case.state.stop = False
+    case.state.stop_after_wave = None
+    case.state.completed_pair_counts = None
+    assert case.supervisor.run(stop_requested=lambda: False, once=True) == 1
+    resumed = json.loads(case.result_path.read_text(encoding="utf-8"))
+    per_ring_ids = {
+        ring: [int(pair["pair"]) for pair in resumed["pairs"] if pair["ring"] == ring]
+        for ring in WEIGHTED_PAIR_RATIOS
+    }
+    assert per_ring_ids == {
+        4: [0, 1],
+        6: [0, 1],
+        8: [0, 1],
+        10: list(range(14)),
+    }
+    assert len(resumed["pairs"]) == len(
+        {(pair["ring"], pair["pair"]) for pair in resumed["pairs"]}
+    )
+    assert all(pair["opening_seed"] == pair["pair"] for pair in resumed["pairs"])
+    assert case.state.wave_starts == [
+        {4: 0, 6: 0, 8: 0, 10: 0},
+        {4: 1, 6: 1, 8: 1, 10: 3},
+    ]
+    assert case.state.wave_counts == [
+        {4: 2, 6: 2, 8: 2, 10: 14},
+        {4: 1, 6: 1, 8: 1, 10: 11},
+    ]
+    assert resumed["wave_plan"]["complete_blocks_before"] == 0
+    assert resumed["wave_plan"]["complete_blocks_after"] == 2
+    assert resumed["wave_plan"]["pair_counts_before"] == {
+        "4": 1,
+        "6": 1,
+        "8": 1,
+        "10": 3,
+    }
+    assert resumed["weighted_aggregate"]["complete_blocks"] == 2
+    assert resumed["weighted_aggregate"]["incomplete_pair_counts"] == {
+        "4": 0,
+        "6": 0,
+        "8": 0,
+        "10": 0,
+    }
+    assert resumed["terminal"] is False
+
+
+def test_weighted_max_blocks_rejects_before_scalar_ring_maximums(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    case = _promotion_wave_case(tmp_path, monkeypatch)
+    case.experiment = _weighted_experiment(
+        case.experiment,
+        initial_blocks=1,
+        continuation_blocks=1,
+        max_blocks=2,
+    )
+    case.supervisor.experiment = case.experiment
+
+    assert case.supervisor.run(stop_requested=lambda: False, once=True) == 1
+    first = json.loads(case.result_path.read_text(encoding="utf-8"))
+    assert first["terminal"] is False
+    assert case.state.wave_counts == [{4: 1, 6: 1, 8: 1, 10: 7}]
+
+    assert case.supervisor.run(stop_requested=lambda: False, once=True) == 1
+    final = json.loads(case.result_path.read_text(encoding="utf-8"))
+    assert final["terminal"] is True
+    assert final["promotion"]["decision"] == "reject_max_pairs"
+    final_counts = {
+        ring: sum(pair["ring"] == ring for pair in final["pairs"])
+        for ring in WEIGHTED_PAIR_RATIOS
+    }
+    assert final_counts == {4: 2, 6: 2, 8: 2, 10: 14}
+    assert final_counts[4] < case.experiment.arena.max_pairs_per_ring
+    starts, counts = case.supervisor._wave_plan(
+        case.supervisor._pairs_from_result(final)
+    )
+    assert starts == {4: 2, 6: 2, 8: 2, 10: 14}
+    assert counts == {4: 0, 6: 0, 8: 0, 10: 0}
 
 
 def test_historical_crossplay_persists_bounded_waves_without_promoting(

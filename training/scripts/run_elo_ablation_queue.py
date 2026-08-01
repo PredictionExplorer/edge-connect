@@ -537,9 +537,7 @@ def generate_deployment_manifest(
         )
     raw_guard_rings = plan.get("guard_rings", list(DEFAULT_GUARD_RINGS))
     guard_rings = _list(raw_guard_rings, "plan guard rings")
-    if not guard_rings or any(
-        type(ring) is not int or ring <= 0 for ring in guard_rings
-    ):
+    if any(type(ring) is not int or ring <= 0 for ring in guard_rings):
         raise AblationQueueError("plan guard rings must be positive integers")
     if len(set(guard_rings)) != len(guard_rings):
         raise AblationQueueError("plan guard rings must be unique")
@@ -883,9 +881,7 @@ def _queue_config(manifest: Mapping[str, object]) -> dict[str, Any]:
             "comparison provisioned GPUs must be a positive integer"
         )
     guard_rings = _list(comparison.get("guard_rings"), "comparison guard rings")
-    if not guard_rings or any(
-        type(ring) is not int or ring <= 0 for ring in guard_rings
-    ):
+    if any(type(ring) is not int or ring <= 0 for ring in guard_rings):
         raise AblationQueueError("comparison guard rings must be positive integers")
     if len(set(guard_rings)) != len(guard_rings):
         raise AblationQueueError("comparison guard rings must be unique")

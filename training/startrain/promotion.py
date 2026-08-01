@@ -686,6 +686,11 @@ class PromotionSupervisor:
             pairs_per_ring=configured.pairs_per_ring,
             minimum_pairs_per_ring=configured.max_pairs_per_ring,
             max_pairs_per_ring=configured.max_pairs_per_ring,
+            promotion_pair_ratios={},
+            required_regression_rings=None,
+            weighted_initial_blocks=0,
+            weighted_continuation_blocks=0,
+            weighted_max_blocks=0,
             seed=seed,
         )
         accumulated = self._pairs_from_result(previous)
@@ -973,6 +978,7 @@ class PromotionSupervisor:
                         session_started if waves == 0 else time.perf_counter()
                     )
                     persisted_chunk = False
+                    pair_ratios = arena_config.promotion_pair_ratios
                     for chunk_starts, chunk_counts in self._pair_chunks(
                         starts,
                         counts,
@@ -980,6 +986,8 @@ class PromotionSupervisor:
                             arena_config.pair_chunk_size
                             or max(counts.values(), default=1)
                         ),
+                        pair_ratios=pair_ratios,
+                        existing_counts=self._ring_pair_counts(accumulated),
                     ):
                         if stop_requested():
                             return waves + int(persisted_chunk), "stopped"
@@ -1056,6 +1064,7 @@ class PromotionSupervisor:
         pair_counts: Mapping[int, int],
     ) -> tuple[str, bool]:
         synchronize_device(metric_device)
+        completed_pairs = self._pairs_from_result(result)
         evaluation_metrics = result.get("evaluation_metrics")
         if evaluation_metrics is None:
             evaluation_metrics = {}
@@ -1071,7 +1080,7 @@ class PromotionSupervisor:
             peak_reserved if collect_cuda_metrics else None
         )
         evaluation_metrics["requested_pairs"] = sum(pair_counts.values())
-        evaluation_metrics["completed_pairs"] = len(self._pairs_from_result(result))
+        evaluation_metrics["completed_pairs"] = len(completed_pairs)
         previous_history = (
             previous.get("wave_history", []) if previous is not None else []
         )
@@ -1093,11 +1102,52 @@ class PromotionSupervisor:
                         },
                     }
                 ]
-        wave_plan = {
-            "schema_version": 1,
-            "wave_index": len(previous_history),
-            "lease_wave_index": wave_index,
-            "phase": (
+        pair_ratios = arena_config.promotion_pair_ratios
+        existing_pair_counts = self._ring_pair_counts(accumulated)
+        weighted_metadata: dict[str, object] = {}
+        if pair_ratios:
+            complete_blocks_before = self._complete_blocks(
+                existing_pair_counts,
+                pair_ratios,
+            )
+            requested_pair_counts = {
+                ring: existing_pair_counts[ring] + int(pair_counts.get(ring, 0))
+                for ring in arena_config.rings
+            }
+            complete_blocks_target = self._complete_blocks(
+                requested_pair_counts,
+                pair_ratios,
+            )
+            phase = (
+                "initial"
+                if complete_blocks_before < arena_config.weighted_initial_blocks
+                else "continuation"
+            )
+            weighted_metadata = {
+                "allocation_mode": "weighted_complete_blocks",
+                "pair_ratios": {
+                    str(ring): int(pair_ratios[ring]) for ring in arena_config.rings
+                },
+                "complete_blocks_before": complete_blocks_before,
+                "target_complete_blocks": complete_blocks_target,
+                "pair_counts_before": {
+                    str(ring): existing_pair_counts[ring] for ring in arena_config.rings
+                },
+                "pair_count_targets": {
+                    str(ring): complete_blocks_target * int(pair_ratios[ring])
+                    for ring in arena_config.rings
+                },
+                "pair_deficits": {
+                    str(ring): int(pair_counts.get(ring, 0))
+                    for ring in arena_config.rings
+                },
+                "pair_counts_completed": {
+                    str(ring): sum(pair.ring == ring for pair in completed_pairs)
+                    for ring in arena_config.rings
+                },
+            }
+        else:
+            phase = (
                 "initial"
                 if any(
                     pair_starts.get(ring, 0)
@@ -1105,7 +1155,12 @@ class PromotionSupervisor:
                     for ring in self.experiment.arena.rings
                 )
                 else "continuation"
-            ),
+            )
+        wave_plan = {
+            "schema_version": 1,
+            "wave_index": len(previous_history),
+            "lease_wave_index": wave_index,
+            "phase": phase,
             "pair_starts": {
                 str(ring): int(pair_starts.get(ring, 0))
                 for ring in self.experiment.arena.rings
@@ -1114,18 +1169,28 @@ class PromotionSupervisor:
                 str(ring): int(pair_counts.get(ring, 0))
                 for ring in self.experiment.arena.rings
             },
+            **weighted_metadata,
         }
         result["wave_plan"] = wave_plan
         result["wave_history"] = [*previous_history, wave_plan]
         result["arena_seed_block"] = arena_config.seed
         unique = {(pair.ring, pair.pair): pair for pair in accumulated}
-        for pair in self._pairs_from_result(result):
+        for pair in completed_pairs:
             key = (pair.ring, pair.pair)
             existing = unique.get(key)
             if existing is not None and existing != pair:
                 raise ValueError("arena wave changed a persisted pair")
             unique[key] = pair
         accumulated[:] = [unique[key] for key in sorted(unique)]
+        if pair_ratios:
+            pair_counts_after = self._ring_pair_counts(accumulated)
+            wave_plan["complete_blocks_after"] = self._complete_blocks(
+                pair_counts_after,
+                pair_ratios,
+            )
+            wave_plan["pair_counts_after"] = {
+                str(ring): pair_counts_after[ring] for ring in arena_config.rings
+            }
         result["schema_version"] = ARENA_RESULT_SCHEMA_VERSION
         result["pairs"] = [asdict(pair) for pair in accumulated]
         result.update(summarize_completed_arena_pairs(accumulated, arena_config))
@@ -1141,11 +1206,7 @@ class PromotionSupervisor:
                 *result_games,
             ]
         self._annotate_result(result, candidate, champion)
-        max_reached = all(
-            sum(pair.ring == ring for pair in accumulated)
-            >= self.experiment.arena.max_pairs_per_ring
-            for ring in self.experiment.arena.rings
-        )
+        max_reached = self._max_allocation_reached(accumulated)
         promotion_result = result.get("promotion")
         if not isinstance(promotion_result, dict) or not isinstance(
             promotion_result.get("decision"), str
@@ -1205,9 +1266,11 @@ class PromotionSupervisor:
         counts: Mapping[int, int],
         *,
         chunk_size: int,
+        pair_ratios: Mapping[int, int] | None = None,
+        existing_counts: Mapping[int, int] | None = None,
     ) -> list[tuple[dict[int, int], dict[int, int]]]:
         maximum = max(counts.values(), default=0)
-        return [
+        legacy_chunks = [
             (
                 {ring: int(start) + offset for ring, start in starts.items()},
                 {
@@ -1217,15 +1280,113 @@ class PromotionSupervisor:
             )
             for offset in range(0, maximum, chunk_size)
         ]
+        if not pair_ratios or maximum <= chunk_size:
+            return legacy_chunks
+
+        current_counts = {
+            ring: int((existing_counts or {}).get(ring, 0)) for ring in starts
+        }
+        complete_blocks_before = PromotionSupervisor._complete_blocks(
+            current_counts,
+            pair_ratios,
+        )
+        final_counts = {
+            ring: current_counts[ring] + max(0, int(counts.get(ring, 0)))
+            for ring in starts
+        }
+        complete_blocks_target = PromotionSupervisor._complete_blocks(
+            final_counts,
+            pair_ratios,
+        )
+        if complete_blocks_target <= complete_blocks_before:
+            return legacy_chunks
+
+        # A weighted persistence boundary must finish whole macro blocks. Treat
+        # a single ratio block as atomic even when it exceeds pair_chunk_size.
+        blocks_per_chunk = max(1, chunk_size // max(pair_ratios.values()))
+        scheduled = {ring: 0 for ring in starts}
+        chunks: list[tuple[dict[int, int], dict[int, int]]] = []
+        chunk_target = complete_blocks_before
+        while chunk_target < complete_blocks_target:
+            chunk_target = min(
+                complete_blocks_target,
+                chunk_target + blocks_per_chunk,
+            )
+            chunk_counts = {}
+            for ring in starts:
+                running = current_counts[ring] + scheduled[ring]
+                remaining = max(0, int(counts.get(ring, 0)) - scheduled[ring])
+                needed = max(0, chunk_target * int(pair_ratios[ring]) - running)
+                chunk_counts[ring] = min(remaining, needed)
+            if not any(chunk_counts.values()):
+                break
+            chunks.append(
+                (
+                    {ring: int(starts[ring]) + scheduled[ring] for ring in starts},
+                    chunk_counts,
+                )
+            )
+            for ring, count in chunk_counts.items():
+                scheduled[ring] += count
+
+        remaining_counts = {
+            ring: max(0, int(counts.get(ring, 0)) - scheduled[ring]) for ring in starts
+        }
+        if any(remaining_counts.values()):
+            chunks.append(
+                (
+                    {ring: int(starts[ring]) + scheduled[ring] for ring in starts},
+                    remaining_counts,
+                )
+            )
+        return chunks
+
+    def _ring_pair_counts(
+        self,
+        accumulated: list[ArenaPair],
+    ) -> dict[int, int]:
+        return {
+            ring: sum(pair.ring == ring for pair in accumulated)
+            for ring in self.experiment.arena.rings
+        }
+
+    @staticmethod
+    def _complete_blocks(
+        pair_counts: Mapping[int, int],
+        pair_ratios: Mapping[int, int],
+    ) -> int:
+        return min(
+            (
+                int(pair_counts.get(ring, 0)) // int(ratio)
+                for ring, ratio in pair_ratios.items()
+            ),
+            default=0,
+        )
+
+    def _max_allocation_reached(
+        self,
+        accumulated: list[ArenaPair],
+    ) -> bool:
+        pair_ratios = self.experiment.arena.promotion_pair_ratios
+        if pair_ratios:
+            return (
+                self._complete_blocks(
+                    self._ring_pair_counts(accumulated),
+                    pair_ratios,
+                )
+                >= self.experiment.arena.weighted_max_blocks
+            )
+        return all(
+            sum(pair.ring == ring for pair in accumulated)
+            >= self.experiment.arena.max_pairs_per_ring
+            for ring in self.experiment.arena.rings
+        )
 
     def _wave_plan(
         self,
         accumulated: list[ArenaPair],
     ) -> tuple[dict[int, int], dict[int, int]]:
-        existing_counts = {
-            ring: sum(pair.ring == ring for pair in accumulated)
-            for ring in self.experiment.arena.rings
-        }
+        existing_counts = self._ring_pair_counts(accumulated)
         starts = {
             ring: (
                 max(
@@ -1236,6 +1397,27 @@ class PromotionSupervisor:
             )
             for ring in self.experiment.arena.rings
         }
+        pair_ratios = self.experiment.arena.promotion_pair_ratios
+        if pair_ratios:
+            complete_blocks = self._complete_blocks(existing_counts, pair_ratios)
+            if complete_blocks >= self.experiment.arena.weighted_max_blocks:
+                target_blocks = self.experiment.arena.weighted_max_blocks
+            elif complete_blocks < self.experiment.arena.weighted_initial_blocks:
+                target_blocks = self.experiment.arena.weighted_initial_blocks
+            else:
+                target_blocks = min(
+                    self.experiment.arena.weighted_max_blocks,
+                    complete_blocks
+                    + self.experiment.arena.weighted_continuation_blocks,
+                )
+            return starts, {
+                ring: max(
+                    0,
+                    target_blocks * int(pair_ratios[ring]) - existing_counts[ring],
+                )
+                for ring in self.experiment.arena.rings
+            }
+
         counts = {}
         for ring, existing in existing_counts.items():
             remaining = self.experiment.arena.max_pairs_per_ring - existing

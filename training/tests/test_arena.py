@@ -1,26 +1,33 @@
 from __future__ import annotations
 
+import math
+import random
 import threading
 import time
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
 
 from startrain.arena import (
     ARENA_RESULT_SCHEMA_VERSION,
+    WEIGHTED_OBSERVATION_MODEL,
     ArenaPair,
     ArenaRunner,
     ArenaSearchBudget,
     BinaryResults,
+    bounded_confidence_sequence,
+    bounded_log_e_value,
     internal_elo_target_assessment,
     pair_confidence_sequence,
     promotion_assessment,
     summarize_arena_pairs,
     summarize_binary_results,
+    summarize_completed_arena_pairs,
     summarize_pairs,
     wilson_interval,
 )
-from startrain.config import ArenaConfig
+from startrain.config import ArenaConfig, ConfigError
 from startrain.inference import InferenceResponse
 from startrain.native import BITBOARD_WORDS
 
@@ -126,6 +133,50 @@ def arena_config(**overrides: object) -> ArenaConfig:
     }
     values.update(overrides)
     return ArenaConfig(**values)
+
+
+def weighted_arena_config(**overrides: object) -> ArenaConfig:
+    values = {
+        "rings": (4, 6, 8, 10),
+        "pairs_per_ring": 2,
+        "simulations": 1,
+        "max_considered": 2,
+        "minimum_pairs_per_ring": 2,
+        "max_pairs_per_ring": 200,
+        "bootstrap_samples": 200,
+        "regression_floor_elo": 0.0,
+        "promotion_pair_ratios": {4: 1, 6: 1, 8: 1, 10: 7},
+        "required_regression_rings": (),
+        "weighted_initial_blocks": 1,
+        "weighted_continuation_blocks": 1,
+        "weighted_max_blocks": 50,
+    }
+    values.update(overrides)
+    return ArenaConfig(**values)
+
+
+def scored_pair(ring: int, pair: int, score_rate: float) -> ArenaPair:
+    outcomes = {
+        0.0: (-1, -1),
+        0.5: (1, -1),
+        1.0: (1, 1),
+    }[score_rate]
+    return ArenaPair(ring, pair, pair, 0, True, outcomes)
+
+
+def weighted_pairs(
+    blocks: int,
+    *,
+    ring_scores: dict[int, float],
+) -> dict[int, list[ArenaPair]]:
+    ratios = {4: 1, 6: 1, 8: 1, 10: 7}
+    return {
+        ring: [
+            scored_pair(ring, pair, ring_scores[ring])
+            for pair in range(blocks * ratios[ring])
+        ]
+        for ring in ratios
+    }
 
 
 def test_arena_records_only_binary_results() -> None:
@@ -619,3 +670,363 @@ def test_arena_summary_requires_every_configured_ring_and_records_budget() -> No
         )
     with pytest.raises(ValueError, match="positive integer"):
         ArenaSearchBudget(False, 1, 1.0, 1.0)
+
+
+def test_weighted_macro_block_uses_exact_seven_of_ten_score() -> None:
+    config = weighted_arena_config()
+    per_ring = {
+        4: [scored_pair(4, 0, 0.0)],
+        6: [scored_pair(6, 0, 0.0)],
+        8: [scored_pair(8, 0, 0.0)],
+        10: [scored_pair(10, pair, 1.0) for pair in (6, 0, 5, 1, 4, 2, 3)],
+    }
+    aggregate = [
+        pair for values in reversed(tuple(per_ring.values())) for pair in values
+    ]
+
+    summary = summarize_arena_pairs(aggregate, config)
+    weighted = summary["weighted_aggregate"]
+
+    assert weighted["observation_model"] == WEIGHTED_OBSERVATION_MODEL
+    assert weighted["pair_ratios"] == {"4": 1, "6": 1, "8": 1, "10": 7}
+    assert weighted["normalized_weights"] == {
+        "4": 0.1,
+        "6": 0.1,
+        "8": 0.1,
+        "10": 0.7,
+    }
+    assert weighted["complete_blocks"] == 1
+    assert weighted["block_scores"] == [0.7]
+    assert weighted["score_rate"] == 0.7
+    assert weighted["elo_difference"] == pytest.approx(147.19071411783776)
+    assert weighted["block_pair_indices"] == [
+        {
+            "4": [0],
+            "6": [0],
+            "8": [0],
+            "10": [0, 1, 2, 3, 4, 5, 6],
+        }
+    ]
+    assert summary["promotion"]["weighted_aggregate"] == weighted
+
+
+def test_weighted_macro_blocks_exclude_every_incomplete_pair() -> None:
+    config = weighted_arena_config()
+    per_ring = {
+        ring: [
+            scored_pair(ring, 1, 1.0),
+            scored_pair(ring, 0, 0.0),
+        ]
+        for ring in (4, 6, 8)
+    }
+    per_ring[10] = [
+        *[scored_pair(10, pair, 1.0) for pair in range(7)],
+        *[scored_pair(10, pair, 0.0) for pair in range(7, 13)],
+    ]
+    aggregate = [pair for values in per_ring.values() for pair in reversed(values)]
+
+    assessment = promotion_assessment(aggregate, per_ring, config)
+    weighted = assessment["weighted_aggregate"]
+
+    assert weighted["complete_blocks"] == 1
+    assert weighted["incomplete_pair_counts"] == {
+        "4": 1,
+        "6": 1,
+        "8": 1,
+        "10": 6,
+    }
+    assert weighted["block_scores"] == [0.7]
+    assert weighted["score_rate"] == 0.7
+    assert assessment["pair_score_rate"] == 0.7
+
+
+def test_weighted_partial_ring_coverage_persists_incomplete_counts() -> None:
+    config = weighted_arena_config()
+
+    summary = summarize_completed_arena_pairs(
+        [scored_pair(4, 0, 1.0)],
+        config,
+    )
+
+    assert summary["promotion"]["decision"] == "continue"
+    assert summary["weighted_aggregate"]["complete_blocks"] == 0
+    assert summary["weighted_aggregate"]["incomplete_pair_counts"] == {
+        "4": 1,
+        "6": 0,
+        "8": 0,
+        "10": 0,
+    }
+
+
+def test_weighted_macro_block_order_is_deterministic_by_pair_index() -> None:
+    config = weighted_arena_config()
+    per_ring = {
+        ring: [
+            scored_pair(ring, 1, 1.0),
+            scored_pair(ring, 0, 0.0),
+        ]
+        for ring in (4, 6, 8)
+    }
+    per_ring[10] = [
+        scored_pair(10, pair, 1.0 if pair < 7 else 0.0) for pair in reversed(range(14))
+    ]
+    aggregate = [pair for values in per_ring.values() for pair in values]
+    reversed_per_ring = {
+        ring: list(reversed(values)) for ring, values in per_ring.items()
+    }
+
+    forward = promotion_assessment(aggregate, per_ring, config)
+    backward = promotion_assessment(
+        list(reversed(aggregate)),
+        reversed_per_ring,
+        config,
+    )
+
+    assert forward["weighted_aggregate"] == backward["weighted_aggregate"]
+    weighted = forward["weighted_aggregate"]
+    assert weighted["block_scores"] == [0.7, 0.3]
+    assert weighted["block_pair_indices"][0]["10"] == list(range(7))
+    assert weighted["block_pair_indices"][1]["10"] == list(range(7, 14))
+
+
+def test_weighted_macro_blocks_reject_gapped_pair_indices() -> None:
+    config = weighted_arena_config()
+    per_ring = {
+        4: [scored_pair(4, 0, 0.5), scored_pair(4, 2, 0.5)],
+        6: [scored_pair(6, 0, 0.5), scored_pair(6, 1, 0.5)],
+        8: [scored_pair(8, 0, 0.5), scored_pair(8, 1, 0.5)],
+        10: [scored_pair(10, pair, 0.5) for pair in range(14)],
+    }
+    aggregate = [pair for values in per_ring.values() for pair in values]
+
+    with pytest.raises(ValueError, match="contiguous from zero"):
+        promotion_assessment(aggregate, per_ring, config)
+
+
+def test_weighted_promotion_ignores_nonrequired_small_ring_regression() -> None:
+    config = weighted_arena_config(
+        minimum_pairs_per_ring=10,
+        required_regression_rings=(),
+        weighted_initial_blocks=15,
+        weighted_continuation_blocks=10,
+        weighted_max_blocks=50,
+    )
+    per_ring = weighted_pairs(
+        20,
+        ring_scores={4: 0.0, 6: 1.0, 8: 1.0, 10: 1.0},
+    )
+    aggregate = [pair for values in per_ring.values() for pair in values]
+
+    assessment = promotion_assessment(aggregate, per_ring, config)
+
+    assert assessment["sequential_state"] == "accept_alternative"
+    assert assessment["weighted_aggregate"]["score_rate"] == 0.9
+    assert assessment["ring_floors"]["4"]["status"] == "regress"
+    assert assessment["ring_floors"]["4"]["required_for_promotion"] is False
+    assert assessment["decision"] == "promote"
+
+
+def test_required_regression_ring_retains_legacy_guard_behavior() -> None:
+    config = weighted_arena_config(
+        minimum_pairs_per_ring=10,
+        required_regression_rings=(4,),
+        weighted_initial_blocks=15,
+        weighted_continuation_blocks=10,
+        weighted_max_blocks=50,
+    )
+    per_ring = weighted_pairs(
+        20,
+        ring_scores={4: 0.0, 6: 1.0, 8: 1.0, 10: 1.0},
+    )
+    aggregate = [pair for values in per_ring.values() for pair in values]
+
+    required = promotion_assessment(aggregate, per_ring, config)
+    default_all = promotion_assessment(
+        aggregate,
+        per_ring,
+        replace(config, required_regression_rings=None),
+    )
+
+    assert required["sequential_state"] == "accept_alternative"
+    assert required["ring_floors"]["4"]["required_for_promotion"] is True
+    assert required["decision"] == "reject_ring_regression"
+    assert default_all["decision"] == "reject_ring_regression"
+    assert default_all["weighted_aggregate"]["required_regression_rings"] == [
+        4,
+        6,
+        8,
+        10,
+    ]
+
+
+def test_required_regression_rings_control_legacy_pair_path() -> None:
+    config = ArenaConfig(
+        rings=(4, 6),
+        pairs_per_ring=2,
+        simulations=1,
+        max_considered=2,
+        minimum_pairs_per_ring=10,
+        max_pairs_per_ring=100,
+        bootstrap_samples=200,
+        regression_floor_elo=0.0,
+    )
+    per_ring = {
+        4: [scored_pair(4, pair, 0.0) for pair in range(20)],
+        6: [scored_pair(6, pair, 1.0) for pair in range(80)],
+    }
+    aggregate = [pair for values in per_ring.values() for pair in values]
+
+    legacy = promotion_assessment(aggregate, per_ring, config)
+    only_six_required = promotion_assessment(
+        aggregate,
+        per_ring,
+        replace(config, required_regression_rings=(6,)),
+    )
+
+    assert legacy["sequential_state"] == "accept_alternative"
+    assert legacy["ring_floors"]["4"]["status"] == "regress"
+    assert legacy["decision"] == "reject_ring_regression"
+    assert only_six_required["decision"] == "promote"
+    assert "weighted_aggregate" not in only_six_required
+
+
+def test_empty_ratios_preserve_legacy_arena_result_shape() -> None:
+    config = arena_config()
+    pairs = [scored_pair(4, pair, 1.0) for pair in range(2)]
+    assessment = promotion_assessment(pairs, {4: pairs}, config)
+    summary = summarize_arena_pairs(pairs, config)
+
+    assert set(assessment) == {
+        "decision",
+        "sequential_state",
+        "pair_score_rate",
+        "confidence_sequence",
+        "null_elo",
+        "alternative_elo",
+        "pair_model",
+        "statistical_test",
+        "ring_floors",
+    }
+    assert assessment["pair_model"] == "pair-level-mixture-betting-e-process-v1"
+    assert assessment["statistical_test"]["observation_unit"] == (
+        "complete-role-reversed-pair"
+    )
+    assert set(summary) == {"aggregate", "per_ring", "promotion"}
+
+
+def test_generic_bounded_e_process_matches_pair_specialization() -> None:
+    pairs = [scored_pair(4, index, (0.0, 0.5, 1.0)[index % 3]) for index in range(60)]
+    observations = [pair.score_rate for pair in pairs]
+
+    generic = bounded_confidence_sequence(
+        observations,
+        error_probability=0.025,
+    )
+    paired = pair_confidence_sequence(pairs, error_probability=0.025)
+    assert generic == pytest.approx(paired)
+    assert bounded_log_e_value(
+        [1.0] * 20,
+        null_mean=0.5,
+        direction="greater",
+    ) == pytest.approx(
+        bounded_log_e_value(
+            [0.0] * 20,
+            null_mean=0.5,
+            direction="less",
+        )
+    )
+
+    arbitrary = bounded_confidence_sequence(
+        [0.1, 0.3, 0.65, 0.8] * 20,
+        error_probability=0.05,
+    )
+    assert 0.0 <= arbitrary[0] <= arbitrary[1] <= 1.0
+    with pytest.raises(ValueError, match=r"\[0, 1\]"):
+        bounded_log_e_value([1.01], null_mean=0.5, direction="greater")
+
+
+def test_weighted_macro_gate_controls_repeated_look_null_and_has_power() -> None:
+    def crossing_count(probability: float, *, seed: int) -> int:
+        rng = random.Random(seed)
+        crossings = 0
+        for _ in range(250):
+            observations: list[float] = []
+            for blocks in range(1, 51):
+                observations.append(
+                    sum(rng.random() < probability for _ in range(10)) / 10
+                )
+                if blocks >= 15 and bounded_log_e_value(
+                    observations,
+                    null_mean=0.5,
+                    direction="greater",
+                ) >= math.log(20):
+                    crossings += 1
+                    break
+        return crossings
+
+    null_crossings = crossing_count(0.5, seed=20260851)
+    alternative_crossings = crossing_count(0.65, seed=20260866)
+
+    assert null_crossings <= 12
+    assert alternative_crossings >= 225
+
+
+def test_weighted_arena_config_accepts_production_parameters() -> None:
+    config = weighted_arena_config(
+        weighted_initial_blocks=15,
+        weighted_continuation_blocks=10,
+        weighted_max_blocks=50,
+    )
+
+    assert config.promotion_pair_ratios == {4: 1, 6: 1, 8: 1, 10: 7}
+    assert config.required_regression_rings == ()
+    assert (
+        config.weighted_initial_blocks,
+        config.weighted_continuation_blocks,
+        config.weighted_max_blocks,
+    ) == (15, 10, 50)
+    assert replace(
+        config, required_regression_rings=(10, 4)
+    ).required_regression_rings == (
+        10,
+        4,
+    )
+    legacy = arena_config()
+    assert legacy.promotion_pair_ratios == {}
+    assert (
+        legacy.weighted_initial_blocks,
+        legacy.weighted_continuation_blocks,
+        legacy.weighted_max_blocks,
+    ) == (0, 0, 0)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"promotion_pair_ratios": {4: 1, 6: 1, 8: 1}},
+        {"promotion_pair_ratios": {4: 2, 6: 2, 8: 2, 10: 14}},
+        {"promotion_pair_ratios": {4: True, 6: 1, 8: 1, 10: 7}},
+        {"weighted_initial_blocks": 0},
+        {"weighted_continuation_blocks": 0},
+        {"weighted_max_blocks": 14, "weighted_initial_blocks": 15},
+        {"promotion_pair_ratios": {}},
+        {"required_regression_rings": (4, 4)},
+        {"required_regression_rings": (12,)},
+        {"weighted_initial_blocks": True},
+    ],
+)
+def test_weighted_arena_config_rejects_incoherent_parameters(
+    overrides: dict[str, object],
+) -> None:
+    values = {
+        "rings": (4, 6, 8, 10),
+        "promotion_pair_ratios": {4: 1, 6: 1, 8: 1, 10: 7},
+        "required_regression_rings": (),
+        "weighted_initial_blocks": 15,
+        "weighted_continuation_blocks": 10,
+        "weighted_max_blocks": 50,
+    }
+    values.update(overrides)
+
+    with pytest.raises(ConfigError):
+        ArenaConfig(**values)

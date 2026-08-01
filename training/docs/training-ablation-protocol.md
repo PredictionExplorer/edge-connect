@@ -52,6 +52,12 @@ The following switches are deliberately first-class and recorded in metrics:
   while retaining homogeneous tensor shapes.
 - `arena.continuation_pairs_per_ring`, which increases GPU occupancy only after
   the unchanged minimum anytime-valid promotion look.
+- `arena.promotion_pair_ratios` plus weighted initial, continuation, and maximum
+  block counts, which opt into a pre-registered macro-block objective. The
+  1/1/1/7 setting weights rings 4/6/8/10 as 10/10/10/70.
+- `arena.required_regression_rings`, which is `null` for the legacy all-ring
+  guard contract. Setting it to `[]` removes every blocking per-ring floor while
+  retaining per-ring confidence sequences as diagnostics.
 - `orchestration.plateau.action: reduce_lr_keep_weights`, which clears stale
   optimizer moments and lowers rates without discarding the learner branch.
 
@@ -80,6 +86,12 @@ games never enter replay.
 7. Use successive halving for expensive scratch treatments: equal-leaf pilots
    first, then at least three seeds for any treatment promoted to a long run.
 
+The weighted-generalist 55/65/70 matrix is an explicit exception to per-ring
+non-inferiority gating. Its arms share one weighted promotion objective and
+must not be compared in the same selector as legacy guarded arms. Selecting a
+weighted winner accepts that rings 4, 6, or 8 may regress without blocking
+promotion; diagnostic reporting is not a guarantee.
+
 ## Required metrics
 
 Each report must retain:
@@ -90,6 +102,8 @@ Each report must retain:
 - candidate/champion role share and model lag;
 - game length, search entropy, and ring distribution;
 - paired aggregate and per-ring Elo intervals;
+- weighted macro-block progress, weighted aggregate Elo, and its anytime-valid
+  interval whenever a weighted promotion objective is configured;
 - autonomous checkpoint-ladder Elo slope per billion leaf evaluations and
   provisioned GPU-hour;
 - peak memory, replay I/O, restarts, and failed/quarantined shards; and

@@ -18,6 +18,7 @@ from .topology import get_topology
 
 
 ARENA_RESULT_SCHEMA_VERSION = 3
+WEIGHTED_OBSERVATION_MODEL = "complete-weighted-macro-block-score-v1"
 
 
 class ArenaEvaluatorProtocol(Protocol):
@@ -352,6 +353,62 @@ def internal_elo_target_assessment(
     }
 
 
+@dataclass(frozen=True, slots=True)
+class _WeightedMacroBlock:
+    score_rate: float
+    pair_indices: dict[int, tuple[int, ...]]
+
+
+def _weighted_macro_blocks(
+    pairs: Sequence[ArenaPair],
+    config: ArenaConfig,
+) -> tuple[tuple[_WeightedMacroBlock, ...], dict[int, int]]:
+    per_ring: dict[int, list[ArenaPair]] = {ring: [] for ring in config.rings}
+    for pair in pairs:
+        if pair.ring not in per_ring:
+            raise ValueError("arena pair has an unconfigured ring")
+        per_ring[pair.ring].append(pair)
+    for ring, values in per_ring.items():
+        values.sort(key=lambda pair: pair.pair)
+        sorted_pair_indices = [pair.pair for pair in values]
+        if len(sorted_pair_indices) != len(set(sorted_pair_indices)):
+            raise ValueError(f"weighted arena ring {ring} has duplicate pair indices")
+        if sorted_pair_indices != list(range(len(sorted_pair_indices))):
+            raise ValueError(
+                f"weighted arena ring {ring} pair indices must be contiguous from zero"
+            )
+
+    complete_blocks = min(
+        len(per_ring[ring]) // config.promotion_pair_ratios[ring]
+        for ring in config.rings
+    )
+    pairs_per_block = sum(config.promotion_pair_ratios.values())
+    blocks: list[_WeightedMacroBlock] = []
+    for block_index in range(complete_blocks):
+        selected: list[ArenaPair] = []
+        pair_indices: dict[int, tuple[int, ...]] = {}
+        for ring in config.rings:
+            ratio = config.promotion_pair_ratios[ring]
+            start = block_index * ratio
+            ring_pairs = per_ring[ring][start : start + ratio]
+            selected.extend(ring_pairs)
+            pair_indices[ring] = tuple(pair.pair for pair in ring_pairs)
+        score_rate = math.fsum(pair.score_rate for pair in selected) / pairs_per_block
+        if not 0.0 <= score_rate <= 1.0:
+            raise RuntimeError("weighted macro-block score escaped [0, 1]")
+        blocks.append(
+            _WeightedMacroBlock(
+                score_rate=score_rate,
+                pair_indices=pair_indices,
+            )
+        )
+    incomplete_pair_counts = {
+        ring: len(per_ring[ring]) - complete_blocks * config.promotion_pair_ratios[ring]
+        for ring in config.rings
+    }
+    return tuple(blocks), incomplete_pair_counts
+
+
 def promotion_assessment(
     aggregate: Sequence[ArenaPair],
     per_ring: Mapping[int, Sequence[ArenaPair]],
@@ -381,6 +438,90 @@ def promotion_assessment(
     )
     if not minimum_ready:
         sequential_state = "continue"
+    weighted_aggregate: dict[str, object] | None = None
+    observation_model = "pair-level-mixture-betting-e-process-v1"
+    observation_unit = "complete-role-reversed-pair"
+    if config.promotion_pair_ratios:
+        blocks, incomplete_pair_counts = _weighted_macro_blocks(aggregate, config)
+        block_scores = tuple(block.score_rate for block in blocks)
+        if block_scores:
+            score_rate = math.fsum(block_scores) / len(block_scores)
+            lower, _ = bounded_confidence_sequence(
+                block_scores,
+                error_probability=config.alpha,
+            )
+            _, upper = bounded_confidence_sequence(
+                block_scores,
+                error_probability=config.beta,
+            )
+            (
+                evidence_state,
+                promotion_log_e_value,
+                rejection_log_e_value,
+            ) = _bounded_sequential_state(
+                block_scores,
+                null_score_rate=probability_null,
+                alternative_score_rate=probability_alternative,
+                alpha=config.alpha,
+                beta=config.beta,
+            )
+        else:
+            score_rate = 0.5
+            lower, upper = 0.0, 1.0
+            evidence_state = "continue"
+            promotion_log_e_value = 0.0
+            rejection_log_e_value = 0.0
+        minimum_ready = len(blocks) >= config.weighted_initial_blocks
+        sequential_state = evidence_state if minimum_ready else "continue"
+        observation_model = WEIGHTED_OBSERVATION_MODEL
+        observation_unit = "complete-weighted-macro-block"
+        ratio_total = sum(config.promotion_pair_ratios.values())
+        weighted_score_rate = score_rate if block_scores else None
+        weighted_aggregate = {
+            "schema_version": 1,
+            "observation_model": WEIGHTED_OBSERVATION_MODEL,
+            "pair_ratios": {
+                str(ring): config.promotion_pair_ratios[ring] for ring in config.rings
+            },
+            "normalized_weights": {
+                str(ring): config.promotion_pair_ratios[ring] / ratio_total
+                for ring in config.rings
+            },
+            "pairs_per_block": ratio_total,
+            "complete_blocks": len(blocks),
+            "incomplete_pair_counts": {
+                str(ring): incomplete_pair_counts[ring] for ring in config.rings
+            },
+            "block_scores": list(block_scores),
+            "block_pair_indices": [
+                {str(ring): list(block.pair_indices[ring]) for ring in config.rings}
+                for block in blocks
+            ],
+            "score_rate": weighted_score_rate,
+            "elo_difference": (
+                elo_from_probability(score_rate) if block_scores else None
+            ),
+            "anytime_confidence_sequence": [lower, upper],
+            "anytime_elo_interval": [
+                elo_from_probability(lower),
+                elo_from_probability(upper),
+            ],
+            "anytime_error_probability": {
+                "lower": config.alpha,
+                "upper": config.beta,
+            },
+            "promotion_e_value": _reported_e_value(promotion_log_e_value),
+            "promotion_log_e_value": promotion_log_e_value,
+            "rejection_e_value": _reported_e_value(rejection_log_e_value),
+            "rejection_log_e_value": rejection_log_e_value,
+            "evidence_state": evidence_state,
+            "minimum_ready": minimum_ready,
+            "configured_blocks": {
+                "initial": config.weighted_initial_blocks,
+                "continuation": config.weighted_continuation_blocks,
+                "maximum": config.weighted_max_blocks,
+            },
+        }
 
     ring_floors: dict[str, object] = {}
     floor_statuses: list[Literal["pass", "regress", "continue"]] = []
@@ -452,28 +593,50 @@ def promotion_assessment(
             "status": status,
         }
 
+    configured_required_rings = (
+        set(config.rings)
+        if config.required_regression_rings is None
+        else set(config.required_regression_rings)
+    )
+    required_regression_rings = tuple(
+        ring for ring in config.rings if ring in configured_required_rings
+    )
+    required_ring_set = set(required_regression_rings)
+    required_floor_statuses = [
+        status
+        for ring, status in zip(config.rings, floor_statuses, strict=True)
+        if ring in required_ring_set
+    ]
+    if weighted_aggregate is not None:
+        weighted_aggregate["required_regression_rings"] = list(
+            required_regression_rings
+        )
+        for ring in config.rings:
+            floor_summary = cast(dict[str, object], ring_floors[str(ring)])
+            floor_summary["required_for_promotion"] = ring in required_ring_set
+
     if sequential_state == "accept_alternative" and all(
-        status == "pass" for status in floor_statuses
+        status == "pass" for status in required_floor_statuses
     ):
         decision = "promote"
     elif sequential_state == "accept_null":
         decision = "reject"
-    elif any(status == "regress" for status in floor_statuses):
+    elif any(status == "regress" for status in required_floor_statuses):
         decision = "reject_ring_regression"
     else:
         decision = "continue"
-    return {
+    assessment: dict[str, object] = {
         "decision": decision,
         "sequential_state": sequential_state,
         "pair_score_rate": score_rate,
         "confidence_sequence": [lower, upper],
         "null_elo": config.null_elo,
         "alternative_elo": config.alternative_elo,
-        "pair_model": "pair-level-mixture-betting-e-process-v1",
+        "pair_model": observation_model,
         "statistical_test": {
             "schema_version": 1,
             "name": "bounded-mean-mixture-betting-e-process",
-            "observation_unit": "complete-role-reversed-pair",
+            "observation_unit": observation_unit,
             "betting_fractions": list(_PAIR_BETTING_FRACTIONS),
             "promotion": {
                 "null_score_rate": probability_null,
@@ -491,6 +654,12 @@ def promotion_assessment(
         },
         "ring_floors": ring_floors,
     }
+    if weighted_aggregate is not None:
+        assessment["observation_model"] = WEIGHTED_OBSERVATION_MODEL
+        assessment["weighted_aggregate"] = weighted_aggregate
+        statistical_test = cast(dict[str, object], assessment["statistical_test"])
+        statistical_test["observation_model"] = WEIGHTED_OBSERVATION_MODEL
+    return assessment
 
 
 def pair_confidence_sequence(
@@ -557,6 +726,171 @@ def pair_confidence_sequence(
                 low = middle
         upper = high
     return lower, upper
+
+
+def bounded_log_e_value(
+    observations: Sequence[float],
+    *,
+    null_mean: float,
+    direction: Literal["greater", "less"],
+) -> float:
+    """Return mixture-betting log evidence for arbitrary ``[0, 1]`` data."""
+
+    values = _validated_bounded_observations(observations)
+    return _bounded_log_e_value(
+        values,
+        null_mean=null_mean,
+        direction=direction,
+    )
+
+
+def bounded_confidence_sequence(
+    observations: Sequence[float],
+    *,
+    error_probability: float,
+) -> tuple[float, float]:
+    """Invert bounded-mean e-processes into anytime-valid mean bounds."""
+
+    values = _validated_bounded_observations(observations)
+    if not 0 < error_probability < 1:
+        raise ValueError("bounded confidence sequence error probability is invalid")
+    log_threshold = math.log(1.0 / error_probability)
+    epsilon = 1e-12
+
+    if (
+        _bounded_log_e_value(
+            values,
+            null_mean=epsilon,
+            direction="greater",
+        )
+        < log_threshold
+    ):
+        lower = 0.0
+    else:
+        low, high = epsilon, 1.0 - epsilon
+        for _ in range(52):
+            middle = (low + high) / 2.0
+            evidence = _bounded_log_e_value(
+                values,
+                null_mean=middle,
+                direction="greater",
+            )
+            if evidence >= log_threshold:
+                low = middle
+            else:
+                high = middle
+        lower = low
+
+    if (
+        _bounded_log_e_value(
+            values,
+            null_mean=1.0 - epsilon,
+            direction="less",
+        )
+        < log_threshold
+    ):
+        upper = 1.0
+    else:
+        low, high = epsilon, 1.0 - epsilon
+        for _ in range(52):
+            middle = (low + high) / 2.0
+            evidence = _bounded_log_e_value(
+                values,
+                null_mean=middle,
+                direction="less",
+            )
+            if evidence >= log_threshold:
+                high = middle
+            else:
+                low = middle
+        upper = high
+    return lower, upper
+
+
+def _validated_bounded_observations(
+    observations: Sequence[float],
+) -> tuple[float, ...]:
+    values: list[float] = []
+    for observation in observations:
+        if (
+            isinstance(observation, bool)
+            or not isinstance(observation, int | float)
+            or not math.isfinite(float(observation))
+            or not 0.0 <= float(observation) <= 1.0
+        ):
+            raise ValueError("bounded observations must be finite values in [0, 1]")
+        values.append(float(observation))
+    if not values:
+        raise ValueError("bounded e-process requires at least one observation")
+    return tuple(values)
+
+
+def _bounded_log_e_value(
+    observations: Sequence[float],
+    *,
+    null_mean: float,
+    direction: Literal["greater", "less"],
+) -> float:
+    if (
+        isinstance(null_mean, bool)
+        or not isinstance(null_mean, int | float)
+        or not math.isfinite(float(null_mean))
+        or not 0 < null_mean < 1
+        or direction not in ("greater", "less")
+    ):
+        raise ValueError("bounded e-process null and direction are invalid")
+    denominator = null_mean if direction == "greater" else 1.0 - null_mean
+    transformed = (
+        tuple(observations)
+        if direction == "greater"
+        else tuple(1.0 - observation for observation in observations)
+    )
+    log_wealths = [
+        sum(
+            math.log(1.0 - fraction + fraction * observation / denominator)
+            for observation in transformed
+        )
+        for fraction in _PAIR_BETTING_FRACTIONS
+    ]
+    maximum = max(log_wealths)
+    return (
+        maximum
+        + math.log(sum(math.exp(value - maximum) for value in log_wealths))
+        - math.log(len(log_wealths))
+    )
+
+
+def _bounded_sequential_state(
+    observations: Sequence[float],
+    *,
+    null_score_rate: float,
+    alternative_score_rate: float,
+    alpha: float,
+    beta: float,
+) -> tuple[str, float, float]:
+    if (
+        not 0 < null_score_rate < alternative_score_rate < 1
+        or not 0 < alpha < 1
+        or not 0 < beta < 1
+    ):
+        raise ValueError("bounded sequential test inputs are invalid")
+    promotion_log_e_value = _bounded_log_e_value(
+        observations,
+        null_mean=null_score_rate,
+        direction="greater",
+    )
+    rejection_log_e_value = _bounded_log_e_value(
+        observations,
+        null_mean=alternative_score_rate,
+        direction="less",
+    )
+    if promotion_log_e_value >= math.log(1.0 / alpha):
+        state = "accept_alternative"
+    elif rejection_log_e_value >= math.log(1.0 / beta):
+        state = "accept_null"
+    else:
+        state = "continue"
+    return state, promotion_log_e_value, rejection_log_e_value
 
 
 def _pair_sequential_state(
@@ -720,7 +1054,7 @@ def summarize_arena_pairs(
         per_ring[pair.ring].append(pair)
     if any(not values for values in per_ring.values()):
         raise ValueError("arena summary requires at least one pair per ring")
-    return {
+    summary: dict[str, object] = {
         "aggregate": summarize_pairs(
             pairs,
             confidence=config.confidence,
@@ -738,6 +1072,10 @@ def summarize_arena_pairs(
         },
         "promotion": promotion_assessment(pairs, per_ring, config),
     }
+    if config.promotion_pair_ratios:
+        promotion = cast(dict[str, object], summary["promotion"])
+        summary["weighted_aggregate"] = promotion["weighted_aggregate"]
+    return summary
 
 
 def summarize_completed_arena_pairs(
@@ -757,6 +1095,28 @@ def summarize_completed_arena_pairs(
     per_ring = {
         ring: [pair for pair in pairs if pair.ring == ring] for ring in config.rings
     }
+    if config.promotion_pair_ratios:
+        promotion = promotion_assessment(pairs, per_ring, config)
+        return {
+            "aggregate": summarize_pairs(
+                pairs,
+                confidence=config.confidence,
+                bootstrap_samples=config.bootstrap_samples,
+                seed=config.seed,
+            ),
+            "per_ring": {
+                str(ring): summarize_pairs(
+                    values,
+                    confidence=config.confidence,
+                    bootstrap_samples=config.bootstrap_samples,
+                    seed=config.seed + ring * 1_000_003,
+                )
+                for ring, values in per_ring.items()
+                if values
+            },
+            "promotion": promotion,
+            "weighted_aggregate": promotion["weighted_aggregate"],
+        }
     return {
         "aggregate": summarize_pairs(
             pairs,

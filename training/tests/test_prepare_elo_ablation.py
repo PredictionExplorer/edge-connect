@@ -10,6 +10,7 @@ from scripts.prepare_elo_ablation import (
     CLEAN_TREATMENTS,
     DEFAULT_TREATMENTS,
     SYSTEM_TREATMENTS,
+    WEIGHTED_TREATMENTS,
     main,
     prepare_elo_ablation,
 )
@@ -205,6 +206,77 @@ def test_prepare_generates_optional_system_screening_profiles(tmp_path: Path) ->
     learner_1024 = load_config(output / "learner-batch-1024.yaml")
     assert learner_1024.train.per_rank_batch_size == 1024
     assert learner_1024.learner.target_updates_per_new_sample == 1.0
+
+
+def test_prepare_generates_isolated_weighted_generalist_matrix(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source-run"
+    source.mkdir()
+    output = tmp_path / "weighted-profiles"
+
+    manifest = prepare_elo_ablation(
+        base_config=CONFIGS / "h100-8gpu-throughput.yaml",
+        output_dir=output,
+        run_root_parent=tmp_path / "weighted-runs",
+        run_id="shared-parent-run",
+        source_run_root=source,
+        prefix="weighted",
+        seed=41,
+        wall_budget_hours=8,
+        leaf_budget=2_000_000_000,
+        guard_floor_elo=-35,
+        treatments=WEIGHTED_TREATMENTS,
+        guard_rings=(),
+    )
+
+    assert manifest["guard_rings"] == []
+    assert manifest["promotion_objective"] == "weighted_aggregate"
+    assert manifest["per_ring_guarantees"] is False
+    profiles = {
+        name: load_config(output / f"{name}.yaml") for name in WEIGHTED_TREATMENTS
+    }
+    for profile in profiles.values():
+        assert profile.arena.promotion_pair_ratios == {4: 1, 6: 1, 8: 1, 10: 7}
+        assert profile.arena.required_regression_rings == ()
+        assert profile.arena.per_ring_regression_floor_elo == {}
+        assert profile.arena.weighted_initial_blocks == 15
+        assert profile.arena.weighted_continuation_blocks == 10
+        assert profile.arena.weighted_max_blocks == 50
+
+    control_weights = load_config(
+        CONFIGS / "h100-8gpu-throughput.yaml"
+    ).orchestration.ring_mixture.weights_for_step(0)
+    assert (
+        profiles["weighted-control"].orchestration.ring_mixture.weights_for_step(0)
+        == control_weights
+    )
+    assert profiles["ring10-65-weighted"].orchestration.ring_mixture.weights_for_step(
+        0
+    ) == (0.1, 0.1, 0.15, 0.65)
+    assert profiles["ring10-70-weighted"].orchestration.ring_mixture.weights_for_step(
+        0
+    ) == (0.1, 0.1, 0.1, 0.7)
+
+
+def test_prepare_rejects_mixed_promotion_objectives(tmp_path: Path) -> None:
+    source = tmp_path / "source-run"
+    source.mkdir()
+
+    with pytest.raises(ValueError, match="separate ablation plans"):
+        prepare_elo_ablation(
+            base_config=CONFIGS / "h100-8gpu-throughput.yaml",
+            output_dir=tmp_path / "mixed-profiles",
+            run_root_parent=tmp_path / "mixed-runs",
+            run_id="shared-parent-run",
+            source_run_root=source,
+            prefix="mixed",
+            seed=41,
+            wall_budget_hours=8,
+            leaf_budget=2_000_000_000,
+            guard_floor_elo=-35,
+            treatments=("control", "weighted-control"),
+        )
 
 
 def test_prepare_requires_staged_winner_snapshot_to_match_current_champion(

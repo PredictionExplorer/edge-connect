@@ -264,6 +264,71 @@ def test_snapshot_warns_about_fragmented_arena_continuation(
     assert "arena_continuation_fragmented" not in migrated_codes
 
 
+def test_monitor_surfaces_weighted_block_progress_and_evidence(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    now_ns = 10_000_000_000
+    root = _fixture(tmp_path, now_ns=now_ns)
+    profile = yaml.safe_load((root / "profile.yaml").read_text(encoding="utf-8"))
+    profile["arena"] = {
+        "promotion_pair_ratios": {4: 1, 6: 1, 8: 1, 10: 7},
+        "required_regression_rings": [],
+        "weighted_initial_blocks": 15,
+        "weighted_continuation_blocks": 10,
+        "weighted_max_blocks": 50,
+    }
+    (root / "profile.yaml").write_text(
+        yaml.safe_dump(profile, sort_keys=False),
+        encoding="utf-8",
+    )
+    _write_json(
+        root / "arena" / "weighted-evaluation.json",
+        {
+            "schema_version": 4,
+            "candidate": "candidate",
+            "baseline": "baseline",
+            "started_ns": 1_000_000_000,
+            "completed_ns": now_ns,
+            "terminal": False,
+            "promotion": {"decision": "continue"},
+            "aggregate": {
+                "elo_difference": 10,
+                "wins": 10,
+                "losses": 10,
+                "games": 20,
+            },
+            "per_ring": {"10": {"elo_difference": 20}},
+            "weighted_aggregate": {
+                "pair_ratios": {"4": 1, "6": 1, "8": 1, "10": 7},
+                "complete_blocks": 25,
+                "incomplete_pair_counts": {"4": 0, "6": 0, "8": 0, "10": 3},
+                "score_rate": 0.58,
+                "elo_difference": 56,
+                "anytime_elo_interval": [12, 90],
+                "evidence_state": "continue",
+            },
+            "wave_plan": {"target_complete_blocks": 25},
+        },
+    )
+    _healthy_dependencies(monkeypatch)
+
+    snapshot: Any = monitor.collect_snapshot(root, now_ns=now_ns)
+    weighted = snapshot["weighted_promotion"]
+    text = monitor.format_text(snapshot)
+
+    assert weighted["enabled"] is True
+    assert weighted["pair_ratios"] == {"4": 1, "6": 1, "8": 1, "10": 7}
+    assert weighted["complete_blocks"] == 25
+    assert weighted["remaining_blocks"] == 25
+    assert weighted["wave_target_blocks"] == 25
+    assert weighted["anytime_lower_elo"] == 12
+    assert snapshot["arena_history"]["weighted"] == weighted
+    assert "weighted_blocks=25/50" in text
+    assert "weighted_lcb=12.00" in text
+    assert "weighted_state=continue" in text
+
+
 def test_collect_snapshot_reports_unlimited_recovery_state(
     tmp_path, monkeypatch
 ) -> None:

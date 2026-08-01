@@ -13,6 +13,8 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
+from startrain.arena import bounded_confidence_sequence, elo_from_probability
+
 if __package__:
     from .strength_efficiency_report import build_strength_efficiency_report
 else:
@@ -46,6 +48,9 @@ class _Treatment:
     ranking_score: float | None
     point_score: float | None
     reasons: list[dict[str, str]]
+    weighted_ranking_score: float | None = None
+    weighted_point_score: float | None = None
+    weighted_objective: str | None = None
 
 
 def _positive_integer(argument: str) -> int:
@@ -87,6 +92,11 @@ def _parser() -> argparse.ArgumentParser:
         action="append",
         type=_positive_integer,
         help="ring requiring non-inferiority evidence; defaults to 4, 6, and 8",
+    )
+    parser.add_argument(
+        "--no-guard-rings",
+        action="store_true",
+        help="disable blocking per-ring floors for a pre-registered aggregate objective",
     )
     parser.add_argument(
         "--guard-floor-elo",
@@ -265,6 +275,138 @@ def _arena_results(
     return results
 
 
+def _weighted_summary(
+    result: Mapping[str, object],
+    promotion: Mapping[str, object],
+    *,
+    path: str,
+    failures: list[dict[str, object]],
+) -> dict[str, object] | None:
+    raw = result.get("weighted_aggregate")
+    if raw is None:
+        raw = promotion.get("weighted_aggregate")
+    if raw is None:
+        return None
+    if not isinstance(raw, Mapping):
+        failures.append(_failure(path, "weighted_aggregate must be an object"))
+        return None
+
+    raw_ratios = raw.get(
+        "pair_ratios",
+        raw.get("promotion_pair_ratios", raw.get("ratios")),
+    )
+    ratios: dict[int, int] = {}
+    if isinstance(raw_ratios, Mapping):
+        for raw_ring, raw_ratio in raw_ratios.items():
+            try:
+                ring = int(raw_ring)
+            except (TypeError, ValueError):
+                ratios = {}
+                break
+            if type(raw_ratio) is not int or raw_ratio <= 0:
+                ratios = {}
+                break
+            ratios[ring] = raw_ratio
+    if not ratios:
+        failures.append(
+            _failure(path, "weighted_aggregate pair ratios are missing or invalid")
+        )
+        return None
+
+    score_rate = _number(raw.get("score_rate", raw.get("weighted_score_rate")))
+    elo_difference = _number(
+        raw.get("elo_difference", raw.get("weighted_elo_difference"))
+    )
+    interval = raw.get("anytime_elo_interval")
+    if (
+        score_rate is None
+        or not 0 <= score_rate <= 1
+        or elo_difference is None
+        or not isinstance(interval, Sequence)
+        or isinstance(interval, str | bytes)
+        or len(interval) != 2
+        or (lower := _number(interval[0])) is None
+        or (upper := _number(interval[1])) is None
+        or lower > upper
+    ):
+        failures.append(
+            _failure(path, "weighted_aggregate Elo evidence is missing or invalid")
+        )
+        return None
+    complete_blocks = _nonnegative_integer(
+        raw.get("complete_blocks", raw.get("completed_blocks"))
+    )
+    if complete_blocks is None:
+        failures.append(_failure(path, "weighted_aggregate complete_blocks is invalid"))
+        return None
+
+    ratio_total = sum(ratios.values())
+    serialized_weights = {
+        str(ring): ratios[ring] / ratio_total for ring in sorted(ratios)
+    }
+    error_probability = _mapping(raw.get("anytime_error_probability")) or {}
+    objective = json.dumps(
+        {
+            "pair_ratios": {str(ring): ratios[ring] for ring in sorted(ratios)},
+            "normalized_weights": serialized_weights,
+            "observation_model": raw.get("observation_model"),
+            "null_elo": promotion.get("null_elo"),
+            "alternative_elo": promotion.get("alternative_elo"),
+            "lower_error_probability": error_probability.get("lower"),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    return {
+        **dict(raw),
+        "pair_ratios": {str(ring): ratios[ring] for ring in sorted(ratios)},
+        "normalized_weights": serialized_weights,
+        "complete_blocks": complete_blocks,
+        "score_rate": score_rate,
+        "elo_difference": elo_difference,
+        "anytime_elo_interval": [lower, upper],
+        "one_sided_lower_elo": lower,
+        "objective": objective,
+    }
+
+
+def _per_ring_evidence(
+    result: Mapping[str, object],
+    *,
+    path: str,
+    failures: list[dict[str, object]],
+) -> dict[str, dict[str, object]]:
+    raw_per_ring = result.get("per_ring")
+    if not isinstance(raw_per_ring, Mapping):
+        return {}
+    output: dict[str, dict[str, object]] = {}
+    for raw_ring, raw_summary in raw_per_ring.items():
+        try:
+            ring = int(raw_ring)
+        except (TypeError, ValueError):
+            failures.append(_failure(path, "per-ring evidence has an invalid ring"))
+            continue
+        if ring <= 0 or not isinstance(raw_summary, Mapping):
+            failures.append(_failure(path, f"ring {ring} evidence must be an object"))
+            continue
+        summary = dict(raw_summary)
+        interval = summary.get("anytime_elo_interval")
+        if interval is not None and (
+            not isinstance(interval, Sequence)
+            or isinstance(interval, str | bytes)
+            or len(interval) != 2
+            or _number(interval[0]) is None
+            or _number(interval[1]) is None
+        ):
+            failures.append(
+                _failure(path, f"ring {ring} anytime_elo_interval is invalid")
+            )
+            continue
+        output[str(ring)] = summary
+    return output
+
+
 def _terminal_evaluations(
     results: Sequence[Mapping[str, object]],
     *,
@@ -301,6 +443,13 @@ def _terminal_evaluations(
             )
             continue
         ring_floors = _mapping(promotion.get("ring_floors"))
+        weighted = _weighted_summary(
+            result,
+            promotion,
+            path=path,
+            failures=failures,
+        )
+        per_ring = _per_ring_evidence(result, path=path, failures=failures)
         guards = []
         for ring in guard_rings:
             floor = (
@@ -355,6 +504,8 @@ def _terminal_evaluations(
                 "decision": decision,
                 "completed_ns": completed_ns,
                 "guards": guards,
+                "weighted_aggregate": weighted,
+                "per_ring": per_ring,
             }
         )
     return sorted(
@@ -1454,6 +1605,170 @@ def _champion_frontier(
     )
 
 
+def _weighted_champion_frontier(
+    evaluations: Sequence[Mapping[str, object]],
+    *,
+    anchor_identity: str | None,
+) -> tuple[dict[str, object] | None, str | None, str | None]:
+    weighted = [
+        summary
+        for evaluation in evaluations
+        if isinstance(
+            summary := evaluation.get("weighted_aggregate"),
+            Mapping,
+        )
+    ]
+    if not weighted:
+        return None, None, None
+    objectives = {
+        str(summary.get("objective"))
+        for summary in weighted
+        if isinstance(summary.get("objective"), str)
+    }
+    objective = next(iter(objectives)) if len(objectives) == 1 else None
+    if objective is None:
+        return None, "weighted promotion objective changed within the run", None
+    if len(weighted) != len(evaluations):
+        return (
+            None,
+            "weighted promotion data is missing from a terminal evaluation",
+            objective,
+        )
+    if anchor_identity is None:
+        return None, "common anchor identity is unavailable", objective
+
+    current = anchor_identity
+    point_gain = 0.0
+    lower_gain = 0.0
+    promotions = []
+    promoted_evaluations = [
+        evaluation
+        for evaluation in evaluations
+        if evaluation.get("decision") == "promote"
+    ]
+    objective_document = json.loads(objective)
+    familywise_error = _number(objective_document.get("lower_error_probability"))
+    if familywise_error is None or not 0 < familywise_error < 1:
+        return None, "weighted objective has invalid lower error probability", objective
+    for promotion_index, evaluation in enumerate(promoted_evaluations):
+        baseline = evaluation.get("baseline")
+        candidate = evaluation.get("candidate")
+        if baseline != current:
+            return (
+                None,
+                "weighted promoted champion chain is not contiguous: "
+                f"expected baseline {current!r}, observed {baseline!r}",
+                objective,
+            )
+        summary = evaluation.get("weighted_aggregate")
+        assert isinstance(summary, Mapping)
+        link_elo = _number(summary.get("elo_difference"))
+        raw_scores = summary.get("block_scores")
+        if (
+            link_elo is None
+            or not isinstance(raw_scores, Sequence)
+            or isinstance(raw_scores, str | bytes)
+            or not raw_scores
+            or any(
+                isinstance(value, bool) or not isinstance(value, int | float)
+                for value in raw_scores
+            )
+        ):
+            return (
+                None,
+                f"weighted promotion {candidate!r} has invalid Elo evidence",
+                objective,
+            )
+        link_error_probability = familywise_error / (2 ** (promotion_index + 1))
+        link_lower_score, _ = bounded_confidence_sequence(
+            tuple(float(value) for value in raw_scores),
+            error_probability=link_error_probability,
+        )
+        link_lower = elo_from_probability(link_lower_score)
+        if not isinstance(candidate, str) or not candidate:
+            return None, "weighted promoted champion identity is invalid", objective
+        point_gain += link_elo
+        lower_gain += link_lower
+        promotions.append(
+            {
+                "from_identity": current,
+                "to_identity": candidate,
+                "completed_ns": evaluation.get("completed_ns"),
+                "path": evaluation.get("path"),
+                "weighted_elo_difference": link_elo,
+                "weighted_anytime_lower_elo": link_lower,
+                "link_error_probability": link_error_probability,
+                "complete_blocks": summary.get("complete_blocks"),
+            }
+        )
+        current = candidate
+    return (
+        {
+            "identity": current,
+            "weighted_elo_gained": point_gain,
+            "weighted_elo_one_sided_lower_bound": lower_gain,
+            "promotion_count": len(promotions),
+            "promotions": promotions,
+            "selection": "chronological_weighted_promotions_from_common_anchor",
+            "non_promoted_terminal_count": len(evaluations) - len(promotions),
+            "objective": json.loads(objective),
+            "lower_bound_method": (
+                "sum_of_geometric_alpha_spending_anytime_lower_bounds"
+            ),
+            "familywise_error_probability": familywise_error,
+            "link_error_spending": "alpha / 2^(promotion_index + 1)",
+        },
+        None,
+        objective,
+    )
+
+
+def _per_ring_diagnostics(
+    evaluations: Sequence[Mapping[str, object]],
+) -> dict[str, object]:
+    observed_rings: set[int] = set()
+    for evaluation in evaluations:
+        per_ring = evaluation.get("per_ring")
+        if not isinstance(per_ring, Mapping):
+            continue
+        observed_rings.update(
+            int(ring) for ring in per_ring if str(ring).isdigit() and int(ring) > 0
+        )
+    rings = sorted(observed_rings)
+    summaries = []
+    for ring in rings:
+        observations = []
+        for evaluation in evaluations:
+            per_ring = evaluation.get("per_ring")
+            if not isinstance(per_ring, Mapping):
+                continue
+            summary = per_ring.get(str(ring), per_ring.get(ring))
+            if not isinstance(summary, Mapping):
+                continue
+            observations.append(
+                {
+                    "path": evaluation.get("path"),
+                    "candidate": evaluation.get("candidate"),
+                    "baseline": evaluation.get("baseline"),
+                    "decision": evaluation.get("decision"),
+                    "completed_ns": evaluation.get("completed_ns"),
+                    "summary": dict(summary),
+                }
+            )
+        summaries.append(
+            {
+                "ring": ring,
+                "observation_count": len(observations),
+                "latest": observations[-1] if observations else None,
+                "observations": observations,
+            }
+        )
+    return {
+        "status": "available" if summaries else "unavailable",
+        "rings": summaries,
+    }
+
+
 def _winner_snapshot(
     root: Path,
     *,
@@ -1561,6 +1876,7 @@ def _empty_payload(
             "latest_terminal_endpoint_error": None,
         },
         "champion_frontier": None,
+        "weighted_champion_frontier": None,
         "verified_winner_snapshot": None,
         "measurement": {
             "source": None,
@@ -1610,6 +1926,17 @@ def _empty_payload(
             "time_basis": "measurement_started_ns_to_resource_released_ns",
             "selection": "chronological_promotions_only",
         },
+        "ring_10_deployment_metric": None,
+        "weighted_deployment_metric": {
+            "name": (
+                "weighted_champion_frontier_elo_lcb_per_total_provisioned_wall_hour"
+            ),
+            "available": False,
+            "value": None,
+            "point_value": None,
+            "time_basis": "measurement_started_ns_to_resource_released_ns",
+            "selection": "chronological_weighted_promotions_only",
+        },
         "efficiency": {
             "accounting_basis": None,
             "started_ns": None,
@@ -1635,6 +1962,10 @@ def _empty_payload(
             "reject_ring_regression_count": 0,
             "rings": [],
             "terminal_evaluations": [],
+        },
+        "per_ring_diagnostics": {
+            "status": "unavailable",
+            "rings": [],
         },
         "candidate_publish_to_terminal": {
             "status": "unavailable",
@@ -1775,6 +2106,7 @@ def _analyze_treatment(
         guard_floor_elo=guard_floor_elo,
     )
     payload["guardrails"] = guardrails
+    payload["per_ring_diagnostics"] = _per_ring_diagnostics(evaluations)
     payload["candidate_publish_to_terminal"] = _candidate_latency_summary(
         evaluations,
         publications,
@@ -1801,6 +2133,15 @@ def _analyze_treatment(
         anchor_identity=anchor_identity,
     )
     payload["champion_frontier"] = frontier
+    (
+        weighted_frontier,
+        weighted_frontier_error,
+        weighted_objective,
+    ) = _weighted_champion_frontier(
+        evaluations,
+        anchor_identity=anchor_identity,
+    )
+    payload["weighted_champion_frontier"] = weighted_frontier
     winner_snapshot, snapshot_error = _winner_snapshot(
         root,
         label=label,
@@ -1842,6 +2183,13 @@ def _analyze_treatment(
             reasons,
             "missing_champion_frontier",
             frontier_error or "ring-10 champion frontier is unavailable",
+        )
+    if weighted_objective is not None and weighted_frontier is None:
+        _add_reason(
+            reasons,
+            "missing_weighted_champion_frontier",
+            weighted_frontier_error
+            or "weighted champion frontier evidence is unavailable",
         )
     if winner_snapshot is None:
         _add_reason(
@@ -2033,7 +2381,7 @@ def _analyze_treatment(
         if frontier_lcb is not None and resource_wall_hours is not None
         else None
     )
-    payload["deployment_metric"] = {
+    ring_10_deployment_metric = {
         "name": (
             "guarded_champion_frontier_ring_10_elo_lcb_per_total_provisioned_wall_hour"
         ),
@@ -2050,13 +2398,50 @@ def _analyze_treatment(
         "time_basis": "measurement_started_ns_to_resource_released_ns",
         "selection": "chronological_promotions_only",
     }
-    if ranking_score is None:
-        _add_reason(
-            reasons,
-            "unavailable_ranking_metric",
-            "guarded champion-frontier ring-10 Elo/hour lower bound "
-            "could not be computed",
-        )
+    payload["ring_10_deployment_metric"] = ring_10_deployment_metric
+    payload["deployment_metric"] = ring_10_deployment_metric
+    weighted_gain = (
+        _number(weighted_frontier.get("weighted_elo_gained"))
+        if weighted_frontier is not None
+        else None
+    )
+    weighted_lower = (
+        _number(weighted_frontier.get("weighted_elo_one_sided_lower_bound"))
+        if weighted_frontier is not None
+        else None
+    )
+    weighted_point_score = (
+        weighted_gain / resource_wall_hours
+        if weighted_gain is not None and resource_wall_hours is not None
+        else None
+    )
+    weighted_ranking_score = (
+        weighted_lower / resource_wall_hours
+        if weighted_lower is not None and resource_wall_hours is not None
+        else None
+    )
+    payload["weighted_deployment_metric"] = {
+        "name": ("weighted_champion_frontier_elo_lcb_per_total_provisioned_wall_hour"),
+        "available": weighted_frontier is not None,
+        "value": weighted_ranking_score,
+        "point_value": weighted_point_score,
+        "champion_frontier_weighted_elo_gained": weighted_gain,
+        "champion_frontier_weighted_elo_one_sided_lower_bound": weighted_lower,
+        "total_provisioned_wall_hours": resource_wall_hours,
+        "total_provisioned_gpu_hours": total_provisioned_gpu_hours,
+        "objective": (
+            weighted_frontier.get("objective")
+            if weighted_frontier is not None
+            else None
+        ),
+        "lower_bound_method": (
+            weighted_frontier.get("lower_bound_method")
+            if weighted_frontier is not None
+            else None
+        ),
+        "time_basis": "measurement_started_ns_to_resource_released_ns",
+        "selection": "chronological_weighted_promotions_only",
+    }
     return _Treatment(
         label,
         payload,
@@ -2064,6 +2449,9 @@ def _analyze_treatment(
         ranking_score,
         point_score,
         reasons,
+        weighted_ranking_score,
+        weighted_point_score,
+        weighted_objective,
     )
 
 
@@ -2107,9 +2495,7 @@ def build_elo_ablation_comparison(
     ):
         raise ValueError("guard_floor_elo must be finite")
     parsed_rings = tuple(sorted(guard_rings))
-    if not parsed_rings or any(
-        type(ring) is not int or ring <= 0 for ring in parsed_rings
-    ):
+    if any(type(ring) is not int or ring <= 0 for ring in parsed_rings):
         raise ValueError("guard_rings must contain positive integers")
     if len(set(parsed_rings)) != len(parsed_rings):
         raise ValueError("guard_rings must not contain duplicates")
@@ -2152,7 +2538,61 @@ def build_elo_ablation_comparison(
         for treatment in treatments:
             _add_reason(treatment.reasons, "missing_common_anchor", message)
 
+    weighted_objectives = {
+        treatment.weighted_objective
+        for treatment in treatments
+        if treatment.weighted_objective is not None
+    }
+    if not weighted_objectives:
+        ranking_objective = "ring_10_guarded"
+    elif len(weighted_objectives) == 1 and all(
+        treatment.weighted_objective is not None for treatment in treatments
+    ):
+        ranking_objective = "weighted_aggregate"
+    else:
+        ranking_objective = "incompatible"
+        message = (
+            "all treatments must expose the same pre-registered weighted promotion "
+            "objective; weighted and legacy metrics cannot be mixed"
+        )
+        errors.append({"code": "incompatible_promotion_objectives", "message": message})
+        for treatment in treatments:
+            _add_reason(
+                treatment.reasons,
+                "incompatible_promotion_objectives",
+                message,
+            )
+
+    legacy_metric_name = (
+        "guarded_champion_frontier_ring_10_elo_lcb_per_total_provisioned_wall_hour"
+    )
+    weighted_metric_name = (
+        "weighted_champion_frontier_elo_lcb_per_total_provisioned_wall_hour"
+    )
     for treatment in treatments:
+        if ranking_objective == "weighted_aggregate":
+            treatment.ranking_score = treatment.weighted_ranking_score
+            treatment.point_score = treatment.weighted_point_score
+            weighted_metric = treatment.payload.get("weighted_deployment_metric")
+            if isinstance(weighted_metric, Mapping):
+                treatment.payload["deployment_metric"] = weighted_metric
+        else:
+            ring_metric = treatment.payload.get("ring_10_deployment_metric")
+            if isinstance(ring_metric, Mapping):
+                treatment.payload["deployment_metric"] = ring_metric
+        treatment.payload["ranking_objective"] = ranking_objective
+        if treatment.ranking_score is None or treatment.point_score is None:
+            _add_reason(
+                treatment.reasons,
+                "unavailable_ranking_metric",
+                (
+                    "weighted champion-frontier Elo/hour lower bound could not "
+                    "be computed"
+                    if ranking_objective == "weighted_aggregate"
+                    else "guarded champion-frontier ring-10 Elo/hour lower bound "
+                    "could not be computed"
+                ),
+            )
         if treatment.label in forced:
             _add_reason(
                 treatment.reasons,
@@ -2210,37 +2650,70 @@ def build_elo_ablation_comparison(
         and winner_snapshot.get("status") == "verified"
         else None
     )
+    if (
+        serialized_winner_snapshot is not None
+        and ranking_objective == "weighted_aggregate"
+    ):
+        serialized_winner_snapshot["selection"] = (
+            "weighted_chronological_champion_frontier"
+        )
+        serialized_winner_snapshot["ranking_metric"] = weighted_metric_name
     selector_verified = serialized_winner_snapshot is not None
+    ranking_metric = (
+        weighted_metric_name
+        if ranking_objective == "weighted_aggregate"
+        else (legacy_metric_name if ranking_objective == "ring_10_guarded" else None)
+    )
     selector = {
         "status": "verified" if selector_verified else "unavailable",
-        "ranking_metric": (
-            "guarded_champion_frontier_ring_10_elo_lcb_per_total_provisioned_wall_hour"
-        ),
+        "ranking_metric": ranking_metric,
+        "ranking_objective": ranking_objective,
         "winner_snapshot": serialized_winner_snapshot,
         "reason": (
             None
             if selector_verified
             else "all treatments must be eligible with a verified champion snapshot"
         ),
-        "selection": "highest_ranked_chronological_champion_frontier",
+        "selection": (
+            "highest_ranked_chronological_weighted_champion_frontier"
+            if ranking_objective == "weighted_aggregate"
+            else "highest_ranked_chronological_champion_frontier"
+        ),
         "non_promoted_endpoints_are_diagnostic_only": True,
     }
     return {
         "schema_version": SCHEMA_VERSION,
         "report": REPORT_NAME,
         "status": status,
-        "ranking_metric": (
-            "guarded_champion_frontier_ring_10_elo_lcb_per_total_provisioned_wall_hour"
+        "ranking_metric": ranking_metric,
+        "ranking_objective": ranking_objective,
+        "confidence": (
+            {
+                "level": CONFIDENCE_LEVEL,
+                "sidedness": "one-sided-lower",
+                "method": (
+                    "normal lower bound using the conservative sum of frontier and "
+                    "common-anchor Bradley-Terry standard_error"
+                ),
+                "normal_quantile": ONE_SIDED_95_NORMAL_QUANTILE,
+            }
+            if ranking_objective != "weighted_aggregate"
+            else {
+                "level": None,
+                "component_level": CONFIDENCE_LEVEL,
+                "sidedness": "one-sided-lower",
+                "method": (
+                    "sum of pre-registered chronological promoted-link anytime "
+                    "weighted Elo lower bounds"
+                ),
+                "normal_quantile": None,
+                "note": (
+                    "component confidence sequences are anytime-valid; the report "
+                    "does not claim a fixed simultaneous level across multiple "
+                    "promoted links"
+                ),
+            }
         ),
-        "confidence": {
-            "level": CONFIDENCE_LEVEL,
-            "sidedness": "one-sided-lower",
-            "method": (
-                "normal lower bound using the conservative sum of frontier and "
-                "common-anchor Bradley-Terry standard_error"
-            ),
-            "normal_quantile": ONE_SIDED_95_NORMAL_QUANTILE,
-        },
         "compute_accounting": {
             "provisioned_gpus": provisioned_gpus,
             "basis": (
@@ -2300,10 +2773,16 @@ def main(argv: list[str] | None = None) -> int:
     arguments = _parser().parse_args(argv)
     try:
         runs = _parse_run_arguments(arguments.run)
+        if arguments.no_guard_rings and arguments.guard_ring is not None:
+            raise ValueError("--no-guard-rings cannot be combined with --guard-ring")
         guard_rings = (
-            tuple(arguments.guard_ring)
-            if arguments.guard_ring is not None
-            else DEFAULT_GUARD_RINGS
+            ()
+            if arguments.no_guard_rings
+            else (
+                tuple(arguments.guard_ring)
+                if arguments.guard_ring is not None
+                else DEFAULT_GUARD_RINGS
+            )
         )
         report = build_elo_ablation_comparison(
             runs,

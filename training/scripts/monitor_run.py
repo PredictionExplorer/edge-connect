@@ -619,12 +619,16 @@ def _arena_history(run_root: Path, *, limit: int = 5) -> dict[str, object]:
             result = _read_json(result_path, attempts=1) or {}
             promotion = _mapping(result.get("promotion"))
             aggregate = _mapping(result.get("aggregate"))
+            weighted_aggregate = _mapping(
+                result.get("weighted_aggregate") or promotion.get("weighted_aggregate")
+            )
             summary = {
                 "result_kind": _arena_result_kind(result),
                 "result_category": _arena_result_category(result),
                 "candidate": result.get("candidate"),
                 "baseline": result.get("baseline"),
                 "decision": promotion.get("decision"),
+                "started_ns": result.get("started_ns"),
                 "completed_ns": result.get("completed_ns"),
                 "aggregate": {
                     key: aggregate.get(key)
@@ -640,6 +644,10 @@ def _arena_history(run_root: Path, *, limit: int = 5) -> dict[str, object]:
                     str(ring): _mapping(metrics).get("elo_difference")
                     for ring, metrics in _mapping(result.get("per_ring")).items()
                 },
+                "weighted_aggregate": (
+                    dict(weighted_aggregate) if weighted_aggregate else None
+                ),
+                "weighted_wave_plan": result.get("wave_plan"),
             }
             _ARENA_RESULT_CACHE[result_path] = (
                 stat.st_mtime_ns,
@@ -677,6 +685,8 @@ def _arena_history(run_root: Path, *, limit: int = 5) -> dict[str, object]:
                 "losses": aggregate.get("losses"),
                 "games": aggregate.get("games"),
                 "per_ring_elo": summary.get("per_ring_elo"),
+                "weighted_aggregate": summary.get("weighted_aggregate"),
+                "weighted_wave_plan": summary.get("weighted_wave_plan"),
             }
         )
     for stale_path in set(_ARENA_RESULT_CACHE) - existing_paths:
@@ -716,6 +726,86 @@ def _arena_history(run_root: Path, *, limit: int = 5) -> dict[str, object]:
             else None
         ),
         "recent": completed[-limit:],
+    }
+
+
+def _weighted_arena_progress(
+    arena_config: Mapping[str, object],
+    arena_history: Mapping[str, object],
+) -> dict[str, object]:
+    raw_ratios = arena_config.get("promotion_pair_ratios")
+    ratios = (
+        {str(ring): ratio for ring, ratio in raw_ratios.items()}
+        if isinstance(raw_ratios, Mapping)
+        else {}
+    )
+    recent = arena_history.get("recent")
+    recent = recent if isinstance(recent, list) else []
+    latest = next(
+        (
+            row
+            for row in reversed(recent)
+            if isinstance(row, Mapping)
+            and isinstance(row.get("weighted_aggregate"), Mapping)
+        ),
+        None,
+    )
+    aggregate = _mapping(latest.get("weighted_aggregate")) if latest is not None else {}
+    interval = aggregate.get("anytime_elo_interval")
+    lower_elo = (
+        _number(interval[0])
+        if isinstance(interval, list) and len(interval) == 2
+        else None
+    )
+    complete_blocks = aggregate.get(
+        "complete_blocks",
+        aggregate.get("completed_blocks"),
+    )
+    complete_blocks = (
+        complete_blocks
+        if type(complete_blocks) is int and complete_blocks >= 0
+        else None
+    )
+    maximum_blocks = arena_config.get("weighted_max_blocks")
+    maximum_blocks = (
+        maximum_blocks if type(maximum_blocks) is int and maximum_blocks > 0 else None
+    )
+    wave_plan = _mapping(latest.get("weighted_wave_plan")) if latest is not None else {}
+    return {
+        "enabled": bool(ratios),
+        "pair_ratios": ratios,
+        "initial_blocks": arena_config.get("weighted_initial_blocks"),
+        "continuation_blocks": arena_config.get("weighted_continuation_blocks"),
+        "max_blocks": maximum_blocks,
+        "complete_blocks": complete_blocks,
+        "remaining_blocks": (
+            max(0, maximum_blocks - complete_blocks)
+            if maximum_blocks is not None and complete_blocks is not None
+            else None
+        ),
+        "wave_target_blocks": wave_plan.get(
+            "target_complete_blocks",
+            wave_plan.get("target_blocks"),
+        ),
+        "incomplete_pair_counts": aggregate.get("incomplete_pair_counts"),
+        "score_rate": aggregate.get(
+            "score_rate",
+            aggregate.get("weighted_score_rate"),
+        ),
+        "elo_difference": aggregate.get(
+            "elo_difference",
+            aggregate.get("weighted_elo_difference"),
+        ),
+        "anytime_elo_interval": interval,
+        "anytime_lower_elo": lower_elo,
+        "sequential_state": aggregate.get(
+            "sequential_state",
+            aggregate.get("evidence_state"),
+        ),
+        "decision": latest.get("decision") if latest is not None else None,
+        "latest_completed_ns": (
+            latest.get("completed_ns") if latest is not None else None
+        ),
     }
 
 
@@ -1470,6 +1560,8 @@ def collect_snapshot(
     arena = _read_json(root / "arena" / "promotion-status.json") or {}
     arena_history = _arena_history(root)
     arena_config = _mapping(profile.get("arena"))
+    weighted_promotion = _weighted_arena_progress(arena_config, arena_history)
+    arena_history["weighted"] = weighted_promotion
     promotion_config = _mapping(orchestration.get("promotion"))
     finish_inflight = promotion_config.get("finish_inflight_candidate") is True
     pairs_per_ring = _number(arena_config.get("pairs_per_ring"))
@@ -1642,6 +1734,7 @@ def collect_snapshot(
         "recovery": recovery,
         "arena": arena,
         "arena_history": arena_history,
+        "weighted_promotion": weighted_promotion,
         "strength_efficiency": strength_efficiency,
         "pause": pause,
         "disk": disk,
@@ -1680,6 +1773,10 @@ def format_text(snapshot: Mapping[str, object]) -> str:
     strength_efficiency = snapshot.get("strength_efficiency")
     strength_efficiency = (
         strength_efficiency if isinstance(strength_efficiency, Mapping) else {}
+    )
+    weighted_promotion = snapshot.get("weighted_promotion")
+    weighted_promotion = (
+        weighted_promotion if isinstance(weighted_promotion, Mapping) else {}
     )
     recent_evaluations = arena_history.get("recent")
     recent_evaluations = (
@@ -1734,6 +1831,10 @@ def format_text(snapshot: Mapping[str, object]) -> str:
         f"promotion_evals={arena_history.get('promotion_evaluations', 0)} "
         f"crossplay_evals={arena_history.get('crossplay_evaluations', 0)} "
         f"elo={_compact(displayed_elo)} elo_source={elo_source or 'n/a'} "
+        f"weighted_blocks={_count(weighted_promotion.get('complete_blocks'))}/"
+        f"{_count(weighted_promotion.get('max_blocks'))} "
+        f"weighted_lcb={_compact(weighted_promotion.get('anytime_lower_elo'))} "
+        f"weighted_state={weighted_promotion.get('sequential_state') or 'n/a'} "
         f"failure={failure.get('failure_class', '-')} "
         f"continuity={continuity.get('phase', 'n/a')} "
         f"active_workload={continuity.get('active_workload_id', 'n/a')} "

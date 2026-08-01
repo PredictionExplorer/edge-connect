@@ -5,11 +5,14 @@ from pathlib import Path
 
 import pytest
 
+from startrain.arena import bounded_confidence_sequence, elo_from_probability
+
 from scripts.compare_elo_ablation import (
     DEFAULT_GUARD_FLOOR_ELO,
     DEFAULT_GUARD_RINGS,
     ONE_SIDED_95_NORMAL_QUANTILE,
     REPORT_NAME,
+    _weighted_champion_frontier,
     build_elo_ablation_comparison,
     main,
 )
@@ -35,6 +38,8 @@ def _run_fixture(
     decision: str = "promote",
     guard_lowers: dict[int, float] | None = None,
     omitted_guard_rings: tuple[int, ...] = (),
+    weighted_elo: float | None = None,
+    weighted_lower: float | None = None,
 ) -> Path:
     root = parent / label
     root.mkdir()
@@ -164,32 +169,50 @@ def _run_fixture(
     }
     arena = root / "arena"
     arena.mkdir()
+    arena_payload: dict[str, object] = {
+        "schema_version": 3,
+        "candidate": candidate,
+        "baseline": anchor,
+        "baseline_metadata": {
+            "kind": "checkpoint",
+            "identity": anchor,
+        },
+        "started_ns": terminal_ns - 1_000_000_000,
+        "completed_ns": terminal_ns,
+        "terminal": True,
+        "aggregate": {
+            "wins": ring_wins,
+            "losses": ring_losses,
+            "games": ring_wins + ring_losses,
+            "elo_difference": 0.0,
+            "anytime_elo_interval": [-100.0, 100.0],
+        },
+        "per_ring": per_ring,
+        "promotion": {
+            "decision": decision,
+            "ring_floors": ring_floors,
+        },
+    }
+    if weighted_elo is not None:
+        lower = weighted_elo - 10 if weighted_lower is None else weighted_lower
+        arena_payload["weighted_aggregate"] = {
+            "observation_model": "complete-weighted-macro-block-score-v1",
+            "pair_ratios": {"4": 1, "6": 1, "8": 1, "10": 7},
+            "normalized_weights": {"4": 0.1, "6": 0.1, "8": 0.1, "10": 0.7},
+            "complete_blocks": 15,
+            "incomplete_pair_counts": {"4": 0, "6": 0, "8": 0, "10": 0},
+            "score_rate": 0.8,
+            "elo_difference": weighted_elo,
+            "anytime_elo_interval": [lower, weighted_elo + 20],
+            "anytime_error_probability": {"lower": 0.05, "upper": 0.05},
+            "block_scores": [0.8] * 15,
+            "sequential_state": (
+                "accept_alternative" if decision == "promote" else "continue"
+            ),
+        }
     (arena / "candidate-vs-anchor.json").write_text(
         json.dumps(
-            {
-                "schema_version": 3,
-                "candidate": candidate,
-                "baseline": anchor,
-                "baseline_metadata": {
-                    "kind": "checkpoint",
-                    "identity": anchor,
-                },
-                "started_ns": terminal_ns - 1_000_000_000,
-                "completed_ns": terminal_ns,
-                "terminal": True,
-                "aggregate": {
-                    "wins": ring_wins,
-                    "losses": ring_losses,
-                    "games": ring_wins + ring_losses,
-                    "elo_difference": 0.0,
-                    "anytime_elo_interval": [-100.0, 100.0],
-                },
-                "per_ring": per_ring,
-                "promotion": {
-                    "decision": decision,
-                    "ring_floors": ring_floors,
-                },
-            },
+            arena_payload,
             sort_keys=True,
         ),
         encoding="utf-8",
@@ -627,6 +650,151 @@ def test_primary_metric_never_cherry_picks_rejected_terminal_candidate(
     )
     assert results["rejected"]["deployment_metric"]["point_value"] == 0
     assert report["selector"]["winner_snapshot"]["label"] == "promoted"
+
+
+def test_weighted_comparison_ranks_chronological_frontier_without_cherry_picking(
+    tmp_path: Path,
+) -> None:
+    promoted = _run_fixture(
+        tmp_path,
+        "weighted-promoted",
+        ring_wins=55,
+        ring_losses=45,
+        weighted_elo=45,
+        weighted_lower=20,
+    )
+    rejected = _run_fixture(
+        tmp_path,
+        "weighted-rejected",
+        ring_wins=90,
+        ring_losses=10,
+        decision="reject_max_pairs",
+        weighted_elo=250,
+        weighted_lower=200,
+    )
+
+    report = build_elo_ablation_comparison(
+        {"promoted": promoted, "rejected": rejected},
+        guard_rings=(),
+    )
+    results = _by_label(report)
+
+    assert report["status"] == "complete"
+    assert report["ranking_objective"] == "weighted_aggregate"
+    assert report["ranking_metric"] == (
+        "weighted_champion_frontier_elo_lcb_per_total_provisioned_wall_hour"
+    )
+    assert results["promoted"]["rank"] == 1
+    expected_lower, _ = bounded_confidence_sequence(
+        [0.8] * 15,
+        error_probability=0.025,
+    )
+    assert results["promoted"]["deployment_metric"]["value"] == pytest.approx(
+        elo_from_probability(expected_lower) / 8
+    )
+    assert results["promoted"]["ring_10_deployment_metric"]["value"] is not None
+    assert [
+        item["ring"] for item in results["promoted"]["per_ring_diagnostics"]["rings"]
+    ] == [4, 6, 8, 10]
+    assert (
+        results["rejected"]["weighted_champion_frontier"]["identity"]
+        == "checkpoint-common-anchor"
+    )
+    assert results["rejected"]["deployment_metric"]["point_value"] == 0
+    assert report["selector"]["winner_snapshot"]["label"] == "promoted"
+
+
+def test_weighted_frontier_uses_familywise_alpha_spending_across_promotions() -> None:
+    objective = json.dumps(
+        {
+            "pair_ratios": {"4": 1, "6": 1, "8": 1, "10": 7},
+            "normalized_weights": {"4": 0.1, "6": 0.1, "8": 0.1, "10": 0.7},
+            "observation_model": "complete-weighted-macro-block-score-v1",
+            "null_elo": 0.0,
+            "alternative_elo": 35.0,
+            "lower_error_probability": 0.05,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    first_scores = [0.62] * 15
+    second_scores = [0.65] * 15
+    evaluations = [
+        {
+            "decision": "promote",
+            "baseline": "anchor",
+            "candidate": "champion-1",
+            "completed_ns": 1,
+            "path": "first.json",
+            "weighted_aggregate": {
+                "objective": objective,
+                "elo_difference": 40.0,
+                "one_sided_lower_elo": 1.0,
+                "complete_blocks": 15,
+                "block_scores": first_scores,
+            },
+        },
+        {
+            "decision": "promote",
+            "baseline": "champion-1",
+            "candidate": "champion-2",
+            "completed_ns": 2,
+            "path": "second.json",
+            "weighted_aggregate": {
+                "objective": objective,
+                "elo_difference": 50.0,
+                "one_sided_lower_elo": 2.0,
+                "complete_blocks": 15,
+                "block_scores": second_scores,
+            },
+        },
+    ]
+
+    frontier, error, _ = _weighted_champion_frontier(
+        evaluations,
+        anchor_identity="anchor",
+    )
+    first_lower, _ = bounded_confidence_sequence(
+        first_scores,
+        error_probability=0.025,
+    )
+    second_lower, _ = bounded_confidence_sequence(
+        second_scores,
+        error_probability=0.0125,
+    )
+
+    assert error is None
+    assert frontier is not None
+    assert frontier["weighted_elo_one_sided_lower_bound"] == pytest.approx(
+        elo_from_probability(first_lower) + elo_from_probability(second_lower)
+    )
+    assert frontier["lower_bound_method"] == (
+        "sum_of_geometric_alpha_spending_anytime_lower_bounds"
+    )
+    assert [row["link_error_probability"] for row in frontier["promotions"]] == [
+        0.025,
+        0.0125,
+    ]
+
+
+def test_comparison_refuses_mixed_weighted_and_legacy_objectives(
+    tmp_path: Path,
+) -> None:
+    weighted = _run_fixture(tmp_path, "weighted", weighted_elo=20, weighted_lower=5)
+    legacy = _run_fixture(tmp_path, "legacy")
+
+    report = build_elo_ablation_comparison(
+        {"weighted": weighted, "legacy": legacy},
+        guard_rings=(),
+    )
+
+    assert report["status"] == "incomplete"
+    assert report["ranking_objective"] == "incompatible"
+    assert report["errors"][0]["code"] == "incompatible_promotion_objectives"
+    assert all(
+        "incompatible_promotion_objectives" in _reason_codes(treatment)
+        for treatment in _by_label(report).values()
+    )
 
 
 def test_queue_can_force_unfinished_arm_ineligible(tmp_path: Path) -> None:

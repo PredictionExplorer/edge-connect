@@ -59,6 +59,26 @@ The default matrix is:
 The command refuses to overwrite its output and records profile digests in
 `ablation-plan.json`.
 
+### Weighted-generalist matrix
+
+Run the weighted objective as a separate 55/65/70 matrix:
+
+- `weighted-control` keeps the frozen control training mix (currently
+  15/15/15/55 after its large-board transition);
+- `ring10-65-weighted` trains 10/10/15/65; and
+- `ring10-70-weighted` trains 10/10/10/70.
+
+All three promote on complete 1/1/1/7 arena blocks for rings 4/6/8/10, with 15
+initial blocks, 10-block continuations, and a 50-block cap. Prepare them with
+repeated `--treatment` options. Do not mix weighted and legacy treatments in
+one plan because their promotion objectives and guard contracts differ.
+
+This matrix intentionally sets `required_regression_rings: []` and clears
+blocking per-ring floor overrides. Per-ring Elo and anytime intervals remain
+in reports as diagnostics, but a weighted winner can regress on rings 4, 6, or
+8 and still promote. There is no per-ring non-inferiority guarantee; use the
+legacy matrix when one is required.
+
 ## Fork treatments
 
 Fork every arm before running any arm so all treatments have the same source
@@ -288,6 +308,13 @@ metric is guarded champion-frontier ring-10 Elo lower bound per total
 provisioned wall hour. The latest terminal candidate remains a diagnostic and
 is never cherry-picked as the deployed winner.
 
+For a weighted-only plan, pass `--no-guard-rings`. When every arm exposes the
+same weighted objective, the comparator instead ranks chronological promoted
+champion frontiers by weighted Elo lower bound per total provisioned wall hour.
+Ring-10 and all per-ring summaries remain secondary diagnostics. Mixed weighted
+and legacy objectives are ineligible rather than being ranked on whichever
+metric looks best.
+
 For dependent experiment stages, use `run_staged_elo_pipeline.py`. It accepts
 only a hash-verified upstream winner snapshot and refuses a downstream fork
 whose champion anchor or canonical stage specification is stale. Every
@@ -295,7 +322,11 @@ downstream fork receives a new weights-only champion warm-start, recovery
 pointer, resume cutover, optimizer, scheduler, and cadence boundary at the
 selected champion; `resume_latest` must never select an inherited rejected
 checkpoint. Futility policies are pre-registered, stop-only, and require
-anytime-valid upper bounds; they never grant promotion authority.
+anytime-valid upper bounds; they never grant promotion authority. Weighted
+stages use `guard_rings: []`, `promotion_objective: weighted_aggregate`, and
+weighted-aggregate confidence-sequence evidence. Empty guards remove per-ring
+futility vetoes, not lifecycle, integrity, fixed-budget, or common-anchor
+requirements.
 
 ## Rollback
 

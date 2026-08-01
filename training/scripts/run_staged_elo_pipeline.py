@@ -18,6 +18,9 @@ if __package__:
     from .prepare_champion_warm_start import prepare_champion_warm_start
     from .prepare_elo_ablation import (
         GUARD_RINGS,
+        WEIGHTED_INITIAL_BLOCKS,
+        WEIGHTED_TREATMENTS,
+        blocking_guard_rings,
         prepare_elo_ablation,
         validate_futility_policy,
         verify_winner_snapshot,
@@ -29,6 +32,9 @@ else:
     from prepare_champion_warm_start import prepare_champion_warm_start
     from prepare_elo_ablation import (
         GUARD_RINGS,
+        WEIGHTED_INITIAL_BLOCKS,
+        WEIGHTED_TREATMENTS,
+        blocking_guard_rings,
         prepare_elo_ablation,
         validate_futility_policy,
         verify_winner_snapshot,
@@ -101,11 +107,29 @@ def build_futility_policy(
     *,
     guard_rings: Sequence[int] = GUARD_RINGS,
     guard_floor_elo: float,
-    minimum_decisive_games: int = 200,
+    minimum_decisive_games: int | None = None,
     minimum_control_advantage_elo: float = 0.0,
+    control_objective: str = "ring_10",
     enabled: bool = True,
 ) -> dict[str, object]:
     """Build the deterministic, pre-registered stop-only policy."""
+    if control_objective not in {"ring_10", "weighted_aggregate"}:
+        raise ValueError("futility control objective is unsupported")
+    if minimum_decisive_games is None:
+        minimum_decisive_games = (
+            WEIGHTED_INITIAL_BLOCKS
+            if control_objective == "weighted_aggregate"
+            else 200
+        )
+    control_comparison: dict[str, object] = {
+        "minimum_advantage_elo": minimum_control_advantage_elo,
+        "arm_upper_field": "anytime_upper_elo",
+        "control_lower_field": "anytime_lower_elo",
+    }
+    if control_objective == "ring_10":
+        control_comparison["ring"] = 10
+    else:
+        control_comparison["objective"] = "weighted_aggregate"
     policy: dict[str, object] = {
         "schema_version": SCHEMA_VERSION,
         "report": FUTILITY_REPORT,
@@ -119,12 +143,7 @@ def build_futility_policy(
             "floor_elo": guard_floor_elo,
             "arm_upper_field": "anytime_upper_elo",
         },
-        "control_comparison": {
-            "ring": 10,
-            "minimum_advantage_elo": minimum_control_advantage_elo,
-            "arm_upper_field": "anytime_upper_elo",
-            "control_lower_field": "anytime_lower_elo",
-        },
+        "control_comparison": control_comparison,
     }
     return validate_futility_policy(
         policy,
@@ -174,7 +193,22 @@ def evaluate_futility(
             "decision": "continue",
             "reason": "insufficient_anytime_valid_evidence",
         }
-    games = evidence.get("decisive_games")
+    control = validated["control_comparison"]
+    assert isinstance(control, dict)
+    objective = str(control.get("objective", "ring_10"))
+    objective_evidence = evidence.get(objective)
+    games = (
+        evidence.get(
+            "complete_blocks",
+            (
+                objective_evidence.get("complete_blocks")
+                if isinstance(objective_evidence, Mapping)
+                else evidence.get("decisive_games")
+            ),
+        )
+        if objective == "weighted_aggregate"
+        else evidence.get("decisive_games")
+    )
     raw_minimum_games = validated["minimum_decisive_games"]
     assert type(raw_minimum_games) is int
     minimum_games = raw_minimum_games
@@ -186,13 +220,14 @@ def evaluate_futility(
         }
 
     raw_guards = evidence.get("guard_rings")
-    if not isinstance(raw_guards, Mapping):
+    if rings and not isinstance(raw_guards, Mapping):
         return {
             **base,
             "decision": "continue",
             "reason": "insufficient_anytime_valid_evidence",
         }
     for ring in rings:
+        assert isinstance(raw_guards, Mapping)
         raw_ring = raw_guards.get(str(ring), raw_guards.get(ring))
         if not isinstance(raw_ring, Mapping):
             return {
@@ -217,23 +252,37 @@ def evaluate_futility(
                 "guard_floor_elo": floor,
             }
 
-    ring_ten = evidence.get("ring_10")
-    if not isinstance(ring_ten, Mapping):
+    comparison_evidence = objective_evidence
+    if not isinstance(comparison_evidence, Mapping):
         return {
             **base,
             "decision": "continue",
             "reason": "insufficient_anytime_valid_evidence",
         }
-    arm_upper = _finite_number(ring_ten.get("anytime_upper_elo"))
-    control_lower = _finite_number(ring_ten.get("control_anytime_lower_elo"))
+    arm_upper = _finite_number(comparison_evidence.get("anytime_upper_elo"))
+    control_lower = _finite_number(comparison_evidence.get("control_anytime_lower_elo"))
+    arm_interval = comparison_evidence.get("anytime_elo_interval")
+    if (
+        arm_upper is None
+        and isinstance(arm_interval, Sequence)
+        and not isinstance(arm_interval, str | bytes)
+        and len(arm_interval) == 2
+    ):
+        arm_upper = _finite_number(arm_interval[1])
+    control_interval = comparison_evidence.get("control_anytime_elo_interval")
+    if (
+        control_lower is None
+        and isinstance(control_interval, Sequence)
+        and not isinstance(control_interval, str | bytes)
+        and len(control_interval) == 2
+    ):
+        control_lower = _finite_number(control_interval[0])
     if arm_upper is None or control_lower is None:
         return {
             **base,
             "decision": "continue",
             "reason": "insufficient_anytime_valid_evidence",
         }
-    control = validated["control_comparison"]
-    assert isinstance(control, dict)
     required_advantage = float(control["minimum_advantage_elo"])
     if arm_upper <= control_lower + required_advantage:
         return {
@@ -243,8 +292,57 @@ def evaluate_futility(
             "arm_anytime_upper_elo": arm_upper,
             "control_anytime_lower_elo": control_lower,
             "minimum_control_advantage_elo": required_advantage,
+            "control_objective": objective,
         }
-    return {**base, "decision": "continue", "reason": "futility_not_proven"}
+    return {
+        **base,
+        "decision": "continue",
+        "reason": "futility_not_proven",
+        "control_objective": objective,
+    }
+
+
+def _preparation_objective(
+    preparation: Mapping[str, object],
+) -> tuple[tuple[int, ...], str]:
+    treatments = _list(preparation.get("treatments"), "downstream treatments")
+    if any(not isinstance(item, str) or not item for item in treatments):
+        raise StagedEloPipelineError("downstream treatments must be strings")
+    try:
+        inferred = blocking_guard_rings(tuple(str(item) for item in treatments))
+    except ValueError as error:
+        raise StagedEloPipelineError(str(error)) from error
+    raw_rings = preparation.get("guard_rings")
+    if raw_rings is None:
+        guard_rings = inferred
+    else:
+        configured = _list(raw_rings, "downstream guard rings")
+        if any(type(ring) is not int or ring <= 0 for ring in configured):
+            raise StagedEloPipelineError(
+                "downstream guard rings must contain positive integers"
+            )
+        if len(set(configured)) != len(configured):
+            raise StagedEloPipelineError("downstream guard rings contain duplicates")
+        guard_rings = tuple(configured)
+        if guard_rings != inferred:
+            raise StagedEloPipelineError(
+                "downstream guard rings do not match the treatment objective"
+            )
+    raw_objective = preparation.get("promotion_objective")
+    objective = (
+        str(raw_objective)
+        if raw_objective is not None
+        else ("weighted_aggregate" if not guard_rings else "ring_10")
+    )
+    if objective not in {"ring_10", "weighted_aggregate"}:
+        raise StagedEloPipelineError("downstream promotion objective is unsupported")
+    if (objective == "weighted_aggregate") != all(
+        str(item) in WEIGHTED_TREATMENTS for item in treatments
+    ):
+        raise StagedEloPipelineError(
+            "downstream promotion objective does not match its treatments"
+        )
+    return guard_rings, objective
 
 
 def _comparison_path(deployment_manifest: Path) -> Path:
@@ -299,6 +397,7 @@ def _prepared_plan(
     source: Path,
     snapshot: Mapping[str, object],
     futility_policy: Mapping[str, object],
+    guard_rings: Sequence[int],
     preparer: Preparer,
 ) -> tuple[dict[str, object], Path]:
     output_dir = (
@@ -358,6 +457,7 @@ def _prepared_plan(
             treatments=tuple(treatments),
             winner_snapshot=snapshot,
             futility_policy=futility_policy,
+            guard_rings=guard_rings,
         )
     except (
         FileExistsError,
@@ -462,20 +562,34 @@ def advance_staged_elo_pipeline(
     guard_floor = preparation.get("guard_floor_elo")
     if isinstance(guard_floor, bool) or not isinstance(guard_floor, int | float):
         raise StagedEloPipelineError("downstream guard floor must be numeric")
+    guard_rings, control_objective = _preparation_objective(preparation)
     raw_policy = downstream.get("futility_policy")
     if raw_policy is None:
-        policy = build_futility_policy(guard_floor_elo=float(guard_floor))
+        policy = build_futility_policy(
+            guard_rings=guard_rings,
+            guard_floor_elo=float(guard_floor),
+            control_objective=control_objective,
+        )
     elif isinstance(raw_policy, Mapping):
         try:
             policy = validate_futility_policy(
                 raw_policy,
-                guard_rings=GUARD_RINGS,
+                guard_rings=guard_rings,
                 guard_floor_elo=float(guard_floor),
             )
         except ValueError as error:
             raise StagedEloPipelineError(str(error)) from error
     else:
         raise StagedEloPipelineError("downstream futility policy must be an object")
+    control_comparison = _mapping(
+        policy.get("control_comparison"),
+        "downstream futility control comparison",
+    )
+    policy_objective = str(control_comparison.get("objective", "ring_10"))
+    if policy_objective != control_objective:
+        raise StagedEloPipelineError(
+            "downstream futility objective differs from the treatment objective"
+        )
 
     verify_winner_snapshot(source, snapshot)
     plan, plan_path = _prepared_plan(
@@ -483,6 +597,7 @@ def advance_staged_elo_pipeline(
         source=source,
         snapshot=snapshot,
         futility_policy=policy,
+        guard_rings=guard_rings,
         preparer=preparer,
     )
     raw_treatments = _list(plan.get("treatments"), "prepared treatments")
