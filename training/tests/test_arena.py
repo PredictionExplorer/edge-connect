@@ -16,6 +16,7 @@ from startrain.arena import (
     ArenaRunner,
     ArenaSearchBudget,
     BinaryResults,
+    _wave_local_summary_config,
     bounded_confidence_sequence,
     bounded_log_e_value,
     internal_elo_target_assessment,
@@ -801,6 +802,26 @@ def test_weighted_macro_blocks_reject_gapped_pair_indices() -> None:
 
     with pytest.raises(ValueError, match="contiguous from zero"):
         promotion_assessment(aggregate, per_ring, config)
+
+
+def test_weighted_continuation_wave_defers_summary_until_durable_merge() -> None:
+    config = weighted_arena_config()
+    starts = {4: 15, 6: 15, 8: 15, 10: 105}
+    pairs = [
+        scored_pair(ring, pair, 0.5)
+        for ring, count in config.promotion_pair_ratios.items()
+        for pair in range(starts[ring], starts[ring] + count)
+    ]
+
+    with pytest.raises(ValueError, match="contiguous from zero"):
+        summarize_completed_arena_pairs(pairs, config)
+
+    local_config = _wave_local_summary_config(config, starts)
+    summary = summarize_completed_arena_pairs(pairs, local_config)
+
+    assert local_config.promotion_pair_ratios == {}
+    assert "weighted_aggregate" not in summary
+    assert summary["promotion"]["decision"] == "continue"
 
 
 def test_weighted_promotion_ignores_nonrequired_small_ring_regression() -> None:

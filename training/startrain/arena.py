@@ -7,7 +7,7 @@ import random
 import time
 from concurrent.futures import Executor, ThreadPoolExecutor
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from statistics import NormalDist
 from typing import Any, Literal, Protocol, cast
 
@@ -1146,6 +1146,28 @@ def summarize_completed_arena_pairs(
     }
 
 
+def _wave_local_summary_config(
+    config: ArenaConfig,
+    pair_starts: Mapping[int, int] | None,
+) -> ArenaConfig:
+    if not config.promotion_pair_ratios or not any(
+        int((pair_starts or {}).get(ring, 0)) > 0 for ring in config.rings
+    ):
+        return config
+    # Continuation-wave pair indices are absolute so they can be merged with
+    # durable prior waves. A wave-local weighted assessment cannot construct
+    # macro blocks starting from zero without those prior pairs; promotion
+    # recomputes the authoritative weighted summary after merging.
+    return replace(
+        config,
+        promotion_pair_ratios={},
+        required_regression_rings=None,
+        weighted_initial_blocks=0,
+        weighted_continuation_blocks=0,
+        weighted_max_blocks=0,
+    )
+
+
 class ArenaRunner:
     def __init__(
         self,
@@ -1291,8 +1313,9 @@ class ArenaRunner:
                         break
                 if interrupted:
                     break
+        summary_config = _wave_local_summary_config(self.config, pair_starts)
         statistical = (
-            summarize_completed_arena_pairs(pairs, self.config)
+            summarize_completed_arena_pairs(pairs, summary_config)
             if pairs
             else {
                 "aggregate": None,
