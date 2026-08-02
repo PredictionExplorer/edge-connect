@@ -23,8 +23,10 @@ from startrain.runtime import SignalLatch, atomic_json, load_run_identity
 
 if __package__:
     from .preflight_run_state import run_state_preflight
+    from .replay_manifest_backup import restore_if_corrupt
 else:
     from preflight_run_state import run_state_preflight
+    from replay_manifest_backup import restore_if_corrupt
 
 SCHEMA_VERSION = 1
 REPORT_NAME = "startrain-elo-ablation-run"
@@ -392,15 +394,11 @@ def _measurement_attempts(metadata: dict[str, Any]) -> list[dict[str, object]]:
     return [dict(attempt) for attempt in raw_attempts]
 
 
-def _measurement_start(
-    metadata: dict[str, Any],
-    *,
-    now_ns: int,
-) -> tuple[int, list[dict[str, object]]]:
+def _validate_measurement_resumable(metadata: dict[str, Any]) -> None:
     raw_started = metadata.get("measurement_started_ns")
-    attempts = _measurement_attempts(metadata)
+    _measurement_attempts(metadata)
     if raw_started is None:
-        return now_ns, attempts
+        return
     if type(raw_started) is not int or raw_started <= 0:
         raise ValueError("ablation measurement start is invalid")
     status = metadata.get("measurement_status")
@@ -414,6 +412,19 @@ def _measurement_start(
         TRANSIENT_CRASH,
     }:
         raise RuntimeError("ablation measurement has already started")
+
+
+def _measurement_start(
+    metadata: dict[str, Any],
+    *,
+    now_ns: int,
+) -> tuple[int, list[dict[str, object]]]:
+    _validate_measurement_resumable(metadata)
+    raw_started = metadata.get("measurement_started_ns")
+    attempts = _measurement_attempts(metadata)
+    if raw_started is None:
+        return now_ns, attempts
+    assert isinstance(raw_started, int)
     if attempts and attempts[-1].get("outcome") == "running":
         attempts[-1].update(
             {
@@ -425,6 +436,49 @@ def _measurement_start(
             }
         )
     return raw_started, attempts
+
+
+def _append_replay_restore_evidence(
+    metadata: dict[str, Any],
+    *,
+    run_root: Path,
+    restored_from: Path | None,
+) -> dict[str, object]:
+    previous = metadata.get("replay_restore")
+    history: list[dict[str, object]] = []
+    if previous is not None:
+        if not isinstance(previous, dict):
+            raise ValueError("replay restore evidence is malformed")
+        raw_history = previous.get("attempts")
+        if isinstance(raw_history, list):
+            if any(not isinstance(item, dict) for item in raw_history):
+                raise ValueError("replay restore attempt history is malformed")
+            history = [dict(item) for item in raw_history]
+        elif isinstance(previous.get("status"), str):
+            history = [dict(previous)]
+        else:
+            raise ValueError("replay restore evidence is malformed")
+    if restored_from is not None:
+        status = "restored"
+    elif (run_root / "replay" / "manifest.sqlite3").is_file():
+        status = "verified"
+    else:
+        status = "uninitialized"
+    record: dict[str, object] = {
+        "schema_version": 1,
+        "attempt": len(history) + 1,
+        "checked_ns": time.time_ns(),
+        "status": status,
+        "restored_from": str(restored_from) if restored_from is not None else None,
+    }
+    history.append(record)
+    evidence: dict[str, object] = {
+        "schema_version": 1,
+        "latest": record,
+        "attempts": history,
+    }
+    metadata["replay_restore"] = evidence
+    return evidence
 
 
 def _finish_attempt(
@@ -582,6 +636,14 @@ def run_elo_ablation(
         "wall_budget_seconds", metadata.get("wall_budget_seconds")
     )
     leaf_budget = int(_positive_number("leaf_budget", metadata.get("leaf_budget")))
+    _validate_measurement_resumable(metadata)
+    restored_from = restore_if_corrupt(root)
+    _append_replay_restore_evidence(
+        metadata,
+        run_root=root,
+        restored_from=restored_from,
+    )
+    atomic_json(metadata_path, metadata)
     state_preflight = run_state_preflight(root, profile, apply=True)
     metadata["state_preflight"] = state_preflight
     atomic_json(metadata_path, metadata)

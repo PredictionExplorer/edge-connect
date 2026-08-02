@@ -1176,6 +1176,7 @@ def test_persistent_replay_window_reuses_loader_across_utd_waits(
                 yield indices
 
         watermark_during_wait: list[int] = []
+        pause_exercised = False
 
         def progress(**payload) -> None:
             if payload.get("phase") == "update_to_data_wait":
@@ -1185,14 +1186,31 @@ def test_persistent_replay_window_reuses_loader_across_utd_waits(
                     ).fetchone()[0]
                 )
 
+        def gpu_pause_control(
+            *,
+            stop_requested,
+            progress,
+            on_pause,
+            on_resume,
+        ) -> bool:
+            nonlocal pause_exercised
+            del stop_requested, progress
+            if learner.step == 1 and not pause_exercised:
+                assert on_pause() == 1
+                assert on_resume() == 1
+                pause_exercised = True
+            return True
+
         monkeypatch.setattr(learner, "_loader", capture_loader)
         monkeypatch.setattr(learner, "_utd_step_budget", utd_budget)
+        monkeypatch.setattr(learner, "_gpu_pause_control", gpu_pause_control)
         monkeypatch.setattr(UniqueReplayBatchSampler, "__iter__", capture_sampler)
         monkeypatch.setattr("startrain.learner.time.sleep", lambda _seconds: None)
 
         assert learner.run(steps=4, progress=progress) == 4
 
         assert loader_batches == [4]
+        assert pause_exercised is True
         assert watermark_during_wait == [1]
         assert len(selected_indices) == len(set(selected_indices)) == 4
         assert (
@@ -1208,10 +1226,21 @@ def test_persistent_replay_window_reuses_loader_across_utd_waits(
         allocations = [
             event for event in events if event.get("event") == "replay_window_allocated"
         ]
+        suspensions = [
+            event for event in events if event.get("event") == "replay_window_suspended"
+        ]
+        resumptions = [
+            event for event in events if event.get("event") == "replay_window_resumed"
+        ]
         consumptions = [
             event for event in events if event.get("event") == "replay_window_consumed"
         ]
         assert len(allocations) == 1
+        assert len(suspensions) == len(resumptions) == 1
+        assert suspensions[0]["pause_generation"] == 1
+        assert resumptions[0]["pause_generation"] == 1
+        assert suspensions[0]["window_batches_allocated"] == 4
+        assert resumptions[0]["window_batches_consumed"] == 1
         assert allocations[0]["window_batches_allocated"] == 4
         assert allocations[0]["loader_workers_effective"] == 0
         assert [event["window_reuse"] for event in consumptions] == [

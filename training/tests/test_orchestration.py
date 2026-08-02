@@ -179,6 +179,7 @@ def test_h100_layouts_assign_one_learner_and_every_actor_gpu() -> None:
     eight = load_config(CONFIGS / "h100-8gpu.yaml")
     four = load_config(CONFIGS / "h100-4gpu.yaml")
     optimized = load_config(CONFIGS / "h100-8gpu-optimized.yaml")
+    learner_shared = load_config(CONFIGS / "h100-8gpu-learner-shared.yaml")
     assert [gpu.gpu_id for gpu in eight.orchestration.learner_gpus] == [0]
     assert [gpu.gpu_id for gpu in eight.orchestration.actor_gpus] == list(range(1, 7))
     assert [gpu.gpu_id for gpu in four.orchestration.learner_gpus] == [0]
@@ -187,6 +188,10 @@ def test_h100_layouts_assign_one_learner_and_every_actor_gpu() -> None:
         range(1, 8)
     )
     assert optimized.orchestration.promotion.gpu_id == 7
+    assert [gpu.gpu_id for gpu in learner_shared.orchestration.actor_gpus] == list(
+        range(1, 8)
+    )
+    assert learner_shared.orchestration.promotion.gpu_id == 0
 
     directories = RunDirectories.from_experiment(four)
     specs = build_worker_specs(
@@ -277,6 +282,29 @@ def test_h100_layouts_assign_one_learner_and_every_actor_gpu() -> None:
     assert arena.role == "arena"
     assert arena.environment["CUDA_VISIBLE_DEVICES"] == "7"
     assert "--gpu-pause" in arena.command
+
+    learner_shared_directories = RunDirectories.from_experiment(learner_shared)
+    learner_shared_specs = build_worker_specs(
+        learner_shared,
+        config_path=CONFIGS / "h100-8gpu-learner-shared.yaml",
+        directories=learner_shared_directories,
+        python_executable="/test/python",
+        base_environment={},
+    )
+    shared_learner = next(
+        spec for spec in learner_shared_specs if spec.role == "learner"
+    )
+    shared_actors = [spec for spec in learner_shared_specs if spec.role == "actor"]
+    shared_arena = next(spec for spec in learner_shared_specs if spec.role == "arena")
+    assert len(shared_actors) == 14
+    assert "--gpu-pause" in shared_learner.command
+    assert [spec.name for spec in shared_actors if spec.gpu_ids == (7,)] == [
+        "actor-gpu-7-lane-0",
+        "actor-gpu-7-lane-1",
+    ]
+    assert shared_arena.gpu_ids == (0,)
+    assert shared_arena.environment["CUDA_VISIBLE_DEVICES"] == "0"
+    assert "--gpu-pause" in shared_arena.command
 
 
 def test_autonomous_run_provenance_rejects_imports_and_profile_drift(
@@ -986,7 +1014,17 @@ def test_fatal_worker_exit_is_not_retried_and_persists_reason(tmp_path) -> None:
     )
 
 
-def test_transient_learner_exit_retries_with_bounded_jitter(tmp_path) -> None:
+@pytest.mark.parametrize(
+    "reason",
+    (
+        "DataLoader worker exited unexpectedly",
+        "multiprocessing resource_tracker semaphore cleanup failed",
+    ),
+)
+def test_transient_learner_exit_retries_with_bounded_jitter(
+    tmp_path,
+    reason: str,
+) -> None:
     experiment = recovery_experiment(tmp_path, max_restarts=2)
     directories = RunDirectories.from_experiment(experiment)
     specs = build_worker_specs(
@@ -997,7 +1035,6 @@ def test_transient_learner_exit_retries_with_bounded_jitter(tmp_path) -> None:
     )
     launches: dict[str, int] = {}
     learner_environments: list[dict[str, str]] = []
-    reason = "DataLoader worker exited unexpectedly"
 
     def process_factory(command: list[str], **options: Any) -> FakeProcess:
         name = worker_name(command)

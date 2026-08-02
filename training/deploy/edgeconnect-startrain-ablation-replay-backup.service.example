@@ -1,0 +1,14 @@
+[Unit]
+Description=EdgeConnect Elo-ablation active-arm replay-ledger backup
+
+[Service]
+Type=oneshot
+User=@USER@
+WorkingDirectory=@TRAINING_DIR@
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONPATH=@TRAINING_DIR@
+Environment=PATH=@TRAINING_DIR@/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=@TRAINING_DIR@/.venv/bin/python @TRAINING_DIR@/scripts/replay_manifest_backup.py backup-active-arm --queue-state @QUEUE_STATE@ --interval-seconds @REPLAY_BACKUP_INTERVAL_SECONDS@ --retain @REPLAY_BACKUP_RETAIN@ --max-total-bytes @REPLAY_BACKUP_MAX_TOTAL_BYTES@
+NoNewPrivileges=true
+UMask=0027

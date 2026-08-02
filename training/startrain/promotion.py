@@ -873,7 +873,7 @@ class PromotionSupervisor:
             progress=progress,
             candidate_identity=candidate.model_identity,
         ):
-            return self._evaluate_waves(
+            result = self._evaluate_waves(
                 candidate=candidate,
                 champion=champion,
                 previous=previous,
@@ -882,6 +882,9 @@ class PromotionSupervisor:
                 progress=progress,
                 once=once,
             )
+        if result[1] == "lease_yield":
+            self._record_inter_wave_cooldown(candidate)
+        return result
 
     def _evaluate_waves(
         self,
@@ -1035,7 +1038,6 @@ class PromotionSupervisor:
                         self.experiment.orchestration.promotion.max_waves_per_lease
                     )
                     if max_waves is not None and waves >= max_waves:
-                        self._record_inter_wave_cooldown(candidate)
                         return waves, "lease_yield"
             finally:
                 del runner

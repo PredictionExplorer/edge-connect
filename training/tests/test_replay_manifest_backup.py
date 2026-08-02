@@ -1,11 +1,20 @@
 from __future__ import annotations
 
+import json
 import sqlite3
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
 
+import scripts.replay_manifest_backup as backup_module
 from scripts.replay_manifest_backup import create_backup, restore_if_corrupt
+from scripts.replay_manifest_backup import (
+    BackupLockBusy,
+    backup_active_arm,
+    backup_lock,
+    create_backup_with_evidence,
+)
 from startrain.replay_store import ReplayStore
 from startrain.runtime import RunIdentity, atomic_json
 
@@ -130,3 +139,176 @@ def test_markerless_empty_bootstrap_database_is_safely_reinitialized(tmp_path) -
     assert restore_if_corrupt(run_root) is None
     assert not (run_root / "replay" / "manifest.sqlite3").exists()
     assert list((run_root / "recovery").glob("uninitialized-replay-*"))
+
+
+def test_backup_lock_serializes_overlapping_writers(tmp_path) -> None:
+    run_root = tmp_path / "locked-run"
+    _database(run_root, "durable")
+
+    with backup_lock(run_root):
+        with pytest.raises(BackupLockBusy, match="already active"):
+            create_backup(run_root, retain=3, blocking=False)
+
+    assert create_backup(run_root, retain=3).is_file()
+
+
+def test_backup_evidence_is_captured_under_the_backup_lock(tmp_path) -> None:
+    run_root = tmp_path / "evidence-run"
+    _database(run_root, "durable")
+
+    destination, evidence = create_backup_with_evidence(run_root, retain=3)
+
+    assert evidence["path"] == str(destination)
+    assert evidence["bytes"] == destination.stat().st_size
+    assert evidence["sha256"]
+    assert evidence["created_ns"]
+
+
+def test_active_arm_backup_obeys_queue_state_and_interval(tmp_path) -> None:
+    run_root = tmp_path / "active-run"
+    _database(run_root, "durable")
+    queue_state = tmp_path / "queue.json"
+    atomic_json(
+        queue_state,
+        {
+            "schema_version": 1,
+            "report": "startrain-elo-ablation-queue",
+            "queue_status": "running",
+            "arms": [
+                {
+                    "treatment": "control",
+                    "status": "running",
+                    "run_root": str(run_root),
+                },
+                {
+                    "treatment": "candidate",
+                    "status": "pending",
+                    "run_root": str(tmp_path / "candidate"),
+                },
+            ],
+        },
+    )
+
+    with backup_lock(run_root):
+        assert (
+            backup_active_arm(
+                queue_state,
+                interval_seconds=3_600,
+                retain=3,
+                now_ns=9_000_000_000_000,
+            )
+            is None
+        )
+
+    first = backup_active_arm(
+        queue_state,
+        interval_seconds=3_600,
+        retain=3,
+        now_ns=10_000_000_000_000,
+    )
+    assert first is not None and first.is_file()
+    latest = json.loads(
+        (run_root / "recovery" / "replay-manifest" / "latest.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert (
+        backup_active_arm(
+            queue_state,
+            interval_seconds=3_600,
+            retain=3,
+            now_ns=int(latest["created_ns"]) + 3_599_000_000_000,
+        )
+        is None
+    )
+
+    state = json.loads(queue_state.read_text(encoding="utf-8"))
+    state["queue_status"] = "completed"
+    atomic_json(queue_state, state)
+    assert (
+        backup_active_arm(
+            queue_state,
+            interval_seconds=3_600,
+            retain=3,
+        )
+        is None
+    )
+
+
+def test_active_arm_backup_rejects_ambiguous_or_future_state(tmp_path) -> None:
+    first_root = tmp_path / "first"
+    second_root = tmp_path / "second"
+    _database(first_root, "first")
+    _database(second_root, "second")
+    queue_state = tmp_path / "queue.json"
+    atomic_json(
+        queue_state,
+        {
+            "queue_status": "running",
+            "arms": [
+                {"status": "running", "run_root": str(first_root)},
+                {"status": "running", "run_root": str(second_root)},
+            ],
+        },
+    )
+    with pytest.raises(RuntimeError, match="multiple running arms"):
+        backup_active_arm(queue_state, interval_seconds=60, retain=3)
+
+    state = json.loads(queue_state.read_text(encoding="utf-8"))
+    state["arms"][1]["status"] = "pending"
+    atomic_json(queue_state, state)
+    create_backup(first_root, retain=3)
+    latest_path = first_root / "recovery" / "replay-manifest" / "latest.json"
+    latest = json.loads(latest_path.read_text(encoding="utf-8"))
+    latest["created_ns"] = 10_000
+    atomic_json(latest_path, latest)
+    with pytest.raises(RuntimeError, match="in the future"):
+        backup_active_arm(
+            queue_state,
+            interval_seconds=60,
+            retain=3,
+            now_ns=9_999,
+        )
+
+
+def test_active_arm_rechecks_interval_after_acquiring_lock(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_root = tmp_path / "active-run"
+    _database(run_root, "durable")
+    queue_state = tmp_path / "queue.json"
+    atomic_json(
+        queue_state,
+        {
+            "queue_status": "running",
+            "arms": [{"status": "running", "run_root": str(run_root)}],
+        },
+    )
+    latest_path = run_root / "recovery" / "replay-manifest" / "latest.json"
+
+    @contextmanager
+    def competing_backup(_run_root: Path, *, blocking: bool):
+        assert blocking is False
+        atomic_json(
+            latest_path,
+            {
+                "schema_version": 1,
+                "path": "manifest-competing.sqlite3",
+                "bytes": 1,
+                "sha256": "d" * 64,
+                "created_ns": 10_000,
+            },
+        )
+        yield latest_path.with_name(".backup.lock")
+
+    monkeypatch.setattr(backup_module, "backup_lock", competing_backup)
+    assert (
+        backup_active_arm(
+            queue_state,
+            interval_seconds=60,
+            retain=3,
+            now_ns=10_001,
+        )
+        is None
+    )

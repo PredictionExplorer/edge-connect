@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+import scripts.run_elo_ablation_queue as queue_module
 from scripts.fork_elo_ablation import fork_elo_ablation
 from scripts.prepare_elo_ablation import prepare_elo_ablation
 from scripts.run_elo_ablation import (
@@ -54,6 +56,7 @@ def _deployment(
     continue_after_fatal: bool = False,
     max_transient_retries: int = 2,
     warm_start: bool = False,
+    replay_backup: bool = False,
 ) -> DeploymentFixture:
     source = tmp_path / "seed"
     _write_json(
@@ -128,6 +131,7 @@ def _deployment(
         "run_elo_ablation.py",
         "compare_elo_ablation.py",
         "preflight_run_state.py",
+        "replay_manifest_backup.py",
     ):
         (scripts / name).write_text(f"# deployed {name}\n", encoding="utf-8")
     queue_unit = tmp_path / "systemd" / "ablation-queue.service"
@@ -135,9 +139,23 @@ def _deployment(
     queue_unit.parent.mkdir()
     queue_unit.write_text("[Service]\nExecStart=queue\n", encoding="utf-8")
     finalize_unit.write_text("[Service]\nExecStart=finalize\n", encoding="utf-8")
+    state = tmp_path / "state" / "queue.json"
+    backup_service_unit = tmp_path / "systemd" / "ablation-backup.service"
+    backup_timer_unit = tmp_path / "systemd" / "ablation-backup.timer"
+    backup_service_unit.write_text(
+        "[Service]\n"
+        f"ExecStart=/test/python {scripts / 'replay_manifest_backup.py'} "
+        "backup-active-arm "
+        f"--queue-state {state} --interval-seconds 3600 --retain 3 "
+        f"--max-total-bytes {20 * 1024 * 1024 * 1024}\n",
+        encoding="utf-8",
+    )
+    backup_timer_unit.write_text(
+        f"[Timer]\nOnUnitActiveSec=3600s\nUnit={backup_service_unit.name}\n",
+        encoding="utf-8",
+    )
     environment = tmp_path / "edgeconnect-ablation.env"
     environment.write_text("CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7\n", encoding="utf-8")
-    state = tmp_path / "state" / "queue.json"
     comparison = tmp_path / "reports" / "comparison.json"
     manifest = tmp_path / "deployment" / "manifest.json"
     generate_deployment_manifest(
@@ -154,6 +172,9 @@ def _deployment(
         max_transient_retries=max_transient_retries,
         retry_delay_seconds=0,
         continue_after_fatal=continue_after_fatal,
+        replay_backup_service_unit=(backup_service_unit if replay_backup else None),
+        replay_backup_timer_unit=(backup_timer_unit if replay_backup else None),
+        replay_backup_interval_seconds=3_600 if replay_backup else None,
     )
     return DeploymentFixture(
         manifest=manifest,
@@ -291,6 +312,85 @@ def test_manifest_pins_revision_and_all_launch_inputs(tmp_path: Path) -> None:
         )
 
 
+def test_manifest_optionally_pins_replay_backup_policy_and_units(
+    tmp_path: Path,
+) -> None:
+    deployment = _deployment(tmp_path, replay_backup=True)
+
+    report = verify_deployment_manifest(
+        deployment.manifest,
+        current_source_commit=SOURCE_COMMIT,
+        source_tree_clean=True,
+    )
+    manifest = json.loads(deployment.manifest.read_text(encoding="utf-8"))
+
+    assert report["status"] == "verified"
+    assert manifest["queue"]["replay_backup"] == {
+        "enabled": True,
+        "interval_seconds": 3_600.0,
+        "retain": 3,
+        "max_total_bytes": 20 * 1024 * 1024 * 1024,
+    }
+    assert {script["name"] for script in manifest["scripts"]} == {
+        "run_elo_ablation_queue",
+        "run_staged_elo_pipeline",
+        "run_elo_ablation",
+        "compare_elo_ablation",
+        "preflight_run_state",
+        "replay_manifest_backup",
+    }
+    assert {unit["name"] for unit in manifest["units"]} == {
+        "queue",
+        "finalize",
+        "replay_backup_service",
+        "replay_backup_timer",
+    }
+    backup_script = next(
+        script
+        for script in manifest["scripts"]
+        if script["name"] == "replay_manifest_backup"
+    )
+    Path(backup_script["path"]).write_text(
+        "# changed backup script\n", encoding="utf-8"
+    )
+    with pytest.raises(AblationQueueError, match="digest mismatch"):
+        verify_deployment_manifest(
+            deployment.manifest,
+            current_source_commit=SOURCE_COMMIT,
+            source_tree_clean=True,
+        )
+
+
+def test_manifest_rejects_replay_backup_unit_policy_drift(tmp_path: Path) -> None:
+    deployment = _deployment(tmp_path, replay_backup=True)
+    manifest = json.loads(deployment.manifest.read_text(encoding="utf-8"))
+    units = {unit["name"]: Path(unit["path"]) for unit in manifest["units"]}
+    service = units["replay_backup_service"]
+    service.write_text(
+        service.read_text(encoding="utf-8").replace(
+            "--interval-seconds 3600",
+            "--interval-seconds 7200",
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(AblationQueueError, match="service interval differs"):
+        generate_deployment_manifest(
+            plan_path=Path(manifest["plan"]["path"]),
+            output_path=tmp_path / "deployment" / "drifted.json",
+            training_dir=Path(manifest["source"]["training_dir"]),
+            queue_unit=units["queue"],
+            finalize_unit=units["finalize"],
+            replay_backup_service_unit=service,
+            replay_backup_timer_unit=units["replay_backup_timer"],
+            replay_backup_interval_seconds=3_600,
+            environment_file=Path(manifest["environment"]["path"]),
+            state_path=Path(manifest["queue"]["state_path"]),
+            comparison_output=Path(manifest["queue"]["comparison_output"]),
+            source_commit=SOURCE_COMMIT,
+        )
+
+
 def test_manifest_accepts_empty_guard_rings_for_weighted_objective(
     tmp_path: Path,
 ) -> None:
@@ -350,6 +450,16 @@ def test_systemd_queue_triggers_finalizer_for_both_outcomes() -> None:
     assert "run_elo_ablation_queue.py verify" in queue
     assert "RestartPreventExitStatus=2 3" in queue
     assert "run_elo_ablation_queue.py finalize" in finalizer
+    backup_service = (
+        DEPLOY / "edgeconnect-startrain-ablation-replay-backup.service.example"
+    ).read_text(encoding="utf-8")
+    backup_timer = (
+        DEPLOY / "edgeconnect-startrain-ablation-replay-backup.timer.example"
+    ).read_text(encoding="utf-8")
+    assert "backup-active-arm" in backup_service
+    assert "--queue-state @QUEUE_STATE@" in backup_service
+    assert "Persistent=true" in backup_timer
+    assert "edgeconnect-startrain-@QUEUE_ID@-replay-backup.service" in backup_timer
 
 
 @pytest.mark.parametrize(
@@ -461,6 +571,144 @@ def test_queue_runs_exclusively_persists_completion_and_finalizes(
                 pass
 
 
+def test_queue_records_verified_final_replay_backups(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    deployment = _deployment(tmp_path, replay_backup=True)
+    backup_roots: list[Path] = []
+
+    def backup(
+        run_root: Path,
+        *,
+        retain: int,
+        max_total_bytes: int,
+    ) -> tuple[Path, dict[str, object]]:
+        assert retain == 3
+        assert max_total_bytes == 20 * 1024 * 1024 * 1024
+        backup_roots.append(run_root)
+        destination = (
+            run_root
+            / "recovery"
+            / "replay-manifest"
+            / f"manifest-{len(backup_roots)}.sqlite3"
+        )
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(b"verified-backup")
+        pointer = {
+            "schema_version": 1,
+            "path": destination.name,
+            "bytes": destination.stat().st_size,
+            "sha256": "a" * 64,
+            "created_ns": len(backup_roots),
+        }
+        _write_json(destination.parent / "latest.json", pointer)
+        return destination, {**pointer, "path": str(destination)}
+
+    monkeypatch.setattr(queue_module, "create_backup_with_evidence", backup)
+    state = run_ablation_queue(
+        deployment.manifest,
+        arm_runner=lambda **_kwargs: _complete_report(),
+        current_source_commit=SOURCE_COMMIT,
+        source_tree_clean=True,
+    )
+
+    assert len(backup_roots) == 2
+    assert state["queue_status"] == "completed"
+    for arm in _arms(state).values():
+        backup_state = arm["replay_backup"]
+        assert backup_state["enabled"] is True
+        assert backup_state["latest"]["status"] == "completed"
+        assert backup_state["latest"]["sha256"] == "a" * 64
+        assert len(backup_state["attempts"]) == 1
+    comparison = json.loads(deployment.comparison.read_text(encoding="utf-8"))
+    assert all(
+        arm["replay_backup"]["latest"]["status"] == "completed"
+        for arm in comparison["queue"]["arms"]
+    )
+
+
+@pytest.mark.parametrize(
+    "backup_error",
+    (
+        RuntimeError("backup disk unavailable"),
+        sqlite3.OperationalError("backup database is locked"),
+    ),
+)
+def test_final_replay_backup_failure_does_not_rewrite_arm_outcome(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    backup_error: Exception,
+) -> None:
+    deployment = _deployment(tmp_path, replay_backup=True)
+
+    def fail_backup(
+        *_args: object, **_kwargs: object
+    ) -> tuple[Path, dict[str, object]]:
+        raise backup_error
+
+    monkeypatch.setattr(queue_module, "create_backup_with_evidence", fail_backup)
+    state = run_ablation_queue(
+        deployment.manifest,
+        arm_runner=lambda **_kwargs: _complete_report(),
+        current_source_commit=SOURCE_COMMIT,
+        source_tree_clean=True,
+    )
+
+    assert state["queue_status"] == "completed"
+    for arm in _arms(state).values():
+        assert arm["status"] == "completed"
+        assert arm["replay_backup"]["latest"]["status"] == "failed"
+        assert str(backup_error) in arm["replay_backup"]["latest"]["error"]
+
+
+def test_terminal_arm_reconciles_missing_final_backup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_root = tmp_path / "terminal-arm"
+    _write_json(run_root / "ablation.json", {"replay_restore": {"status": "verified"}})
+    destination = run_root / "recovery" / "replay-manifest" / "manifest-final.sqlite3"
+    destination.parent.mkdir(parents=True)
+    destination.write_bytes(b"backup")
+
+    monkeypatch.setattr(
+        queue_module,
+        "create_backup_with_evidence",
+        lambda *_args, **_kwargs: (
+            destination,
+            {
+                "bytes": 6,
+                "sha256": "c" * 64,
+                "created_ns": 1,
+            },
+        ),
+    )
+    state = {
+        "arms": [
+            {
+                "status": "completed",
+                "run_root": str(run_root),
+                "replay_restore": None,
+                "replay_backup": None,
+            }
+        ]
+    }
+
+    queue_module._ensure_terminal_replay_backups(
+        state,
+        policy={
+            "enabled": True,
+            "interval_seconds": 3_600.0,
+            "retain": 3,
+            "max_total_bytes": 20 * 1024 * 1024 * 1024,
+        },
+    )
+    arm = state["arms"][0]
+    assert arm["replay_restore"] == {"status": "verified"}
+    assert arm["replay_backup"]["latest"]["status"] == "completed"
+
+
 def test_queue_retries_transient_crash_then_resumes_same_arm(tmp_path: Path) -> None:
     deployment = _deployment(tmp_path)
     calls = 0
@@ -489,6 +737,55 @@ def test_queue_retries_transient_crash_then_resumes_same_arm(tmp_path: Path) -> 
     assert control["attempts"] == 2
     assert control["transient_failures"] == 1
     assert control["status"] == "completed"
+
+
+def test_replay_backup_history_is_preserved_across_transient_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    deployment = _deployment(tmp_path, replay_backup=True)
+    runner_calls = 0
+    backup_calls = 0
+
+    def runner(**_kwargs: object) -> dict[str, object]:
+        nonlocal runner_calls
+        runner_calls += 1
+        return _transient_report() if runner_calls == 1 else _complete_report()
+
+    def backup(run_root: Path, **_kwargs: object) -> tuple[Path, dict[str, object]]:
+        nonlocal backup_calls
+        backup_calls += 1
+        destination = (
+            run_root
+            / "recovery"
+            / "replay-manifest"
+            / f"manifest-{backup_calls}.sqlite3"
+        )
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(b"backup")
+        pointer = {
+            "schema_version": 1,
+            "path": destination.name,
+            "bytes": 6,
+            "sha256": "b" * 64,
+            "created_ns": backup_calls,
+        }
+        _write_json(destination.parent / "latest.json", pointer)
+        return destination, {**pointer, "path": str(destination)}
+
+    monkeypatch.setattr(queue_module, "create_backup_with_evidence", backup)
+    state = run_ablation_queue(
+        deployment.manifest,
+        arm_runner=runner,
+        current_source_commit=SOURCE_COMMIT,
+        source_tree_clean=True,
+    )
+    control = _arms(state)["control"]
+
+    assert state["queue_status"] == "completed"
+    assert runner_calls == backup_calls == 3
+    assert len(control["replay_backup"]["attempts"]) == 2
+    assert control["replay_backup"]["latest"]["status"] == "completed"
 
 
 def test_budget_completion_with_verified_teardown_warning_is_completed(

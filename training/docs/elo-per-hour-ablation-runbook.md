@@ -144,6 +144,8 @@ their final systemd paths:
 
 - `deploy/edgeconnect-startrain-ablation-queue.service.example`
 - `deploy/edgeconnect-startrain-ablation-finalize.service.example`
+- `deploy/edgeconnect-startrain-ablation-replay-backup.service.example`
+- `deploy/edgeconnect-startrain-ablation-replay-backup.timer.example`
 
 Both rendered units must reference the same deployment manifest and environment
 file. The environment file can contain host-specific settings, but it must be
@@ -160,6 +162,10 @@ python scripts/run_elo_ablation_queue.py manifest \
   --training-dir "$PWD" \
   --queue-unit /etc/systemd/system/edgeconnect-startrain-ablation-queue.service \
   --finalize-unit /etc/systemd/system/edgeconnect-startrain-ablation-finalize.service \
+  --replay-backup-service-unit /etc/systemd/system/edgeconnect-startrain-ablation-seed17-replay-backup.service \
+  --replay-backup-timer-unit /etc/systemd/system/edgeconnect-startrain-ablation-seed17-replay-backup.timer \
+  --replay-backup-interval-seconds 3600 \
+  --replay-backup-retain 3 \
   --environment-file /etc/edgeconnect/elo-ablation-seed17.env \
   --state /var/lib/edgeconnect/elo-ablation-seed17/queue.json \
   --comparison-output /var/lib/edgeconnect/elo-ablation-seed17/comparison.json \
@@ -169,11 +175,12 @@ python scripts/run_elo_ablation_queue.py manifest \
 ```
 
 The manifest pins the Git commit and clean-tree requirement, plan and installed
-profiles, queue/runner/comparator scripts, rendered systemd units, environment
-file, and seed snapshot identity, model/recovery pointers, and replay ledger.
-Generation refuses a dirty checkout when it infers `HEAD`. Every launch verifies
-the commit and all digests again; a mixed-revision launch is refused before an
-arm starts.
+profiles, queue/runner/comparator/backup scripts, rendered systemd units,
+environment file, and seed snapshot identity, model/recovery pointers, and
+replay ledger. Backup flags are optional for old or short diagnostic manifests;
+use them for every unattended queue. Generation refuses a dirty checkout when
+it infers `HEAD`. Every launch verifies the commit and all digests again; a
+mixed-revision launch is refused before an arm starts.
 
 Verify the exact installed deployment before enabling it:
 
@@ -188,10 +195,11 @@ instead.
 
 ## Run and recover the queue
 
-Start only the queue unit on the 8-H100 host:
+Enable the queue and its rendered replay-backup timer on the 8-H100 host:
 
 ```bash
 sudo systemctl daemon-reload
+sudo systemctl enable --now edgeconnect-startrain-ablation-seed17-replay-backup.timer
 sudo systemctl enable --now edgeconnect-startrain-ablation-queue.service
 ```
 
@@ -202,6 +210,16 @@ protects the state, while the shared execution lock allows only one ablation
 deployment to use the host. Use the same execution-lock path for every
 deployment on that host. On restart, a stale `running` arm is reconciled from
 `ablation.json` and resumed rather than skipped.
+
+The timer reads `queue.json` but never writes it. It backs up only the single
+arm whose status is `running`, uses a non-blocking per-run file lock to avoid
+overlap with manual or arm-boundary backups, and no-ops during transitions or
+after queue completion. Each arm runner performs a fail-closed replay integrity
+check and restores only a verified rotating backup before state preflight. The
+queue attempts one final verified backup after every arm attempt and records
+its status in queue and comparison evidence. A final backup failure is visible
+but cannot rewrite a completed measurement; corrupt replay with no valid backup
+blocks the arm before the orchestrator starts.
 
 The per-arm runner records one of these durable outcomes:
 
@@ -239,7 +257,8 @@ python scripts/run_elo_ablation.py \
 ```
 
 The direct runner uses the same durable attempt metadata and resumes only a
-`running` or `transient_crash` measurement. It refuses completed and fatal arms.
+`running` or `transient_crash` measurement. It performs the same fail-closed
+replay restore before state preflight and refuses completed and fatal arms.
 
 ## Always-run finalization
 

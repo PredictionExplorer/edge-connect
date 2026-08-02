@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import signal
+import sys
 import time
 from pathlib import Path
 
@@ -34,6 +35,7 @@ def _successful_state_preflight(monkeypatch: pytest.MonkeyPatch) -> None:
             "mode": "apply" if apply else "dry-run",
         },
     )
+    monkeypatch.setattr(run_module, "restore_if_corrupt", lambda _root: None)
 
 
 def test_evaluator_rows_incrementally_reads_actor_metrics(tmp_path: Path) -> None:
@@ -62,6 +64,140 @@ def test_evaluator_rows_incrementally_reads_actor_metrics(tmp_path: Path) -> Non
     with first.open("a", encoding="utf-8") as stream:
         stream.write("}\n")
     assert tracker.refresh() == 50
+
+
+def test_runner_restores_replay_before_state_preflight(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, profile = _forked_run(tmp_path)
+    metadata_path = root / "ablation.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    started_ns = time.time_ns() - 2_000_000_000
+    metadata.update(
+        {
+            "wall_budget_seconds": 0.01,
+            "measurement_started_ns": started_ns,
+            "measurement_status": "retryable",
+            "measurement_outcome": TRANSIENT_CRASH,
+            "measurement_attempts": [],
+        }
+    )
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+    restored = root / "recovery" / "replay-manifest" / "manifest-restored.sqlite3"
+    events: list[str] = []
+
+    def restore(run_root: Path) -> Path:
+        assert run_root == root
+        events.append("restore")
+        return restored
+
+    def preflight(_root: Path, _profile: Path, *, apply: bool):
+        assert apply is True
+        events.append("preflight")
+        return {"status": "ok", "mode": "apply"}
+
+    monkeypatch.setattr(run_module, "restore_if_corrupt", restore)
+    monkeypatch.setattr(run_module, "run_state_preflight", preflight)
+
+    report = run_elo_ablation(
+        config_path=profile,
+        orchestrator=sys.executable,
+        poll_seconds=0.01,
+    )
+
+    assert report["status"] == "complete"
+    assert events == ["restore", "preflight"]
+    persisted = json.loads(metadata_path.read_text(encoding="utf-8"))
+    assert persisted["replay_restore"]["latest"]["status"] == "restored"
+    assert persisted["replay_restore"]["latest"]["restored_from"] == str(restored)
+    assert len(persisted["replay_restore"]["attempts"]) == 1
+
+
+def test_runner_fails_closed_when_replay_cannot_be_restored(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _root, profile = _forked_run(tmp_path)
+    preflight_called = False
+
+    def failed_restore(_run_root: Path) -> None:
+        raise RuntimeError("corrupt replay has no valid backup")
+
+    def preflight(_root: Path, _profile: Path, *, apply: bool):
+        nonlocal preflight_called
+        del apply
+        preflight_called = True
+        return {"status": "ok"}
+
+    monkeypatch.setattr(run_module, "restore_if_corrupt", failed_restore)
+    monkeypatch.setattr(run_module, "run_state_preflight", preflight)
+
+    with pytest.raises(RuntimeError, match="no valid backup"):
+        run_elo_ablation(
+            config_path=profile,
+            orchestrator=sys.executable,
+            poll_seconds=0.01,
+        )
+    assert preflight_called is False
+
+
+def test_runner_persists_restore_evidence_before_preflight_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, profile = _forked_run(tmp_path)
+    restored = root / "recovery" / "replay-manifest" / "manifest-restored.sqlite3"
+    monkeypatch.setattr(run_module, "restore_if_corrupt", lambda _root: restored)
+
+    def failed_preflight(_root: Path, _profile: Path, *, apply: bool):
+        assert apply is True
+        raise RuntimeError("state preflight failed")
+
+    monkeypatch.setattr(run_module, "run_state_preflight", failed_preflight)
+
+    with pytest.raises(RuntimeError, match="state preflight failed"):
+        run_elo_ablation(
+            config_path=profile,
+            orchestrator=sys.executable,
+            poll_seconds=0.01,
+        )
+    persisted = json.loads((root / "ablation.json").read_text(encoding="utf-8"))
+    assert persisted["replay_restore"]["latest"]["status"] == "restored"
+    assert persisted["replay_restore"]["latest"]["restored_from"] == str(restored)
+
+
+def test_terminal_measurement_is_rejected_before_replay_restore(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, profile = _forked_run(tmp_path)
+    metadata_path = root / "ablation.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata.update(
+        {
+            "measurement_started_ns": 1,
+            "measurement_status": "complete",
+            "measurement_outcome": BUDGET_COMPLETION,
+        }
+    )
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+    restore_called = False
+
+    def restore(_root: Path) -> None:
+        nonlocal restore_called
+        restore_called = True
+
+    monkeypatch.setattr(run_module, "restore_if_corrupt", restore)
+
+    with pytest.raises(RuntimeError, match="already completed"):
+        run_elo_ablation(
+            config_path=profile,
+            orchestrator=sys.executable,
+            poll_seconds=0.01,
+        )
+    assert restore_called is False
+    assert "replay_restore" not in json.loads(metadata_path.read_text(encoding="utf-8"))
 
 
 def _forked_run(tmp_path: Path) -> tuple[Path, Path]:
@@ -171,6 +307,7 @@ while not stopping:
     assert metadata["measurement_attempt_count"] == 1
     assert metadata["measurement_attempts"][0]["outcome"] == BUDGET_COMPLETION
     assert metadata["state_preflight"] == {"status": "ok", "mode": "apply"}
+    assert metadata["replay_restore"]["latest"]["status"] == "uninitialized"
     assert signal.getsignal(signal.SIGINT) == previous_sigint
     assert signal.getsignal(signal.SIGTERM) == previous_sigterm
 
@@ -470,6 +607,9 @@ while not stopping:
         TRANSIENT_CRASH,
         BUDGET_COMPLETION,
     ]
+    restore_history = persisted["replay_restore"]["attempts"]
+    assert [attempt["attempt"] for attempt in restore_history] == [1, 2]
+    assert persisted["replay_restore"]["latest"] == restore_history[-1]
 
 
 def test_runner_recovers_unfinalized_attempt_without_resetting_wall_clock(

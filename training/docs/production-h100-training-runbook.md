@@ -31,6 +31,10 @@ The supplied layouts are single-host profiles:
 - `configs/h100-8gpu-throughput.yaml` keeps that physical role layout, runs
   two actor lanes on GPUs 1–6, keeps GPU 7 single-lane for pause sharing, and
   applies the measured target host's NUMA affinity.
+- `configs/h100-8gpu-learner-shared.yaml` preserves the throughput treatment,
+  runs two actor lanes on GPUs 1–7, and pause-shares learner GPU 0 with
+  arena/promotion. It is an opt-in topology experiment and must use one-wave
+  leases, a 30-minute catch-up interval, and disabled historical evaluation.
 - `configs/h100-8gpu-autonomous.yaml` runs two actor lanes on GPUs 1–7 and
   pause-shares learner GPU 0 with arena/promotion. The learner releases unused
   CUDA cache before each bounded one-wave arena lease and catches up for 30
@@ -73,6 +77,8 @@ The current profiles allocate these CPU-thread budgets:
 - optimized 8-GPU profile: 16 learner + 56 actor + 8 arena = 80 threads.
 - throughput 8-GPU profile: 16 learner + 104 actor-lane + 8 arena threads =
   128 configured threads; the arena and GPU-7 actor do not run concurrently.
+- learner-shared 8-GPU profile: 16 learner + 112 actor-lane + 8 arena threads =
+  136 configured threads; learner and arena do not compute concurrently.
 - autonomous 8-GPU profile: 16 learner + 112 actor-lane + 8 arena threads =
   136 configured threads; learner and arena do not compute concurrently.
 - 4-GPU profile: 24 learner + 24 actor + 8 arena = 56 threads.
@@ -317,9 +323,19 @@ export SOURCE_PROFILE="configs/h100-8gpu.yaml"
 # Strict autonomous scratch training on eight H100s:
 # export SOURCE_PROFILE="configs/h100-8gpu-autonomous.yaml"
 
+# Opt-in learner-shared throughput experiment on eight H100s:
+# export SOURCE_PROFILE="configs/h100-8gpu-learner-shared.yaml"
+
 # Four to seven H100s; consumes GPU IDs 0-3:
 # export SOURCE_PROFILE="configs/h100-4gpu.yaml"
 ```
+
+The learner-shared profile is for a fresh frozen run root. It deliberately
+leaves the default throughput profile unchanged, and the non-autonomous
+migrator does not allow an initialized run to change GPU ownership. Validate it
+with `validate_continuous_profile.py`, then require a bounded H100 canary with
+zero learner restarts, clean pause/resume evidence, and a retained-sample plus
+Elo/hour improvement before adopting it.
 
 Create a unique UTC run ID, absolute run root, and copied profile:
 

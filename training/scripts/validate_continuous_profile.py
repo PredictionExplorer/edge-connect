@@ -8,6 +8,24 @@ import argparse
 from startrain.config import ExperimentConfig, load_config
 
 
+def _validate_learner_shared_promotion(config: ExperimentConfig) -> None:
+    promotion = config.orchestration.promotion
+    learner_gpu_ids = {
+        gpu.gpu_id for gpu in config.orchestration.gpus if gpu.role == "learner"
+    }
+    if promotion.gpu_id not in learner_gpu_ids:
+        return
+    if (
+        promotion.max_waves_per_lease != 1
+        or promotion.inter_wave_cooldown_seconds < 1_800
+        or config.orchestration.historical_evaluation.enabled
+    ):
+        raise ValueError(
+            "continuous learner-shared promotion requires one-wave leases, "
+            "a 30-minute catch-up interval, and disabled historical evaluation"
+        )
+
+
 def _validate_autonomous_config(config: ExperimentConfig) -> None:
     autonomous = config.orchestration.autonomous
     if not autonomous.enabled:
@@ -78,19 +96,6 @@ def _validate_autonomous_config(config: ExperimentConfig) -> None:
         or historical.max_pairs_per_ring > 10
     ):
         raise ValueError("autonomous historical evaluation exceeds its compute budget")
-    promotion = config.orchestration.promotion
-    learner_gpu_ids = {
-        gpu.gpu_id for gpu in config.orchestration.gpus if gpu.role == "learner"
-    }
-    if promotion.gpu_id in learner_gpu_ids and (
-        promotion.max_waves_per_lease != 1
-        or promotion.inter_wave_cooldown_seconds < 1_800
-        or historical.enabled
-    ):
-        raise ValueError(
-            "autonomous learner-shared promotion requires one-wave leases, "
-            "a 30-minute catch-up interval, and disabled historical evaluation"
-        )
     if config.arena.max_considered < 48:
         raise ValueError("autonomous arena must evaluate a broad action set")
 
@@ -187,6 +192,7 @@ def validate_continuous_config(config: ExperimentConfig) -> None:
         or retention.recovery_checkpoints <= 0
     ):
         raise ValueError("continuous service requires bounded active retention")
+    _validate_learner_shared_promotion(config)
     if config.orchestration.autonomous.enabled:
         _validate_autonomous_config(config)
     else:

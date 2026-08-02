@@ -806,6 +806,13 @@ def test_learner_shared_promotion_yields_after_one_wave_and_cools_down(
     now_ns = [1_000_000_000]
     case.supervisor.wall_clock_ns = lambda: now_ns[0]
 
+    @contextmanager
+    def release_after_cleanup(**_options):
+        case.state.lease_entries += 1
+        yield
+        now_ns[0] += 5_000_000_000
+
+    monkeypatch.setattr(case.supervisor, "_gpu_pause", release_after_cleanup)
     evaluated, state = case.supervisor._evaluate_candidate_session(
         candidate=case.candidate,
         champion=case.champion,
@@ -819,7 +826,9 @@ def test_learner_shared_promotion_yields_after_one_wave_and_cools_down(
     assert state == "lease_yield"
     assert case.state.lease_entries == 1
     assert len(json.loads(case.result_path.read_text())["pairs"]) == 2
-    assert case.supervisor.cooldown_path.is_file()
+    cooldown = json.loads(case.supervisor.cooldown_path.read_text(encoding="utf-8"))
+    assert cooldown["created_ns"] == 6_000_000_000
+    assert cooldown["not_before_ns"] == 36_000_000_000
     sleeps = []
 
     def sleep(seconds: float) -> None:

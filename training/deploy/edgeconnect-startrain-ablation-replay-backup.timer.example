@@ -1,0 +1,12 @@
+[Unit]
+Description=Periodic EdgeConnect Elo-ablation replay-ledger backup
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=@REPLAY_BACKUP_INTERVAL_SECONDS@s
+RandomizedDelaySec=5min
+Persistent=true
+Unit=edgeconnect-startrain-@QUEUE_ID@-replay-backup.service
+
+[Install]
+WantedBy=timers.target

@@ -84,6 +84,9 @@ The supplied layouts are single-host profiles:
 - `configs/h100-8gpu-throughput.yaml`: GPU 0 learner, two actor lanes on
   GPUs 1–6, one pause-shared actor/arena lane on GPU 7, and target-host NUMA
   affinity.
+- `configs/h100-8gpu-learner-shared.yaml`: the same throughput treatment with
+  two actor lanes on GPUs 1–7 and bounded learner/arena pause-sharing on GPU 0.
+  It is an opt-in topology experiment, not the default throughput profile.
 - `configs/h100-8gpu-autonomous.yaml`: two actor lanes on GPUs 1–7 with
   learner/arena pause-sharing on GPU 0, enforced random initialization,
   self-play-only provenance, a bounded update-to-data ratio,
@@ -320,6 +323,21 @@ candidates are spaced far enough apart for a complete arena decision, and the
 active candidate keeps its evidence when a newer checkpoint appears. Small
 post-minimum continuation waves persist frequently and can terminate as soon as
 the anytime-valid gate resolves.
+
+The learner-shared topology is also available as an explicit one-factor
+experiment:
+
+```bash
+startrain-orchestrate --config configs/h100-8gpu-learner-shared.yaml
+```
+
+It preserves the throughput profile's training and search settings, runs two
+actor lanes on every GPU 1–7, and moves promotion to GPU 0. Each arena lease is
+limited to one wave; the learner checkpoints, suspends its replay prefetcher,
+releases CUDA cache, and receives at least 30 minutes to catch up before another
+unresolved wave. Use a fresh frozen run root and certify retained samples and
+Elo per provisioned wall-hour before adopting it. Do not migrate a live run or
+replace the default profile from utilization alone.
 
 Before changing the learner batch on an initialized run, stop the coordinator and
 benchmark the verified recovery checkpoint against read-only replay:

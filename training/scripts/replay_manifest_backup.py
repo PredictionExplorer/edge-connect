@@ -4,17 +4,47 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import json
+import math
 import os
 import shutil
 import sqlite3
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 from startrain.contracts import FEATURE_SCHEMA_HASH, RULES_HASH_WIRE
 from startrain.replay_store import MANIFEST_SCHEMA_VERSION
 from startrain.runtime import atomic_json
+
+
+class BackupLockBusy(RuntimeError):
+    """Raised when another process owns a run's replay-backup lock."""
+
+
+@contextmanager
+def backup_lock(run_root: Path, *, blocking: bool = True) -> Iterator[Path]:
+    backup_directory = run_root / "recovery" / "replay-manifest"
+    backup_directory.mkdir(parents=True, exist_ok=True)
+    lock_path = backup_directory / ".backup.lock"
+    descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    operation = fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB)
+    try:
+        try:
+            fcntl.flock(descriptor, operation)
+        except BlockingIOError as exc:
+            raise BackupLockBusy(
+                f"replay backup is already active for {run_root}"
+            ) from exc
+        yield lock_path
+    finally:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
 
 
 def _run_identity(run_root: Path) -> tuple[str, str]:
@@ -128,7 +158,7 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def create_backup(
+def _create_backup_locked(
     run_root: Path,
     *,
     retain: int,
@@ -199,6 +229,8 @@ def create_backup(
                 "initialized_ns": time.time_ns(),
             },
         )
+    except sqlite3.Error as exc:
+        raise RuntimeError(f"SQLite replay backup failed: {exc}") from exc
     finally:
         temporary.unlink(missing_ok=True)
     backups = sorted(
@@ -218,7 +250,76 @@ def create_backup(
     return destination
 
 
-def restore_if_corrupt(run_root: Path) -> Path | None:
+def _backup_evidence_locked(destination: Path) -> dict[str, object]:
+    latest_path = destination.parent / "latest.json"
+    try:
+        latest = json.loads(latest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            f"cannot read replay backup pointer {latest_path}: {exc}"
+        ) from exc
+    if not isinstance(latest, dict) or latest.get("schema_version") != 1:
+        raise RuntimeError("replay backup pointer is invalid")
+    if latest.get("path") != destination.name:
+        raise RuntimeError("replay backup pointer does not reference the new backup")
+    size = destination.stat().st_size
+    digest = _sha256(destination)
+    if latest.get("bytes") != size or latest.get("sha256") != digest:
+        raise RuntimeError("replay backup pointer metadata disagrees with the artifact")
+    created_ns = latest.get("created_ns")
+    if (
+        isinstance(created_ns, bool)
+        or not isinstance(created_ns, int)
+        or created_ns <= 0
+    ):
+        raise RuntimeError("replay backup pointer timestamp is invalid")
+    return {
+        "schema_version": 1,
+        "path": str(destination),
+        "bytes": size,
+        "sha256": digest,
+        "created_ns": created_ns,
+    }
+
+
+def create_backup_with_evidence(
+    run_root: Path,
+    *,
+    retain: int,
+    max_total_bytes: int = 20 * 1024 * 1024 * 1024,
+    blocking: bool = True,
+) -> tuple[Path, dict[str, object]]:
+    if retain <= 0:
+        raise ValueError("retain must be positive")
+    if max_total_bytes <= 0:
+        raise ValueError("max_total_bytes must be positive")
+    root = run_root.expanduser().resolve()
+    with backup_lock(root, blocking=blocking):
+        destination = _create_backup_locked(
+            root,
+            retain=retain,
+            max_total_bytes=max_total_bytes,
+        )
+        return destination, _backup_evidence_locked(destination)
+
+
+def create_backup(
+    run_root: Path,
+    *,
+    retain: int,
+    max_total_bytes: int = 20 * 1024 * 1024 * 1024,
+    blocking: bool = True,
+) -> Path:
+    destination, _ = create_backup_with_evidence(
+        run_root,
+        retain=retain,
+        max_total_bytes=max_total_bytes,
+        blocking=blocking,
+    )
+    return destination
+
+
+def _restore_if_corrupt_locked(run_root: Path) -> Path | None:
     replay_directory = run_root / "replay"
     manifest = replay_directory / "manifest.sqlite3"
     initialized = replay_directory / "initialized.json"
@@ -288,10 +389,91 @@ def restore_if_corrupt(run_root: Path) -> Path | None:
     return selected
 
 
+def restore_if_corrupt(run_root: Path, *, blocking: bool = True) -> Path | None:
+    root = run_root.expanduser().resolve()
+    with backup_lock(root, blocking=blocking):
+        return _restore_if_corrupt_locked(root)
+
+
+def backup_active_arm(
+    queue_state_path: Path,
+    *,
+    interval_seconds: float,
+    retain: int,
+    max_total_bytes: int = 20 * 1024 * 1024 * 1024,
+    now_ns: int | None = None,
+) -> Path | None:
+    if not math.isfinite(interval_seconds) or interval_seconds <= 0:
+        raise ValueError("backup interval must be positive")
+    if retain <= 0:
+        raise ValueError("retain must be positive")
+    if max_total_bytes <= 0:
+        raise ValueError("max_total_bytes must be positive")
+    if now_ns is not None and (
+        isinstance(now_ns, bool) or not isinstance(now_ns, int) or now_ns <= 0
+    ):
+        raise ValueError("now_ns must be a positive integer")
+    state_path = queue_state_path.expanduser().resolve()
+    try:
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            f"cannot read ablation queue state {state_path}: {exc}"
+        ) from exc
+    if not isinstance(state, dict):
+        raise RuntimeError("ablation queue state is not an object")
+    if state.get("queue_status") != "running":
+        return None
+    arms = state.get("arms")
+    if not isinstance(arms, list):
+        raise RuntimeError("ablation queue arms are missing")
+    running = [
+        arm for arm in arms if isinstance(arm, dict) and arm.get("status") == "running"
+    ]
+    if not running:
+        return None
+    if len(running) != 1:
+        raise RuntimeError("ablation queue has multiple running arms")
+    run_root_value = running[0].get("run_root")
+    if not isinstance(run_root_value, str) or not run_root_value:
+        raise RuntimeError("active ablation arm run root is invalid")
+    run_root = Path(run_root_value).expanduser().resolve()
+    captured_ns = time.time_ns() if now_ns is None else now_ns
+    try:
+        with backup_lock(run_root, blocking=False):
+            latest_path = run_root / "recovery" / "replay-manifest" / "latest.json"
+            try:
+                latest = json.loads(latest_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                latest = None
+            if isinstance(latest, dict):
+                created_ns = latest.get("created_ns")
+                if isinstance(created_ns, int) and not isinstance(created_ns, bool):
+                    if created_ns > captured_ns:
+                        raise RuntimeError(
+                            "latest replay backup timestamp is in the future"
+                        )
+                    interval_ns = int(interval_seconds * 1_000_000_000)
+                    if captured_ns - created_ns < interval_ns:
+                        return None
+            return _create_backup_locked(
+                run_root,
+                retain=retain,
+                max_total_bytes=max_total_bytes,
+            )
+    except BackupLockBusy:
+        return None
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("backup", "check-and-restore"))
-    parser.add_argument("--run-root", required=True, type=Path)
+    parser.add_argument(
+        "action",
+        choices=("backup", "check-and-restore", "backup-active-arm"),
+    )
+    parser.add_argument("--run-root", type=Path)
+    parser.add_argument("--queue-state", type=Path)
+    parser.add_argument("--interval-seconds", type=float, default=3_600.0)
     parser.add_argument("--retain", type=int, default=3)
     parser.add_argument(
         "--max-total-bytes",
@@ -303,6 +485,28 @@ def main() -> None:
         parser.error("--retain must be positive")
     if arguments.max_total_bytes <= 0:
         parser.error("--max-total-bytes must be positive")
+    if arguments.action == "backup-active-arm":
+        if arguments.queue_state is None:
+            parser.error("--queue-state is required for backup-active-arm")
+        if arguments.run_root is not None:
+            parser.error("--run-root cannot be used with backup-active-arm")
+        if (
+            not math.isfinite(arguments.interval_seconds)
+            or arguments.interval_seconds <= 0
+        ):
+            parser.error("--interval-seconds must be positive")
+        destination = backup_active_arm(
+            arguments.queue_state,
+            interval_seconds=arguments.interval_seconds,
+            retain=arguments.retain,
+            max_total_bytes=arguments.max_total_bytes,
+        )
+        print(destination if destination is not None else "no backup required")
+        return
+    if arguments.run_root is None:
+        parser.error("--run-root is required")
+    if arguments.queue_state is not None:
+        parser.error("--queue-state requires backup-active-arm")
     run_root = arguments.run_root.expanduser().resolve()
     if arguments.action == "backup":
         destination = create_backup(

@@ -10,6 +10,8 @@ import json
 import math
 import os
 import re
+import shlex
+import sqlite3
 import subprocess
 import time
 from collections.abc import Callable, Iterator, Mapping
@@ -34,6 +36,7 @@ if __package__:
         TRANSIENT_CRASH,
         run_elo_ablation,
     )
+    from .replay_manifest_backup import create_backup_with_evidence
 else:
     from compare_elo_ablation import (
         DEFAULT_GUARD_FLOOR_ELO,
@@ -48,6 +51,7 @@ else:
         TRANSIENT_CRASH,
         run_elo_ablation,
     )
+    from replay_manifest_backup import create_backup_with_evidence
 
 SCHEMA_VERSION = 1
 DEPLOYMENT_REPORT = "startrain-elo-ablation-deployment"
@@ -63,12 +67,14 @@ _CLEAN_TEARDOWN_STATUSES = frozenset(
 )
 _COMMIT_PATTERN = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
-_SCRIPT_NAMES = (
+_BACKUP_SCRIPT_NAME = "replay_manifest_backup.py"
+_BASE_SCRIPT_NAMES = (
     "run_elo_ablation_queue.py",
     "run_staged_elo_pipeline.py",
     "run_elo_ablation.py",
     "compare_elo_ablation.py",
     "preflight_run_state.py",
+    _BACKUP_SCRIPT_NAME,
 )
 
 
@@ -118,6 +124,15 @@ def _parser() -> argparse.ArgumentParser:
     manifest.add_argument("--max-transient-retries", type=int, default=2)
     manifest.add_argument("--retry-delay-seconds", type=float, default=30.0)
     manifest.add_argument("--continue-after-fatal", action="store_true")
+    manifest.add_argument("--replay-backup-service-unit", type=Path)
+    manifest.add_argument("--replay-backup-timer-unit", type=Path)
+    manifest.add_argument("--replay-backup-interval-seconds", type=float)
+    manifest.add_argument("--replay-backup-retain", type=int, default=3)
+    manifest.add_argument(
+        "--replay-backup-max-total-bytes",
+        type=int,
+        default=20 * 1024 * 1024 * 1024,
+    )
     manifest.add_argument(
         "--provisioned-gpus",
         type=int,
@@ -196,6 +211,52 @@ def _nonnegative_integer(value: object, name: str) -> int:
     return value
 
 
+def _positive_integer(value: object, name: str) -> int:
+    parsed = _nonnegative_integer(value, name)
+    if parsed == 0:
+        raise AblationQueueError(f"{name} must be positive")
+    return parsed
+
+
+def _replay_backup_policy(
+    queue: Mapping[str, object],
+) -> dict[str, object] | None:
+    raw = queue.get("replay_backup")
+    if raw is None:
+        return None
+    policy = _mapping(raw, "replay backup policy")
+    if policy.get("enabled") is not True:
+        raise AblationQueueError("replay backup policy must be enabled or omitted")
+    return {
+        "enabled": True,
+        "interval_seconds": _positive_float(
+            policy.get("interval_seconds"),
+            "replay backup interval seconds",
+        ),
+        "retain": _positive_integer(
+            policy.get("retain"),
+            "replay backup retention count",
+        ),
+        "max_total_bytes": _positive_integer(
+            policy.get("max_total_bytes"),
+            "replay backup maximum bytes",
+        ),
+    }
+
+
+def _required_script_names(manifest: Mapping[str, object]) -> tuple[str, ...]:
+    _mapping(manifest.get("queue"), "deployment queue")
+    return _BASE_SCRIPT_NAMES
+
+
+def _required_unit_names(manifest: Mapping[str, object]) -> set[str]:
+    queue = _mapping(manifest.get("queue"), "deployment queue")
+    names = {"queue", "finalize"}
+    if _replay_backup_policy(queue) is not None:
+        names.update({"replay_backup_service", "replay_backup_timer"})
+    return names
+
+
 def _artifact(name: str, path: Path) -> dict[str, object]:
     absolute = Path(os.path.abspath(path.expanduser()))
     if not absolute.is_file():
@@ -218,6 +279,87 @@ def _unit_artifact(name: str, path: Path) -> dict[str, object]:
     if re.search(r"@[A-Z][A-Z0-9_]*@", contents):
         raise AblationQueueError(f"{name} unit still contains template placeholders")
     return _artifact(name, absolute)
+
+
+def _unit_value(path: Path, name: str) -> str:
+    try:
+        lines = path.expanduser().resolve().read_text(encoding="utf-8").splitlines()
+    except OSError as error:
+        raise AblationQueueError(f"cannot read unit {path}: {error}") from error
+    values = [
+        line.partition("=")[2].strip()
+        for line in lines
+        if line.partition("=")[0].strip() == name
+    ]
+    if len(values) != 1 or not values[0]:
+        raise AblationQueueError(f"unit {path} must define exactly one {name}")
+    return values[0]
+
+
+def _validate_replay_backup_units(
+    *,
+    service_unit: Path,
+    timer_unit: Path,
+    backup_script: Path,
+    state_path: Path,
+    policy: Mapping[str, object],
+) -> None:
+    try:
+        command = shlex.split(_unit_value(service_unit, "ExecStart"))
+    except ValueError as error:
+        raise AblationQueueError(
+            f"replay backup ExecStart is invalid: {error}"
+        ) from error
+    if "backup-active-arm" not in command:
+        raise AblationQueueError("replay backup service must run backup-active-arm")
+    script_tokens = [
+        token for token in command if Path(token).name == "replay_manifest_backup.py"
+    ]
+    if len(script_tokens) != 1 or Path(script_tokens[0]).expanduser().resolve() != (
+        backup_script.expanduser().resolve()
+    ):
+        raise AblationQueueError(
+            "replay backup service script differs from the deployed revision"
+        )
+
+    def option(name: str) -> str:
+        try:
+            index = command.index(name)
+            return command[index + 1]
+        except (ValueError, IndexError) as error:
+            raise AblationQueueError(
+                f"replay backup service is missing {name}"
+            ) from error
+
+    configured_state = Path(option("--queue-state")).expanduser().resolve()
+    if configured_state != state_path:
+        raise AblationQueueError("replay backup service queue state path differs")
+    interval = _positive_float(
+        policy.get("interval_seconds"),
+        "replay backup interval seconds",
+    )
+    retain = _positive_integer(
+        policy.get("retain"),
+        "replay backup retention count",
+    )
+    max_total_bytes = _positive_integer(
+        policy.get("max_total_bytes"),
+        "replay backup maximum bytes",
+    )
+    if float(option("--interval-seconds")) != interval:
+        raise AblationQueueError("replay backup service interval differs")
+    if int(option("--retain")) != retain:
+        raise AblationQueueError("replay backup service retention differs")
+    if int(option("--max-total-bytes")) != max_total_bytes:
+        raise AblationQueueError("replay backup service byte cap differs")
+    timer_interval = _unit_value(timer_unit, "OnUnitActiveSec")
+    expected_interval = f"{interval:g}s"
+    if timer_interval != expected_interval:
+        raise AblationQueueError(
+            "replay backup timer interval differs from the manifest policy"
+        )
+    if _unit_value(timer_unit, "Unit") != service_unit.expanduser().resolve().name:
+        raise AblationQueueError("replay backup timer targets a different service")
 
 
 def _git_revision(training_dir: Path) -> tuple[str, bool]:
@@ -459,6 +601,11 @@ def generate_deployment_manifest(
     retry_delay_seconds: float = 30.0,
     continue_after_fatal: bool = False,
     provisioned_gpus: int = DEFAULT_PROVISIONED_GPUS,
+    replay_backup_service_unit: Path | None = None,
+    replay_backup_timer_unit: Path | None = None,
+    replay_backup_interval_seconds: float | None = None,
+    replay_backup_retain: int = 3,
+    replay_backup_max_total_bytes: int = 20 * 1024 * 1024 * 1024,
 ) -> dict[str, object]:
     """Create a manifest that pins every launch-critical deployment artifact."""
     output = output_path.expanduser().resolve()
@@ -511,6 +658,35 @@ def generate_deployment_manifest(
         raise AblationQueueError("continue-after-fatal policy must be boolean")
     if type(provisioned_gpus) is not int or provisioned_gpus <= 0:
         raise AblationQueueError("provisioned GPUs must be a positive integer")
+    replay_backup = None
+    if replay_backup_interval_seconds is None:
+        if (
+            replay_backup_service_unit is not None
+            or replay_backup_timer_unit is not None
+        ):
+            raise AblationQueueError(
+                "replay backup units require a configured backup interval"
+            )
+    else:
+        if replay_backup_service_unit is None or replay_backup_timer_unit is None:
+            raise AblationQueueError(
+                "replay backup requires both service and timer units"
+            )
+        replay_backup = {
+            "enabled": True,
+            "interval_seconds": _positive_float(
+                replay_backup_interval_seconds,
+                "replay backup interval seconds",
+            ),
+            "retain": _positive_integer(
+                replay_backup_retain,
+                "replay backup retention count",
+            ),
+            "max_total_bytes": _positive_integer(
+                replay_backup_max_total_bytes,
+                "replay backup maximum bytes",
+            ),
+        }
     resolved_state = state_path.expanduser().resolve()
     resolved_comparison = comparison_output.expanduser().resolve()
     resolved_handoff = (
@@ -551,8 +727,34 @@ def generate_deployment_manifest(
         raise AblationQueueError("plan guard floor must be finite and negative")
     scripts = [
         _artifact(name.removesuffix(".py"), training / "scripts" / name)
-        for name in _SCRIPT_NAMES
+        for name in _BASE_SCRIPT_NAMES
     ]
+    units = [
+        _unit_artifact("queue", queue_unit),
+        _unit_artifact("finalize", finalize_unit),
+    ]
+    if replay_backup is not None:
+        assert replay_backup_service_unit is not None
+        assert replay_backup_timer_unit is not None
+        _validate_replay_backup_units(
+            service_unit=replay_backup_service_unit,
+            timer_unit=replay_backup_timer_unit,
+            backup_script=training / "scripts" / _BACKUP_SCRIPT_NAME,
+            state_path=resolved_state,
+            policy=replay_backup,
+        )
+        units.extend(
+            (
+                _unit_artifact(
+                    "replay_backup_service",
+                    replay_backup_service_unit,
+                ),
+                _unit_artifact(
+                    "replay_backup_timer",
+                    replay_backup_timer_unit,
+                ),
+            )
+        )
     manifest: dict[str, object] = {
         "schema_version": SCHEMA_VERSION,
         "report": DEPLOYMENT_REPORT,
@@ -566,10 +768,7 @@ def generate_deployment_manifest(
         "seed_snapshot": seed,
         "profiles": profiles,
         "scripts": scripts,
-        "units": [
-            _unit_artifact("queue", queue_unit),
-            _unit_artifact("finalize", finalize_unit),
-        ],
+        "units": units,
         "environment": _artifact("environment", environment_file),
         "queue": {
             "state_path": str(resolved_state),
@@ -590,6 +789,9 @@ def generate_deployment_manifest(
             },
         },
     }
+    if replay_backup is not None:
+        queue_manifest = _mapping(manifest["queue"], "deployment queue")
+        queue_manifest["replay_backup"] = replay_backup
     output.parent.mkdir(parents=True, exist_ok=True)
     atomic_json(output, manifest)
     return manifest
@@ -657,13 +859,14 @@ def _verify_manifest_artifacts(manifest: Mapping[str, object]) -> int:
             )
             count += 1
     scripts = _list(manifest.get("scripts"), "deployment scripts")
-    if len(scripts) != len(_SCRIPT_NAMES):
+    required_scripts = _required_script_names(manifest)
+    if len(scripts) != len(required_scripts):
         raise AblationQueueError("deployment must pin all ablation scripts")
     script_names = {
         _string(_mapping(script, "script").get("name"), "script name")
         for script in scripts
     }
-    if script_names != {name.removesuffix(".py") for name in _SCRIPT_NAMES}:
+    if script_names != {name.removesuffix(".py") for name in required_scripts}:
         raise AblationQueueError("deployment script set is incomplete")
     for index, script in enumerate(scripts):
         _verify_artifact(script, f"script {index}")
@@ -672,8 +875,8 @@ def _verify_manifest_artifacts(manifest: Mapping[str, object]) -> int:
     unit_names = {
         _string(_mapping(unit, "unit").get("name"), "unit name") for unit in units
     }
-    if unit_names != {"queue", "finalize"}:
-        raise AblationQueueError("deployment must pin queue and finalize units")
+    if unit_names != _required_unit_names(manifest):
+        raise AblationQueueError("deployment unit set is incomplete")
     for index, unit in enumerate(units):
         _verify_artifact(unit, f"unit {index}")
         count += 1
@@ -872,6 +1075,7 @@ def _queue_config(manifest: Mapping[str, object]) -> dict[str, Any]:
     )
     if type(policy.get("continue_after_fatal")) is not bool:
         raise AblationQueueError("continue-after-fatal policy must be boolean")
+    _replay_backup_policy(queue)
     comparison = _mapping(queue.get("comparison"), "comparison configuration")
     if (
         type(comparison.get("provisioned_gpus")) is not int
@@ -951,6 +1155,8 @@ def _initial_state(
             "completion_status": None,
             "lifecycle_warnings": [],
             "quarantine": None,
+            "replay_restore": None,
+            "replay_backup": None,
         }
         for arm in _manifest_arms(manifest)
     ]
@@ -1059,6 +1265,8 @@ def _load_or_create_state(
             "completion_status",
             "lifecycle_warnings",
             "quarantine",
+            "replay_restore",
+            "replay_backup",
         ):
             arm.setdefault(field, None)
     finalization = _mapping(state.get("finalization"), "queue finalization")
@@ -1645,6 +1853,8 @@ def _finalize_locked(
                         "completion_status",
                         "lifecycle_warnings",
                         "quarantine",
+                        "replay_restore",
+                        "replay_backup",
                     )
                 }
                 for arm in _state_arms(state)
@@ -1689,6 +1899,10 @@ def finalize_ablation_queue(manifest_path: Path) -> dict[str, object]:
             manifest=manifest,
         )
         _reconcile_arms(state)
+        _ensure_terminal_replay_backups(
+            state,
+            policy=_replay_backup_policy(_queue_config(manifest)),
+        )
         if state.get("queue_status") in {"pending", "running"}:
             state["queue_status"] = _reconciled_queue_status(state)
         _save_state(state_path, state)
@@ -1704,6 +1918,97 @@ def finalize_ablation_queue(manifest_path: Path) -> dict[str, object]:
                 state=state,
                 manifest=manifest,
             )
+
+
+def _record_replay_restore(arm: dict[str, Any]) -> None:
+    metadata_path = Path(str(arm["run_root"])) / "ablation.json"
+    try:
+        metadata = _read_json(metadata_path)
+    except AblationQueueError:
+        return
+    restore = metadata.get("replay_restore")
+    arm["replay_restore"] = dict(restore) if isinstance(restore, Mapping) else None
+
+
+def _record_final_replay_backup(
+    arm: dict[str, Any],
+    *,
+    policy: Mapping[str, object] | None,
+) -> None:
+    if policy is None:
+        return
+    attempted_ns = time.time_ns()
+    run_root = Path(str(arm["run_root"])).expanduser().resolve()
+    try:
+        destination, evidence = create_backup_with_evidence(
+            run_root,
+            retain=_positive_integer(
+                policy.get("retain"),
+                "replay backup retention count",
+            ),
+            max_total_bytes=_positive_integer(
+                policy.get("max_total_bytes"),
+                "replay backup maximum bytes",
+            ),
+        )
+        record: dict[str, object] = {
+            "schema_version": SCHEMA_VERSION,
+            "status": "completed",
+            "attempted_ns": attempted_ns,
+            "completed_ns": time.time_ns(),
+            "path": str(destination),
+            "bytes": evidence.get("bytes"),
+            "sha256": evidence.get("sha256"),
+            "created_ns": evidence.get("created_ns"),
+            "error": None,
+        }
+    except (
+        OSError,
+        RuntimeError,
+        ValueError,
+        sqlite3.Error,
+        AblationQueueError,
+    ) as error:
+        record = {
+            "schema_version": SCHEMA_VERSION,
+            "status": "failed",
+            "attempted_ns": attempted_ns,
+            "completed_ns": time.time_ns(),
+            "path": None,
+            "bytes": None,
+            "sha256": None,
+            "created_ns": None,
+            "error": f"{type(error).__name__}: {error}",
+        }
+    previous = arm.get("replay_backup")
+    history = (
+        list(previous.get("attempts", []))
+        if isinstance(previous, Mapping) and isinstance(previous.get("attempts"), list)
+        else []
+    )
+    history.append(record)
+    arm["replay_backup"] = {
+        "schema_version": SCHEMA_VERSION,
+        "enabled": True,
+        "latest": record,
+        "attempts": history,
+    }
+
+
+def _ensure_terminal_replay_backups(
+    state: dict[str, Any],
+    *,
+    policy: Mapping[str, object] | None,
+) -> None:
+    if policy is None:
+        return
+    for arm in _state_arms(state):
+        if arm.get("status") not in {"completed", "failed", "quarantined"}:
+            continue
+        if arm.get("replay_backup") is not None:
+            continue
+        _record_replay_restore(arm)
+        _record_final_replay_backup(arm, policy=policy)
 
 
 def _apply_arm_report(
@@ -1757,6 +2062,7 @@ def run_ablation_queue(
     resolved_manifest, manifest = _load_deployment_manifest(manifest_path)
     queue = _queue_config(manifest)
     policy = _mapping(queue.get("policy"), "queue policy")
+    replay_backup_policy = _replay_backup_policy(queue)
     state_path = _state_path(manifest)
     execution_lock_path = Path(
         _string(queue.get("execution_lock_path"), "execution lock path")
@@ -1777,6 +2083,10 @@ def run_ablation_queue(
                 source_tree_clean=source_tree_clean,
             )
             _reconcile_arms(state)
+            _ensure_terminal_replay_backups(
+                state,
+                policy=replay_backup_policy,
+            )
             failed = [
                 arm for arm in _state_arms(state) if arm.get("status") == "failed"
             ]
@@ -1833,6 +2143,11 @@ def run_ablation_queue(
                         report,
                         policy=policy,
                     )
+                _record_replay_restore(pending)
+                _record_final_replay_backup(
+                    pending,
+                    policy=replay_backup_policy,
+                )
                 _save_state(state_path, state)
                 if action == "interrupted":
                     state["queue_status"] = "pending"
@@ -1936,6 +2251,13 @@ def main(argv: list[str] | None = None) -> int:
                 retry_delay_seconds=arguments.retry_delay_seconds,
                 continue_after_fatal=arguments.continue_after_fatal,
                 provisioned_gpus=arguments.provisioned_gpus,
+                replay_backup_service_unit=arguments.replay_backup_service_unit,
+                replay_backup_timer_unit=arguments.replay_backup_timer_unit,
+                replay_backup_interval_seconds=(
+                    arguments.replay_backup_interval_seconds
+                ),
+                replay_backup_retain=arguments.replay_backup_retain,
+                replay_backup_max_total_bytes=(arguments.replay_backup_max_total_bytes),
             )
             status = 0
         elif arguments.command == "verify":

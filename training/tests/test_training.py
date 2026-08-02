@@ -165,6 +165,67 @@ def test_yaml_configs_load_strictly() -> None:
     assert throughput.orchestration.promotion.finish_inflight_candidate is True
     assert throughput.arena.continuation_pairs_per_ring == 25
     validate_continuous_config(throughput)
+    learner_shared = load_config(CONFIGS / "h100-8gpu-learner-shared.yaml")
+    assert [gpu.gpu_id for gpu in learner_shared.orchestration.actor_gpus] == list(
+        range(1, 8)
+    )
+    assert sum(gpu.actor_lanes for gpu in learner_shared.orchestration.actor_gpus) == 14
+    assert learner_shared.orchestration.promotion.gpu_id == 0
+    assert learner_shared.orchestration.promotion.pause_sharing_mode is True
+    assert learner_shared.orchestration.promotion.max_waves_per_lease == 1
+    assert learner_shared.orchestration.promotion.inter_wave_cooldown_seconds == 1_800
+    assert learner_shared.orchestration.historical_evaluation.enabled is False
+    for field in (
+        "game",
+        "model",
+        "loss",
+        "optimizer",
+        "train",
+        "data",
+        "selfplay",
+        "learner",
+        "arena",
+    ):
+        assert getattr(learner_shared, field) == getattr(throughput, field)
+    for field in (
+        "actor_games_per_batch",
+        "ring_mixture",
+        "model_refresh",
+        "restart",
+        "shutdown",
+        "distributed",
+        "hardware_health",
+        "plateau",
+        "retention",
+    ):
+        assert getattr(learner_shared.orchestration, field) == getattr(
+            throughput.orchestration, field
+        )
+    validate_continuous_config(learner_shared)
+    for unsafe_orchestration in (
+        replace(
+            learner_shared.orchestration,
+            promotion=replace(
+                learner_shared.orchestration.promotion,
+                max_waves_per_lease=2,
+            ),
+        ),
+        replace(
+            learner_shared.orchestration,
+            promotion=replace(
+                learner_shared.orchestration.promotion,
+                inter_wave_cooldown_seconds=1_799,
+            ),
+        ),
+        replace(
+            learner_shared.orchestration,
+            historical_evaluation=HistoricalEvaluationConfig(enabled=True),
+        ),
+    ):
+        with pytest.raises(ValueError, match="learner-shared promotion"):
+            validate_continuous_config(
+                replace(learner_shared, orchestration=unsafe_orchestration)
+            )
     with pytest.raises(ValueError, match="resumable in-flight"):
         validate_continuous_config(
             replace(
