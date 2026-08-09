@@ -131,6 +131,8 @@ def test_yaml_configs_load_strictly() -> None:
     assert optimized.orchestration.promotion.gpu_id == 7
     assert optimized.orchestration.promotion.pause_sharing_mode is True
     throughput = load_config(CONFIGS / "h100-8gpu-throughput.yaml")
+    assert throughput.orchestration.training_objective == "generalist"
+    assert throughput.as_dict()["orchestration"]["training_objective"] == "generalist"
     assert sum(gpu.actor_lanes for gpu in throughput.orchestration.actor_gpus) == 13
     assert throughput.data.shard_cache_size == 8
     assert throughput.orchestration.learner_gpus[0].cpu_affinity == "0-103"
@@ -165,6 +167,25 @@ def test_yaml_configs_load_strictly() -> None:
     assert throughput.orchestration.promotion.finish_inflight_candidate is True
     assert throughput.arena.continuation_pairs_per_ring == 25
     validate_continuous_config(throughput)
+    ring10_only = load_config(CONFIGS / "h100-8gpu-ring10-only.yaml")
+    assert ring10_only.game.rings == (4, 6, 8, 10)
+    assert ring10_only.orchestration.training_objective == "ring10_only"
+    assert ring10_only.orchestration.ring_mixture.rings == (4, 6, 8, 10)
+    assert ring10_only.orchestration.ring_mixture.weights_for_step(0) == (
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+    )
+    assert ring10_only.selfplay.rings == 10
+    assert ring10_only.arena.rings == (10,)
+    assert ring10_only.arena.required_regression_rings == ()
+    assert ring10_only.arena.per_ring_regression_floor_elo == {}
+    assert ring10_only.arena.promotion_pair_ratios == {}
+    assert ring10_only.arena.weighted_initial_blocks == 0
+    assert ring10_only.arena.weighted_continuation_blocks == 0
+    assert ring10_only.arena.weighted_max_blocks == 0
+    validate_continuous_config(ring10_only)
     learner_shared = load_config(CONFIGS / "h100-8gpu-learner-shared.yaml")
     assert [gpu.gpu_id for gpu in learner_shared.orchestration.actor_gpus] == list(
         range(1, 8)
@@ -321,6 +342,61 @@ def test_yaml_configs_load_strictly() -> None:
                 ),
             )
         )
+
+
+def test_continuous_training_objective_mismatches_fail_closed(tmp_path: Path) -> None:
+    generalist = load_config(CONFIGS / "h100-8gpu-throughput.yaml")
+    ring10_only = load_config(CONFIGS / "h100-8gpu-ring10-only.yaml")
+
+    with pytest.raises(ValueError, match="step-1000000 weights"):
+        validate_continuous_config(
+            replace(
+                ring10_only,
+                orchestration=replace(
+                    ring10_only.orchestration,
+                    training_objective="generalist",
+                ),
+            )
+        )
+    with pytest.raises(ValueError, match="exactly step-0 weights"):
+        validate_continuous_config(
+            replace(
+                generalist,
+                orchestration=replace(
+                    generalist.orchestration,
+                    training_objective="ring10_only",
+                ),
+            )
+        )
+    with pytest.raises(ValueError, match="single-ring unguarded"):
+        validate_continuous_config(
+            replace(
+                ring10_only,
+                arena=replace(ring10_only.arena, required_regression_rings=None),
+            )
+        )
+
+    invalid = tmp_path / "invalid-objective.yaml"
+    source = (CONFIGS / "h100-8gpu-throughput.yaml").read_text(encoding="utf-8")
+    invalid.write_text(
+        source.replace(
+            "orchestration:\n  enabled: true\n",
+            "orchestration:\n  enabled: true\n  training_objective: best_ring\n",
+            1,
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ConfigError, match="training_objective"):
+        load_config(invalid)
+
+    malformed_ring10 = tmp_path / "malformed-ring10.yaml"
+    ring10_source = (CONFIGS / "h100-8gpu-ring10-only.yaml").read_text(encoding="utf-8")
+    malformed_ring10.write_text(
+        ring10_source.replace("selfplay:\n  rings: 10\n", "selfplay:\n  rings: 4\n", 1),
+        encoding="utf-8",
+    )
+    with pytest.raises(ConfigError, match="ring-10 self-play"):
+        load_config(malformed_ring10)
 
 
 def test_data_worker_window_threshold_loads_and_validates_strictly(

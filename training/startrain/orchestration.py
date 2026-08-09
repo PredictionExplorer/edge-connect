@@ -30,6 +30,7 @@ from .runtime import (
     append_jsonl,
     atomic_json,
     load_or_create_run_identity,
+    require_active_selection_cutover,
 )
 
 
@@ -2407,6 +2408,7 @@ def orchestrate_main(argv: list[str] | None = None) -> None:
     try:
         experiment = load_config(arguments.config)
         directories = RunDirectories.from_experiment(experiment)
+        require_active_selection_cutover(directories.learner)
         worker_config = materialize_worker_config(
             arguments.config, experiment, directories
         )

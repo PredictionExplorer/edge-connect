@@ -450,6 +450,13 @@ def test_ring_scheduler_curriculum_then_favors_deficits() -> None:
     ]
     ring_ten_fraction = post_million.count(10) / len(post_million)
     assert 0.68 <= ring_ten_fraction <= 0.72
+    ring10_only = RingMixtureScheduler(
+        RingMixtureConfig(step_weights=(RingWeightStage(0, (0.0, 0.0, 0.0, 1.0)),)),
+        seed=11,
+    )
+    assert {
+        ring10_only.choose(mature, learner_step=step) for step in (0, 1, 1_000_000)
+    } == {10}
 
 
 def test_ring_mixture_stage_selection_uses_aggregate_sample_boundaries() -> None:

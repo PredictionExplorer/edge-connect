@@ -9,6 +9,7 @@ import pytest
 from scripts.prepare_elo_ablation import (
     CLEAN_TREATMENTS,
     DEFAULT_TREATMENTS,
+    RING10_ONLY_TREATMENTS,
     SYSTEM_TREATMENTS,
     WEIGHTED_TREATMENTS,
     main,
@@ -85,6 +86,8 @@ def test_prepare_generates_strict_one_factor_profiles(tmp_path: Path) -> None:
     manifest, output = _prepare(tmp_path)
 
     assert manifest["report"] == "startrain-elo-ablation-plan"
+    assert manifest["training_objective"] == "generalist"
+    assert manifest["promotion_objective"] == "ring_10_guarded"
     assert manifest["guard_rings"] == [4, 6, 8]
     assert manifest["wall_budget_seconds"] == 28_800
     assert [item["treatment"] for item in manifest["treatments"]] == list(
@@ -97,6 +100,7 @@ def test_prepare_generates_strict_one_factor_profiles(tmp_path: Path) -> None:
         name: load_config(output / f"{name}.yaml") for name in DEFAULT_TREATMENTS
     }
     for name, profile in profiles.items():
+        assert profile.orchestration.training_objective == "generalist"
         assert profile.train.seed == profile.selfplay.seed == 23
         assert profile.orchestration.run_id == "shared-parent-run"
         assert profile.orchestration.directories.root.endswith(f"pilot-{name}-seed23")
@@ -231,6 +235,7 @@ def test_prepare_generates_isolated_weighted_generalist_matrix(
     )
 
     assert manifest["guard_rings"] == []
+    assert manifest["training_objective"] == "generalist"
     assert manifest["promotion_objective"] == "weighted_aggregate"
     assert manifest["per_ring_guarantees"] is False
     profiles = {
@@ -259,6 +264,52 @@ def test_prepare_generates_isolated_weighted_generalist_matrix(
     ) == (0.1, 0.1, 0.1, 0.7)
 
 
+def test_prepare_generates_fail_closed_ring10_only_treatment(tmp_path: Path) -> None:
+    source = tmp_path / "source-run"
+    source.mkdir()
+    output = tmp_path / "ring10-only-profiles"
+
+    manifest = prepare_elo_ablation(
+        base_config=CONFIGS / "h100-8gpu-throughput.yaml",
+        output_dir=output,
+        run_root_parent=tmp_path / "ring10-only-runs",
+        run_id="shared-parent-run",
+        source_run_root=source,
+        prefix="ring10-only",
+        seed=43,
+        wall_budget_hours=8,
+        leaf_budget=2_000_000_000,
+        guard_floor_elo=-35,
+        treatments=RING10_ONLY_TREATMENTS,
+        guard_rings=(),
+    )
+
+    assert manifest["training_objective"] == "ring10_only"
+    assert manifest["promotion_objective"] == "ring_10_only"
+    assert manifest["guard_rings"] == []
+    assert manifest["per_ring_guarantees"] is False
+    assert manifest["treatments"][0]["training_objective"] == "ring10_only"
+    profile_path = output / "ring10-only.yaml"
+    profile = load_config(profile_path)
+    assert profile.game.rings == (4, 6, 8, 10)
+    assert profile.orchestration.training_objective == "ring10_only"
+    assert profile.selfplay.rings == 10
+    assert tuple(
+        (stage.from_step, stage.weights)
+        for stage in profile.orchestration.ring_mixture.step_weights
+    ) == ((0, (0.0, 0.0, 0.0, 1.0)),)
+    assert profile.arena.rings == (10,)
+    assert profile.arena.required_regression_rings == ()
+    assert profile.arena.per_ring_regression_floor_elo == {}
+    assert profile.arena.promotion_pair_ratios == {}
+    assert profile.arena.weighted_initial_blocks == 0
+    assert profile.arena.weighted_continuation_blocks == 0
+    assert profile.arena.weighted_max_blocks == 0
+    serialized = profile_path.read_text(encoding="utf-8")
+    assert "promotion_pair_ratios:" not in serialized
+    assert "weighted_initial_blocks:" not in serialized
+
+
 def test_prepare_rejects_mixed_promotion_objectives(tmp_path: Path) -> None:
     source = tmp_path / "source-run"
     source.mkdir()
@@ -276,6 +327,26 @@ def test_prepare_rejects_mixed_promotion_objectives(tmp_path: Path) -> None:
             leaf_budget=2_000_000_000,
             guard_floor_elo=-35,
             treatments=("control", "weighted-control"),
+        )
+
+
+def test_prepare_rejects_mixed_training_objectives(tmp_path: Path) -> None:
+    source = tmp_path / "source-run"
+    source.mkdir()
+
+    with pytest.raises(ValueError, match="incompatible training objectives"):
+        prepare_elo_ablation(
+            base_config=CONFIGS / "h100-8gpu-throughput.yaml",
+            output_dir=tmp_path / "mixed-training-profiles",
+            run_root_parent=tmp_path / "mixed-training-runs",
+            run_id="shared-parent-run",
+            source_run_root=source,
+            prefix="mixed-training",
+            seed=41,
+            wall_budget_hours=8,
+            leaf_budget=2_000_000_000,
+            guard_floor_elo=-35,
+            treatments=("control", "ring10-only"),
         )
 
 

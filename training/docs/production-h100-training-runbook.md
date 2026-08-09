@@ -326,6 +326,10 @@ export SOURCE_PROFILE="configs/h100-8gpu.yaml"
 # Opt-in learner-shared throughput experiment on eight H100s:
 # export SOURCE_PROFILE="configs/h100-8gpu-learner-shared.yaml"
 
+# Explicit ring-10-only objective; smaller boards remain playable but are not
+# trained or evaluated:
+# export SOURCE_PROFILE="configs/h100-8gpu-ring10-only.yaml"
+
 # Four to seven H100s; consumes GPU IDs 0-3:
 # export SOURCE_PROFILE="configs/h100-4gpu.yaml"
 ```
@@ -336,6 +340,11 @@ migrator does not allow an initialized run to change GPU ownership. Validate it
 with `validate_continuous_profile.py`, then require a bounded H100 canary with
 zero learner restarts, clean pause/resume evidence, and a retained-sample plus
 Elo/hour improvement before adopting it.
+
+The ring-10-only profile is also a distinct treatment, not an in-place edit to
+the throughput profile. It keeps the shared four-ring game/model contract for
+serving compatibility while assigning all actor, learner, and arena work to
+ring 10. It intentionally provides no strength guarantee for rings 4, 6, or 8.
 
 Create a unique UTC run ID, absolute run root, and copied profile:
 
@@ -1140,6 +1149,29 @@ do not enable custom DDP. Check driver versions, GPU topology, NCCL environment,
 shared memory, and firewall/network interfaces first.
 
 ## 20. Controlled migration of an initialized continuous run
+
+### Ring-objective changes require an isolated fork
+
+Changing between `generalist` and `ring10_only` alters actor replay generation,
+learner sampling, and the promotion contract. Neither continuous-profile
+migrator permits that treatment change in place.
+
+Build and test the new release while the existing run remains active. At a
+durable arena boundary, create a verified replay backup, stop the coordinator,
+and verify that its lock owner is gone. Freeze an archived-manifest selection
+plan before running any new ring-10 evaluation. Run
+`evaluate_archived_manifests.py` against one common champion baseline and write
+its evidence outside the parent root.
+
+Fork the stopped parent with `fork_elo_ablation.py` using the verified selection
+snapshot, then use `prepare_champion_warm_start.py` on the fork. The fork may
+hard-link immutable replay, manifests, and checkpoints, but it receives a fresh
+optimizer/scheduler/EMA boundary and the ring-10-only profile. Never repoint the
+parent champion or merge the fork's replay back into the parent.
+
+Re-render the training, replay-backup, report, and continuity units with the
+forked root and profile hashes. A rollback repoints those units to the untouched
+parent root; it does not delete the failed fork.
 
 ### Non-autonomous throughput runs
 

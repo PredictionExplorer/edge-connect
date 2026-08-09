@@ -19,6 +19,13 @@ from pathlib import Path
 
 import yaml
 
+from startrain.config import load_config
+
+if __package__:
+    from .validate_continuous_profile import validate_continuous_config
+else:
+    from validate_continuous_profile import validate_continuous_config
+
 SEVERITY = {"OK": 0, "WARN": 1, "ERROR": 2}
 CONTINUITY_STALE_SECONDS = 180.0
 _DIGEST_CACHE: dict[Path, tuple[int, int, int, str]] = {}
@@ -886,6 +893,75 @@ def _add_warning(
     warnings.append({"severity": severity, "code": code, "message": message})
 
 
+def _ring10_weights_match(value: object) -> bool:
+    if isinstance(value, Mapping):
+        try:
+            weights = {int(ring): float(weight) for ring, weight in value.items()}
+        except (TypeError, ValueError):
+            return False
+        return weights.get(10) == 1.0 and all(
+            weight == 0.0 for ring, weight in weights.items() if ring != 10
+        )
+    if isinstance(value, Sequence) and not isinstance(value, str | bytes):
+        try:
+            weights = tuple(float(weight) for weight in value)
+        except (TypeError, ValueError):
+            return False
+        return weights == (0.0, 0.0, 0.0, 1.0)
+    return False
+
+
+def _ring10_active_rings_match(value: object) -> bool:
+    if not isinstance(value, Sequence) or isinstance(value, str | bytes):
+        return False
+    try:
+        return tuple(int(ring) for ring in value) == (10,)
+    except (TypeError, ValueError):
+        return False
+
+
+def _ring10_arena_violations(
+    root: Path,
+    *,
+    objective_started_ns: int | None,
+) -> list[str]:
+    violations = []
+    for path in sorted((root / "arena").glob("*.json")):
+        result = _read_json(path, attempts=1)
+        if result is None:
+            continue
+        evidence_ns = result.get("completed_ns", result.get("started_ns"))
+        if (
+            objective_started_ns is not None
+            and isinstance(evidence_ns, int)
+            and not isinstance(evidence_ns, bool)
+            and evidence_ns < objective_started_ns
+        ):
+            continue
+        rings: set[int] = set()
+        per_ring = result.get("per_ring")
+        if isinstance(per_ring, Mapping):
+            try:
+                rings.update(int(ring) for ring in per_ring)
+            except (TypeError, ValueError):
+                violations.append(path.name)
+                continue
+        weighted = _mapping(
+            result.get("weighted_aggregate")
+            or _mapping(result.get("promotion")).get("weighted_aggregate")
+        )
+        ratios = weighted.get("pair_ratios")
+        if isinstance(ratios, Mapping):
+            try:
+                rings.update(int(ring) for ring in ratios)
+            except (TypeError, ValueError):
+                violations.append(path.name)
+                continue
+        if any(ring != 10 for ring in rings):
+            violations.append(path.name)
+    return violations
+
+
 def collect_snapshot(
     run_root: Path,
     *,
@@ -910,6 +986,37 @@ def collect_snapshot(
         except (OSError, yaml.YAMLError):
             profile = {}
     orchestration = _mapping(profile.get("orchestration"))
+    training_objective = orchestration.get("training_objective", "generalist")
+    objective_contract: dict[str, object] = {
+        "validated": False,
+        "error": None,
+        "profile": str(profile_source),
+    }
+    if "training_objective" in orchestration:
+        try:
+            validated_profile = load_config(profile_source)
+            validate_continuous_config(validated_profile)
+        except (OSError, ValueError, yaml.YAMLError) as error:
+            objective_contract["error"] = f"{type(error).__name__}: {error}"
+            _add_warning(
+                warnings,
+                "ERROR",
+                "objective_profile_invalid",
+                f"training objective profile is invalid: {error}",
+            )
+        else:
+            training_objective = validated_profile.orchestration.training_objective
+            objective_contract["validated"] = True
+    ring10_objective_active = (
+        training_objective == "ring10_only" and objective_contract["validated"] is True
+    )
+    ablation_metadata = _read_json(root / "ablation.json") or {}
+    prepared_ns = ablation_metadata.get("prepared_ns")
+    objective_started_ns = (
+        prepared_ns
+        if isinstance(prepared_ns, int) and not isinstance(prepared_ns, bool)
+        else None
+    )
     shutdown = _mapping(orchestration.get("shutdown"))
     stale_threshold = _number(shutdown.get("stale_heartbeat_seconds")) or 180.0
     stall_threshold = _number(shutdown.get("stall_timeout_seconds")) or 1_800.0
@@ -1031,6 +1138,8 @@ def collect_snapshot(
                     "phase": heartbeat.get("phase"),
                     "progress": heartbeat.get("progress"),
                     "active_ring_weights": heartbeat.get("active_ring_weights"),
+                    "active_rings": heartbeat.get("active_rings"),
+                    "ring": heartbeat.get("ring"),
                     "heartbeat_age_seconds": heartbeat_age,
                     "progress_age_seconds": progress_age,
                 }
@@ -1142,10 +1251,33 @@ def collect_snapshot(
         "learning_rates": learner_metric.get("learning_rates"),
         "replay_samples_by_ring": learner_metric.get("replay_samples_by_ring"),
         "ring_batch_weights": learner_metric.get("ring_batch_weights"),
+        "active_rings": learner_heartbeat.get("active_rings"),
+        "active_ring_weights": learner_heartbeat.get("active_ring_weights"),
         "losses": losses,
         "gradient_norm": learner_metric.get("gradient_norm"),
         "feature_path": learner_metric.get("feature_path"),
     }
+    if ring10_objective_active:
+        learner_violations = []
+        for source, weights in (
+            ("metric ring_batch_weights", learner_metric.get("ring_batch_weights")),
+            (
+                "heartbeat active_ring_weights",
+                learner_heartbeat.get("active_ring_weights"),
+            ),
+        ):
+            if weights is not None and not _ring10_weights_match(weights):
+                learner_violations.append(source)
+        active_rings = learner_heartbeat.get("active_rings")
+        if active_rings is not None and not _ring10_active_rings_match(active_rings):
+            learner_violations.append("heartbeat active_rings")
+        if learner_violations:
+            _add_warning(
+                warnings,
+                "ERROR",
+                "ring10_learner_evidence_mismatch",
+                "learner reports non-ring-10 work: " + ", ".join(learner_violations),
+            )
 
     actors = []
     for metrics_path in sorted((root / "metrics").glob("actor-gpu-*.jsonl")):
@@ -1161,6 +1293,44 @@ def collect_snapshot(
         for row in actors
         if _mapping(worker_map.get(str(row.get("worker")))).get("state") == "running"
     ]
+    if ring10_objective_active:
+        ring10_actor_violations = []
+        for row in active_actor_rows:
+            worker_name = str(row.get("worker"))
+            worker_health = _mapping(worker_health_map.get(worker_name))
+            for source, weights in (
+                ("heartbeat weights", worker_health.get("active_ring_weights")),
+                ("metric weights", row.get("active_ring_weights")),
+            ):
+                if weights is not None and not _ring10_weights_match(weights):
+                    ring10_actor_violations.append(f"{worker_name} {source}")
+            for source, active_rings in (
+                ("heartbeat active_rings", worker_health.get("active_rings")),
+                ("metric active_rings", row.get("active_rings")),
+            ):
+                if active_rings is not None and not _ring10_active_rings_match(
+                    active_rings
+                ):
+                    ring10_actor_violations.append(f"{worker_name} {source}")
+            for source, ring in (
+                ("heartbeat ring", worker_health.get("ring")),
+                ("metric ring", row.get("ring")),
+            ):
+                if ring is not None:
+                    try:
+                        matches_ring10 = int(str(ring)) == 10
+                    except (TypeError, ValueError):
+                        matches_ring10 = False
+                    if not matches_ring10:
+                        ring10_actor_violations.append(f"{worker_name} {source}")
+        if ring10_actor_violations:
+            _add_warning(
+                warnings,
+                "ERROR",
+                "ring10_actor_evidence_mismatch",
+                "actors report non-ring-10 work: "
+                + ", ".join(sorted(set(ring10_actor_violations))),
+            )
     weight_variants = {
         tuple(float(value) for value in weights)
         for row in active_actor_rows
@@ -1562,6 +1732,19 @@ def collect_snapshot(
     arena_config = _mapping(profile.get("arena"))
     weighted_promotion = _weighted_arena_progress(arena_config, arena_history)
     arena_history["weighted"] = weighted_promotion
+    if ring10_objective_active:
+        arena_violations = _ring10_arena_violations(
+            root,
+            objective_started_ns=objective_started_ns,
+        )
+        if arena_violations:
+            _add_warning(
+                warnings,
+                "ERROR",
+                "ring10_arena_evidence_mismatch",
+                "current arena evidence contains non-ring-10 work: "
+                + ", ".join(arena_violations),
+            )
     promotion_config = _mapping(orchestration.get("promotion"))
     finish_inflight = promotion_config.get("finish_inflight_candidate") is True
     pairs_per_ring = _number(arena_config.get("pairs_per_ring"))
@@ -1716,6 +1899,8 @@ def collect_snapshot(
         "timestamp": _utc_now(),
         "status": status,
         "run_root": str(root),
+        "training_objective": training_objective,
+        "objective_contract": objective_contract,
         "autonomous": {
             "enabled": autonomous_enabled,
             "provenance": provenance if autonomous_enabled else None,
@@ -1812,6 +1997,7 @@ def format_text(snapshot: Mapping[str, object]) -> str:
     continuity = continuity if isinstance(continuity, Mapping) else {}
     return (
         f"{snapshot.get('timestamp')} {snapshot.get('status')} "
+        f"objective={snapshot.get('training_objective', 'generalist')} "
         f"learner={learner.get('step')}/{learner.get('target_steps')} "
         f"phase={learner.get('phase')} eps={_compact(learner.get('examples_per_second'))} "
         f"utd_segment={_compact(learner.get('segment_updates_per_new_sample'))}/"

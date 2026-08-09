@@ -507,11 +507,59 @@ def _profile_manifest_entry(
         raise AblationQueueError(f"{label} metadata seed root disagrees")
     anchor = _mapping(metadata.get("anchor"), f"{label} ablation anchor")
     seed_champion = _mapping(seed.get("champion"), "seed champion")
+    state_artifacts = []
+    selection = metadata.get("source_manifest_selection")
+    expected_anchor: Mapping[str, object] = seed_champion
+    if selection is not None:
+        selected = _mapping(selection, f"{label} manifest selection")
+        selected_manifest = _mapping(
+            selected.get("selected_manifest"),
+            f"{label} selected manifest",
+        )
+        if selected.get("status") != "verified":
+            raise AblationQueueError(f"{label} manifest selection is not verified")
+        expected_anchor = selected_manifest
+        installed_snapshot = Path(
+            _string(
+                selected.get("installed_snapshot"),
+                f"{label} installed selection snapshot",
+            )
+        ).resolve()
+        if installed_snapshot != run_root / "selection-snapshot.json":
+            raise AblationQueueError(
+                f"{label} installed selection snapshot path is invalid"
+            )
+        snapshot_artifact = _artifact("manifest_selection", installed_snapshot)
+        if snapshot_artifact["sha256"] != selected.get(
+            "source_snapshot_sha256"
+        ) or snapshot_artifact["bytes"] != selected.get("source_snapshot_bytes"):
+            raise AblationQueueError(
+                f"{label} installed selection snapshot differs from its source"
+            )
+        cutover_path = run_root / "learner" / "selection-cutover.json"
+        cutover = _read_json(cutover_path)
+        if (
+            cutover.get("format") != "startrain.selection-cutover"
+            or cutover.get("schema_version") != 1
+            or cutover.get("status") != "active"
+            or cutover.get("selected_model_identity")
+            != selected_manifest.get("model_identity")
+            or cutover.get("selected_model_step") != selected_manifest.get("model_step")
+        ):
+            raise AblationQueueError(
+                f"{label} selected manifest lacks an active warm-start cutover"
+            )
+        state_artifacts.extend(
+            (
+                snapshot_artifact,
+                _artifact("selection_cutover", cutover_path),
+            )
+        )
     if any(
-        anchor.get(field) != seed_champion.get(field)
+        anchor.get(field) != expected_anchor.get(field)
         for field in ("model_identity", "model_step")
     ):
-        raise AblationQueueError(f"{label} anchor differs from the seed champion")
+        raise AblationQueueError(f"{label} anchor differs from its verified source")
     if metadata.get("source_winner_snapshot") != source_winner_snapshot:
         raise AblationQueueError(f"{label} staged winner snapshot disagrees with plan")
     if metadata.get("futility_policy") != futility_policy:
@@ -532,7 +580,6 @@ def _profile_manifest_entry(
         != run_root
     ):
         raise AblationQueueError(f"{label} profile run root disagrees")
-    state_artifacts = []
     warm_start_path = run_root / "learner" / "champion-warm-start.json"
     if warm_start_path.is_file():
         warm_start = _read_json(warm_start_path)
@@ -541,8 +588,9 @@ def _profile_manifest_entry(
             or warm_start.get("schema_version") != 1
             or warm_start.get("status") != "active"
             or warm_start.get("source_model_identity")
-            != seed_champion.get("model_identity")
-            or warm_start.get("absolute_model_step") != seed_champion.get("model_step")
+            != expected_anchor.get("model_identity")
+            or warm_start.get("absolute_model_step")
+            != expected_anchor.get("model_step")
         ):
             raise AblationQueueError(f"{label} champion warm start is incompatible")
         checkpoint_value = _string(
@@ -575,6 +623,10 @@ def _profile_manifest_entry(
             "source_generation_family": metadata.get("source_generation_family"),
             "source_created_ns": metadata.get("source_created_ns"),
             "source_winner_snapshot": metadata.get("source_winner_snapshot"),
+            "source_manifest_selection": selection,
+            "training_objective": metadata.get("training_objective"),
+            "promotion_objective": metadata.get("promotion_objective"),
+            "per_ring_guarantees": metadata.get("per_ring_guarantees"),
             "futility_policy": metadata.get("futility_policy"),
             "anchor": metadata.get("anchor"),
         },
@@ -965,6 +1017,10 @@ def _verify_manifest_semantics(manifest: Mapping[str, object]) -> None:
             "source_generation_family",
             "source_created_ns",
             "source_winner_snapshot",
+            "source_manifest_selection",
+            "training_objective",
+            "promotion_objective",
+            "per_ring_guarantees",
             "futility_policy",
             "anchor",
         ):
@@ -980,11 +1036,22 @@ def _verify_manifest_semantics(manifest: Mapping[str, object]) -> None:
             raise AblationQueueError(f"{label} metadata seed root changed")
         anchor = _mapping(metadata.get("anchor"), f"{label} ablation anchor")
         seed_champion = _mapping(seed.get("champion"), "seed champion")
+        selection = metadata.get("source_manifest_selection")
+        expected_anchor: Mapping[str, object] = seed_champion
+        if selection is not None:
+            selection_metadata = _mapping(
+                selection,
+                f"{label} manifest selection",
+            )
+            expected_anchor = _mapping(
+                selection_metadata.get("selected_manifest"),
+                f"{label} selected manifest",
+            )
         if any(
-            anchor.get(field) != seed_champion.get(field)
+            anchor.get(field) != expected_anchor.get(field)
             for field in ("model_identity", "model_step")
         ):
-            raise AblationQueueError(f"{label} anchor changed from seed champion")
+            raise AblationQueueError(f"{label} anchor changed from verified source")
         if (
             not isinstance(metadata.get("profile"), str)
             or Path(str(metadata["profile"])).expanduser().resolve()

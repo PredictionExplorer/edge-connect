@@ -281,6 +281,19 @@ def _validate_replay(
                 run_id=run_id,
                 generation_family=generation_family,
             )
+            ready_samples_by_ring = {
+                str(int(row["ring"])): int(row["samples"])
+                for row in connection.execute(
+                    """
+                    SELECT ring, COALESCE(SUM(sample_count), 0) AS samples
+                    FROM shards
+                    WHERE run_id = ? AND generation_family = ? AND state = 'ready'
+                    GROUP BY ring
+                    ORDER BY ring
+                    """,
+                    (run_id, generation_family),
+                )
+            }
     except sqlite3.Error as exc:
         raise StatePreflightError(f"cannot validate replay manifest: {exc}") from exc
     committed = _nonnegative_int(
@@ -314,6 +327,7 @@ def _validate_replay(
         {
             "manifest": str(path),
             "committed_samples": committed,
+            "ready_samples_by_ring": ready_samples_by_ring,
             "history_complete": history_complete,
             "history_reconciliable": reconciliable,
             "counter_schema_current": counter_has_history,

@@ -858,6 +858,18 @@ def test_learner_curriculum_readiness_expands_only_at_aggregate_boundaries() -> 
     assert not learner._replay_is_ready(fully_unlocked)
 
 
+def test_learner_ring10_only_weights_activate_one_replay_ring() -> None:
+    learner = curriculum_learner_stub()
+    learner.ring_mixture_config = RingMixtureConfig(
+        step_weights=(RingWeightStage(0, (0.0, 0.0, 0.0, 1.0)),)
+    )
+    counts = {4: 10_000, 6: 10_000, 8: 10_000, 10: 4}
+
+    assert learner._active_replay_rings(counts) == (10,)
+    assert learner._active_replay_counts(counts) == {10: 4}
+    assert learner._replay_is_ready(counts)
+
+
 def test_learner_curriculum_selects_only_currently_active_rings(tmp_path) -> None:
     class CapturingStore:
         def __init__(self, counts: dict[int, int]) -> None:

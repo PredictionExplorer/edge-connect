@@ -820,6 +820,7 @@ class RetentionConfig:
 @dataclass(frozen=True, slots=True)
 class OrchestrationConfig:
     enabled: bool = False
+    training_objective: Literal["generalist", "ring10_only"] = "generalist"
     run_id: str | None = None
     gpus: tuple[GPUWorkerConfig, ...] = ()
     device: str = "cuda"
@@ -841,6 +842,10 @@ class OrchestrationConfig:
     def __post_init__(self) -> None:
         if type(self.enabled) is not bool:
             raise ConfigError("orchestration.enabled must be boolean")
+        if self.training_objective not in ("generalist", "ring10_only"):
+            raise ConfigError(
+                "orchestration.training_objective must be generalist or ring10_only"
+            )
         if type(self.allow_colocated_workers) is not bool:
             raise ConfigError("allow_colocated_workers must be boolean")
         if self.device not in ("cuda", "mps", "cpu", "auto"):
@@ -1102,6 +1107,42 @@ class ExperimentConfig:
             raise ConfigError("experiment profile is invalid")
         if self.profile == "continuous" and not self.orchestration.enabled:
             raise ConfigError("continuous profile requires orchestration")
+        if self.orchestration.training_objective == "ring10_only":
+            stages = tuple(
+                (stage.from_step, tuple(float(weight) for weight in stage.weights))
+                for stage in self.orchestration.ring_mixture.step_weights
+            )
+            if stages != ((0, (0.0, 0.0, 0.0, 1.0)),):
+                raise ConfigError(
+                    "ring10_only objective requires exactly step-0 weights [0, 0, 0, 1]"
+                )
+            if (
+                self.selfplay.rings != 10
+                or not self.data.ring_stratified
+                or not self.learner.use_ring_mixture_curriculum
+            ):
+                raise ConfigError(
+                    "ring10_only objective requires ring-10 self-play and "
+                    "ring-stratified active-ring replay"
+                )
+            if (
+                self.arena.rings != (10,)
+                or self.arena.promotion_pair_ratios
+                or self.arena.required_regression_rings != ()
+                or self.arena.per_ring_regression_floor_elo
+                or any(
+                    value != 0
+                    for value in (
+                        self.arena.weighted_initial_blocks,
+                        self.arena.weighted_continuation_blocks,
+                        self.arena.weighted_max_blocks,
+                    )
+                )
+            ):
+                raise ConfigError(
+                    "ring10_only objective requires a single-ring unguarded "
+                    "legacy arena"
+                )
         if (
             self.orchestration.plateau.enabled
             and self.orchestration.plateau.max_learner_champion_lag_steps

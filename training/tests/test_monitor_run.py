@@ -11,6 +11,8 @@ import yaml
 
 from scripts import monitor_run as monitor
 
+CONFIGS = Path(__file__).parents[1] / "configs"
+
 
 def _write_json(path: Path, payload: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -169,6 +171,54 @@ def _healthy_dependencies(monkeypatch) -> None:
     )
 
 
+def _install_ring10_profile(root: Path) -> None:
+    (root / "profile.yaml").write_text(
+        (CONFIGS / "h100-8gpu-ring10-only.yaml").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+
+
+def _install_ring10_runtime_evidence(root: Path) -> None:
+    learner_heartbeat_path = root / "status" / "learner.heartbeat.json"
+    learner_heartbeat = json.loads(learner_heartbeat_path.read_text(encoding="utf-8"))
+    learner_heartbeat.update(
+        {
+            "active_rings": [10],
+            "active_ring_weights": [0.0, 0.0, 0.0, 1.0],
+        }
+    )
+    _write_json(learner_heartbeat_path, learner_heartbeat)
+    actor_heartbeat_path = root / "status" / "actor-gpu-1.heartbeat.json"
+    actor_heartbeat = json.loads(actor_heartbeat_path.read_text(encoding="utf-8"))
+    actor_heartbeat.update(
+        {
+            "ring": 10,
+            "active_rings": [10],
+            "active_ring_weights": [0.0, 0.0, 0.0, 1.0],
+        }
+    )
+    _write_json(actor_heartbeat_path, actor_heartbeat)
+    learner_metrics_path = root / "learner" / "metrics.jsonl"
+    learner_metric = json.loads(learner_metrics_path.read_text(encoding="utf-8"))
+    learner_metric["ring_batch_weights"] = {
+        "4": 0.0,
+        "6": 0.0,
+        "8": 0.0,
+        "10": 1.0,
+    }
+    learner_metrics_path.write_text(json.dumps(learner_metric) + "\n", encoding="utf-8")
+    actor_metrics_path = root / "metrics" / "actor-gpu-1.jsonl"
+    actor_metric = json.loads(actor_metrics_path.read_text(encoding="utf-8"))
+    actor_metric.update(
+        {
+            "ring": 10,
+            "active_rings": [10],
+            "active_ring_weights": [0.0, 0.0, 0.0, 1.0],
+        }
+    )
+    actor_metrics_path.write_text(json.dumps(actor_metric) + "\n", encoding="utf-8")
+
+
 def test_collect_snapshot_reports_healthy_run(tmp_path, monkeypatch) -> None:
     now_ns = 10_000_000_000
     root = _fixture(tmp_path, now_ns=now_ns)
@@ -211,6 +261,111 @@ def test_collect_snapshot_reports_healthy_run(tmp_path, monkeypatch) -> None:
     assert snapshot["arena_history"]["recent"][-1]["per_ring_elo"]["10"] == 25.0
     assert "learner=10/100" in monitor.format_text(snapshot)
     assert "elo=42.00" in monitor.format_text(snapshot)
+
+
+def test_monitor_exposes_training_objective(tmp_path, monkeypatch) -> None:
+    now_ns = 10_000_000_000
+    root = _fixture(tmp_path, now_ns=now_ns)
+    _install_ring10_profile(root)
+    _install_ring10_runtime_evidence(root)
+    _healthy_dependencies(monkeypatch)
+
+    snapshot: Any = monitor.collect_snapshot(root, now_ns=now_ns)
+
+    assert snapshot["training_objective"] == "ring10_only"
+    assert snapshot["objective_contract"]["validated"] is True
+    assert not any(
+        warning["code"].startswith("ring10_") for warning in snapshot["warnings"]
+    )
+    assert "objective=ring10_only" in monitor.format_text(snapshot)
+
+
+def test_monitor_rejects_malformed_ring10_profile(tmp_path, monkeypatch) -> None:
+    now_ns = 10_000_000_000
+    root = _fixture(tmp_path, now_ns=now_ns)
+    _install_ring10_profile(root)
+    profile = yaml.safe_load((root / "profile.yaml").read_text(encoding="utf-8"))
+    profile["selfplay"]["rings"] = 8
+    (root / "profile.yaml").write_text(
+        yaml.safe_dump(profile, sort_keys=False),
+        encoding="utf-8",
+    )
+    _healthy_dependencies(monkeypatch)
+
+    snapshot: Any = monitor.collect_snapshot(root, now_ns=now_ns)
+
+    assert snapshot["status"] == "ERROR"
+    assert snapshot["objective_contract"]["validated"] is False
+    assert "objective_profile_invalid" in {
+        warning["code"] for warning in snapshot["warnings"]
+    }
+
+
+def test_monitor_flags_current_non_ring10_runtime_evidence(
+    tmp_path, monkeypatch
+) -> None:
+    now_ns = 10_000_000_000
+    root = _fixture(tmp_path, now_ns=now_ns)
+    _install_ring10_profile(root)
+    _install_ring10_runtime_evidence(root)
+    actor_metrics_path = root / "metrics" / "actor-gpu-1.jsonl"
+    actor_metric = json.loads(actor_metrics_path.read_text(encoding="utf-8"))
+    actor_metric["ring"] = 8
+    actor_metrics_path.write_text(json.dumps(actor_metric) + "\n", encoding="utf-8")
+    learner_metrics_path = root / "learner" / "metrics.jsonl"
+    learner_metric = json.loads(learner_metrics_path.read_text(encoding="utf-8"))
+    learner_metric["ring_batch_weights"] = {"8": 1.0}
+    learner_metrics_path.write_text(json.dumps(learner_metric) + "\n", encoding="utf-8")
+    _write_json(
+        root / "arena" / "current-evaluation.json",
+        {
+            "started_ns": now_ns - 2_000_000_000,
+            "completed_ns": now_ns - 1_000_000_000,
+            "per_ring": {"8": {"games": 2}},
+        },
+    )
+    _healthy_dependencies(monkeypatch)
+
+    snapshot: Any = monitor.collect_snapshot(root, now_ns=now_ns)
+    codes = {warning["code"] for warning in snapshot["warnings"]}
+
+    assert snapshot["status"] == "ERROR"
+    assert {
+        "ring10_actor_evidence_mismatch",
+        "ring10_learner_evidence_mismatch",
+        "ring10_arena_evidence_mismatch",
+    } <= codes
+
+
+def test_monitor_ignores_pre_objective_and_rotated_arena_evidence(
+    tmp_path, monkeypatch
+) -> None:
+    now_ns = 10_000_000_000
+    root = _fixture(tmp_path, now_ns=now_ns)
+    _install_ring10_profile(root)
+    _install_ring10_runtime_evidence(root)
+    _write_json(root / "ablation.json", {"prepared_ns": now_ns - 2_000_000_000})
+    _write_json(
+        root / "arena" / "pre-objective-diagnostic.json",
+        {
+            "completed_ns": now_ns - 3_000_000_000,
+            "per_ring": {"4": {"games": 2}},
+        },
+    )
+    _write_json(
+        root / "ablation-parent" / "arena" / "inherited.json",
+        {
+            "completed_ns": now_ns,
+            "per_ring": {"6": {"games": 2}},
+        },
+    )
+    _healthy_dependencies(monkeypatch)
+
+    snapshot: Any = monitor.collect_snapshot(root, now_ns=now_ns)
+
+    assert "ring10_arena_evidence_mismatch" not in {
+        warning["code"] for warning in snapshot["warnings"]
+    }
 
 
 def test_snapshot_warns_about_fragmented_arena_continuation(

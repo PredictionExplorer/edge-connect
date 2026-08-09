@@ -27,9 +27,20 @@ from startrain.checkpoint import (
     write_resume_cutover,
 )
 from startrain.config import load_config
+from startrain.manifest_selection import (
+    ManifestEvidence,
+    ManifestSelectionError,
+    selected_manifest_in_copy,
+    verify_selection_snapshot,
+)
 from startrain.model import GraphResTNet
 from startrain.optim import build_optimizer
-from startrain.runtime import atomic_json, load_run_identity
+from startrain.runtime import (
+    SELECTION_CUTOVER_FORMAT,
+    SELECTION_CUTOVER_SCHEMA_VERSION,
+    atomic_json,
+    load_run_identity,
+)
 from startrain.training import build_scheduler
 
 WARM_START_FORMAT = "startrain.champion-warm-start"
@@ -57,6 +68,7 @@ def _existing_warm_start(
     generation_family: str,
     champion_identity: str,
     profile_sha256: str,
+    source_manifest_sha256: str | None = None,
 ) -> dict[str, Any] | None:
     if not marker_path.is_file():
         return None
@@ -69,6 +81,8 @@ def _existing_warm_start(
         "source_model_identity": champion_identity,
         "profile_sha256": profile_sha256,
     }
+    if source_manifest_sha256 is not None:
+        expected["source_manifest_sha256"] = source_manifest_sha256
     if any(payload.get(key) != value for key, value in expected.items()):
         raise WarmStartError(
             "existing champion warm-start marker is incomplete or incompatible"
@@ -88,6 +102,145 @@ def _existing_warm_start(
     ):
         raise WarmStartError("warm-start marker disagrees with resume cutover")
     return payload
+
+
+def _warm_start_source(
+    root: Path,
+    *,
+    run_id: str,
+    generation_family: str,
+    selection_snapshot: str | Path | None,
+    source_manifest: str | Path | None,
+) -> tuple[ModelManifest, dict[str, object], bool]:
+    """Resolve a strictly verified source without changing any model pointer."""
+
+    champion = load_model_manifest(root / "learner" / "champion.json")
+    verified_selection = (
+        verify_selection_snapshot(selection_snapshot)
+        if selection_snapshot is not None
+        else None
+    )
+    selected_from_snapshot: ModelManifest | None = None
+    if verified_selection is not None:
+        if (
+            verified_selection.plan.source_run_id != run_id
+            or verified_selection.plan.source_generation_family != generation_family
+        ):
+            raise WarmStartError(
+                "selection snapshot belongs to another run or generation"
+            )
+        try:
+            selected_from_snapshot = selected_manifest_in_copy(
+                verified_selection,
+                root,
+            )
+        except ManifestSelectionError:
+            # A direct source manifest can be used when the caller did not make
+            # a complete filesystem fork, but it still has to match the exact
+            # selected artifact digests below.
+            if source_manifest is None:
+                selected_from_snapshot = verified_selection.selected_manifest
+        ablation_path = root / "ablation.json"
+        if ablation_path.is_file():
+            ablation = _read_json(ablation_path)
+            pinned = ablation.get("source_manifest_selection")
+            anchor = ablation.get("anchor")
+            if not isinstance(pinned, dict) or not isinstance(anchor, dict):
+                raise WarmStartError(
+                    "fork metadata does not pin the selection snapshot and anchor"
+                )
+            expected_snapshot = {
+                "source_snapshot_sha256": (verified_selection.snapshot_artifact.sha256),
+                "source_snapshot_bytes": verified_selection.snapshot_artifact.bytes,
+                "plan_digest": verified_selection.plan.plan_digest,
+            }
+            if any(
+                pinned.get(key) != value for key, value in expected_snapshot.items()
+            ) or any(
+                anchor.get(key) != value
+                for key, value in (
+                    (
+                        "model_identity",
+                        verified_selection.selected_evidence.model_identity,
+                    ),
+                    (
+                        "model_step",
+                        verified_selection.selected_evidence.model_step,
+                    ),
+                )
+            ):
+                raise WarmStartError(
+                    "selection snapshot disagrees with the fork's verified anchor"
+                )
+            if (
+                champion.model_identity
+                != verified_selection.selected_evidence.model_identity
+                or champion.model_step
+                != verified_selection.selected_evidence.model_step
+                or champion.manifest_sha256
+                != verified_selection.selected_evidence.manifest.sha256
+                or champion.checkpoint_sha256
+                != verified_selection.selected_evidence.checkpoint.sha256
+            ):
+                raise WarmStartError(
+                    "fork champion no longer matches its verified selection anchor"
+                )
+
+    try:
+        explicit = (
+            load_model_manifest(Path(source_manifest).expanduser().resolve())
+            if source_manifest is not None
+            else None
+        )
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise WarmStartError(f"source manifest is incompatible: {exc}") from exc
+    if explicit is not None and verified_selection is not None:
+        selected_evidence = verified_selection.selected_evidence
+        explicit_evidence = ManifestEvidence.from_manifest(explicit)
+        if (
+            explicit_evidence.model_identity != selected_evidence.model_identity
+            or explicit_evidence.model_step != selected_evidence.model_step
+            or explicit_evidence.manifest.sha256 != selected_evidence.manifest.sha256
+            or explicit_evidence.manifest.bytes != selected_evidence.manifest.bytes
+            or explicit_evidence.checkpoint.sha256
+            != selected_evidence.checkpoint.sha256
+            or explicit_evidence.checkpoint.bytes != selected_evidence.checkpoint.bytes
+        ):
+            raise WarmStartError(
+                "source manifest does not match the verified selection snapshot"
+            )
+    selected = selected_from_snapshot or explicit or champion
+    if selected.run_id != run_id or selected.generation_family != generation_family:
+        raise WarmStartError("warm-start source belongs to another run or generation")
+    evidence = ManifestEvidence.from_manifest(selected)
+    source_details: dict[str, object] = {
+        "kind": (
+            "verified-selection"
+            if verified_selection is not None
+            else ("explicit-immutable-manifest" if explicit is not None else "champion")
+        ),
+        "manifest": evidence.as_dict(),
+        "selection_snapshot": (
+            {
+                "path": str(verified_selection.snapshot_path),
+                "sha256": verified_selection.snapshot_artifact.sha256,
+                "bytes": verified_selection.snapshot_artifact.bytes,
+                "plan_digest": verified_selection.plan.plan_digest,
+                "source_run_root": verified_selection.plan.source_run_root,
+                "fallback_to_champion": {
+                    "used": verified_selection.fallback_used,
+                    "reason": verified_selection.fallback_reason,
+                },
+            }
+            if verified_selection is not None
+            else None
+        ),
+    }
+    return (
+        selected,
+        source_details,
+        (selection_snapshot is not None or source_manifest is not None),
+    )
 
 
 def _prepared_checkpoint(
@@ -152,6 +305,34 @@ def _prepared_checkpoint(
         generation_family=generation_family,
         source="prepared-champion-warm-start",
     )
+
+
+def _activate_selection_cutover(
+    learner_root: Path,
+    *,
+    champion: ModelManifest,
+    recovery: ResumeCheckpoint,
+) -> None:
+    marker_path = learner_root / "selection-cutover.json"
+    if not marker_path.is_file():
+        return
+    marker = _read_json(marker_path)
+    if (
+        marker.get("format") != SELECTION_CUTOVER_FORMAT
+        or marker.get("schema_version") != SELECTION_CUTOVER_SCHEMA_VERSION
+        or marker.get("status") not in ("pending", "active")
+        or marker.get("selected_model_identity") != champion.model_identity
+        or marker.get("selected_model_step") != champion.model_step
+    ):
+        raise WarmStartError("archived selection cutover marker is incompatible")
+    active = {
+        **marker,
+        "status": "active",
+        "warm_start_checkpoint_sha256": recovery.checkpoint_sha256,
+        "warm_start_checkpoint_bytes": recovery.checkpoint_bytes,
+        "activated_ns": time.time_ns(),
+    }
+    atomic_json(marker_path, active)
 
 
 def _activate_prepared_warm_start(
@@ -256,6 +437,11 @@ def _activate_prepared_warm_start(
         }
     )
     atomic_json(marker_path, active)
+    _activate_selection_cutover(
+        learner_root,
+        champion=champion,
+        recovery=prepared,
+    )
     return active, cutover
 
 
@@ -266,45 +452,67 @@ def prepare_champion_warm_start(
     apply: bool = False,
     initial_replay_credit: int | None = None,
     replace_existing: bool = False,
+    selection_snapshot: str | Path | None = None,
+    source_manifest: str | Path | None = None,
 ) -> dict[str, object]:
     """Validate and optionally activate a fresh optimizer segment."""
 
     root = Path(run_root).expanduser().resolve()
     profile_path = Path(profile).expanduser().resolve()
-    preflight = run_state_preflight(root, profile_path, apply=apply)
     experiment = load_config(profile_path)
     identity = load_run_identity(root / "run.json")
     learner_root = root / "learner"
-    champion = load_model_manifest(learner_root / "champion.json")
+    warm_source, source_details, strict_source_pin = _warm_start_source(
+        root,
+        run_id=identity.run_id,
+        generation_family=identity.generation_family,
+        selection_snapshot=selection_snapshot,
+        source_manifest=source_manifest,
+    )
+    if apply and strict_source_pin and not (root / "ablation.json").is_file():
+        raise WarmStartError(
+            "verified archived-manifest warm starts may only be applied to a fork"
+        )
+    if apply and strict_source_pin:
+        source_artifact = (warm_source.artifact_manifest or warm_source.path).resolve()
+        if source_artifact.parent != (root / "learner" / "manifests").resolve():
+            raise WarmStartError(
+                "warm-start source manifest must be isolated inside the fork"
+            )
+    snapshot_details = source_details.get("selection_snapshot")
     if (
-        champion.run_id != identity.run_id
-        or champion.generation_family != identity.generation_family
+        apply
+        and isinstance(snapshot_details, dict)
+        and Path(str(snapshot_details.get("source_run_root"))).resolve() == root
     ):
-        raise WarmStartError("champion belongs to another run")
-    champion_metadata = inspect_checkpoint(
-        champion.checkpoint,
+        raise WarmStartError(
+            "selection snapshot source cannot be mutated as its own warm-start fork"
+        )
+    preflight = run_state_preflight(root, profile_path, apply=apply)
+    source_metadata = inspect_checkpoint(
+        warm_source.checkpoint,
         expected_model_config=experiment.as_dict()["model"],
         expected_game_config=experiment.as_dict()["game"],
         expected_run_id=identity.run_id,
         expected_generation_family=identity.generation_family,
-        expected_sha256=champion.checkpoint_sha256,
-        expected_bytes=champion.checkpoint_bytes,
+        expected_sha256=warm_source.checkpoint_sha256,
+        expected_bytes=warm_source.checkpoint_bytes,
     )
-    champion_extra = champion_metadata.get("extra")
-    champion_examples = (
-        champion_extra.get("examples_consumed")
-        if isinstance(champion_extra, dict)
+    source_extra = source_metadata.get("extra")
+    source_examples = (
+        source_extra.get("examples_consumed")
+        if isinstance(source_extra, dict)
         else None
     )
     if (
-        champion_metadata.get("step") != champion.model_step
-        or champion_metadata.get("has_ema") is not True
-        or isinstance(champion_examples, bool)
-        or not isinstance(champion_examples, int)
-        or champion_examples < 0
+        source_metadata.get("step") != warm_source.model_step
+        or source_metadata.get("has_ema") is not True
+        or isinstance(source_examples, bool)
+        or not isinstance(source_examples, int)
+        or source_examples < 0
     ):
         raise WarmStartError(
-            "champion checkpoint lacks a compatible examples/EMA boundary"
+            "warm-start source lacks a compatible examples/EMA boundary"
         )
     profile_report = preflight.get("profile")
     if not isinstance(profile_report, dict) or not isinstance(
@@ -319,8 +527,11 @@ def prepare_champion_warm_start(
             marker_path,
             run_id=identity.run_id,
             generation_family=identity.generation_family,
-            champion_identity=champion.model_identity,
+            champion_identity=warm_source.model_identity,
             profile_sha256=profile_sha256,
+            source_manifest_sha256=(
+                warm_source.manifest_sha256 if strict_source_pin else None
+            ),
         )
     except WarmStartError:
         if not replace_existing or not marker_path.is_file():
@@ -357,7 +568,7 @@ def prepare_champion_warm_start(
                     learner_root,
                     marker_path,
                     existing,
-                    champion=champion,
+                    champion=warm_source,
                     selfplay_enabled=selfplay_enabled,
                     run_id=identity.run_id,
                     generation_family=identity.generation_family,
@@ -374,6 +585,19 @@ def prepare_champion_warm_start(
                 },
                 "preflight": preflight,
             }
+        if existing.get("status") == "active" and apply:
+            prepared = _prepared_checkpoint(
+                learner_root,
+                existing,
+                run_id=identity.run_id,
+                generation_family=identity.generation_family,
+            )
+            with state_apply_guard(root):
+                _activate_selection_cutover(
+                    learner_root,
+                    champion=warm_source,
+                    recovery=prepared,
+                )
         return {
             "status": "ok",
             "mode": (
@@ -401,13 +625,34 @@ def prepare_champion_warm_start(
         or committed_value < 0
     ):
         raise WarmStartError("preflight returned invalid numeric boundaries")
-    examples_consumed = champion_examples
+    examples_consumed = source_examples
     committed_samples = committed_value
     if initial_replay_credit is None:
-        ring_count = len(experiment.orchestration.ring_mixture.rings)
+        mixture = experiment.orchestration.ring_mixture
+        active_weights = mixture.weights_for_step(warm_source.model_step)
+        active_rings = (
+            tuple(
+                ring
+                for ring, weight in zip(
+                    mixture.rings,
+                    active_weights,
+                    strict=True,
+                )
+                if weight > 0
+            )
+            if active_weights is not None
+            else mixture.rings
+        )
+        ready_samples = replay.get("ready_samples_by_ring")
+        if not isinstance(ready_samples, dict):
+            raise WarmStartError("preflight omitted ready replay samples by ring")
+        active_ready_samples = sum(
+            int(ready_samples.get(str(ring), 0)) for ring in active_rings
+        )
         replay_credit = min(
             committed_samples,
-            experiment.learner.recent_samples_per_ring * ring_count,
+            active_ready_samples,
+            experiment.learner.recent_samples_per_ring * len(active_rings),
         )
     else:
         if (
@@ -461,9 +706,9 @@ def prepare_champion_warm_start(
         "kind": "weights-only-champion-warm-start",
         "run_id": identity.run_id,
         "generation_family": identity.generation_family,
-        "source_model_identity": champion.model_identity,
-        "source_model_step": champion.model_step,
-        "absolute_model_step": champion.model_step,
+        "source_model_identity": warm_source.model_identity,
+        "source_model_step": warm_source.model_step,
+        "absolute_model_step": warm_source.model_step,
         "segment_step": 0,
         "baseline_examples_consumed": examples_consumed,
         "baseline_committed_replay_samples": committed_samples,
@@ -471,21 +716,22 @@ def prepare_champion_warm_start(
         "optimizer_state": "fresh",
         "scheduler_state": "fresh",
         "ema_state": "fresh-from-champion-ema",
+        "source_selection": source_details,
         "created_ns": time.time_ns(),
     }
 
     model = GraphResTNet(experiment.model)
     ema = ExponentialMovingAverage(model, decay=experiment.train.ema_decay)
     load_ema_weights_for_warm_start(
-        champion.checkpoint,
+        warm_source.checkpoint,
         model=model,
         ema=ema,
         expected_model_config=experiment.as_dict()["model"],
         expected_game_config=experiment.as_dict()["game"],
         expected_run_id=identity.run_id,
         expected_generation_family=identity.generation_family,
-        expected_sha256=champion.checkpoint_sha256,
-        expected_bytes=champion.checkpoint_bytes,
+        expected_sha256=warm_source.checkpoint_sha256,
+        expected_bytes=warm_source.checkpoint_bytes,
     )
     optimizer = build_optimizer(model, experiment.optimizer)
     scheduler = build_scheduler(optimizer, experiment.train.scheduler)
@@ -500,9 +746,10 @@ def prepare_champion_warm_start(
         "profile_sha256": profile_sha256,
         "run_id": identity.run_id,
         "generation_family": identity.generation_family,
-        "source_model_identity": champion.model_identity,
-        "source_model_step": champion.model_step,
-        "absolute_model_step": champion.model_step,
+        "source_model_identity": warm_source.model_identity,
+        "source_model_step": warm_source.model_step,
+        "absolute_model_step": warm_source.model_step,
+        "source_selection": source_details,
         "examples_consumed": examples_consumed,
         "committed_replay_samples": committed_samples,
         "initial_replay_credit": replay_credit,
@@ -549,7 +796,7 @@ def prepare_champion_warm_start(
             optimizer=optimizer,
             scheduler=scheduler,
             ema=ema,
-            step=champion.model_step,
+            step=warm_source.model_step,
             epoch=0,
             config=experiment.as_dict(),
             run_id=identity.run_id,
@@ -567,8 +814,16 @@ def prepare_champion_warm_start(
             "generation_family": identity.generation_family,
             "profile": str(profile_path),
             "profile_sha256": profile_sha256,
-            "source_model_identity": champion.model_identity,
-            "source_model_step": champion.model_step,
+            "source_model_identity": warm_source.model_identity,
+            "source_model_step": warm_source.model_step,
+            "source_manifest": str(
+                (warm_source.artifact_manifest or warm_source.path).resolve()
+            ),
+            "source_manifest_sha256": warm_source.manifest_sha256,
+            "source_manifest_bytes": warm_source.manifest_bytes,
+            "source_checkpoint_sha256": warm_source.checkpoint_sha256,
+            "source_checkpoint_bytes": warm_source.checkpoint_bytes,
+            "source_selection": source_details,
             "absolute_model_step": prepared.step,
             "examples_consumed": examples_consumed,
             "committed_replay_samples": committed_samples,
@@ -583,11 +838,15 @@ def prepare_champion_warm_start(
         if utd_segment is not None:
             atomic_json(learner_root / "utd-segment.json", utd_segment)
         atomic_json(learner_root / "cadence.json", cadence)
-        write_model_pointer(learner_root / "candidate.json", champion, role="candidate")
+        write_model_pointer(
+            learner_root / "candidate.json",
+            warm_source,
+            role="candidate",
+        )
         if selfplay_enabled:
             write_model_pointer(
                 learner_root / "selfplay" / "candidate.json",
-                champion,
+                warm_source,
                 role="candidate",
             )
         atomic_json(marker_path, marker)
@@ -596,7 +855,7 @@ def prepare_champion_warm_start(
             learner_root,
             marker_path,
             marker,
-            champion=champion,
+            champion=warm_source,
             selfplay_enabled=selfplay_enabled,
             run_id=identity.run_id,
             generation_family=identity.generation_family,
@@ -615,6 +874,16 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--run-root", required=True, type=Path)
     parser.add_argument("--profile", required=True, type=Path)
     parser.add_argument("--initial-replay-credit", type=int)
+    parser.add_argument(
+        "--selection-snapshot",
+        type=Path,
+        help="verified archived-manifest selection snapshot",
+    )
+    parser.add_argument(
+        "--source-manifest",
+        type=Path,
+        help="immutable source manifest (must match the snapshot when both are set)",
+    )
     parser.add_argument(
         "--replace-existing",
         action="store_true",
@@ -637,6 +906,8 @@ def main(argv: list[str] | None = None) -> int:
             apply=arguments.apply,
             initial_replay_credit=arguments.initial_replay_credit,
             replace_existing=arguments.replace_existing,
+            selection_snapshot=arguments.selection_snapshot,
+            source_manifest=arguments.source_manifest,
         )
     except Exception as exc:
         print(

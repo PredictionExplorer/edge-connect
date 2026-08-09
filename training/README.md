@@ -84,6 +84,9 @@ The supplied layouts are single-host profiles:
 - `configs/h100-8gpu-throughput.yaml`: GPU 0 learner, two actor lanes on
   GPUs 1–6, one pause-shared actor/arena lane on GPU 7, and target-host NUMA
   affinity.
+- `configs/h100-8gpu-ring10-only.yaml`: the same safe continuous topology with
+  actor replay, learner batches, and promotion restricted to ring 10. The
+  shared model still serves rings 4/6/8, but their strength may regress.
 - `configs/h100-8gpu-learner-shared.yaml`: the same throughput treatment with
   two actor lanes on GPUs 1–7 and bounded learner/arena pause-sharing on GPU 0.
   It is an opt-in topology experiment, not the default throughput profile.
@@ -324,6 +327,18 @@ active candidate keeps its evidence when a newer checkpoint appears. Small
 post-minimum continuation waves persist frequently and can terminate as soon as
 the anytime-valid gate resolves.
 
+The explicit ring-10-only objective uses the same topology:
+
+```bash
+startrain-orchestrate --config configs/h100-8gpu-ring10-only.yaml
+```
+
+It sets `orchestration.training_objective: ring10_only`, fixes ring-mixture
+weights to `[0, 0, 0, 1]` from step zero, and configures the arena for ring 10
+only. The continuous-profile validator rejects partial or mixed versions of
+this contract. Use a new isolated run root; do not edit an initialized
+generalist profile in place.
+
 The learner-shared topology is also available as an explicit one-factor
 experiment:
 
@@ -387,11 +402,13 @@ For custom DDP, configure at least two learner GPU entries with equal CPU budget
 set `orchestration.distributed.enabled: true` with backend `nccl`. The coordinator then
 constructs the `torch.distributed.run` command and required run-identity arguments.
 
-The actor ring mixture progresses from small to large boards. The shipped profiles keep
-`learner.use_ring_mixture_curriculum: false` as a control, so their stratified learner
-waits for the replay minimum on all four supported rings. Set it to `true` in a new
-frozen profile to follow the actor schedule: ring 4, then rings 4 and 6, then
-4/6/8/10. A transition waits only for the newly active rings.
+The generalist actor ring mixture progresses from small to large boards. Profiles
+with `learner.use_ring_mixture_curriculum: false` keep all four rings active in
+stratified learner replay; setting it to `true` follows the actor schedule:
+ring 4, then rings 4 and 6, then 4/6/8/10. A transition waits only for newly
+active rings. An explicit `step_weights` stage overrides that curriculum. The
+ring-10-only profile uses `[0, 0, 0, 1]`, so only ring 10 participates in actor
+selection, learner readiness, uniqueness checks, and batch quotas.
 
 ## Run files and model lifecycle
 

@@ -1,9 +1,10 @@
 # Ring-10 Elo-per-hour ablation runbook
 
-This runbook optimizes ring-10 Elo gained per wall-clock hour while treating
-rings 4, 6, and 8 as non-inferiority guardrails. It complements the
-[training ablation protocol](training-ablation-protocol.md); it does not weaken
-the paired arena or its anytime-valid promotion test.
+This runbook optimizes ring-10 Elo gained per wall-clock hour. The default
+contract treats rings 4, 6, and 8 as non-inferiority guardrails; the explicitly
+separate `ring10-only` contract trains and evaluates only ring 10. It
+complements the [training ablation protocol](training-ablation-protocol.md) and
+does not weaken the paired arena or its anytime-valid promotion test.
 
 ## Acceptance contract
 
@@ -16,6 +17,11 @@ the paired arena or its anytime-valid promotion test.
   hardware failure, or an incomplete fixed-budget run.
 - Promote a treatment only after three seeds, a positive lower confidence
   bound versus control, and at least 20% median ring-10 Elo/hour improvement.
+
+For a pre-registered `ring10-only` plan, omit the smaller-ring guard margin and
+use only ring-10 games for both training and promotion. Keep all eight
+provisioned GPUs in the wall-clock denominator. Smaller boards remain playable,
+but their strength is outside the experiment contract and may regress.
 
 ## Safety model
 
@@ -78,6 +84,37 @@ blocking per-ring floor overrides. Per-ring Elo and anytime intervals remain
 in reports as diagnostics, but a weighted winner can regress on rings 4, 6, or
 8 and still promote. There is no per-ring non-inferiority guarantee; use the
 legacy matrix when one is required.
+
+### Ring-10-only treatment
+
+Prepare `ring10-only` as a separate plan. Do not mix it with the guarded legacy
+or weighted-generalist matrices. Its frozen contract is:
+
+```yaml
+orchestration:
+  training_objective: ring10_only
+  ring_mixture:
+    step_weights:
+      - from_step: 0
+        weights: [0.0, 0.0, 0.0, 1.0]
+arena:
+  rings: [10]
+  promotion_pair_ratios: {}
+  required_regression_rings: []
+  per_ring_regression_floor_elo: {}
+```
+
+The actor scheduler therefore creates only ring-10 games, learner readiness and
+batch quotas count only ring-10 replay, and every arena pair is ring 10. Keep
+`game.rings: [4, 6, 8, 10]`; changing the game contract would break checkpoint
+and serving compatibility rather than merely narrowing the training objective.
+
+Before warm-starting a long ring-10-only run from an archived checkpoint,
+freeze the candidate manifest allowlist and evaluation profile, then use
+`evaluate_archived_manifests.py` to run fresh ring-10-only matches against one
+common champion baseline. Select only an independently confirmed improvement;
+if none passes, warm-start from the existing champion. Write selection results
+outside the parent run root and preserve the parent unchanged for rollback.
 
 ## Fork treatments
 

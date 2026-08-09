@@ -13,9 +13,20 @@ import time
 from pathlib import Path
 from typing import Any
 
+from startrain.checkpoint import load_model_manifest, write_model_pointer
 from startrain.config import ExperimentConfig, load_config
+from startrain.manifest_selection import (
+    VerifiedSelection,
+    selected_manifest_in_copy,
+    verify_selection_snapshot,
+)
 from startrain.replay_store import ReplayStore
-from startrain.runtime import atomic_json, load_run_identity
+from startrain.runtime import (
+    SELECTION_CUTOVER_FORMAT,
+    SELECTION_CUTOVER_SCHEMA_VERSION,
+    atomic_json,
+    load_run_identity,
+)
 
 if __package__:
     from .prepare_elo_ablation import verify_winner_snapshot
@@ -32,6 +43,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--source-run-root", type=Path, required=True)
     parser.add_argument("--plan", type=Path, required=True)
     parser.add_argument("--treatment", required=True)
+    parser.add_argument(
+        "--selection-snapshot",
+        type=Path,
+        help="verified archived-manifest selection used only to anchor the fork",
+    )
     return parser
 
 
@@ -91,7 +107,11 @@ def _copy_function(
     return copy
 
 
-def _rotate_branch_runtime(destination: Path) -> None:
+def _rotate_branch_runtime(
+    destination: Path,
+    *,
+    rotate_arena: bool = False,
+) -> None:
     parent = destination / "ablation-parent"
     inherited_parent = destination / ".inherited-ablation-parent"
     if parent.exists() or parent.is_symlink():
@@ -103,7 +123,10 @@ def _rotate_branch_runtime(destination: Path) -> None:
     parent.mkdir()
     if inherited_parent.exists() or inherited_parent.is_symlink():
         inherited_parent.rename(parent / "ancestor")
-    for name in _ROTATED_DIRECTORIES:
+    rotated_directories = (
+        (*_ROTATED_DIRECTORIES, "arena") if rotate_arena else _ROTATED_DIRECTORIES
+    )
+    for name in rotated_directories:
         current = destination / name
         if current.exists():
             current.rename(parent / name)
@@ -180,6 +203,7 @@ def fork_elo_ablation(
     source_run_root: Path,
     plan_path: Path,
     treatment: str,
+    selection_snapshot: Path | None = None,
 ) -> dict[str, object]:
     source = source_run_root.expanduser().resolve()
     plan_file = plan_path.expanduser().resolve()
@@ -206,11 +230,38 @@ def fork_elo_ablation(
     )
     if raw_winner_snapshot is not None and winner_snapshot is None:
         raise ValueError("plan source winner snapshot is malformed")
+    verified_selection: VerifiedSelection | None = (
+        verify_selection_snapshot(
+            selection_snapshot,
+            expected_source_run_root=source,
+        )
+        if selection_snapshot is not None
+        else None
+    )
+    if winner_snapshot is not None and verified_selection is not None:
+        raise ValueError(
+            "winner snapshot and archived-manifest selection are mutually exclusive"
+        )
     entry = _plan_treatment(plan, treatment)
     profile_path = Path(entry["profile"]).expanduser().resolve()
     if not profile_path.is_file() or _sha256(profile_path) != entry["profile_sha256"]:
         raise ValueError("treatment profile is missing or its digest changed")
     experiment = load_config(profile_path)
+    training_objective = plan.get("training_objective", "generalist")
+    promotion_objective = plan.get("promotion_objective", "ring_10_guarded")
+    if training_objective != experiment.orchestration.training_objective:
+        raise ValueError(
+            "ablation plan training objective differs from the treatment profile"
+        )
+    if training_objective == "ring10_only":
+        if promotion_objective != "ring_10_only" or plan.get("guard_rings") != []:
+            raise ValueError(
+                "ring10_only fork requires ring_10_only promotion and no guard rings"
+            )
+    elif promotion_objective == "ring_10_only":
+        raise ValueError(
+            "generalist fork cannot claim the ring_10_only promotion objective"
+        )
     destination = Path(entry["run_root"]).expanduser().resolve()
     if destination.exists():
         raise FileExistsError(f"treatment run root already exists: {destination}")
@@ -234,7 +285,10 @@ def fork_elo_ablation(
             symlinks=True,
             copy_function=_copy_function(source, counters),
         )
-        _rotate_branch_runtime(destination)
+        _rotate_branch_runtime(
+            destination,
+            rotate_arena=experiment.orchestration.training_objective == "ring10_only",
+        )
         installed_profile = destination / "profile-elo-ablation.yaml"
         shutil.copy2(profile_path, installed_profile)
         profile_sha256 = _sha256(installed_profile)
@@ -253,8 +307,71 @@ def fork_elo_ablation(
             run_id=identity.run_id,
             generation_family=identity.generation_family,
         )
-        champion = _read_json(destination / "learner" / "champion.json")
-        if winner_snapshot is not None:
+        champion_path = destination / "learner" / "champion.json"
+        selection_metadata: dict[str, object] | None = None
+        if verified_selection is not None:
+            installed_snapshot = destination / "selection-snapshot.json"
+            shutil.copy2(verified_selection.snapshot_path, installed_snapshot)
+            verified_selection.snapshot_artifact.verify(installed_snapshot)
+            selected_manifest = selected_manifest_in_copy(
+                verified_selection,
+                destination,
+            )
+            if (
+                selected_manifest.run_id != identity.run_id
+                or selected_manifest.generation_family != identity.generation_family
+            ):
+                raise ValueError(
+                    "selected manifest belongs to another run or generation"
+                )
+            write_model_pointer(
+                champion_path,
+                selected_manifest,
+                role="champion",
+            )
+            anchored = load_model_manifest(champion_path)
+            selected_evidence = verified_selection.selected_evidence
+            if (
+                anchored.model_identity != selected_evidence.model_identity
+                or anchored.model_step != selected_evidence.model_step
+                or anchored.manifest_sha256 != selected_evidence.manifest.sha256
+                or anchored.manifest_bytes != selected_evidence.manifest.bytes
+                or anchored.checkpoint_sha256 != selected_evidence.checkpoint.sha256
+                or anchored.checkpoint_bytes != selected_evidence.checkpoint.bytes
+            ):
+                raise ValueError(
+                    "forked champion failed exact selection evidence verification"
+                )
+            selection_metadata = {
+                "status": "verified",
+                "source_snapshot": str(verified_selection.snapshot_path),
+                "source_snapshot_sha256": (verified_selection.snapshot_artifact.sha256),
+                "source_snapshot_bytes": (verified_selection.snapshot_artifact.bytes),
+                "installed_snapshot": str(installed_snapshot),
+                "plan_digest": verified_selection.plan.plan_digest,
+                "selected_manifest": selected_evidence.as_dict(),
+                "fallback_to_champion": {
+                    "used": verified_selection.fallback_used,
+                    "reason": verified_selection.fallback_reason,
+                },
+            }
+            atomic_json(
+                destination / "learner" / "selection-cutover.json",
+                {
+                    "format": SELECTION_CUTOVER_FORMAT,
+                    "schema_version": SELECTION_CUTOVER_SCHEMA_VERSION,
+                    "status": "pending",
+                    "selected_model_identity": selected_evidence.model_identity,
+                    "selected_model_step": selected_evidence.model_step,
+                    "selection_snapshot_sha256": (
+                        verified_selection.snapshot_artifact.sha256
+                    ),
+                    "selection_plan_digest": verified_selection.plan.plan_digest,
+                    "created_ns": time.time_ns(),
+                },
+            )
+        champion = _read_json(champion_path)
+        if winner_snapshot is not None and verified_selection is None:
             selected = winner_snapshot["champion"]
             assert isinstance(selected, dict)
             if any(
@@ -275,6 +392,10 @@ def fork_elo_ablation(
             "source_generation_family": identity.generation_family,
             "source_created_ns": identity.created_ns,
             "source_winner_snapshot": winner_snapshot,
+            "source_manifest_selection": selection_metadata,
+            "training_objective": training_objective,
+            "promotion_objective": promotion_objective,
+            "per_ring_guarantees": plan.get("per_ring_guarantees", True),
             "futility_policy": plan.get("futility_policy"),
             "prepared_ns": time.time_ns(),
             "measurement_started_ns": None,
@@ -302,6 +423,14 @@ def fork_elo_ablation(
             "storage": counters,
         }
         atomic_json(destination / "ablation.json", metadata)
+        if verified_selection is not None:
+            # Recheck every frozen parent/result artifact after all child-only
+            # writes.  A fork must never make an archive manifest live in the
+            # parent or accept concurrent evidence drift.
+            verify_selection_snapshot(
+                verified_selection.snapshot_path,
+                expected_source_run_root=source,
+            )
     except BaseException:
         shutil.rmtree(destination, ignore_errors=True)
         raise
@@ -315,6 +444,7 @@ def main(argv: list[str] | None = None) -> int:
             source_run_root=arguments.source_run_root,
             plan_path=arguments.plan,
             treatment=arguments.treatment,
+            selection_snapshot=arguments.selection_snapshot,
         )
     except (
         FileExistsError,

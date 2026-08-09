@@ -100,34 +100,7 @@ def _validate_autonomous_config(config: ExperimentConfig) -> None:
         raise ValueError("autonomous arena must evaluate a broad action set")
 
 
-def _validate_throughput_config(config: ExperimentConfig) -> None:
-    mixture = config.orchestration.ring_mixture
-    weights = mixture.weights_for_step(1_000_000)
-    tail_weights = mixture.weights_for_step(10**18)
-    expected_weights = (0.1, 0.1, 0.1, 0.7)
-    if any(
-        configured is None
-        or any(
-            abs(actual - expected) > 1e-9
-            for actual, expected in zip(configured, expected_weights, strict=True)
-        )
-        for configured in (weights, tail_weights)
-    ):
-        raise ValueError(
-            "continuous service requires step-1000000 weights [0.1, 0.1, 0.1, 0.7]"
-        )
-    ring_ten_weights = mixture.weights_for_step(360_000)
-    expected_stages = (
-        (360_000, (0.15, 0.15, 0.15, 0.55)),
-        (1_000_000, (0.1, 0.1, 0.1, 0.7)),
-    )
-    actual_stages = tuple(
-        (stage.from_step, stage.weights) for stage in mixture.step_weights
-    )
-    if ring_ten_weights != (0.15, 0.15, 0.15, 0.55) or actual_stages != expected_stages:
-        raise ValueError(
-            "continuous service requires step-360000 weights [0.15, 0.15, 0.15, 0.55]"
-        )
+def _validate_safe_throughput_invariants(config: ExperimentConfig) -> None:
     selfplay = config.selfplay
     if (
         selfplay.max_considered != 16
@@ -158,6 +131,79 @@ def _validate_throughput_config(config: ExperimentConfig) -> None:
             "continuous service requires resumable in-flight candidates and "
             "bounded continuation waves"
         )
+
+
+def _validate_throughput_config(config: ExperimentConfig) -> None:
+    mixture = config.orchestration.ring_mixture
+    weights = mixture.weights_for_step(1_000_000)
+    tail_weights = mixture.weights_for_step(10**18)
+    expected_weights = (0.1, 0.1, 0.1, 0.7)
+    if any(
+        configured is None
+        or any(
+            abs(actual - expected) > 1e-9
+            for actual, expected in zip(configured, expected_weights, strict=True)
+        )
+        for configured in (weights, tail_weights)
+    ):
+        raise ValueError(
+            "continuous service requires step-1000000 weights [0.1, 0.1, 0.1, 0.7]"
+        )
+    ring_ten_weights = mixture.weights_for_step(360_000)
+    expected_stages = (
+        (360_000, (0.15, 0.15, 0.15, 0.55)),
+        (1_000_000, (0.1, 0.1, 0.1, 0.7)),
+    )
+    actual_stages = tuple(
+        (stage.from_step, stage.weights) for stage in mixture.step_weights
+    )
+    if ring_ten_weights != (0.15, 0.15, 0.15, 0.55) or actual_stages != expected_stages:
+        raise ValueError(
+            "continuous service requires step-360000 weights [0.15, 0.15, 0.15, 0.55]"
+        )
+    _validate_safe_throughput_invariants(config)
+
+
+def _validate_ring10_only_config(config: ExperimentConfig) -> None:
+    if config.orchestration.autonomous.enabled:
+        raise ValueError("ring10_only objective requires the throughput profile")
+    mixture = config.orchestration.ring_mixture
+    stages = tuple(
+        (stage.from_step, tuple(float(weight) for weight in stage.weights))
+        for stage in mixture.step_weights
+    )
+    if stages != ((0, (0.0, 0.0, 0.0, 1.0)),):
+        raise ValueError(
+            "ring10_only objective requires exactly step-0 weights [0, 0, 0, 1]"
+        )
+    if (
+        config.selfplay.rings != 10
+        or not config.data.ring_stratified
+        or not config.learner.use_ring_mixture_curriculum
+    ):
+        raise ValueError(
+            "ring10_only objective requires ring-10 self-play and "
+            "ring-stratified active-ring replay"
+        )
+    arena = config.arena
+    if arena.rings != (10,):
+        raise ValueError("ring10_only objective requires arena.rings: [10]")
+    if arena.promotion_pair_ratios or any(
+        value != 0
+        for value in (
+            arena.weighted_initial_blocks,
+            arena.weighted_continuation_blocks,
+            arena.weighted_max_blocks,
+        )
+    ):
+        raise ValueError(
+            "ring10_only objective forbids weighted promotion ratios and blocks"
+        )
+    if arena.required_regression_rings != ():
+        raise ValueError("ring10_only objective requires required_regression_rings: []")
+    if arena.per_ring_regression_floor_elo:
+        raise ValueError("ring10_only objective forbids per-ring floor overrides")
+    _validate_safe_throughput_invariants(config)
 
 
 def validate_continuous_config(config: ExperimentConfig) -> None:
@@ -193,10 +239,15 @@ def validate_continuous_config(config: ExperimentConfig) -> None:
     ):
         raise ValueError("continuous service requires bounded active retention")
     _validate_learner_shared_promotion(config)
-    if config.orchestration.autonomous.enabled:
+    objective = config.orchestration.training_objective
+    if objective == "ring10_only":
+        _validate_ring10_only_config(config)
+    elif config.orchestration.autonomous.enabled:
         _validate_autonomous_config(config)
-    else:
+    elif objective == "generalist":
         _validate_throughput_config(config)
+    else:
+        raise ValueError(f"unsupported training objective: {objective!r}")
 
 
 def main() -> None:

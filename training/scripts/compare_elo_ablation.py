@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Rank training treatments by guarded ring-10 Elo gained per wall hour."""
+"""Rank training treatments by objective-compatible Elo gained per wall hour."""
 
 from __future__ import annotations
 
@@ -13,7 +13,10 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
+import yaml
+
 from startrain.arena import bounded_confidence_sequence, elo_from_probability
+from startrain.config import load_config
 
 if __package__:
     from .strength_efficiency_report import build_strength_efficiency_report
@@ -51,6 +54,7 @@ class _Treatment:
     weighted_ranking_score: float | None = None
     weighted_point_score: float | None = None
     weighted_objective: str | None = None
+    training_objective: str | None = "generalist"
 
 
 def _positive_integer(argument: str) -> int:
@@ -981,6 +985,157 @@ def _integrity_valid(
     return status in _VALID_INTEGRITY_STATUSES
 
 
+def _profile_checksum(
+    root: Path,
+    *,
+    failures: list[dict[str, object]],
+) -> tuple[Path | None, str | None]:
+    checksum_path = root / "profile.sha256"
+    try:
+        fields = checksum_path.read_text(encoding="utf-8").strip().split()
+    except OSError:
+        return None, None
+    if (
+        len(fields) != 2
+        or not re.fullmatch(r"[0-9a-f]{64}", fields[0])
+        or Path(fields[1]).name != fields[1]
+    ):
+        failures.append(_failure(checksum_path, "profile checksum is malformed"))
+        return None, None
+    return root / fields[1], fields[0]
+
+
+def _verified_profile_objectives(
+    root: Path,
+    metadata: Mapping[str, object] | None,
+    *,
+    failures: list[dict[str, object]],
+) -> dict[str, object]:
+    checksum_profile, checksum_sha256 = _profile_checksum(root, failures=failures)
+    profile_path: Path | None = None
+    expected_sha256: str | None = None
+    if metadata is not None:
+        raw_profile = metadata.get("profile")
+        if isinstance(raw_profile, str) and raw_profile:
+            profile_path = Path(raw_profile).expanduser().resolve()
+            if profile_path.parent != root:
+                failures.append(
+                    _failure(
+                        root / "ablation.json",
+                        "ablation profile must be installed directly in the run root",
+                    )
+                )
+                profile_path = None
+        else:
+            failures.append(
+                _failure(root / "ablation.json", "ablation profile path is invalid")
+            )
+        raw_sha256 = metadata.get("profile_sha256")
+        if isinstance(raw_sha256, str) and re.fullmatch(r"[0-9a-f]{64}", raw_sha256):
+            expected_sha256 = raw_sha256
+        else:
+            failures.append(
+                _failure(root / "ablation.json", "ablation profile SHA-256 is invalid")
+            )
+    else:
+        profile_path = checksum_profile
+        expected_sha256 = checksum_sha256
+        if profile_path is None:
+            profile_path = next(
+                (
+                    candidate
+                    for candidate in (
+                        root / "profile-elo-ablation.yaml",
+                        root / "profile.yaml",
+                        root / "resolved-config.yaml",
+                    )
+                    if candidate.is_file()
+                ),
+                None,
+            )
+            failures.append(_failure(root, "run profile checksum is missing"))
+
+    if (
+        profile_path is not None
+        and checksum_profile is not None
+        and profile_path != checksum_profile.resolve()
+    ):
+        failures.append(
+            _failure(root / "profile.sha256", "profile checksum names another profile")
+        )
+    if (
+        expected_sha256 is not None
+        and checksum_sha256 is not None
+        and expected_sha256 != checksum_sha256
+    ):
+        failures.append(_failure(root / "profile.sha256", "profile checksums disagree"))
+    expected_sha256 = expected_sha256 or checksum_sha256
+    if profile_path is None or expected_sha256 is None:
+        return {
+            "path": str(profile_path) if profile_path is not None else None,
+            "sha256": expected_sha256,
+            "training_objective": None,
+            "promotion_objective": None,
+        }
+    try:
+        actual_sha256 = _sha256(profile_path)
+    except OSError as error:
+        failures.append(
+            _failure(profile_path, f"profile could not be read: {type(error).__name__}")
+        )
+        return {
+            "path": str(profile_path),
+            "sha256": expected_sha256,
+            "training_objective": None,
+            "promotion_objective": None,
+        }
+    if actual_sha256 != expected_sha256:
+        failures.append(_failure(profile_path, "profile SHA-256 mismatch"))
+    try:
+        config = load_config(profile_path)
+    except (OSError, ValueError, yaml.YAMLError) as error:
+        failures.append(
+            _failure(
+                profile_path, f"profile is invalid: {type(error).__name__}: {error}"
+            )
+        )
+        return {
+            "path": str(profile_path),
+            "sha256": actual_sha256,
+            "training_objective": None,
+            "promotion_objective": None,
+        }
+    training_objective = config.orchestration.training_objective
+    promotion_objective = (
+        "ring_10_only"
+        if training_objective == "ring10_only"
+        else (
+            "weighted_aggregate"
+            if config.arena.promotion_pair_ratios
+            else "ring_10_guarded"
+        )
+    )
+    if metadata is not None:
+        for name, expected in (
+            ("training_objective", training_objective),
+            ("promotion_objective", promotion_objective),
+        ):
+            claimed = metadata.get(name)
+            if claimed is not None and claimed != expected:
+                failures.append(
+                    _failure(
+                        root / "ablation.json",
+                        f"ablation {name} differs from the frozen profile",
+                    )
+                )
+    return {
+        "path": str(profile_path),
+        "sha256": actual_sha256,
+        "training_objective": training_objective,
+        "promotion_objective": promotion_objective,
+    }
+
+
 def _measurement_context(
     root: Path,
     report: Mapping[str, object],
@@ -989,6 +1144,7 @@ def _measurement_context(
 ) -> tuple[dict[str, object], dict[str, object], str | None]:
     metadata_path = root / "ablation.json"
     if not metadata_path.is_file():
+        profile = _verified_profile_objectives(root, None, failures=failures)
         started_ns = _positive_timestamp(report.get("started_ns"))
         stopped_ns = _positive_timestamp(report.get("observed_until_ns"))
         wall_seconds = (
@@ -1001,6 +1157,9 @@ def _measurement_context(
         return (
             {
                 "source": "strength_efficiency_report",
+                "profile": profile,
+                "training_objective": profile["training_objective"],
+                "promotion_objective": profile["promotion_objective"],
                 "status": "complete",
                 "started_ns": started_ns,
                 "stopped_ns": stopped_ns,
@@ -1032,6 +1191,8 @@ def _measurement_context(
         return (
             {
                 "source": "ablation.json",
+                "training_objective": None,
+                "promotion_objective": None,
                 "status": "invalid",
                 "started_ns": None,
                 "stopped_ns": None,
@@ -1070,6 +1231,9 @@ def _measurement_context(
                 "ablation metadata has an unsupported report identifier",
             )
         )
+    profile = _verified_profile_objectives(root, metadata, failures=failures)
+    training_objective = profile["training_objective"]
+    promotion_objective = profile["promotion_objective"]
     raw_anchor = _mapping(metadata.get("anchor"))
     anchor_identity = raw_anchor.get("model_identity") if raw_anchor else None
     anchor_step = (
@@ -1381,6 +1545,9 @@ def _measurement_context(
     return (
         {
             "source": "ablation.json",
+            "profile": profile,
+            "training_objective": training_objective,
+            "promotion_objective": promotion_objective,
             "status": "complete" if complete else "incomplete",
             "started_ns": started_ns,
             "stopped_ns": cutoff_ns,
@@ -1863,6 +2030,8 @@ def _empty_payload(
         "run_id": None,
         "generation_family": None,
         "source_report_status": "error",
+        "training_objective": None,
+        "promotion_objective": None,
         "anchor": {
             "identity": None,
             "step": None,
@@ -2052,6 +2221,9 @@ def _analyze_treatment(
         failures=failures,
     )
     payload["measurement"] = measurement
+    training_objective = measurement.get("training_objective")
+    payload["training_objective"] = training_objective
+    payload["promotion_objective"] = measurement.get("promotion_objective")
     payload["anchor"] = anchor
     raw_anchor_identity = anchor.get("identity")
     anchor_identity = (
@@ -2081,6 +2253,20 @@ def _analyze_treatment(
         guard_floor_elo=guard_floor_elo,
         failures=failures,
     )
+    if training_objective == "ring10_only":
+        for evaluation in evaluations:
+            per_ring = _mapping(evaluation.get("per_ring")) or {}
+            incompatible_rings = sorted(
+                int(ring) for ring in per_ring if int(ring) != 10
+            )
+            if incompatible_rings:
+                failures.append(
+                    _failure(
+                        str(evaluation.get("path")),
+                        "ring10_only arena evidence contains incompatible rings "
+                        f"{incompatible_rings}",
+                    )
+                )
     publications = _model_publications(root, failures=failures)
     metrics_path = root / "learner" / "metrics.jsonl"
     learner_records = _read_jsonl(metrics_path, failures=failures)
@@ -2142,6 +2328,34 @@ def _analyze_treatment(
         anchor_identity=anchor_identity,
     )
     payload["weighted_champion_frontier"] = weighted_frontier
+    promotion_objective = measurement.get("promotion_objective")
+    profile_evidence = measurement.get("profile")
+    raw_profile_failure_path = (
+        profile_evidence.get("path") if isinstance(profile_evidence, Mapping) else None
+    )
+    profile_failure_path: Path | str = (
+        raw_profile_failure_path
+        if isinstance(raw_profile_failure_path, Path | str)
+        else root
+    )
+    if weighted_objective is not None and promotion_objective != "weighted_aggregate":
+        failures.append(
+            _failure(
+                profile_failure_path,
+                "arena weighted evidence differs from the frozen profile objective",
+            )
+        )
+    elif (
+        promotion_objective == "weighted_aggregate"
+        and evaluations
+        and weighted_objective is None
+    ):
+        failures.append(
+            _failure(
+                profile_failure_path,
+                "frozen weighted objective lacks compatible arena evidence",
+            )
+        )
     winner_snapshot, snapshot_error = _winner_snapshot(
         root,
         label=label,
@@ -2452,6 +2666,7 @@ def _analyze_treatment(
         weighted_ranking_score,
         weighted_point_score,
         weighted_objective,
+        training_objective if isinstance(training_objective, str) else None,
     )
 
 
@@ -2538,12 +2753,52 @@ def build_elo_ablation_comparison(
         for treatment in treatments:
             _add_reason(treatment.reasons, "missing_common_anchor", message)
 
+    training_objectives = {treatment.training_objective for treatment in treatments}
+    compatible_training_objective = (
+        next(iter(training_objectives))
+        if len(training_objectives) == 1 and None not in training_objectives
+        else None
+    )
     weighted_objectives = {
         treatment.weighted_objective
         for treatment in treatments
         if treatment.weighted_objective is not None
     }
-    if not weighted_objectives:
+    if compatible_training_objective is None:
+        ranking_objective = "incompatible"
+        message = (
+            "all treatments must expose the same training objective; "
+            "generalist and ring10_only runs cannot be mixed"
+        )
+        errors.append({"code": "incompatible_training_objectives", "message": message})
+        for treatment in treatments:
+            _add_reason(
+                treatment.reasons,
+                "incompatible_training_objectives",
+                message,
+            )
+    elif compatible_training_objective == "ring10_only":
+        if weighted_objectives:
+            ranking_objective = "incompatible"
+            message = "ring10_only runs cannot expose weighted promotion evidence"
+            errors.append(
+                {"code": "incompatible_promotion_objectives", "message": message}
+            )
+            for treatment in treatments:
+                _add_reason(
+                    treatment.reasons,
+                    "incompatible_promotion_objectives",
+                    message,
+                )
+        elif parsed_rings:
+            ranking_objective = "incompatible"
+            message = "ring10_only comparisons cannot configure guard rings"
+            errors.append({"code": "objective_guard_mismatch", "message": message})
+            for treatment in treatments:
+                _add_reason(treatment.reasons, "objective_guard_mismatch", message)
+        else:
+            ranking_objective = "ring_10_only"
+    elif not weighted_objectives:
         ranking_objective = "ring_10_guarded"
     elif len(weighted_objectives) == 1 and all(
         treatment.weighted_objective is not None for treatment in treatments
@@ -2566,6 +2821,9 @@ def build_elo_ablation_comparison(
     legacy_metric_name = (
         "guarded_champion_frontier_ring_10_elo_lcb_per_total_provisioned_wall_hour"
     )
+    ring10_only_metric_name = (
+        "ring10_only_champion_frontier_elo_lcb_per_total_provisioned_wall_hour"
+    )
     weighted_metric_name = (
         "weighted_champion_frontier_elo_lcb_per_total_provisioned_wall_hour"
     )
@@ -2579,7 +2837,16 @@ def build_elo_ablation_comparison(
         else:
             ring_metric = treatment.payload.get("ring_10_deployment_metric")
             if isinstance(ring_metric, Mapping):
-                treatment.payload["deployment_metric"] = ring_metric
+                if ranking_objective == "ring_10_only":
+                    objective_metric = {
+                        **ring_metric,
+                        "name": ring10_only_metric_name,
+                        "objective": "ring10_only",
+                    }
+                    treatment.payload["ring_10_deployment_metric"] = objective_metric
+                    treatment.payload["deployment_metric"] = objective_metric
+                else:
+                    treatment.payload["deployment_metric"] = ring_metric
         treatment.payload["ranking_objective"] = ranking_objective
         if treatment.ranking_score is None or treatment.point_score is None:
             _add_reason(
@@ -2589,8 +2856,13 @@ def build_elo_ablation_comparison(
                     "weighted champion-frontier Elo/hour lower bound could not "
                     "be computed"
                     if ranking_objective == "weighted_aggregate"
-                    else "guarded champion-frontier ring-10 Elo/hour lower bound "
-                    "could not be computed"
+                    else (
+                        "ring10-only champion-frontier Elo/hour lower bound could "
+                        "not be computed"
+                        if ranking_objective == "ring_10_only"
+                        else "guarded champion-frontier ring-10 Elo/hour lower bound "
+                        "could not be computed"
+                    )
                 ),
             )
         if treatment.label in forced:
@@ -2658,11 +2930,22 @@ def build_elo_ablation_comparison(
             "weighted_chronological_champion_frontier"
         )
         serialized_winner_snapshot["ranking_metric"] = weighted_metric_name
+    elif serialized_winner_snapshot is not None and ranking_objective == "ring_10_only":
+        serialized_winner_snapshot["selection"] = (
+            "ring10_only_chronological_champion_frontier"
+        )
+        serialized_winner_snapshot["ranking_metric"] = ring10_only_metric_name
     selector_verified = serialized_winner_snapshot is not None
     ranking_metric = (
         weighted_metric_name
         if ranking_objective == "weighted_aggregate"
-        else (legacy_metric_name if ranking_objective == "ring_10_guarded" else None)
+        else (
+            ring10_only_metric_name
+            if ranking_objective == "ring_10_only"
+            else (
+                legacy_metric_name if ranking_objective == "ring_10_guarded" else None
+            )
+        )
     )
     selector = {
         "status": "verified" if selector_verified else "unavailable",
@@ -2677,7 +2960,11 @@ def build_elo_ablation_comparison(
         "selection": (
             "highest_ranked_chronological_weighted_champion_frontier"
             if ranking_objective == "weighted_aggregate"
-            else "highest_ranked_chronological_champion_frontier"
+            else (
+                "highest_ranked_chronological_ring10_only_champion_frontier"
+                if ranking_objective == "ring_10_only"
+                else "highest_ranked_chronological_champion_frontier"
+            )
         ),
         "non_promoted_endpoints_are_diagnostic_only": True,
     }

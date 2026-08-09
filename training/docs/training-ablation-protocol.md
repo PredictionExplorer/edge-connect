@@ -58,6 +58,10 @@ The following switches are deliberately first-class and recorded in metrics:
 - `arena.required_regression_rings`, which is `null` for the legacy all-ring
   guard contract. Setting it to `[]` removes every blocking per-ring floor while
   retaining per-ring confidence sequences as diagnostics.
+- `orchestration.training_objective`, which remains `generalist` unless an
+  explicitly frozen profile selects `ring10_only`. The latter requires actor
+  and learner weights `[0, 0, 0, 1]`, a single-ring arena on ring 10, and no
+  smaller-ring regression guards.
 - `orchestration.plateau.action: reduce_lr_keep_weights`, which clears stale
   optimizer moments and lowers rates without discarding the learner branch.
 
@@ -80,7 +84,9 @@ games never enter replay.
    also report wall-clock GPU-hours.
 4. Preserve the same arena openings, roles, search budget, and model architecture
    for each comparison.
-5. Evaluate every ring independently in addition to the aggregate result.
+5. Evaluate every ring independently for a generalist objective. A
+   `ring10_only` experiment evaluates only ring 10 and must not imply preserved
+   strength on smaller boards.
 6. Keep negative and inconclusive results. Do not repeatedly tune on one arena
    seed.
 7. Use successive halving for expensive scratch treatments: equal-leaf pilots
@@ -91,6 +97,13 @@ non-inferiority gating. Its arms share one weighted promotion objective and
 must not be compared in the same selector as legacy guarded arms. Selecting a
 weighted winner accepts that rings 4, 6, or 8 may regress without blocking
 promotion; diagnostic reporting is not a guarantee.
+
+The `ring10_only` objective is a separate, stronger exception. It generates
+training replay only on ring 10 and spends all promotion games on ring 10.
+Rings 4, 6, and 8 remain valid inference inputs because the shared game, feature,
+and model schemas are unchanged, but their playing strength is intentionally
+outside the acceptance contract. Ring-10-only, weighted-generalist, and guarded
+generalist evidence must never be mixed in one selector.
 
 ## Required metrics
 

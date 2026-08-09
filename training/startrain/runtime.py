@@ -16,6 +16,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+SELECTION_CUTOVER_FORMAT = "startrain.selection-cutover"
+SELECTION_CUTOVER_SCHEMA_VERSION = 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,6 +59,37 @@ def atomic_json(path: str | Path, payload: Mapping[str, object]) -> None:
     finally:
         if temporary_name is not None and os.path.exists(temporary_name):
             os.unlink(temporary_name)
+
+
+def require_active_selection_cutover(learner_root: str | Path) -> None:
+    """Fail closed while an archived-manifest fork awaits its warm-start cutover."""
+
+    path = Path(learner_root) / "selection-cutover.json"
+    if not path.exists():
+        return
+    try:
+        with path.open("r", encoding="utf-8") as stream:
+            payload = json.load(stream)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"cannot read archived selection cutover: {exc}") from exc
+    if (
+        not isinstance(payload, dict)
+        or payload.get("format") != SELECTION_CUTOVER_FORMAT
+        or payload.get("schema_version") != SELECTION_CUTOVER_SCHEMA_VERSION
+    ):
+        raise RuntimeError("archived selection cutover marker is incompatible")
+    if payload.get("status") != "active":
+        raise RuntimeError(
+            "archived selection fork is pending a verified warm-start cutover"
+        )
+    if (
+        not isinstance(payload.get("selected_model_identity"), str)
+        or isinstance(payload.get("selected_model_step"), bool)
+        or not isinstance(payload.get("selected_model_step"), int)
+        or payload.get("selected_model_step", -1) < 0
+        or not isinstance(payload.get("warm_start_checkpoint_sha256"), str)
+    ):
+        raise RuntimeError("active archived selection cutover evidence is incomplete")
 
 
 def load_run_identity(path: str | Path) -> RunIdentity:

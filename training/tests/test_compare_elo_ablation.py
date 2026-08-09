@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
 import pytest
+import yaml
 
 from startrain.arena import bounded_confidence_sequence, elo_from_probability
 
@@ -18,6 +20,7 @@ from scripts.compare_elo_ablation import (
 )
 
 HOUR_NS = 3_600_000_000_000
+CONFIGS = Path(__file__).parents[1] / "configs"
 
 
 def _write_jsonl(path: Path, records: list[dict[str, object]]) -> None:
@@ -26,6 +29,41 @@ def _write_jsonl(path: Path, records: list[dict[str, object]]) -> None:
         "".join(json.dumps(record, sort_keys=True) + "\n" for record in records),
         encoding="utf-8",
     )
+
+
+def _write_profile(
+    root: Path,
+    *,
+    training_objective: str = "generalist",
+    promotion_objective: str = "ring_10_guarded",
+    filename: str = "profile.yaml",
+) -> tuple[Path, str]:
+    source = (
+        CONFIGS / "h100-8gpu-ring10-only.yaml"
+        if training_objective == "ring10_only"
+        else CONFIGS / "h100-8gpu-throughput.yaml"
+    )
+    profile = yaml.safe_load(source.read_text(encoding="utf-8"))
+    profile["orchestration"]["training_objective"] = training_objective
+    if promotion_objective == "weighted_aggregate":
+        profile["arena"].update(
+            {
+                "promotion_pair_ratios": {4: 1, 6: 1, 8: 1, 10: 7},
+                "required_regression_rings": [],
+                "per_ring_regression_floor_elo": {},
+                "weighted_initial_blocks": 15,
+                "weighted_continuation_blocks": 10,
+                "weighted_max_blocks": 50,
+            }
+        )
+    path = root / filename
+    path.write_text(yaml.safe_dump(profile, sort_keys=False), encoding="utf-8")
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    (root / "profile.sha256").write_text(
+        f"{digest}  {path.name}\n",
+        encoding="utf-8",
+    )
+    return path.resolve(), digest
 
 
 def _run_fixture(
@@ -40,9 +78,16 @@ def _run_fixture(
     omitted_guard_rings: tuple[int, ...] = (),
     weighted_elo: float | None = None,
     weighted_lower: float | None = None,
+    arena_rings: tuple[int, ...] = (*DEFAULT_GUARD_RINGS, 10),
 ) -> Path:
     root = parent / label
     root.mkdir()
+    _write_profile(
+        root,
+        promotion_objective=(
+            "weighted_aggregate" if weighted_elo is not None else "ring_10_guarded"
+        ),
+    )
     started_ns = 1_000_000_000_000
     candidate = f"checkpoint-{label}"
     published_ns = started_ns + HOUR_NS
@@ -165,7 +210,7 @@ def _run_fixture(
             "elo_difference": 0.0,
             "anytime_elo_interval": [-100.0, 100.0],
         }
-        for ring in (*DEFAULT_GUARD_RINGS, 10)
+        for ring in arena_rings
     }
     arena = root / "arena"
     arena.mkdir()
@@ -226,7 +271,15 @@ def _install_ablation_metadata(
     source_anchor: str = "checkpoint-common-anchor",
     frozen_anchor: str = "checkpoint-frozen-anchor",
     complete: bool = True,
+    training_objective: str = "generalist",
+    promotion_objective: str = "ring_10_guarded",
 ) -> None:
+    installed_profile, profile_sha256 = _write_profile(
+        root,
+        training_objective=training_objective,
+        promotion_objective=promotion_objective,
+        filename="profile-elo-ablation.yaml",
+    )
     run_path = root / "run.json"
     run = json.loads(run_path.read_text(encoding="utf-8"))
     original_started_ns = int(run["created_ns"])
@@ -311,6 +364,10 @@ def _install_ablation_metadata(
                 "schema_version": 1,
                 "report": "startrain-elo-ablation-branch",
                 "treatment": root.name,
+                "training_objective": training_objective,
+                "promotion_objective": promotion_objective,
+                "profile": str(installed_profile),
+                "profile_sha256": profile_sha256,
                 "source_run_id": run["run_id"],
                 "source_generation_family": run["generation_family"],
                 "source_created_ns": run["created_ns"],
@@ -702,6 +759,166 @@ def test_weighted_comparison_ranks_chronological_frontier_without_cherry_picking
     )
     assert results["rejected"]["deployment_metric"]["point_value"] == 0
     assert report["selector"]["winner_snapshot"]["label"] == "promoted"
+
+
+def test_ring10_only_comparison_uses_distinct_objective_name(tmp_path: Path) -> None:
+    stronger = _run_fixture(
+        tmp_path,
+        "ring10-only-stronger",
+        ring_wins=72,
+        ring_losses=28,
+        arena_rings=(10,),
+    )
+    weaker = _run_fixture(
+        tmp_path,
+        "ring10-only-weaker",
+        ring_wins=58,
+        ring_losses=42,
+        arena_rings=(10,),
+    )
+    for root in (stronger, weaker):
+        _install_ablation_metadata(
+            root,
+            training_objective="ring10_only",
+            promotion_objective="ring_10_only",
+        )
+
+    report = build_elo_ablation_comparison(
+        {"stronger": stronger, "weaker": weaker},
+        guard_rings=(),
+    )
+
+    assert report["status"] == "complete"
+    assert report["ranking_objective"] == "ring_10_only"
+    assert report["ranking_metric"].startswith("ring10_only_champion_frontier")
+    assert report["selector"]["ranking_objective"] == "ring_10_only"
+    assert report["selector"]["winner_snapshot"]["selection"] == (
+        "ring10_only_chronological_champion_frontier"
+    )
+    assert all(
+        treatment["training_objective"] == "ring10_only"
+        and treatment["deployment_metric"]["objective"] == "ring10_only"
+        for treatment in _by_label(report).values()
+    )
+
+
+def test_comparison_derives_objective_from_verified_profile(tmp_path: Path) -> None:
+    first = _run_fixture(tmp_path, "profile-first", arena_rings=(10,))
+    second = _run_fixture(tmp_path, "profile-second", arena_rings=(10,))
+    for root in (first, second):
+        _install_ablation_metadata(
+            root,
+            training_objective="ring10_only",
+            promotion_objective="ring_10_only",
+        )
+    metadata_path = first / "ablation.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["training_objective"] = "generalist"
+    metadata["promotion_objective"] = "ring_10_guarded"
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+    report = build_elo_ablation_comparison(
+        {"first": first, "second": second},
+        guard_rings=(),
+    )
+    first_result = _by_label(report)["first"]
+
+    assert first_result["training_objective"] == "ring10_only"
+    assert first_result["eligible"] is False
+    assert "parse_failure" in _reason_codes(first_result)
+    assert any(
+        "differs from the frozen profile" in failure["error"]
+        for failure in first_result["parse_failures"]
+    )
+
+
+def test_comparison_hash_checks_installed_profile(tmp_path: Path) -> None:
+    first = _run_fixture(tmp_path, "hash-first")
+    second = _run_fixture(tmp_path, "hash-second")
+    for root in (first, second):
+        _install_ablation_metadata(root)
+    profile = first / "profile-elo-ablation.yaml"
+    profile.write_text(
+        profile.read_text(encoding="utf-8") + "# drift\n", encoding="utf-8"
+    )
+
+    report = build_elo_ablation_comparison({"first": first, "second": second})
+    first_result = _by_label(report)["first"]
+
+    assert first_result["eligible"] is False
+    assert any(
+        failure["error"] == "profile SHA-256 mismatch"
+        for failure in first_result["parse_failures"]
+    )
+
+
+def test_comparison_derives_ring10_objective_without_ablation_metadata(
+    tmp_path: Path,
+) -> None:
+    first = _run_fixture(tmp_path, "direct-first", arena_rings=(10,))
+    second = _run_fixture(tmp_path, "direct-second", arena_rings=(10,))
+    for root in (first, second):
+        _write_profile(root, training_objective="ring10_only")
+
+    report = build_elo_ablation_comparison(
+        {"first": first, "second": second},
+        guard_rings=(),
+    )
+
+    assert report["status"] == "complete"
+    assert report["ranking_objective"] == "ring_10_only"
+    assert all(
+        treatment["training_objective"] == "ring10_only"
+        for treatment in _by_label(report).values()
+    )
+
+
+def test_ring10_comparison_rejects_all_ring_arena_evidence(tmp_path: Path) -> None:
+    valid = _run_fixture(tmp_path, "ring10-valid", arena_rings=(10,))
+    incompatible = _run_fixture(tmp_path, "ring10-all-rings")
+    for root in (valid, incompatible):
+        _install_ablation_metadata(
+            root,
+            training_objective="ring10_only",
+            promotion_objective="ring_10_only",
+        )
+
+    report = build_elo_ablation_comparison(
+        {"valid": valid, "incompatible": incompatible},
+        guard_rings=(),
+    )
+    result = _by_label(report)["incompatible"]
+
+    assert report["status"] == "incomplete"
+    assert result["eligible"] is False
+    assert any(
+        "incompatible rings [4, 6, 8]" in failure["error"]
+        for failure in result["parse_failures"]
+    )
+
+
+def test_comparison_rejects_mixed_training_objectives(tmp_path: Path) -> None:
+    generalist = _run_fixture(tmp_path, "generalist")
+    ring10_only = _run_fixture(tmp_path, "ring10-only", arena_rings=(10,))
+    _install_ablation_metadata(generalist)
+    _install_ablation_metadata(
+        ring10_only,
+        training_objective="ring10_only",
+        promotion_objective="ring_10_only",
+    )
+
+    report = build_elo_ablation_comparison(
+        {"generalist": generalist, "ring10-only": ring10_only},
+        guard_rings=(),
+    )
+
+    assert report["status"] == "incomplete"
+    assert report["ranking_objective"] == "incompatible"
+    assert report["errors"][0]["code"] == "incompatible_training_objectives"
+    assert all(
+        "incompatible_training_objectives" in _reason_codes(treatment)
+        for treatment in _by_label(report).values()
+    )
 
 
 def test_weighted_frontier_uses_familywise_alpha_spending_across_promotions() -> None:
