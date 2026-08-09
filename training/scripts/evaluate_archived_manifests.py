@@ -5,11 +5,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import multiprocessing
 import os
 import sys
 import time
 from collections.abc import Callable, Mapping
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any
@@ -485,6 +486,39 @@ def _evaluate_device_lane(
     return output
 
 
+def _evaluate_device_lane_process(
+    profile: str,
+    plan_path: str,
+    candidate_identities: tuple[str, ...],
+    device: str,
+    results_directory: str,
+) -> dict[str, Path]:
+    """Run one GPU lane in an isolated process so compilers cannot deadlock."""
+
+    plan = verify_selection_plan(plan_path)
+    candidates_by_identity = {
+        candidate.model_identity: candidate for candidate in plan.candidates
+    }
+    try:
+        candidates = tuple(
+            candidates_by_identity[identity] for identity in candidate_identities
+        )
+    except KeyError as exc:
+        raise ManifestSelectionError(
+            f"device lane references an unknown candidate: {exc.args[0]}"
+        ) from exc
+    native = load_star_native(required=True)
+    assert native is not None
+    return _evaluate_device_lane(
+        experiment=load_config(profile),
+        plan=plan,
+        candidates=candidates,
+        native_module=native,
+        device=device,
+        results_directory=Path(results_directory),
+    )
+
+
 def finalize_archived_manifest_selection(
     *,
     plan_path: str | Path,
@@ -620,31 +654,42 @@ def evaluate_archived_manifests(
     if pending:
         resolved_devices = canonicalize_device_lanes(devices)
         assignments = static_device_assignments(tuple(pending), resolved_devices)
-        experiment = load_config(profile)
-        native = load_star_native(required=True)
-        assert native is not None
-
-        def run_lane(
-            assignment: tuple[str, tuple[ManifestEvidence, ...]],
-        ) -> dict[str, Path]:
-            device, candidates = assignment
-            return _evaluate_device_lane(
-                experiment=experiment,
-                plan=plan,
-                candidates=candidates,
-                native_module=native,
-                device=device,
-                results_directory=results_directory,
-            )
-
         if len(assignments) == 1:
-            result_paths.update(run_lane(assignments[0]))
+            experiment = load_config(profile)
+            native = load_star_native(required=True)
+            assert native is not None
+            device, candidates = assignments[0]
+            result_paths.update(
+                _evaluate_device_lane(
+                    experiment=experiment,
+                    plan=plan,
+                    candidates=candidates,
+                    native_module=native,
+                    device=device,
+                    results_directory=results_directory,
+                )
+            )
         else:
-            with ThreadPoolExecutor(
+            arguments = [
+                (
+                    str(Path(profile).expanduser().resolve()),
+                    str(plan_path),
+                    tuple(candidate.model_identity for candidate in candidates),
+                    device,
+                    str(results_directory),
+                )
+                for device, candidates in assignments
+            ]
+            with ProcessPoolExecutor(
                 max_workers=len(assignments),
-                thread_name_prefix="archived-ring10",
+                mp_context=multiprocessing.get_context("spawn"),
             ) as executor:
-                for lane_results in executor.map(run_lane, assignments):
+                futures = [
+                    executor.submit(_evaluate_device_lane_process, *argument)
+                    for argument in arguments
+                ]
+                for future in futures:
+                    lane_results = future.result()
                     result_paths.update(lane_results)
     finalize_archived_manifest_selection(
         plan_path=plan_path,
