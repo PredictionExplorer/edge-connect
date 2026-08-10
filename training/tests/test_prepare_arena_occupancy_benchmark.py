@@ -85,6 +85,37 @@ def test_git_revision_accepts_sha256_repository(
     assert benchmark_plan_module._git_revision(tmp_path) == ("e" * 64, True)
 
 
+def test_git_revision_allows_only_matching_immutable_release_manifest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    commit = "f" * 40
+    (tmp_path / "release-manifest.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "report": "edgeconnect-immutable-release",
+                "commit": commit,
+            }
+        ),
+        encoding="utf-8",
+    )
+    completed = iter(
+        [
+            SimpleNamespace(stdout=f"{commit}\n"),
+            SimpleNamespace(stdout="?? release-manifest.json\n"),
+        ]
+    )
+    monkeypatch.setattr(benchmark_plan_module, "REPOSITORY_ROOT", tmp_path)
+    monkeypatch.setattr(
+        benchmark_plan_module.subprocess,
+        "run",
+        lambda *_args, **_kwargs: next(completed),
+    )
+
+    assert benchmark_plan_module._git_revision(tmp_path) == (commit, True)
+
+
 def test_native_identity_resolves_compiled_extension_not_package_wrapper(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

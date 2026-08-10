@@ -125,10 +125,31 @@ def _verify_artifact(raw: object, name: str) -> Path:
     return path
 
 
+def _release_manifest_artifact(commit: str) -> dict[str, object] | None:
+    path = REPOSITORY_ROOT / "release-manifest.json"
+    if not path.exists() and not path.is_symlink():
+        return None
+    if path.is_symlink() or not path.is_file():
+        raise ValueError("release manifest must be a regular file")
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError(f"cannot read release manifest: {error}") from error
+    if (
+        not isinstance(payload, dict)
+        or payload.get("schema_version") != 1
+        or payload.get("report") != "edgeconnect-immutable-release"
+        or payload.get("commit") != commit
+    ):
+        raise ValueError("release manifest identity does not match the checkout")
+    return _artifact(path)
+
+
 def _git_revision(training_root: Path = TRAINING_ROOT) -> tuple[str, bool]:
+    git = ["git", "-c", f"safe.directory={REPOSITORY_ROOT}"]
     try:
         commit = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
+            [*git, "rev-parse", "HEAD"],
             cwd=training_root,
             check=True,
             capture_output=True,
@@ -136,7 +157,7 @@ def _git_revision(training_root: Path = TRAINING_ROOT) -> tuple[str, bool]:
             timeout=10,
         ).stdout.strip()
         status = subprocess.run(
-            ["git", "status", "--porcelain", "--untracked-files=all"],
+            [*git, "status", "--porcelain", "--untracked-files=all"],
             cwd=training_root,
             check=True,
             capture_output=True,
@@ -151,7 +172,16 @@ def _git_revision(training_root: Path = TRAINING_ROOT) -> tuple[str, bool]:
         character not in "0123456789abcdef" for character in commit
     ):
         raise ValueError("benchmark source revision is not a full Git commit")
-    return commit, not bool(status.strip())
+    release_manifest = _release_manifest_artifact(commit)
+    unexpected = [
+        line
+        for line in status.splitlines()
+        if line.strip()
+        and not (
+            release_manifest is not None and line.strip() == "?? release-manifest.json"
+        )
+    ]
+    return commit, not unexpected
 
 
 def _assert_stopped_source(
@@ -378,6 +408,7 @@ def prepare_arena_occupancy_benchmark(
         raise ValueError("benchmark plans require a clean source tree")
     harness_artifacts = _harness_artifacts()
     native_extension = _native_extension_artifact()
+    release_manifest = _release_manifest_artifact(source_commit)
 
     selection = plan_archived_manifest_evaluation(
         source_run_root=source,
@@ -412,6 +443,7 @@ def prepare_arena_occupancy_benchmark(
             "training_root": str(TRAINING_ROOT),
         },
         "harness_artifacts": harness_artifacts,
+        "release_manifest": release_manifest,
         "native_extension": native_extension,
         "device": device,
         "physical_gpu_index": physical_gpu_index,
@@ -504,6 +536,8 @@ def verify_arena_occupancy_plan(
         or revision.get("training_root") != str(TRAINING_ROOT)
     ):
         raise ValueError("benchmark source revision changed or is dirty")
+    if payload.get("release_manifest") != _release_manifest_artifact(observed_commit):
+        raise ValueError("benchmark release manifest changed")
     raw_harness = payload.get("harness_artifacts")
     if not isinstance(raw_harness, list) or len(raw_harness) != len(HARNESS_PATHS):
         raise ValueError("benchmark harness artifact set is invalid")
