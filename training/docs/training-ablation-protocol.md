@@ -42,6 +42,9 @@ The following switches are deliberately first-class and recorded in metrics:
   together so the requested cohort can actually fill the larger GPU batch.
 - actor `actor_lanes`, evaluated at fixed total leaf work before enabling more
   than one process on a GPU;
+- `orchestration.allow_colocated_workers` with one explicitly configured actor
+  on the learner GPU, evaluated only from a fresh root with per-process CUDA
+  memory, restart, learner-throughput, and fleet-throughput evidence;
 - `learner.target_updates_per_new_sample` and
   `learner.candidate_interval_examples`, which make replay ratio and candidate
   cadence explicit instead of accidental consequences of throughput.
@@ -91,6 +94,11 @@ games never enter replay.
    seed.
 7. Use successive halving for expensive scratch treatments: equal-leaf pilots
    first, then at least three seeds for any treatment promoted to a long run.
+
+Runtime arena pair-count overrides are permitted only in an isolated
+fixed-manifest throughput benchmark. They are not deployable profile settings,
+must retain the frozen statistical/search contract in their evidence, and must
+not claim outcome equivalence when batch-derived search seeds differ.
 
 The weighted-generalist 55/65/70 matrix is an explicit exception to per-ring
 non-inferiority gating. Its arms share one weighted promotion objective and

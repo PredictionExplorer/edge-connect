@@ -307,6 +307,53 @@ def test_h100_layouts_assign_one_learner_and_every_actor_gpu() -> None:
     assert "--gpu-pause" in shared_arena.command
 
 
+def test_ring10_learner_slack_topology_keeps_arena_pause_on_gpu_seven(
+    tmp_path: Path,
+) -> None:
+    raw = yaml.safe_load(
+        (CONFIGS / "h100-8gpu-ring10-only.yaml").read_text(encoding="utf-8")
+    )
+    orchestration = raw["orchestration"]
+    orchestration["allow_colocated_workers"] = True
+    learner = orchestration["gpus"][0]
+    orchestration["gpus"].insert(
+        1,
+        {
+            "gpu_id": 0,
+            "role": "actor",
+            "cpu_threads": 8,
+            "actor_batch_size": 64,
+            "actor_lanes": 1,
+            "cpu_affinity": learner["cpu_affinity"],
+        },
+    )
+    orchestration["directories"]["root"] = str(tmp_path / "learner-slack")
+    profile_path = tmp_path / "learner-slack.yaml"
+    profile_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+    experiment = load_config(profile_path)
+
+    specs = build_worker_specs(
+        experiment,
+        config_path=profile_path,
+        directories=RunDirectories.from_experiment(experiment),
+        python_executable="/test/python",
+        base_environment={},
+    )
+    learner_spec = next(spec for spec in specs if spec.role == "learner")
+    actor_specs = [spec for spec in specs if spec.role == "actor"]
+    actor_zero = next(spec for spec in actor_specs if spec.name == "actor-gpu-0")
+    actor_seven = next(spec for spec in actor_specs if spec.name == "actor-gpu-7")
+    arena_spec = next(spec for spec in specs if spec.role == "arena")
+
+    assert len(actor_specs) == 14
+    assert learner_spec.gpu_ids == actor_zero.gpu_ids == (0,)
+    assert "--gpu-pause" not in learner_spec.command
+    assert "--gpu-pause" not in actor_zero.command
+    assert actor_seven.gpu_ids == arena_spec.gpu_ids == (7,)
+    assert "--gpu-pause" in arena_spec.command
+    assert experiment.orchestration.promotion.gpu_id == 7
+
+
 def test_autonomous_run_provenance_rejects_imports_and_profile_drift(
     tmp_path,
 ) -> None:

@@ -116,6 +116,97 @@ common champion baseline. Select only an independently confirmed improvement;
 if none passes, warm-start from the existing champion. Write selection results
 outside the parent run root and preserve the parent unchanged for rollback.
 
+### Ring-10 efficiency suite
+
+Prepare the utilization treatments as a separate ring-10-only plan:
+
+```bash
+python scripts/prepare_elo_ablation.py \
+  --base-config /absolute/path/to/frozen-ring10-control.yaml \
+  --source-run-root /absolute/path/to/stopped-ring10-control \
+  --output-dir /absolute/path/to/ring10-efficiency-profiles-seed17 \
+  --run-root-parent /absolute/path/to/ring10-efficiency-runs \
+  --run-id <run-id-from-source-run.json> \
+  --prefix ring10-efficiency \
+  --seed 17 \
+  --wall-budget-hours 8 \
+  --leaf-budget 2000000000 \
+  --suite ring10-efficiency
+```
+
+The frozen queue order is:
+
+1. `ring10-only`: unchanged 13-lane control;
+2. `ring10-learner-slack-64`: one batch-64 actor shares GPU 0 with the
+   replay-limited learner while promotion remains pause-shared on GPU 7; and
+3. `ring10-actor-lanes-3`: three actor lanes on GPUs 1–6 while GPU 7 remains
+   single-lane for the arena pause protocol.
+
+The learner-slack arm is a fresh-root topology treatment, not a profile
+migration. Abort it on CUDA OOM, learner or actor restart loops, a material
+learner-throughput loss without fleet throughput gain, or weaker ring-10
+champion-frontier Elo per provisioned GPU-hour. One-seed equal-leaf pilots are
+screening evidence only. Repeat surviving treatments with seeds 17, 18, and 19
+before adoption.
+
+Fork this suite with its own labels rather than the default matrix:
+
+```bash
+for treatment in \
+  ring10-only ring10-learner-slack-64 ring10-actor-lanes-3
+do
+  python scripts/fork_elo_ablation.py \
+    --source-run-root /absolute/path/to/stopped-ring10-control \
+    --plan /absolute/path/to/ring10-efficiency-profiles-seed17/ablation-plan.json \
+    --treatment "$treatment"
+done
+```
+
+The queue comparator reads the empty guard-ring contract from the plan. If a
+comparison must be regenerated directly, pass `--no-guard-rings`; never add
+the generalist ring 4/6/8 floors to these runs.
+
+### Benchmark arena occupancy without changing promotion
+
+The production ring-10 profile already uses its largest validator-approved
+continuation wave: 25 pairs. A 50-pair continuation cannot be expressed as a
+deployable profile without weakening the continuous-service contract. Test the
+occupancy hypothesis against fixed manifests instead:
+
+```bash
+python scripts/prepare_arena_occupancy_benchmark.py \
+  --source-run-root /absolute/path/to/stopped-ring10-control \
+  --profile /absolute/path/to/frozen-ring10-control.yaml \
+  --candidate-manifest /absolute/path/to/manifest-candidate.json \
+  --output-dir /absolute/path/to/arena-occupancy-plan \
+  --device cuda:7 \
+  --physical-gpu-index 7 \
+  --execution-lock /var/lib/edgeconnect/elo-ablation-execution.lock \
+  --repeats 4
+
+python scripts/benchmark_arena_occupancy.py \
+  --plan /absolute/path/to/arena-occupancy-plan/benchmark-plan.json \
+  --output-dir /absolute/path/to/arena-occupancy-results
+```
+
+The benchmark warms both strategies and counterbalances four paired repeats.
+Each repeat evaluates the same 50 pair indices as either two production-sized
+25-pair chunks or one benchmark-only 50-pair chunk. It records GPU utilization,
+power, memory, evaluator rows/second, serialized inference time, queue wait,
+peak CUDA allocation, exact pair evidence, and runtime/device provenance. The
+50-pair arm is explicitly non-deployable. Different batch sizes use different
+batch-derived search seeds, so the report must not claim game-outcome
+equivalence or update a production profile.
+
+Preparation requires a clean Git revision and no source `coordinator.lock`.
+Execution acquires the coordinator-compatible source lock for the benchmark
+lifetime plus the same host execution lock used by ablation queues and
+continuity, and releases both only after CUDA cleanup and terminal evidence
+publication. It also refuses a physical GPU with another compute process and
+checks that the logical PyTorch device UUID matches the physical GPU sampled
+through `nvidia-smi`. No replay, checkpoint, pointer, metric, or profile in the
+source root is modified.
+
 ## Fork treatments
 
 Fork every arm before running any arm so all treatments have the same source

@@ -5,19 +5,29 @@ import json
 from pathlib import Path
 
 import pytest
+import yaml
 
 from scripts.prepare_elo_ablation import (
     CLEAN_TREATMENTS,
     DEFAULT_TREATMENTS,
+    RING10_EFFICIENCY_TREATMENTS,
     RING10_ONLY_TREATMENTS,
     SYSTEM_TREATMENTS,
     WEIGHTED_TREATMENTS,
     main,
     prepare_elo_ablation,
+    resolve_treatments,
 )
 from startrain.config import load_config
 
 CONFIGS = Path(__file__).parents[1] / "configs"
+
+
+def _treatment_records(manifest: dict[str, object]) -> list[dict[str, object]]:
+    raw = manifest.get("treatments")
+    assert isinstance(raw, list)
+    assert all(isinstance(item, dict) for item in raw)
+    return raw
 
 
 def _winner_snapshot(source: Path) -> dict[str, object]:
@@ -90,7 +100,7 @@ def test_prepare_generates_strict_one_factor_profiles(tmp_path: Path) -> None:
     assert manifest["promotion_objective"] == "ring_10_guarded"
     assert manifest["guard_rings"] == [4, 6, 8]
     assert manifest["wall_budget_seconds"] == 28_800
-    assert [item["treatment"] for item in manifest["treatments"]] == list(
+    assert [item["treatment"] for item in _treatment_records(manifest)] == list(
         DEFAULT_TREATMENTS
     )
     persisted = json.loads((output / "ablation-plan.json").read_text())
@@ -288,7 +298,7 @@ def test_prepare_generates_fail_closed_ring10_only_treatment(tmp_path: Path) -> 
     assert manifest["promotion_objective"] == "ring_10_only"
     assert manifest["guard_rings"] == []
     assert manifest["per_ring_guarantees"] is False
-    assert manifest["treatments"][0]["training_objective"] == "ring10_only"
+    assert _treatment_records(manifest)[0]["training_objective"] == "ring10_only"
     profile_path = output / "ring10-only.yaml"
     profile = load_config(profile_path)
     assert profile.game.rings == (4, 6, 8, 10)
@@ -308,6 +318,149 @@ def test_prepare_generates_fail_closed_ring10_only_treatment(tmp_path: Path) -> 
     serialized = profile_path.read_text(encoding="utf-8")
     assert "promotion_pair_ratios:" not in serialized
     assert "weighted_initial_blocks:" not in serialized
+
+
+def test_prepare_generates_ring10_efficiency_suite(tmp_path: Path) -> None:
+    source = tmp_path / "source-run"
+    source.mkdir()
+    output = tmp_path / "ring10-efficiency-profiles"
+
+    manifest = prepare_elo_ablation(
+        base_config=CONFIGS / "h100-8gpu-ring10-only.yaml",
+        output_dir=output,
+        run_root_parent=tmp_path / "ring10-efficiency-runs",
+        run_id="shared-parent-run",
+        source_run_root=source,
+        prefix="ring10-efficiency",
+        seed=47,
+        wall_budget_hours=8,
+        leaf_budget=2_000_000_000,
+        guard_floor_elo=-35,
+        treatments=RING10_EFFICIENCY_TREATMENTS,
+        guard_rings=(),
+        suite="ring10-efficiency",
+    )
+
+    assert [item["treatment"] for item in _treatment_records(manifest)] == list(
+        RING10_EFFICIENCY_TREATMENTS
+    )
+    assert manifest["training_objective"] == "ring10_only"
+    assert manifest["promotion_objective"] == "ring_10_only"
+    assert manifest["guard_rings"] == []
+    assert manifest["suite"] == "ring10-efficiency"
+
+    control = load_config(output / "ring10-only.yaml")
+    learner_slack = load_config(output / "ring10-learner-slack-64.yaml")
+    actor_lanes = load_config(output / "ring10-actor-lanes-3.yaml")
+    for profile in (control, learner_slack, actor_lanes):
+        assert profile.orchestration.training_objective == "ring10_only"
+        assert profile.arena.rings == (10,)
+        assert profile.arena.required_regression_rings == ()
+        assert profile.arena.per_ring_regression_floor_elo == {}
+
+    assert not control.orchestration.allow_colocated_workers
+    assert sum(gpu.actor_lanes for gpu in control.orchestration.actor_gpus) == 13
+
+    assert learner_slack.orchestration.allow_colocated_workers
+    colocated = [
+        gpu for gpu in learner_slack.orchestration.actor_gpus if gpu.gpu_id == 0
+    ]
+    assert len(colocated) == 1
+    assert colocated[0].actor_batch_size == 64
+    assert colocated[0].actor_lanes == 1
+    assert colocated[0].cpu_affinity == "0-103"
+    assert learner_slack.orchestration.promotion.gpu_id == 7
+    assert sum(gpu.actor_lanes for gpu in learner_slack.orchestration.actor_gpus) == 14
+
+    assert sorted(gpu.actor_lanes for gpu in actor_lanes.orchestration.actor_gpus) == [
+        1,
+        3,
+        3,
+        3,
+        3,
+        3,
+        3,
+    ]
+    assert all(gpu.gpu_id != 0 for gpu in actor_lanes.orchestration.actor_gpus)
+
+
+def test_ring10_efficiency_suite_rejects_control_topology_drift(
+    tmp_path: Path,
+) -> None:
+    raw = yaml.safe_load(
+        (CONFIGS / "h100-8gpu-ring10-only.yaml").read_text(encoding="utf-8")
+    )
+    raw["orchestration"]["gpus"][1]["actor_lanes"] = 1
+    base = tmp_path / "drifted-ring10.yaml"
+    base.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+    source = tmp_path / "source"
+    source.mkdir()
+
+    with pytest.raises(ValueError, match="topology drifted"):
+        prepare_elo_ablation(
+            base_config=base,
+            output_dir=tmp_path / "profiles",
+            run_root_parent=tmp_path / "runs",
+            run_id="shared-parent-run",
+            source_run_root=source,
+            prefix="ring10-efficiency",
+            seed=47,
+            wall_budget_hours=8,
+            leaf_budget=2_000_000_000,
+            guard_floor_elo=-35,
+            treatments=RING10_EFFICIENCY_TREATMENTS,
+            guard_rings=(),
+            suite="ring10-efficiency",
+        )
+    assert not (tmp_path / "profiles").exists()
+
+
+def test_resolve_treatments_keeps_suites_fail_closed() -> None:
+    assert (
+        resolve_treatments(
+            suite="ring10-efficiency",
+            treatments=None,
+        )
+        == RING10_EFFICIENCY_TREATMENTS
+    )
+    with pytest.raises(ValueError, match="cannot be combined"):
+        resolve_treatments(
+            suite="ring10-efficiency",
+            treatments=("ring10-only",),
+        )
+    with pytest.raises(ValueError, match="unknown treatment suite"):
+        resolve_treatments(suite="unknown", treatments=None)
+
+
+def test_prepare_cli_rejects_suite_and_ad_hoc_treatment(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    exit_code = main(
+        [
+            "--base-config",
+            str(CONFIGS / "h100-8gpu-ring10-only.yaml"),
+            "--output-dir",
+            str(tmp_path / "profiles"),
+            "--run-root-parent",
+            str(tmp_path / "runs"),
+            "--run-id",
+            "shared-parent-run",
+            "--source-run-root",
+            str(source),
+            "--suite",
+            "ring10-efficiency",
+            "--treatment",
+            "ring10-only",
+        ]
+    )
+
+    assert exit_code == 2
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "error"
+    assert "--suite cannot be combined" in payload["error"]
 
 
 def test_prepare_rejects_mixed_promotion_objectives(tmp_path: Path) -> None:

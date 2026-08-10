@@ -339,6 +339,16 @@ only. The continuous-profile validator rejects partial or mixed versions of
 this contract. Use a new isolated run root; do not edit an initialized
 generalist profile in place.
 
+To prepare utilization experiments without changing that production profile,
+use `scripts/prepare_elo_ablation.py --suite ring10-efficiency`. It emits an
+unchanged control, a batch-64 actor colocated with the learner on GPU 0, and a
+three-lane actor treatment for GPUs 1–6. The arena remains pause-shared on the
+single actor lane on GPU 7 in every deployable arm. Use
+`scripts/prepare_arena_occupancy_benchmark.py` plus
+`scripts/benchmark_arena_occupancy.py` for the separate fixed-manifest
+25-versus-50-pair occupancy test; its 50-pair arm is benchmark-only. See the
+[Elo-per-hour ablation runbook](docs/elo-per-hour-ablation-runbook.md).
+
 The learner-shared topology is also available as an explicit one-factor
 experiment:
 

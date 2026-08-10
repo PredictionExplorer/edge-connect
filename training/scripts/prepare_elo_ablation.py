@@ -47,7 +47,17 @@ WEIGHTED_TREATMENTS = (
     "ring10-65-weighted",
     "ring10-70-weighted",
 )
+RING10_EFFICIENCY_TREATMENTS = (
+    "ring10-only",
+    "ring10-learner-slack-64",
+    "ring10-actor-lanes-3",
+)
 RING10_ONLY_TREATMENTS = ("ring10-only",)
+RING10_OBJECTIVE_TREATMENTS = frozenset(RING10_EFFICIENCY_TREATMENTS)
+RING10_EFFICIENCY_VARIANTS = frozenset(RING10_EFFICIENCY_TREATMENTS[1:])
+TREATMENT_SUITES = {
+    "ring10-efficiency": RING10_EFFICIENCY_TREATMENTS,
+}
 GUARD_RINGS = (4, 6, 8)
 WEIGHTED_PROMOTION_PAIR_RATIOS = {4: 1, 6: 1, 8: 1, 10: 7}
 WEIGHTED_INITIAL_BLOCKS = 15
@@ -81,6 +91,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--leaf-budget", type=int, default=2_000_000_000)
     parser.add_argument("--guard-floor-elo", type=float, default=-35.0)
     parser.add_argument(
+        "--suite",
+        choices=tuple(TREATMENT_SUITES),
+        help="pre-registered treatment suite; cannot be combined with --treatment",
+    )
+    parser.add_argument(
         "--treatment",
         action="append",
         choices=(
@@ -88,7 +103,7 @@ def _parser() -> argparse.ArgumentParser:
             *SYSTEM_TREATMENTS,
             *CLEAN_TREATMENTS,
             *WEIGHTED_TREATMENTS,
-            *RING10_ONLY_TREATMENTS,
+            *RING10_EFFICIENCY_TREATMENTS,
         ),
         dest="treatments",
     )
@@ -192,6 +207,16 @@ def _ring_ten_only(config: RawConfig) -> None:
         arena.pop(name, None)
 
 
+def _ring_ten_learner_slack(config: RawConfig) -> None:
+    _ring_ten_only(config)
+    _learner_slack_actor(config)
+
+
+def _ring_ten_actor_lanes_three(config: RawConfig) -> None:
+    _ring_ten_only(config)
+    _actor_lanes_three(config)
+
+
 def _search_quality(config: RawConfig) -> None:
     selfplay = _mapping(config, "selfplay")
     selfplay.update(
@@ -234,6 +259,48 @@ def _actor_lanes_three(config: RawConfig) -> None:
             and worker.get("gpu_id") != promotion_gpu
         ):
             worker["actor_lanes"] = 3
+
+
+def _learner_slack_actor(config: RawConfig) -> None:
+    orchestration = _mapping(config, "orchestration")
+    workers = orchestration.get("gpus")
+    if not isinstance(workers, list):
+        raise ValueError("orchestration.gpus must be a list")
+    learner_indexes = [
+        index
+        for index, worker in enumerate(workers)
+        if isinstance(worker, dict) and worker.get("role") == "learner"
+    ]
+    if len(learner_indexes) != 1:
+        raise ValueError("learner-slack treatment requires exactly one learner GPU")
+    learner_index = learner_indexes[0]
+    learner = workers[learner_index]
+    assert isinstance(learner, dict)
+    learner_gpu = learner.get("gpu_id")
+    promotion_gpu = _mapping(orchestration, "promotion").get("gpu_id")
+    if learner_gpu != 0 or promotion_gpu != 7:
+        raise ValueError(
+            "learner-slack treatment requires learner GPU 0 and promotion GPU 7"
+        )
+    if any(
+        isinstance(worker, dict)
+        and worker.get("role") == "actor"
+        and worker.get("gpu_id") == learner_gpu
+        for worker in workers
+    ):
+        raise ValueError("learner GPU already has a colocated actor")
+    colocated_actor: RawConfig = {
+        "gpu_id": learner_gpu,
+        "role": "actor",
+        "cpu_threads": 8,
+        "actor_batch_size": 64,
+        "actor_lanes": 1,
+    }
+    affinity = learner.get("cpu_affinity")
+    if affinity is not None:
+        colocated_actor["cpu_affinity"] = affinity
+    orchestration["allow_colocated_workers"] = True
+    workers.insert(learner_index + 1, colocated_actor)
 
 
 def _learner_batch(config: RawConfig, size: int) -> None:
@@ -300,6 +367,8 @@ TREATMENTS: dict[str, Treatment] = {
     "ring10-65-weighted": _ring_ten_sixty_five_weighted,
     "ring10-70-weighted": _ring_ten_seventy_weighted,
     "ring10-only": _ring_ten_only,
+    "ring10-learner-slack-64": _ring_ten_learner_slack,
+    "ring10-actor-lanes-3": _ring_ten_actor_lanes_three,
 }
 
 
@@ -456,7 +525,7 @@ def validate_futility_policy(
 
 def training_objective_for_treatments(treatments: Sequence[str]) -> str:
     objectives = {
-        "ring10_only" if name in RING10_ONLY_TREATMENTS else "generalist"
+        "ring10_only" if name in RING10_OBJECTIVE_TREATMENTS else "generalist"
         for name in treatments
     }
     if len(objectives) != 1:
@@ -482,6 +551,60 @@ def blocking_guard_rings(treatments: Sequence[str]) -> tuple[int, ...]:
     """Return the one pre-registered guard policy shared by an ablation matrix."""
     promotion_objective = promotion_objective_for_treatments(treatments)
     return GUARD_RINGS if promotion_objective == "ring_10_guarded" else ()
+
+
+def resolve_treatments(
+    *,
+    suite: str | None,
+    treatments: Sequence[str] | None,
+) -> tuple[str, ...]:
+    if suite is not None and treatments:
+        raise ValueError("--suite cannot be combined with --treatment")
+    if suite is not None:
+        try:
+            return TREATMENT_SUITES[suite]
+        except KeyError as error:
+            raise ValueError(f"unknown treatment suite: {suite}") from error
+    return tuple(treatments or DEFAULT_TREATMENTS)
+
+
+def _validate_ring10_efficiency_base(experiment: ExperimentConfig) -> None:
+    validate_continuous_config(experiment)
+    orchestration = experiment.orchestration
+    if orchestration.training_objective != "ring10_only":
+        raise ValueError("ring10-efficiency suite requires a ring10_only base profile")
+    if orchestration.allow_colocated_workers:
+        raise ValueError("ring10-efficiency control must not colocate workers")
+    learners = orchestration.learner_gpus
+    if (
+        len(learners) != 1
+        or learners[0].gpu_id != 0
+        or learners[0].cpu_threads != 16
+        or learners[0].cpu_affinity != "0-103"
+    ):
+        raise ValueError("ring10-efficiency control requires the H100 learner layout")
+    actors = {gpu.gpu_id: gpu for gpu in orchestration.actor_gpus}
+    if set(actors) != set(range(1, 8)):
+        raise ValueError("ring10-efficiency control requires actor GPUs 1 through 7")
+    for gpu_id, actor in actors.items():
+        expected_affinity = "0-103" if gpu_id <= 3 else "104-207"
+        expected_lanes = 1 if gpu_id == 7 else 2
+        if (
+            actor.cpu_threads != 8
+            or actor.actor_batch_size != 128
+            or actor.actor_lanes != expected_lanes
+            or actor.cpu_affinity != expected_affinity
+        ):
+            raise ValueError(
+                f"ring10-efficiency control actor GPU {gpu_id} topology drifted"
+            )
+    promotion = orchestration.promotion
+    if (
+        orchestration.actor_games_per_batch != 128
+        or promotion.gpu_id != 7
+        or not promotion.pause_sharing_mode
+    ):
+        raise ValueError("ring10-efficiency control promotion topology drifted")
 
 
 def _validate_inputs(
@@ -599,7 +722,14 @@ def prepare_elo_ablation(
     winner_snapshot: Mapping[str, object] | None = None,
     futility_policy: Mapping[str, object] | None = None,
     guard_rings: Sequence[int] | None = None,
+    suite: str | None = None,
 ) -> dict[str, object]:
+    if suite is not None:
+        expected = TREATMENT_SUITES.get(suite)
+        if expected is None:
+            raise ValueError(f"unknown treatment suite: {suite}")
+        if tuple(treatments) != expected:
+            raise ValueError("treatments do not match the selected suite")
     _validate_inputs(
         prefix=prefix,
         seed=seed,
@@ -642,9 +772,13 @@ def prepare_elo_ablation(
         if futility_policy is not None
         else None
     )
-    destination.mkdir(parents=True)
     base_sha256 = _sha256(base)
     raw_base = _load_raw(base)
+    if suite == "ring10-efficiency" or any(
+        treatment in RING10_EFFICIENCY_VARIANTS for treatment in treatments
+    ):
+        _validate_ring10_efficiency_base(load_config(base))
+    destination.mkdir(parents=True)
     generated = []
     for treatment_name in treatments:
         run_root = root_parent / f"{prefix}-{treatment_name}-seed{seed}"
@@ -685,6 +819,7 @@ def prepare_elo_ablation(
     manifest = {
         "schema_version": SCHEMA_VERSION,
         "report": REPORT_NAME,
+        "suite": suite,
         "base_config": str(base),
         "base_config_sha256": base_sha256,
         "source_run_root": str(source),
@@ -713,6 +848,10 @@ def prepare_elo_ablation(
 def main(argv: list[str] | None = None) -> int:
     arguments = _parser().parse_args(argv)
     try:
+        treatments = resolve_treatments(
+            suite=arguments.suite,
+            treatments=arguments.treatments,
+        )
         winner_snapshot = (
             winner_snapshot_from_document(_read_json(arguments.winner_snapshot))
             if arguments.winner_snapshot is not None
@@ -734,9 +873,10 @@ def main(argv: list[str] | None = None) -> int:
             wall_budget_hours=arguments.wall_budget_hours,
             leaf_budget=arguments.leaf_budget,
             guard_floor_elo=arguments.guard_floor_elo,
-            treatments=arguments.treatments or DEFAULT_TREATMENTS,
+            treatments=treatments,
             winner_snapshot=winner_snapshot,
             futility_policy=futility_policy,
+            suite=arguments.suite,
         )
     except (FileExistsError, FileNotFoundError, OSError, ValueError) as error:
         print(
