@@ -16,7 +16,16 @@ def _native_compatible() -> bool:
     try:
         native = importlib.import_module("star_native")
         fingerprint = getattr(native, "native_rules_hash", None)
-        return callable(fingerprint) and int(fingerprint()) == _RULES_HASH
+        complete_clinches = getattr(
+            getattr(native, "StateBatch", None),
+            "complete_clinches",
+            None,
+        )
+        return (
+            callable(fingerprint)
+            and int(fingerprint()) == _RULES_HASH
+            and callable(complete_clinches)
+        )
     except (ImportError, TypeError, ValueError):
         return False
 

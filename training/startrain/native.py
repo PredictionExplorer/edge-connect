@@ -167,6 +167,12 @@ def validate_native_module(module: object) -> None:
     schema = getattr(module, "native_rules_schema", None)
     if callable(schema) and schema() != RULES_SCHEMA_ID:
         raise NativeCompatibilityError("star_native rules schema is incompatible")
+    state_batch = getattr(module, "StateBatch", None)
+    complete_clinches = getattr(state_batch, "complete_clinches", None)
+    if not callable(complete_clinches):
+        raise NativeCompatibilityError(
+            "star_native lacks StateBatch.complete_clinches(); rebuild the native extension"
+        )
 
 
 def _integer(name: str, value: object) -> int:

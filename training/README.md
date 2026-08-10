@@ -39,6 +39,17 @@ The canonical gameplay contract is `edgeconnect.star.rules.v2` with fingerprint
 config/checkpoint/model-manifest schema v3, browser manifest v2, and starserve API/config
 schema v2. Older artifacts are rejected; start fresh roots instead of converting them.
 
+Shipped self-play profiles set `clinch_finalization: loser-fill`. Before each search
+wave, the actor applies the same extremal-completion proof used by the web client. A
+clinched row is finalized by assigning every empty node to the loser, and no search or
+policy targets are generated for that skipped tail. The win/loss label is exact; score
+margin, ownership, and alive-stone labels deliberately describe the conservative
+synthetic proof board rather than the board ordinary continued play would have reached.
+Replay provenance records `final=clinch-loser-fill`, and actor metrics report the
+clinch rate and empty nodes saved. Set the option to `disabled` for a board-full A/B
+baseline. Canonical gameplay, arena evaluation, serving, and the rules hash remain
+board-full.
+
 Research inspirations:
 
 - [Gumbel AlphaZero](https://openreview.net/forum?id=bERaNdoegnO) for root policy

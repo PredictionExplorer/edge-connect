@@ -16,7 +16,7 @@ use rayon::ThreadPoolBuilder;
 use rayon::prelude::*;
 use star_engine::{
     Action, BITBOARD_WORDS, BitBoard, Board, D5Maps, GameState, Player, RULES_HASH, RULES_SCHEMA,
-    ScoreResult, ScoringScratch, Symmetry, rules_hash,
+    ScoreResult, ScoringScratch, Symmetry, rules_hash, score_completion_bounds,
 };
 use star_search::{
     Evaluation, EvaluationRequest, GumbelParameters, GumbelSequentialHalving, RootSearchConfig,
@@ -179,6 +179,55 @@ impl PyTrajectoryData {
         self.current_turn_moves.clone()
     }
 
+    #[getter]
+    fn turn_count(&self) -> Vec<u32> {
+        self.turn_count.clone()
+    }
+}
+
+/// Rows finalized from a proven winner to the loser-filled proof board.
+#[pyclass(name = "ClinchData", frozen, skip_from_py_object)]
+#[derive(Clone)]
+struct PyClinchData {
+    batch_size: usize,
+    clinched: Vec<bool>,
+    winner: Vec<i8>,
+    empty_nodes: Vec<u16>,
+    last_move: Vec<i32>,
+    turn_count: Vec<u32>,
+}
+
+#[pymethods]
+impl PyClinchData {
+    #[getter]
+    const fn batch_size(&self) -> usize {
+        self.batch_size
+    }
+
+    #[getter]
+    fn clinched(&self) -> Vec<bool> {
+        self.clinched.clone()
+    }
+
+    /// Guaranteed winner (`-1`, `0`, or `1`) for each row.
+    #[getter]
+    fn winner(&self) -> Vec<i8> {
+        self.winner.clone()
+    }
+
+    /// Number of source-position empties assigned to the loser.
+    #[getter]
+    fn empty_nodes(&self) -> Vec<u16> {
+        self.empty_nodes.clone()
+    }
+
+    /// Last real self-play move before synthetic completion.
+    #[getter]
+    fn last_move(&self) -> Vec<i32> {
+        self.last_move.clone()
+    }
+
+    /// Real self-play turn count before synthetic completion.
     #[getter]
     fn turn_count(&self) -> Vec<u32> {
         self.turn_count.clone()
@@ -380,6 +429,15 @@ struct PackedFeatureRow {
     alive_stones: Vec<u8>,
 }
 
+struct PreparedClinchRow {
+    index: usize,
+    replacement: GameState,
+    winner: Player,
+    empty_nodes: u16,
+    last_move: i32,
+    turn_count: u32,
+}
+
 /// Mutable homogeneous environment batch.
 #[pyclass(name = "StateBatch")]
 struct PyStateBatch {
@@ -504,6 +562,64 @@ impl PyStateBatch {
             self.states[index] = replacement;
         }
         Ok(())
+    }
+
+    /// Finalizes proven live rows to the full proof board that favors the loser.
+    fn complete_clinches(&mut self, py: Python<'_>) -> PyResult<PyClinchData> {
+        let prepared: Result<Vec<_>, String> = py.detach(|| {
+            self.states
+                .par_iter()
+                .enumerate()
+                .map(|(index, state)| {
+                    if state.is_terminal() {
+                        return Ok(None);
+                    }
+                    let bounds = score_completion_bounds(state.board(), state.stones());
+                    let Some(winner) = bounds.guaranteed_winner else {
+                        return Ok(None);
+                    };
+                    let scenario = bounds
+                        .loser_filled_scenario()
+                        .expect("a guaranteed winner has a loser-filled scenario");
+                    debug_assert_eq!(scenario.score.leader, Some(winner));
+                    let replacement = GameState::from_parts(
+                        state.shared_board(),
+                        scenario.stones,
+                        state.to_move(),
+                        0,
+                        false,
+                    )
+                    .map_err(|error| error.to_string())?;
+                    Ok(Some(PreparedClinchRow {
+                        index,
+                        replacement,
+                        winner,
+                        empty_nodes: bounds.empty_nodes,
+                        last_move: state.last_move().map_or(-1, i32::from),
+                        turn_count: state.turn_count(),
+                    }))
+                })
+                .collect()
+        });
+        let prepared = prepared.map_err(PyValueError::new_err)?;
+        let batch_size = self.states.len();
+        let mut output = PyClinchData {
+            batch_size,
+            clinched: vec![false; batch_size],
+            winner: vec![-1; batch_size],
+            empty_nodes: vec![0; batch_size],
+            last_move: vec![-1; batch_size],
+            turn_count: vec![0; batch_size],
+        };
+        for row in prepared.into_iter().flatten() {
+            output.clinched[row.index] = true;
+            output.winner[row.index] = row.winner as i8;
+            output.empty_nodes[row.index] = row.empty_nodes;
+            output.last_move[row.index] = row.last_move;
+            output.turn_count[row.index] = row.turn_count;
+            self.states[row.index] = row.replacement;
+        }
+        Ok(output)
     }
 
     /// Packed state metadata and fixed bitboards.
@@ -1892,6 +2008,7 @@ fn rayon_num_threads() -> usize {
 fn star_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyStateData>()?;
     module.add_class::<PyTrajectoryData>()?;
+    module.add_class::<PyClinchData>()?;
     module.add_class::<PyScoreData>()?;
     module.add_class::<PyFeatureData>()?;
     module.add_class::<PyStateBatch>()?;
@@ -2142,6 +2259,43 @@ mod tests {
         assert!(matches!(score_data.winner.as_slice(), [0 | 1]));
         assert_ne!(score_data.score_margin[0], 0);
         assert_ne!(score_data.score_margin[0] % 2, 0);
+    }
+
+    #[test]
+    fn mixed_batch_completes_only_clinched_rows_to_the_loser_filled_board() {
+        Python::initialize();
+        Python::attach(|py| {
+            let board = Arc::new(Board::new(4).unwrap());
+            let active = GameState::new(Arc::clone(&board));
+            let mut clinched = GameState::new(Arc::clone(&board));
+            for node in 0..49 {
+                clinched.apply(Action::Place(node)).unwrap();
+            }
+            let full = full_state(Arc::clone(&board));
+            let full_key = full.key();
+            let mut batch = PyStateBatch {
+                board,
+                states: vec![active, clinched, full],
+            };
+
+            let result = batch.complete_clinches(py).unwrap();
+
+            assert_eq!(result.clinched, [false, true, false]);
+            assert_eq!(result.winner, [-1, 1, -1]);
+            assert_eq!(result.empty_nodes, [0, 1, 0]);
+            assert_eq!(result.last_move, [-1, 48, -1]);
+            assert_eq!(result.turn_count, [0, 25, 0]);
+            assert!(!batch.states[0].is_terminal());
+            assert!(batch.states[1].is_terminal());
+            assert!(batch.states[1].stones_for(Player::Zero).contains(49));
+            assert_eq!(
+                ScoringScratch::default()
+                    .score_state(&batch.states[1])
+                    .leader,
+                Some(Player::One)
+            );
+            assert_eq!(batch.states[2].key(), full_key);
+        });
     }
 
     #[test]

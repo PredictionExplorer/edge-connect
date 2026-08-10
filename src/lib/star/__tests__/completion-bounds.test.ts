@@ -9,6 +9,7 @@ import {
   type GameAction,
 } from '../game';
 import { EMPTY, scorePosition, validateTerminalWinner } from '../scoring';
+import completionFixtures from '../../../../testdata/star/completion-bounds-v1.json';
 
 const configFor = (rings: number) => ({
   rings,
@@ -71,6 +72,45 @@ describe('completion score bounds', () => {
 
     expect(scoreCompletionBounds(board, zeroDominant).guaranteedWinner).toBe(0);
     expect(scoreCompletionBounds(board, oneDominant).guaranteedWinner).toBe(1);
+  });
+
+  it('matches the shared native completion-bound vectors', () => {
+    expect(completionFixtures.schema).toBe(
+      'edgeconnect.star.completion-bounds.v1',
+    );
+    for (const fixture of completionFixtures.cases) {
+      const state = replay(
+        configFor(fixture.rings),
+        fixture.actions.map(
+          (node): GameAction => ({ type: 'place', node }),
+        ),
+      );
+      const bounds = scoreCompletionBounds(state.board, state.stones);
+
+      expect(bounds.emptyNodes, fixture.id).toBe(fixture.emptyNodes);
+      expect(bounds.guaranteedWinner, fixture.id).toBe(
+        fixture.guaranteedWinner,
+      );
+      for (const expected of fixture.scenarios) {
+        const scenario = bounds.scenarios[expected.fillPlayer as 0 | 1];
+        expect(scenario.fillPlayer, fixture.id).toBe(expected.fillPlayer);
+        expect(scenario.winner, fixture.id).toBe(expected.winner);
+        expect(
+          scenario.score.players.map((player) => player.total),
+          fixture.id,
+        ).toEqual(expected.totals);
+        expect(
+          scenario.score.players.map((player) => player.quarks),
+          fixture.id,
+        ).toEqual(expected.quarks);
+      }
+      expect(
+        bounds.guaranteedWinner === null
+          ? null
+          : bounds.scenarios[1 - bounds.guaranteedWinner].fillPlayer,
+        fixture.id,
+      ).toBe(fixture.proofFillPlayer);
+    }
   });
 
   it('does not confuse projected opponent territory with permanent death', () => {

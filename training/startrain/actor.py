@@ -610,6 +610,12 @@ class ActorSupervisor:
                         if selfplay_metrics.completed_decisions
                         else None
                     )
+                    mean_clinch_empty_nodes = (
+                        selfplay_metrics.clinch_empty_nodes
+                        / selfplay_metrics.clinched_games
+                        if selfplay_metrics.clinched_games
+                        else None
+                    )
                     attempted_decisions = (
                         selfplay_metrics.full_decisions
                         + selfplay_metrics.fast_decisions
@@ -675,6 +681,14 @@ class ActorSupervisor:
                             "mean_game_length": (
                                 statistics.fmean(game_lengths) if game_lengths else None
                             ),
+                            "clinched_games": selfplay_metrics.clinched_games,
+                            "clinch_rate": (
+                                selfplay_metrics.clinched_games / len(summaries)
+                                if summaries
+                                else 0.0
+                            ),
+                            "clinch_empty_nodes": (selfplay_metrics.clinch_empty_nodes),
+                            "mean_clinch_empty_nodes": mean_clinch_empty_nodes,
                             "policy_entropy_count": (
                                 selfplay_metrics.policy_entropy_count
                             ),

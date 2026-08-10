@@ -118,8 +118,19 @@ def test_adapter_rejects_bad_legal_buffers_without_native_extension() -> None:
 
 
 def test_native_module_requires_finalized_rules_hash() -> None:
-    validate_native_module(SimpleNamespace(native_rules_hash=lambda: RULES_HASH))
+    class CompatibleStateBatch:
+        def complete_clinches(self) -> None:
+            pass
+
+    validate_native_module(
+        SimpleNamespace(
+            native_rules_hash=lambda: RULES_HASH,
+            StateBatch=CompatibleStateBatch,
+        )
+    )
     with pytest.raises(NativeCompatibilityError, match="rules hash"):
         validate_native_module(SimpleNamespace(native_rules_hash=lambda: 1))
+    with pytest.raises(NativeCompatibilityError, match="complete_clinches"):
+        validate_native_module(SimpleNamespace(native_rules_hash=lambda: RULES_HASH))
     with pytest.raises(NativeCompatibilityError, match="lacks"):
         validate_native_module(SimpleNamespace())

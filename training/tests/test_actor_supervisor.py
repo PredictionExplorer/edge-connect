@@ -101,6 +101,8 @@ def test_actor_supervisor_refreshes_only_at_batch_boundaries_and_emits_metrics(
                 replay_append_calls=1,
                 replay_append_bytes=2_048,
                 replay_append_seconds=0.25,
+                clinched_games=1,
+                clinch_empty_nodes=5,
             )
 
     monkeypatch.setattr("startrain.actor.ManifestModelProvider", FakeProvider)
@@ -156,6 +158,10 @@ def test_actor_supervisor_refreshes_only_at_batch_boundaries_and_emits_metrics(
     assert metric["game_lengths"] == [3]
     assert metric["game_length_distribution"] == {"3": 1}
     assert metric["mean_game_length"] == 3
+    assert metric["clinched_games"] == 1
+    assert metric["clinch_rate"] == 1.0
+    assert metric["clinch_empty_nodes"] == 5
+    assert metric["mean_clinch_empty_nodes"] == 5
     assert metric["policy_entropy_count"] == 2
     assert metric["policy_entropy_mean"] == 0.625
     assert metric["policy_weight_count"] == 2

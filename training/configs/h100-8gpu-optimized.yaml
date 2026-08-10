@@ -71,6 +71,7 @@ selfplay:
   c_visit: 50.0
   c_scale: 1.0
   score_utility_weight: 0.05
+  clinch_finalization: loser-fill
   shard_size: 4096
   seed: 17
 learner:

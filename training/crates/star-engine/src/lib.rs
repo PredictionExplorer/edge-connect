@@ -13,7 +13,10 @@ mod symmetry;
 pub use bitboard::{BITBOARD_WORDS, BitBoard, BitIter};
 pub use board::{Board, BoardError, SECTOR_CHARS};
 pub use game::{Action, GameError, GameState, LegalActions, Player, StateKey, Transition, Undo};
-pub use scoring::{PlayerScore, ScoreResult, ScoringScratch, score_state, terminal_value};
+pub use scoring::{
+    CompletionBounds, CompletionScenario, PlayerScore, ScoreResult, ScoringScratch,
+    score_completion_bounds, score_state, terminal_value,
+};
 pub use symmetry::{D5_ORDER, D5Maps, Symmetry};
 
 /// Dense node id.

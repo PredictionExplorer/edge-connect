@@ -36,6 +36,37 @@ pub struct ScoreResult {
     pub leader: Option<Player>,
 }
 
+/// One extremal full completion of a live position.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CompletionScenario {
+    /// Player assigned every node that was empty in the source position.
+    pub fill_player: Player,
+    /// Synthetic full-board stones used to calculate the boundary score.
+    pub stones: [BitBoard; 2],
+    /// Exact terminal score of the synthetic completion.
+    pub score: ScoreResult,
+}
+
+/// Score bounds obtained by assigning every empty node to each player.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CompletionBounds {
+    /// Scenarios indexed by the player receiving every empty node.
+    pub scenarios: [CompletionScenario; 2],
+    /// Number of nodes that were empty in the source position.
+    pub empty_nodes: u16,
+    /// Winner forced across every full completion, if one exists.
+    pub guaranteed_winner: Option<Player>,
+}
+
+impl CompletionBounds {
+    /// The proof board that gives every source-position empty to the loser.
+    #[must_use]
+    pub fn loser_filled_scenario(&self) -> Option<&CompletionScenario> {
+        self.guaranteed_winner
+            .map(|winner| &self.scenarios[winner.opponent().index()])
+    }
+}
+
 impl ScoreResult {
     /// Ownership of one in-range node.
     #[must_use]
@@ -259,6 +290,57 @@ impl ScoringScratch {
 #[must_use]
 pub fn score_state(state: &GameState) -> ScoreResult {
     ScoringScratch::default().score_state(state)
+}
+
+/// Scores the two extremal full completions of a position.
+///
+/// Giving every empty node to one player is an upper bound on that player's
+/// terminal score. If the other player still wins that completion, the winner
+/// is therefore fixed for every possible continuation.
+#[must_use]
+pub fn score_completion_bounds(board: &Board, stones: [BitBoard; 2]) -> CompletionBounds {
+    let empty = board.node_mask().difference(stones[0].union(stones[1]));
+    let mut scratch = ScoringScratch::default();
+    let scenarios = core::array::from_fn(|index| {
+        let fill_player = if index == 0 {
+            Player::Zero
+        } else {
+            Player::One
+        };
+        let mut completed = stones;
+        completed[index] = completed[index].union(empty);
+        let score = scratch.score(board, completed);
+        debug_assert!(
+            score.leader.is_some(),
+            "a full Double *Star board must have a decisive winner"
+        );
+        CompletionScenario {
+            fill_player,
+            stones: completed,
+            score,
+        }
+    });
+    let zero_fill_winner = scenarios[0]
+        .score
+        .leader
+        .expect("a full Double *Star board must have a decisive winner");
+    let one_fill_winner = scenarios[1]
+        .score
+        .leader
+        .expect("a full Double *Star board must have a decisive winner");
+    let guaranteed_winner = if zero_fill_winner == Player::One {
+        Some(Player::One)
+    } else if one_fill_winner == Player::Zero {
+        Some(Player::Zero)
+    } else {
+        None
+    };
+
+    CompletionBounds {
+        scenarios,
+        empty_nodes: empty.count(),
+        guaranteed_winner,
+    }
 }
 
 /// Terminal zero-sum value from the state's current-player perspective.

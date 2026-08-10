@@ -123,6 +123,7 @@ def test_yaml_configs_load_strictly() -> None:
     assert continuous.orchestration.model_refresh.candidate_probability == 0.8
     assert continuous.selfplay.record_fast_policy_targets is False
     assert continuous.selfplay.max_considered_cap == 64
+    assert continuous.selfplay.clinch_finalization == "loser-fill"
     optimized = load_config(CONFIGS / "h100-8gpu-optimized.yaml")
     assert optimized.learner.use_ring_mixture_curriculum is True
     assert len(optimized.orchestration.actor_gpus) == 7

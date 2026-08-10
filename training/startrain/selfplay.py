@@ -8,7 +8,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Protocol, Sequence
+from typing import Any, Literal, Protocol, Sequence
 
 import numpy as np
 
@@ -70,6 +70,7 @@ class SelfPlayConfig:
     c_visit: float = 50.0
     c_scale: float = 1.0
     score_utility_weight: float = 0.0
+    clinch_finalization: Literal["disabled", "loser-fill"] = "disabled"
     shard_size: int = 512
     seed: int = 17
 
@@ -111,6 +112,8 @@ class SelfPlayConfig:
             raise ValueError("policy-surprise weighting settings are invalid")
         if not 0 <= self.score_utility_weight <= 1:
             raise ValueError("score utility weight must be in [0, 1]")
+        if self.clinch_finalization not in ("disabled", "loser-fill"):
+            raise ValueError("clinch_finalization must be disabled or loser-fill")
 
     @classmethod
     def cpu_smoke(cls, *, seed: int = 17) -> "SelfPlayConfig":
@@ -161,6 +164,8 @@ class GameSummary:
     model_identity: str
     game_id: str
     generation: int
+    finish_reason: Literal["board-full", "clinch"]
+    empty_nodes_saved: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -186,6 +191,8 @@ class SelfPlayMetrics:
     replay_append_calls: int = 0
     replay_append_bytes: int = 0
     replay_append_seconds: float = 0.0
+    clinched_games: int = 0
+    clinch_empty_nodes: int = 0
 
     def delta(self, previous: "SelfPlayMetrics") -> "SelfPlayMetrics":
         values = {
@@ -229,6 +236,14 @@ class _Decision:
     policy_surprise: float
 
 
+@dataclass(frozen=True, slots=True)
+class _ClinchFinalization:
+    winner: int
+    empty_nodes: int
+    last_move: int
+    turn_count: int
+
+
 class SelfPlayActor:
     """Drives PyO3 ``StateBatch``/``SearchBatch`` and emits replay shards."""
 
@@ -267,6 +282,8 @@ class SelfPlayActor:
         self.replay_append_calls = 0
         self.replay_append_bytes = 0
         self.replay_append_seconds = 0.0
+        self.clinched_games = 0
+        self.clinch_empty_nodes = 0
 
     def metrics_snapshot(self) -> SelfPlayMetrics:
         return SelfPlayMetrics(
@@ -285,6 +302,8 @@ class SelfPlayActor:
             replay_append_calls=self.replay_append_calls,
             replay_append_bytes=self.replay_append_bytes,
             replay_append_seconds=self.replay_append_seconds,
+            clinched_games=self.clinched_games,
+            clinch_empty_nodes=self.clinch_empty_nodes,
         )
 
     def run(
@@ -346,6 +365,9 @@ class SelfPlayActor:
     ) -> list[GameSummary]:
         states = self.native.StateBatch(self.config.rings, cohort_size)
         trajectories: list[list[_Decision]] = [[] for _ in range(cohort_size)]
+        clinch_finalizations: list[_ClinchFinalization | None] = [
+            None for _ in range(cohort_size)
+        ]
         game_ids = [self._game_id(first_game + row) for row in range(cohort_size)]
         pinned_versions = [
             (
@@ -357,6 +379,8 @@ class SelfPlayActor:
         ]
         iteration = 0
         while True:
+            if self.config.clinch_finalization == "loser-fill":
+                self._complete_clinches(states, clinch_finalizations)
             state_data = states.data()
             if all(bool(terminal) for terminal in state_data.terminal):
                 break
@@ -444,7 +468,49 @@ class SelfPlayActor:
             pinned_versions,
             list(range(cohort_size)),
             game_ids,
+            clinch_finalizations,
         )
+
+    def _complete_clinches(
+        self,
+        states: Any,
+        finalizations: list[_ClinchFinalization | None],
+    ) -> None:
+        data = states.complete_clinches()
+        batch_size = int(data.batch_size)
+        clinched = [bool(value) for value in data.clinched]
+        winners = [int(value) for value in data.winner]
+        empty_nodes = [int(value) for value in data.empty_nodes]
+        last_moves = [int(value) for value in data.last_move]
+        turn_counts = [int(value) for value in data.turn_count]
+        if batch_size != len(finalizations) or any(
+            len(values) != batch_size
+            for values in (
+                clinched,
+                winners,
+                empty_nodes,
+                last_moves,
+                turn_counts,
+            )
+        ):
+            raise RuntimeError("native clinch completion buffers are invalid")
+        for row, was_clinched in enumerate(clinched):
+            if not was_clinched:
+                continue
+            if (
+                finalizations[row] is not None
+                or winners[row] not in (0, 1)
+                or empty_nodes[row] <= 0
+                or last_moves[row] < 0
+                or turn_counts[row] <= 0
+            ):
+                raise RuntimeError("native clinch completion metadata is invalid")
+            finalizations[row] = _ClinchFinalization(
+                winner=winners[row],
+                empty_nodes=empty_nodes[row],
+                last_move=last_moves[row],
+                turn_count=turn_counts[row],
+            )
 
     def _record_decisions(
         self,
@@ -574,6 +640,7 @@ class SelfPlayActor:
         pinned_versions: list[tuple[str, int, str]],
         rows: Sequence[int],
         game_ids: Sequence[str],
+        clinch_finalizations: Sequence[_ClinchFinalization | None],
     ) -> list[GameSummary]:
         scores_data = states.score_data()
         trajectory_data = states.trajectory_data()
@@ -588,10 +655,13 @@ class SelfPlayActor:
         for row in rows:
             final_position = final_positions[row]
             final_score = scores[row]
+            clinch = clinch_finalizations[row]
             if not final_position.terminal or final_score.leader not in (0, 1):
                 raise RuntimeError("self-play final state must be full and decisive")
             if int(winner[row]) != final_score.leader:
                 raise RuntimeError("native final winner disagrees with final score")
+            if clinch is not None and clinch.winner != final_score.leader:
+                raise RuntimeError("clinch winner disagrees with proof-board score")
             expected_outcome = (
                 OUTCOME_WIN
                 if final_score.leader == final_position.to_move
@@ -625,7 +695,8 @@ class SelfPlayActor:
                             f"gumbel-completed-q:{mode}:"
                             f"simulations={decision.simulations}:"
                             f"seed={decision.search_seed}:model={model_identity}:"
-                            f"game={game_id}:ply={decision.ply}"
+                            f"game={game_id}:ply={decision.ply}:"
+                            f"final={'clinch-loser-fill' if clinch else 'board-full'}"
                         ),
                         policy_provenance=(
                             (
@@ -651,6 +722,13 @@ class SelfPlayActor:
                 self.pending_phases.append(decision.phase)
                 self.completed_decisions += 1
             metadata = trajectory_rows[row]
+            finish_reason: Literal["board-full", "clinch"] = (
+                "clinch" if clinch is not None else "board-full"
+            )
+            empty_nodes_saved = clinch.empty_nodes if clinch is not None else 0
+            if clinch is not None:
+                self.clinched_games += 1
+                self.clinch_empty_nodes += clinch.empty_nodes
             summaries.append(
                 GameSummary(
                     row=row,
@@ -664,12 +742,18 @@ class SelfPlayActor:
                     winner=int(winner[row]),
                     terminal_value=float(terminal_value[row]),
                     score_margin=int(score_margin[row]),
-                    turn_count=metadata.turn_count,
-                    last_move=metadata.last_move,
+                    turn_count=(
+                        clinch.turn_count if clinch is not None else metadata.turn_count
+                    ),
+                    last_move=(
+                        clinch.last_move if clinch is not None else metadata.last_move
+                    ),
                     model_version=version,
                     model_identity=model_identity,
                     game_id=game_id,
                     generation=self.identity.generation,
+                    finish_reason=finish_reason,
+                    empty_nodes_saved=empty_nodes_saved,
                 )
             )
             if len(self.pending_samples) >= self.config.shard_size:
