@@ -85,6 +85,29 @@ def test_git_revision_accepts_sha256_repository(
     assert benchmark_plan_module._git_revision(tmp_path) == ("e" * 64, True)
 
 
+def test_native_identity_resolves_compiled_extension_not_package_wrapper(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    suffix = benchmark_plan_module.importlib.machinery.EXTENSION_SUFFIXES[0]
+    extension = tmp_path / f"star_native{suffix}"
+    extension.write_bytes(b"compiled-extension")
+    monkeypatch.setattr(
+        benchmark_plan_module.importlib.util,
+        "find_spec",
+        lambda _name: SimpleNamespace(origin=str(extension)),
+    )
+
+    resolved = benchmark_plan_module._native_extension_path(
+        SimpleNamespace(
+            __name__="star_native",
+            __file__=str(tmp_path / "__init__.py"),
+        )
+    )
+    assert resolved == extension.resolve()
+    assert resolved.name != "__init__.py"
+
+
 def test_prepare_freezes_registered_arena_occupancy_arms(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

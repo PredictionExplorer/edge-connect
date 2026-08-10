@@ -45,6 +45,7 @@ if __package__:
         SCHEMA_VERSION,
         TREATMENT_ARM,
         _assert_stopped_source,
+        _native_extension_path,
         verify_arena_occupancy_plan,
     )
     from .run_elo_ablation_queue import exclusive_execution_lock
@@ -57,6 +58,7 @@ else:
         SCHEMA_VERSION,
         TREATMENT_ARM,
         _assert_stopped_source,
+        _native_extension_path,
         verify_arena_occupancy_plan,
     )
     from run_elo_ablation_queue import exclusive_execution_lock
@@ -274,11 +276,10 @@ def runtime_metadata(
     native_module: Any,
     device_identity: Mapping[str, object],
 ) -> dict[str, object]:
-    native_path_value = getattr(native_module, "__file__", None)
     native_rules_hash = getattr(native_module, "native_rules_hash", None)
     native_artifact: dict[str, object] | None = None
-    if isinstance(native_path_value, str) and callable(native_rules_hash):
-        native_path = Path(native_path_value).expanduser().resolve()
+    if callable(native_rules_hash):
+        native_path = _native_extension_path(native_module)
         rules_hash_value = native_rules_hash()
         if native_path.is_file() and type(rules_hash_value) is int:
             native_artifact = {

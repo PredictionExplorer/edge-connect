@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.machinery
+import importlib.util
 import json
 import math
 import os
@@ -176,18 +178,30 @@ def _harness_artifacts() -> list[dict[str, object]]:
     return [_artifact(path) for path in HARNESS_PATHS]
 
 
+def _native_extension_path(native_module: object) -> Path:
+    module_name = getattr(native_module, "__name__", None)
+    if not isinstance(module_name, str) or not module_name:
+        raise ValueError("native extension module name is unavailable")
+    spec = importlib.util.find_spec(f"{module_name}.star_native")
+    origin = spec.origin if spec is not None else None
+    if not isinstance(origin, str) or not any(
+        origin.endswith(suffix) for suffix in importlib.machinery.EXTENSION_SUFFIXES
+    ):
+        raise ValueError("compiled native extension artifact is unavailable")
+    return Path(origin).expanduser().resolve()
+
+
 def _native_extension_artifact() -> dict[str, object]:
     native_module = load_star_native(required=True)
     if native_module is None:
         raise ValueError("native extension is required")
-    path_value = getattr(native_module, "__file__", None)
     rules_hash = getattr(native_module, "native_rules_hash", None)
-    if not isinstance(path_value, str) or not callable(rules_hash):
+    if not callable(rules_hash):
         raise ValueError("native extension identity is unavailable")
     rules_hash_value = rules_hash()
     if type(rules_hash_value) is not int:
         raise ValueError("native extension rules hash is invalid")
-    artifact = _artifact(Path(path_value))
+    artifact = _artifact(_native_extension_path(native_module))
     artifact["rules_hash"] = f"fnv1a64:{rules_hash_value:016x}"
     return artifact
 
