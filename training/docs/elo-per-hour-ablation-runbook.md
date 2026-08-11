@@ -35,6 +35,14 @@ never merge their replay or model pointers into the parent.
 shards, checkpoints, manifests, and recovery checkpoints. It rotates prior
 runtime metrics into `ablation-parent/` and writes `ablation.json`.
 
+`replay/initialized.json` is a create-once identity marker, not a backup
+heartbeat. Routine replay backups must preserve its bytes. New deployment
+manifests pin its `schema_version`, `run_id`, and `generation_family`
+semantically while retaining byte-level SHA-256 pins for frozen pointers,
+profiles, scripts, units, and the stopped seed ledger. Legacy deployment
+manifests remain byte-pinned and must be regenerated after any drift; never
+weaken or edit an existing manifest to rescue a failed queue.
+
 ## Prepare one-seed pilots
 
 Run from `training/` after copying the frozen active profile to a stable path:
@@ -375,7 +383,9 @@ An isolated fatal arm is quarantined by metadata; its files are preserved. The
 queue always finalizes the partial report and writes a continuity handoff
 request. The host continuity controller decides whether another arm is safe or
 whether to resume the immutable last-known-good workload. The queue itself
-never invokes `systemctl`.
+never invokes `systemctl`. Every per-seed handoff requests fallback even when
+its selector is verified. The handoff records the comparison path, digest, and
+single-seed selector summary, but explicitly sets `adoption_authorized: false`.
 
 For a local diagnostic only, one arm can still be invoked directly:
 
@@ -461,6 +471,30 @@ champion frontiers by weighted Elo lower bound per total provisioned wall hour.
 Ring-10 and all per-ring summaries remain secondary diagnostics. Mixed weighted
 and legacy objectives are ineligible rather than being ranked on whichever
 metric looks best.
+
+For ring-10 topology adoption, pin comparisons for seeds 17, 18, and 19 plus a
+rendered `deploy/adoption-policy.json.example`, then run:
+
+```bash
+python scripts/compare_elo_ablation_seeds.py \
+  --comparison 17=/absolute/path/to/comparison-seed17.json \
+  --comparison 18=/absolute/path/to/comparison-seed18.json \
+  --comparison 19=/absolute/path/to/comparison-seed19.json \
+  --comparison-sha256 17=<sha256> \
+  --comparison-sha256 18=<sha256> \
+  --comparison-sha256 19=<sha256> \
+  --policy /absolute/path/to/adoption-policy.json \
+  --policy-sha256 <sha256> \
+  --output /absolute/path/to/cross-seed-comparison.json
+```
+
+The cross-seed gate does not invent a pooled confidence interval. It requires a
+strictly positive conservative candidate-minus-control lower bound in every
+seed and at least 20% median point Elo/hour improvement. It selects the median
+candidate seed only after all gates pass. `prepare_ablation_adoption.py` then
+verifies every pinned input and emits an immutable fresh-root 24-hour canary
+plan; it never mutates a treatment root or authorizes direct production
+adoption.
 
 For dependent experiment stages, use `run_staged_elo_pipeline.py`. It accepts
 only a hash-verified upstream winner snapshot and refuses a downstream fork

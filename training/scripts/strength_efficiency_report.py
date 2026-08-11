@@ -183,6 +183,11 @@ def _learner_summary(records: list[dict[str, object]]) -> dict[str, object]:
             "utd_segment_baseline_examples_consumed",
             "utd_segment_baseline_committed_replay_samples",
             "loader_workers_effective",
+            "loader_lifecycle",
+            "loader_pool_starts",
+            "loader_pool_rebinds",
+            "loader_pool_shutdowns",
+            "loader_worker_pids",
             "window_setup_seconds",
             "window_setup_amortized_seconds",
             "window_batches_allocated",
@@ -244,6 +249,11 @@ def _learner_summary(records: list[dict[str, object]]) -> dict[str, object]:
                 name: latest_fields[name]
                 for name in (
                     "loader_workers_effective",
+                    "loader_lifecycle",
+                    "loader_pool_starts",
+                    "loader_pool_rebinds",
+                    "loader_pool_shutdowns",
+                    "loader_worker_pids",
                     "window_setup_seconds",
                     "window_setup_amortized_seconds",
                     "window_batches_allocated",
@@ -300,6 +310,11 @@ def _learner_summary(records: list[dict[str, object]]) -> dict[str, object]:
             "utd_segment_baseline_committed_replay_samples"
         ],
         "loader_workers_effective": latest_fields["loader_workers_effective"],
+        "loader_lifecycle": latest_fields["loader_lifecycle"],
+        "loader_pool_starts": latest_fields["loader_pool_starts"],
+        "loader_pool_rebinds": latest_fields["loader_pool_rebinds"],
+        "loader_pool_shutdowns": latest_fields["loader_pool_shutdowns"],
+        "loader_worker_pids": latest_fields["loader_worker_pids"],
         "latest_window_setup_seconds": latest_fields["window_setup_seconds"],
         "window_setup_amortized_seconds": latest_fields[
             "window_setup_amortized_seconds"

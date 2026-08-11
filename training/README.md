@@ -360,6 +360,12 @@ single actor lane on GPU 7 in every deployable arm. Use
 25-versus-50-pair occupancy test; its 50-pair arm is benchmark-only. See the
 [Elo-per-hour ablation runbook](docs/elo-per-hour-ablation-runbook.md).
 
+Each per-seed queue returns to the verified last-known-good workload. Production
+adoption requires externally pinned seed-17/18/19 comparisons through
+`scripts/compare_elo_ablation_seeds.py`, followed by an immutable fresh-root
+24-hour canary plan from `scripts/prepare_ablation_adoption.py`. A one-seed
+winner snapshot is never deployment authority.
+
 The learner-shared topology is also available as an explicit one-factor
 experiment:
 

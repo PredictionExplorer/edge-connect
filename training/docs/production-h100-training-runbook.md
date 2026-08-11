@@ -745,6 +745,17 @@ degraded launch also fails. This degradation is recorded as
 `learner_loader_degraded` and resets only after the configured stable-runtime
 window.
 
+The normal learner path uses one process-scoped spawned DataLoader pool per
+rank. Replay-window refreshes rebind a parent-side sampler to immutable,
+self-contained replay references; spawned workers therefore keep stable PIDs
+and bounded shard caches without observing mutable parent-only dataset state.
+The pool is shut down exactly once when the learner process exits. Monitor
+`loader_pool=starts/rebinds/shutdowns` and require one start, increasing
+rebinds, and no shutdown while the learner is live. More than one start in one
+learner process is a warning. `STARTRAIN_LOADER_LIFECYCLE=per_window` is an
+emergency, deployment-pinned rollback switch only; it restores the older
+spawn-per-window behavior and must not be treated as a production fix.
+
 Inspect it:
 
 ```bash

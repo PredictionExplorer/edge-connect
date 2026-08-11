@@ -167,7 +167,12 @@ class DeviceBatchPrefetcher(Iterator[ReplayBatch]):
         else:
             self._stage_source(source)
 
-    def close(self, *, strict: bool = True) -> BaseException | None:
+    def close(
+        self,
+        *,
+        strict: bool = True,
+        shutdown_workers: bool = True,
+    ) -> BaseException | None:
         """Release CUDA state and stop the exact iterator owned by this prefetcher."""
 
         if self._closed:
@@ -184,13 +189,14 @@ class DeviceBatchPrefetcher(Iterator[ReplayBatch]):
         self._consumed_copy_events.clear()
         self._topology_cache.clear()
         self._stream = None
-        try:
-            shutdown_workers = getattr(self._batches, "_shutdown_workers", None)
-            if callable(shutdown_workers):
-                shutdown_workers()
-        except BaseException as exc:
-            if failure is None:
-                failure = exc
+        if shutdown_workers:
+            try:
+                shutdown = getattr(self._batches, "_shutdown_workers", None)
+                if callable(shutdown):
+                    shutdown()
+            except BaseException as exc:
+                if failure is None:
+                    failure = exc
         self._closed = True
         self._suspended = False
         if strict and failure is not None:

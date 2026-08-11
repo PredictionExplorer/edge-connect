@@ -219,16 +219,6 @@ def _create_backup_locked(
                 "created_ns": time.time_ns(),
             },
         )
-        run_id, family = _run_identity(run_root)
-        atomic_json(
-            run_root / "replay" / "initialized.json",
-            {
-                "schema_version": 1,
-                "run_id": run_id,
-                "generation_family": family,
-                "initialized_ns": time.time_ns(),
-            },
-        )
     except sqlite3.Error as exc:
         raise RuntimeError(f"SQLite replay backup failed: {exc}") from exc
     finally:

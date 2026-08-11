@@ -1,0 +1,53 @@
+{
+  "schema_version": 1,
+  "report": "startrain-elo-ablation-adoption-policy",
+  "source_commit": "@SOURCE_COMMIT@",
+  "seeds": [
+    17,
+    18,
+    19
+  ],
+  "control_treatment": "ring10-only",
+  "candidate_treatment": "@CANDIDATE_TREATMENT@",
+  "common_objective": "ring10_only",
+  "common_anchor": {
+    "identity": "@COMMON_ANCHOR_IDENTITY@",
+    "step": "@COMMON_ANCHOR_STEP@"
+  },
+  "minimum_median_point_elo_per_hour_improvement": 0.2,
+  "cross_seed_lcb_gate": {
+    "method": "minimum_per_seed_conservative_difference_lcb",
+    "minimum_advantage_elo_per_hour": 0.0,
+    "require_strictly_positive": true
+  },
+  "screening_eliminations": [],
+  "canary": {
+    "duration_hours": 24,
+    "operator_hold_path": "@STATE_ROOT@/operator-hold",
+    "continuity_fallback_required": true,
+    "future_fresh_winner": {
+      "run_root": "@FRESH_WINNER_CANARY_ROOT@",
+      "profile": {
+        "path": "@FRESH_WINNER_CANARY_PROFILE@",
+        "sha256": "@FRESH_WINNER_CANARY_PROFILE_SHA256@"
+      }
+    },
+    "previous_lkg": {
+      "run_root": "@PREVIOUS_LKG_RUN_ROOT@",
+      "profile": {
+        "path": "@PREVIOUS_LKG_PROFILE@",
+        "sha256": "@PREVIOUS_LKG_PROFILE_SHA256@"
+      }
+    },
+    "required_gates": [
+      "duration_complete",
+      "operator_hold_absent",
+      "ring10_only_objective_preserved",
+      "no_fatal_orchestrator_exit",
+      "resource_release_confirmed",
+      "integrity_verified",
+      "continuity_fallback_ready",
+      "previous_lkg_rollback_ready"
+    ]
+  }
+}

@@ -86,7 +86,22 @@ STATE_REBASE_FORMAT = "startrain.learner-state-rebase"
 STATE_REBASE_SCHEMA_VERSION = 1
 STATE_REBASE_FILENAME = "state-rebase.json"
 STATE_REBASE_PENDING_FILENAME = "state-rebase.pending.json"
+LOADER_LIFECYCLE_ENV = "STARTRAIN_LOADER_LIFECYCLE"
+LOADER_LIFECYCLES = ("process", "per_window")
+PROCESS_LOADER_TIMEOUT_SECONDS = 120.0
 _UNSET = object()
+
+
+def resolve_loader_lifecycle(value: str | None = None) -> str:
+    """Resolve and validate the learner DataLoader lifecycle rollback switch."""
+
+    lifecycle = (
+        os.environ.get(LOADER_LIFECYCLE_ENV, "process") if value is None else value
+    )
+    if lifecycle not in LOADER_LIFECYCLES:
+        expected = "|".join(LOADER_LIFECYCLES)
+        raise ValueError(f"{LOADER_LIFECYCLE_ENV} must be {expected}")
+    return lifecycle
 
 
 class AugmentedReplayDataset(Dataset[ReplaySample]):
@@ -122,6 +137,103 @@ class ShardBatchChunk:
     span_index: int
     dataset_start: int
     sample_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class ReplaySampleReference:
+    """Picklable, immutable coordinates for one replay sample."""
+
+    shard_id: int
+    shard_path: str
+    shard_checksum_sha256: str
+    shard_sample_count: int
+    sample_offset: int
+    augmentation_seed: int
+    augmentation_epoch: int
+    logical_index: int
+
+
+class PersistentReplayWorkerDataset(Dataset[ReplaySample]):
+    """Resolve self-contained references with a process-local bounded shard cache."""
+
+    def __init__(
+        self,
+        *,
+        augmentation_enabled: bool,
+        shard_cache_size: int,
+    ) -> None:
+        if shard_cache_size <= 0:
+            raise ValueError("persistent replay requires a positive shard cache")
+        self.augmentation_enabled = augmentation_enabled
+        self.shard_cache_size = shard_cache_size
+        self._cache: OrderedDict[tuple[int, str, str, int], DecodedReplayShard] = (
+            OrderedDict()
+        )
+        self.shard_load_count = 0
+        self.checksum_verification_count = 0
+        self.sample_materialization_count = 0
+
+    def __getitem__(self, reference: ReplaySampleReference) -> ReplaySample:
+        if not isinstance(reference, ReplaySampleReference):
+            raise TypeError("persistent replay indices must be sample references")
+        if (
+            reference.shard_id <= 0
+            or reference.shard_sample_count <= 0
+            or reference.sample_offset < 0
+            or reference.sample_offset >= reference.shard_sample_count
+            or reference.logical_index < 0
+        ):
+            raise IndexError("persistent replay sample reference is invalid")
+        shard = self._load_reference_shard(reference)
+        sample = shard.sample(reference.sample_offset)
+        self.sample_materialization_count += 1
+        if not self.augmentation_enabled:
+            return sample
+        transform = deterministic_transform(
+            seed=reference.augmentation_seed,
+            sample_index=reference.logical_index,
+            epoch=reference.augmentation_epoch,
+        )
+        return augment_sample(sample, transform)
+
+    def __getitems__(
+        self,
+        references: list[ReplaySampleReference],
+    ) -> list[ReplaySample]:
+        return [self[reference] for reference in references]
+
+    def __getstate__(self) -> dict[str, object]:
+        state = dict(self.__dict__)
+        state["_cache"] = OrderedDict()
+        state["shard_load_count"] = 0
+        state["checksum_verification_count"] = 0
+        state["sample_materialization_count"] = 0
+        return state
+
+    def _load_reference_shard(
+        self,
+        reference: ReplaySampleReference,
+    ) -> DecodedReplayShard:
+        key = (
+            reference.shard_id,
+            reference.shard_path,
+            reference.shard_checksum_sha256,
+            reference.shard_sample_count,
+        )
+        cached = self._cache.pop(key, None)
+        if cached is None:
+            path = Path(reference.shard_path)
+            self.checksum_verification_count += 1
+            if _sha256(path) != reference.shard_checksum_sha256:
+                raise ValueError(f"replay shard checksum failed: {path}")
+            cached = decode_replay_shard(path)
+            self.shard_load_count += 1
+            if len(cached) != reference.shard_sample_count:
+                raise ValueError("replay shard count disagrees with its reference")
+        self._cache[key] = cached
+        while len(self._cache) > self.shard_cache_size:
+            self._cache.popitem(last=False)
+        return cached
 
 
 class LazyShardReplayDataset(Dataset[ReplaySample]):
@@ -205,6 +317,24 @@ class LazyShardReplayDataset(Dataset[ReplaySample]):
         )
 
     def __getitem__(self, index: int) -> ReplaySample:
+        reference = self.reference(index)
+        span_index = bisect_right(self._ends, reference.logical_index)
+        span = self.spans[span_index]
+        shard = self._load_span_shard(span)
+        sample = shard.sample(reference.sample_offset)
+        self.sample_materialization_count += 1
+        if not self.augmentation_enabled:
+            return sample
+        transform = deterministic_transform(
+            seed=reference.augmentation_seed,
+            sample_index=reference.logical_index,
+            epoch=reference.augmentation_epoch,
+        )
+        return augment_sample(sample, transform)
+
+    def reference(self, index: int) -> ReplaySampleReference:
+        """Translate a logical selection index without opening its shard."""
+
         if index < 0:
             index += len(self)
         if index < 0 or index >= len(self):
@@ -212,15 +342,16 @@ class LazyShardReplayDataset(Dataset[ReplaySample]):
         span_index = bisect_right(self._ends, index)
         previous_end = self._ends[span_index - 1] if span_index else 0
         span = self.spans[span_index]
-        shard = self._load_span_shard(span)
-        sample = shard.sample(span.sample_start + index - previous_end)
-        self.sample_materialization_count += 1
-        if not self.augmentation_enabled:
-            return sample
-        transform = deterministic_transform(
-            seed=self.seed, sample_index=index, epoch=self.epoch
+        return ReplaySampleReference(
+            shard_id=span.record.shard_id,
+            shard_path=str(span.record.path),
+            shard_checksum_sha256=span.record.checksum_sha256,
+            shard_sample_count=span.record.sample_count,
+            sample_offset=span.sample_start + index - previous_end,
+            augmentation_seed=self.seed,
+            augmentation_epoch=self.epoch,
+            logical_index=index,
         )
-        return augment_sample(sample, transform)
 
     def __getitems__(self, indices: list[int]) -> list[ReplaySample]:
         """Bulk Dataset hook used by DataLoader for one shard-local batch."""
@@ -389,6 +520,134 @@ class UniqueReplayBatchSampler(Sampler[list[int]]):
         yield from local
 
 
+@dataclass(frozen=True, slots=True)
+class _ReplaySamplerBinding:
+    dataset: LazyShardReplayDataset
+    sampler: UniqueReplayBatchSampler
+
+
+class RebindableReplayBatchSampler(Sampler[list[ReplaySampleReference]]):
+    """Parent-only adapter from deterministic integers to immutable references."""
+
+    def __init__(self) -> None:
+        self._binding: _ReplaySamplerBinding | None = None
+        self.rebind_count = 0
+
+    def rebind(
+        self,
+        dataset: LazyShardReplayDataset,
+        sampler: UniqueReplayBatchSampler,
+    ) -> None:
+        if sampler.dataset is not dataset:
+            raise ValueError("replay sampler must be bound to its source dataset")
+        self._binding = _ReplaySamplerBinding(dataset, sampler)
+        self.rebind_count += 1
+
+    def clear(self) -> None:
+        self._binding = None
+
+    def __len__(self) -> int:
+        binding = self._binding
+        return len(binding.sampler) if binding is not None else 0
+
+    def __iter__(self) -> Iterator[list[ReplaySampleReference]]:
+        binding = self._binding
+        if binding is None:
+            return
+        dataset = binding.dataset
+        for indices in binding.sampler:
+            yield [dataset.reference(index) for index in indices]
+
+
+class SpawnedReplayLoaderPool:
+    """One persistent spawned DataLoader worker pool for a learner process."""
+
+    def __init__(
+        self,
+        *,
+        num_workers: int,
+        augmentation_enabled: bool,
+        shard_cache_size: int,
+        pin_memory: bool,
+        prefetch_factor: int,
+    ) -> None:
+        if num_workers <= 0:
+            raise ValueError("spawned replay pool requires positive workers")
+        self.dataset = PersistentReplayWorkerDataset(
+            augmentation_enabled=augmentation_enabled,
+            shard_cache_size=shard_cache_size,
+        )
+        self.batch_sampler = RebindableReplayBatchSampler()
+        self.loader = DataLoader(
+            dataset=self.dataset,
+            batch_sampler=self.batch_sampler,
+            collate_fn=collate_replay_samples,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            prefetch_factor=prefetch_factor,
+            persistent_workers=True,
+            multiprocessing_context="spawn",
+            timeout=PROCESS_LOADER_TIMEOUT_SECONDS,
+        )
+        self.num_workers = num_workers
+        self.closed = False
+        self.shutdown_count = 0
+
+    @property
+    def worker_pids(self) -> tuple[int, ...]:
+        iterator = getattr(self.loader, "_iterator", None)
+        workers = getattr(iterator, "_workers", ())
+        return tuple(
+            int(worker.pid)
+            for worker in workers
+            if getattr(worker, "pid", None) is not None
+        )
+
+    def rebind(
+        self,
+        dataset: LazyShardReplayDataset,
+        sampler: UniqueReplayBatchSampler,
+    ) -> None:
+        if self.closed:
+            raise RuntimeError("cannot rebind a closed replay loader pool")
+        self.batch_sampler.rebind(dataset, sampler)
+
+    def quiesce(self) -> None:
+        """Drain stale work through a zero-length iterator without respawning."""
+
+        if self.closed:
+            return
+        self.batch_sampler.clear()
+        if getattr(self.loader, "_iterator", None) is not None:
+            try:
+                iter(self.loader)
+            except BaseException as error:
+                self.shutdown(strict=False)
+                raise RuntimeError(
+                    "persistent replay loader workers did not quiesce"
+                ) from error
+
+    def shutdown(self, *, strict: bool = True) -> BaseException | None:
+        if self.closed:
+            return None
+        failure: BaseException | None = None
+        iterator = getattr(self.loader, "_iterator", None)
+        try:
+            shutdown_workers = getattr(iterator, "_shutdown_workers", None)
+            if callable(shutdown_workers):
+                shutdown_workers()
+        except BaseException as exc:
+            failure = exc
+        finally:
+            self.loader._iterator = None
+            self.batch_sampler.clear()
+            self.closed = True
+            self.shutdown_count += 1
+        if strict and failure is not None:
+            raise failure
+        return failure
+
+
 def _cross_shard_chunk_groups(
     chunks: Sequence[ShardBatchChunk],
     *,
@@ -520,6 +779,7 @@ class ReplayWindowSession:
     ring_weights: tuple[tuple[int, float], ...] | None
     recovery_boundary: int | None
     ring_weight_boundary: int | None
+    shutdown_loader_workers: bool = True
     batches_consumed: int = 0
     reuse_spins: int = 0
     utd_wait_spins: int = 0
@@ -555,7 +815,10 @@ class ReplayWindowSession:
                 if prefetcher is not None:
                     close = getattr(prefetcher, "close", None)
                     if callable(close):
-                        close_result = close(strict=False)
+                        close_result = close(
+                            strict=False,
+                            shutdown_workers=self.shutdown_loader_workers,
+                        )
                         if close_result is not None and not isinstance(
                             close_result, BaseException
                         ):
@@ -570,7 +833,7 @@ class ReplayWindowSession:
                             stream.synchronize()
             except BaseException as exc:
                 failure = exc
-            if not prefetcher_closed_iterator:
+            if self.shutdown_loader_workers and not prefetcher_closed_iterator:
                 try:
                     iterator = getattr(loader, "_iterator", None)
                     if iterator is None:
@@ -831,6 +1094,11 @@ class LearnerLoop:
     ) -> None:
         if world_size <= 0 or rank < 0 or rank >= world_size:
             raise ValueError("invalid learner distributed rank")
+        self.loader_lifecycle = resolve_loader_lifecycle()
+        self._loader_pool: SpawnedReplayLoaderPool | None = None
+        self._loader_pool_starts = 0
+        self._loader_pool_rebinds = 0
+        self._loader_pool_shutdowns = 0
         self.store = store
         learner_config = replace(
             learner_config,
@@ -1157,6 +1425,7 @@ class LearnerLoop:
         window: ReplayWindowSession | None = None
         next_refresh_reason = "initial"
         exit_reason = "stop"
+        run_failure: BaseException | None = None
 
         def close_active_window(reason: str) -> None:
             nonlocal next_refresh_reason, window
@@ -1465,6 +1734,15 @@ class LearnerLoop:
                                 "loader_workers_effective": (
                                     spin_window.effective_workers
                                 ),
+                                "loader_lifecycle": self.loader_lifecycle,
+                                "loader_pool_starts": self._loader_pool_starts,
+                                "loader_pool_rebinds": self._loader_pool_rebinds,
+                                "loader_pool_shutdowns": self._loader_pool_shutdowns,
+                                "loader_worker_pids": (
+                                    list(self._loader_pool.worker_pids)
+                                    if self._loader_pool is not None
+                                    else []
+                                ),
                                 "utd_wait_spins": spin_window.utd_wait_spins,
                                 "metrics_interval_steps": measured_steps,
                                 "metrics_interval_wall_seconds": wall_seconds,
@@ -1529,12 +1807,24 @@ class LearnerLoop:
                             break
             else:
                 exit_reason = "target"
-        except BaseException:
+        except BaseException as exc:
             exit_reason = "error"
+            run_failure = exc
             raise
         finally:
-            if window is not None:
-                close_active_window(exit_reason)
+            cleanup_failure: BaseException | None = None
+            try:
+                if window is not None:
+                    try:
+                        close_active_window(exit_reason)
+                    except BaseException as exc:
+                        cleanup_failure = exc
+            finally:
+                pool_failure = self._shutdown_loader_pool()
+                if cleanup_failure is None and pool_failure is not None:
+                    cleanup_failure = pool_failure
+            if cleanup_failure is not None and run_failure is None:
+                raise cleanup_failure
         if self.rank == 0:
             completed = target is not None and self.step >= target
             if completed:
@@ -1629,6 +1919,7 @@ class LearnerLoop:
             loader = self._loader(selection, batches=batches)
             if loader is None:
                 raise RuntimeError("replay loader construction returned no loader")
+            pooled_loader = self._loader_uses_process_pool(loader)
             prefetcher = DeviceBatchPrefetcher(
                 loader,
                 device=next(self.model.parameters()).device,
@@ -1650,9 +1941,11 @@ class LearnerLoop:
                 ring_weight_boundary=(
                     self.ring_mixture_config.next_weight_step(self.step)
                 ),
+                shutdown_loader_workers=not pooled_loader,
             )
         except BaseException:
             if loader is not None:
+                pooled_loader = self._loader_uses_process_pool(loader)
                 failed = ReplayWindowSession(
                     selection=selection,
                     loader=loader,
@@ -1667,8 +1960,14 @@ class LearnerLoop:
                     ring_weights=self._ring_weight_fingerprint(),
                     recovery_boundary=self._next_recovery_boundary(),
                     ring_weight_boundary=None,
+                    shutdown_loader_workers=not pooled_loader,
                 )
                 failed.shutdown(strict=False)
+                if pooled_loader and self._loader_pool is not None:
+                    try:
+                        self._loader_pool.quiesce()
+                    except BaseException:
+                        self._shutdown_loader_pool()
             if self.rank == 0:
                 self.store.clear_gc_watermark(watermark_name)
             raise
@@ -1703,50 +2002,104 @@ class LearnerLoop:
     ) -> None:
         if window.closed:
             return
-        failure = None
+        failure: BaseException | None = None
+        pooled_loader = not window.shutdown_loader_workers
+        terminal_cleanup = reason in {"error", "stop", "target"}
         try:
             failure = window.shutdown(strict=False)
-        finally:
-            if self.rank == 0:
+            if pooled_loader and self._loader_pool is not None:
+                try:
+                    if terminal_cleanup:
+                        pool_failure = self._shutdown_loader_pool()
+                        if pool_failure is not None:
+                            raise pool_failure
+                    else:
+                        self._loader_pool.quiesce()
+                except BaseException as exc:
+                    if failure is None:
+                        failure = exc
+                    if self._loader_pool is not None:
+                        pool_failure = self._shutdown_loader_pool()
+                        if failure is None and pool_failure is not None:
+                            failure = pool_failure
+        except BaseException as exc:
+            if failure is None:
+                failure = exc
+
+        collective_completed = self.world_size == 1
+        if self.world_size > 1 and reason != "error":
+            try:
+                messages = self._collective_error_messages(
+                    (
+                        f"{type(failure).__name__}: {failure}"
+                        if failure is not None
+                        else None
+                    )
+                )
+                collective_completed = True
+                if messages:
+                    failure = RuntimeError(
+                        "distributed replay window cleanup failed: "
+                        + "; ".join(messages)
+                    )
+            except BaseException as exc:
+                if failure is None:
+                    failure = exc
+
+        if self.rank == 0 and reason != "error" and collective_completed:
+            try:
                 self.store.clear_gc_watermark(self._watermark_name())
+            except BaseException as exc:
+                if failure is None:
+                    failure = exc
         if failure is not None and self.rank == 0:
-            self.metrics.append(
-                {
-                    "schema_version": 1,
-                    "timestamp_ns": time.time_ns(),
-                    "worker": "learner",
-                    "event": "replay_window_shutdown_warning",
-                    "step": self.step,
-                    "epoch": self.epoch,
-                    "window_refresh_reason": reason,
-                    "error_type": type(failure).__name__,
-                    "error": str(failure),
-                }
-            )
+            try:
+                self.metrics.append(
+                    {
+                        "schema_version": 1,
+                        "timestamp_ns": time.time_ns(),
+                        "worker": "learner",
+                        "event": "replay_window_shutdown_warning",
+                        "step": self.step,
+                        "epoch": self.epoch,
+                        "window_refresh_reason": reason,
+                        "error_type": type(failure).__name__,
+                        "error": str(failure),
+                    }
+                )
+            except BaseException:
+                pass
         if self.rank == 0:
-            self.metrics.append(
-                {
-                    "schema_version": 1,
-                    "timestamp_ns": time.time_ns(),
-                    "worker": "learner",
-                    "event": "replay_window_refreshed",
-                    "step": self.step,
-                    "epoch": self.epoch,
-                    "window_refresh_reason": reason,
-                    "window_batches_allocated": window.batches_allocated,
-                    "window_batches_consumed": window.batches_consumed,
-                    "window_batches_remaining": window.batches_remaining,
-                    "window_reuse_spins": window.reuse_spins,
-                    "utd_wait_spins": window.utd_wait_spins,
-                    "loader_workers_effective": window.effective_workers,
-                    "window_setup_seconds": window.setup_seconds,
-                    "window_setup_amortized_seconds": (
-                        window.setup_seconds / window.batches_allocated
-                    ),
-                }
-            )
-            self._maybe_write_recovery_checkpoint()
-            self._maybe_collect_replay_garbage()
+            try:
+                self.metrics.append(
+                    {
+                        "schema_version": 1,
+                        "timestamp_ns": time.time_ns(),
+                        "worker": "learner",
+                        "event": "replay_window_refreshed",
+                        "step": self.step,
+                        "epoch": self.epoch,
+                        "window_refresh_reason": reason,
+                        "window_batches_allocated": window.batches_allocated,
+                        "window_batches_consumed": window.batches_consumed,
+                        "window_batches_remaining": window.batches_remaining,
+                        "window_reuse_spins": window.reuse_spins,
+                        "utd_wait_spins": window.utd_wait_spins,
+                        "loader_workers_effective": window.effective_workers,
+                        "window_setup_seconds": window.setup_seconds,
+                        "window_setup_amortized_seconds": (
+                            window.setup_seconds / window.batches_allocated
+                        ),
+                    }
+                )
+            except BaseException as exc:
+                if failure is None:
+                    failure = exc
+            if failure is None:
+                self._maybe_write_recovery_checkpoint()
+                self._maybe_collect_replay_garbage()
+        if failure is not None:
+            raise failure
         self.epoch += 1
 
     def _record_window_consumption(
@@ -1860,6 +2213,70 @@ class LearnerLoop:
             return 0
         return self.data_config.workers
 
+    def _loader_uses_process_pool(self, loader: DataLoader) -> bool:
+        pool = self._loader_pool
+        return pool is not None and loader is pool.loader
+
+    @property
+    def loader_pool_counters(self) -> dict[str, int]:
+        return {
+            "starts": self._loader_pool_starts,
+            "rebinds": self._loader_pool_rebinds,
+            "shutdowns": self._loader_pool_shutdowns,
+        }
+
+    def _record_loader_pool_event(
+        self,
+        event: str,
+        *,
+        worker_pids: Sequence[int] = (),
+        error: BaseException | None = None,
+    ) -> None:
+        if self.rank != 0:
+            return
+        self.metrics.append(
+            {
+                "schema_version": 1,
+                "timestamp_ns": time.time_ns(),
+                "worker": "learner",
+                "event": event,
+                "step": self.step,
+                "epoch": self.epoch,
+                "loader_lifecycle": self.loader_lifecycle,
+                "loader_workers_effective": self.data_config.workers,
+                "loader_worker_pids": list(worker_pids),
+                "loader_pool_starts": self._loader_pool_starts,
+                "loader_pool_rebinds": self._loader_pool_rebinds,
+                "loader_pool_shutdowns": self._loader_pool_shutdowns,
+                "error_type": type(error).__name__ if error is not None else None,
+                "error": str(error) if error is not None else None,
+            }
+        )
+
+    def _shutdown_loader_pool(self) -> BaseException | None:
+        pool = self._loader_pool
+        if pool is None:
+            return None
+        worker_pids: tuple[int, ...] = ()
+        failure: BaseException | None = None
+        try:
+            worker_pids = pool.worker_pids
+            failure = pool.shutdown(strict=False)
+        except BaseException as exc:
+            failure = exc
+        self._loader_pool = None
+        self._loader_pool_shutdowns += 1
+        try:
+            self._record_loader_pool_event(
+                "replay_loader_pool_shutdown",
+                worker_pids=worker_pids,
+                error=failure,
+            )
+        except BaseException as exc:
+            if failure is None:
+                failure = exc
+        return failure
+
     def _loader(self, selection: ReplaySelection, *, batches: int) -> DataLoader:
         dataset = LazyShardReplayDataset(
             selection,
@@ -1882,6 +2299,30 @@ class LearnerLoop:
         )
         effective_workers = self._effective_loader_workers(batches)
         if effective_workers:
+            if self.loader_lifecycle == "process":
+                pool = self._loader_pool
+                if pool is None:
+                    pool = SpawnedReplayLoaderPool(
+                        num_workers=effective_workers,
+                        augmentation_enabled=self.data_config.d5_augmentation,
+                        shard_cache_size=self.data_config.shard_cache_size,
+                        pin_memory=self.data_config.pin_memory,
+                        prefetch_factor=self.data_config.prefetch_factor,
+                    )
+                    self._loader_pool = pool
+                    self._loader_pool_starts += 1
+                    self._record_loader_pool_event("replay_loader_pool_started")
+                elif pool.num_workers != effective_workers:
+                    raise RuntimeError(
+                        "replay loader worker count changed within a run"
+                    )
+                pool.rebind(dataset, batch_sampler)
+                self._loader_pool_rebinds += 1
+                self._record_loader_pool_event(
+                    "replay_loader_pool_rebound",
+                    worker_pids=pool.worker_pids,
+                )
+                return pool.loader
             return DataLoader(
                 dataset=dataset,
                 batch_sampler=batch_sampler,

@@ -113,6 +113,9 @@ startrain-orchestrate --config configs/h100-8gpu.yaml
 The orchestration soak is complete only after it demonstrates:
 
 - sustained actor and learner progress without unexplained stalls;
+- one process-scoped learner loader-pool start, stable worker PIDs across at
+  least 200 replay-window refreshes, and no `SemLock` or `resource_tracker`
+  diagnostics;
 - replay writes, quarantine, restart, and checkpoint resume on the target NVMe;
 - at least one candidate-to-arena terminal decision;
 - bounded GPU memory and stable thermals;
@@ -132,6 +135,16 @@ separate primary and verified fallback root. The canary must exercise:
 6. a synthetic unsafe GPU report, proving that active work is stopped and
    fallback is blocked; and
 7. queue completion/failure handoff to the verified last-known-good workload.
+
+The queue fault matrix must also run a replay backup between manifest
+verification and the next arm. The create-once replay initialization marker
+must remain byte-identical, its semantic identity pin must still verify, and
+tampering with `run_id` or `generation_family` must fail closed. A completed
+single-seed queue must request fallback and must never authorize adoption.
+Cross-seed adoption tests require exactly seeds 17/18/19, externally pinned
+comparison and policy digests, a positive conservative advantage in every
+seed, at least 20% median point improvement, and a fresh-root 24-hour canary
+plan.
 
 Do not inject real ECC errors, reset a production GPU, or fill the host
 filesystem. Use isolated artifacts and deterministic fault hooks. Certification

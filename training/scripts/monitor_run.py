@@ -1154,6 +1154,20 @@ def collect_snapshot(
         )
         or {}
     )
+    loader_pool_metric = (
+        _latest_jsonl(
+            root / "learner" / "metrics.jsonl",
+            predicate=lambda row: (
+                row.get("event")
+                in {
+                    "replay_loader_pool_started",
+                    "replay_loader_pool_rebound",
+                    "replay_loader_pool_shutdown",
+                }
+            ),
+        )
+        or {}
+    )
     learner_heartbeat = _read_json(root / "status" / "learner.heartbeat.json") or {}
     losses = learner_metric.get("losses")
     if isinstance(losses, dict) and any(
@@ -1211,6 +1225,60 @@ def collect_snapshot(
             "update_to_data_high",
             f"UTD={effective_updates:.3f} target={effective_target_updates:.3f}",
         )
+
+    def loader_value(name: str) -> object:
+        value = learner_metric.get(name)
+        return value if value is not None else loader_pool_metric.get(name)
+
+    loader_lifecycle = loader_value("loader_lifecycle")
+    loader_workers = _number(learner_metric.get("loader_workers_effective"))
+    loader_pool_starts = _number(loader_value("loader_pool_starts"))
+    loader_pool_shutdowns = _number(loader_value("loader_pool_shutdowns"))
+    loader_worker_pids = loader_value("loader_worker_pids")
+    learner_worker = workers.get("learner") if isinstance(workers, dict) else None
+    learner_worker_state = (
+        learner_worker.get("state") if isinstance(learner_worker, Mapping) else None
+    )
+    if (
+        learner_worker_state == "running"
+        and loader_pool_starts is not None
+        and loader_pool_starts > 1
+    ):
+        _add_warning(
+            warnings,
+            "WARN",
+            "loader_pool_respawned",
+            f"learner loader pool starts={int(loader_pool_starts)}",
+        )
+    if (
+        loader_lifecycle == "process"
+        and loader_workers is not None
+        and loader_workers > 0
+        and learner_worker_state == "running"
+    ):
+        if loader_pool_starts is None or loader_pool_starts < 1:
+            _add_warning(
+                warnings,
+                "WARN",
+                "loader_pool_missing",
+                f"process-scoped loader pool starts={loader_pool_starts}",
+            )
+        if loader_pool_shutdowns not in (None, 0):
+            _add_warning(
+                warnings,
+                "ERROR",
+                "loader_pool_shutdown_live",
+                f"live learner loader pool shutdowns={int(loader_pool_shutdowns)}",
+            )
+        if not isinstance(loader_worker_pids, list) or len(loader_worker_pids) != int(
+            loader_workers
+        ):
+            _add_warning(
+                warnings,
+                "WARN",
+                "loader_pool_pid_mismatch",
+                "loader worker PID count differs from effective worker count",
+            )
     learner = {
         "step": learner_heartbeat.get("step", learner_metric.get("step")),
         "target_steps": target_steps,
@@ -1235,6 +1303,11 @@ def collect_snapshot(
             "utd_segment_baseline_committed_replay_samples"
         ),
         "loader_workers_effective": learner_metric.get("loader_workers_effective"),
+        "loader_lifecycle": loader_lifecycle,
+        "loader_pool_starts": loader_pool_starts,
+        "loader_pool_rebinds": loader_value("loader_pool_rebinds"),
+        "loader_pool_shutdowns": loader_pool_shutdowns,
+        "loader_worker_pids": loader_worker_pids,
         "window_setup_seconds": learner_metric.get("window_setup_seconds"),
         "window_setup_amortized_seconds": learner_metric.get(
             "window_setup_amortized_seconds"
@@ -2003,6 +2076,9 @@ def format_text(snapshot: Mapping[str, object]) -> str:
         f"utd_segment={_compact(learner.get('segment_updates_per_new_sample'))}/"
         f"{_compact(segment_target)} "
         f"loader_workers={_count(learner.get('loader_workers_effective'))} "
+        f"loader_pool={_count(learner.get('loader_pool_starts'))}/"
+        f"{_count(learner.get('loader_pool_rebinds'))}/"
+        f"{_count(learner.get('loader_pool_shutdowns'))} "
         f"window_reuse={_flag(learner.get('window_reuse'))} "
         f"window_setup={_seconds(learner.get('window_setup_amortized_seconds'))} "
         f"actors={actors.get('workers')} "

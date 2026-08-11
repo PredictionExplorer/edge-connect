@@ -874,7 +874,21 @@ def test_monitor_shows_headline_segment_loader_and_result_kind_counts(
         }
     )
     learner_metric_path.write_text(
-        json.dumps(learner_metric) + "\n",
+        json.dumps(learner_metric)
+        + "\n"
+        + json.dumps(
+            {
+                "timestamp_ns": now_ns,
+                "worker": "learner",
+                "event": "replay_loader_pool_rebound",
+                "loader_lifecycle": "process",
+                "loader_pool_starts": 1,
+                "loader_pool_rebinds": 4,
+                "loader_pool_shutdowns": 0,
+                "loader_worker_pids": [101, 102, 103, 104, 105, 106, 107, 108],
+            }
+        )
+        + "\n",
         encoding="utf-8",
     )
     _write_json(
@@ -932,14 +946,50 @@ def test_monitor_shows_headline_segment_loader_and_result_kind_counts(
     assert snapshot["arena_history"]["result_kind_counts"]["historical_crossplay"] == 1
     assert snapshot["learner"]["segment_updates_per_new_sample"] == 1.2
     assert snapshot["learner"]["loader_workers_effective"] == 8
+    assert snapshot["learner"]["loader_lifecycle"] == "process"
+    assert snapshot["learner"]["loader_pool_starts"] == 1
+    assert snapshot["learner"]["loader_pool_rebinds"] == 4
+    assert snapshot["learner"]["loader_pool_shutdowns"] == 0
     assert "utd_segment=1.20/1.25" in text
     assert "loader_workers=8" in text
+    assert "loader_pool=1/4/0" in text
     assert "window_reuse=yes" in text
     assert "window_setup=0.0040s" in text
     assert "promotion_evals=1" in text
     assert "crossplay_evals=1" in text
     assert "elo=321.50" in text
     assert "elo_source=aggregate" in text
+
+
+def test_monitor_warns_on_live_process_loader_pool_violations(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    now_ns = 10_000_000_000
+    root = _fixture(tmp_path, now_ns=now_ns)
+    metric_path = root / "learner" / "metrics.jsonl"
+    metric = json.loads(metric_path.read_text(encoding="utf-8"))
+    metric.update(
+        {
+            "loader_workers_effective": 4,
+            "loader_lifecycle": "process",
+            "loader_pool_starts": 2,
+            "loader_pool_rebinds": 3,
+            "loader_pool_shutdowns": 1,
+            "loader_worker_pids": [101],
+        }
+    )
+    metric_path.write_text(json.dumps(metric) + "\n", encoding="utf-8")
+    _healthy_dependencies(monkeypatch)
+
+    snapshot: Any = monitor.collect_snapshot(root, now_ns=now_ns)
+    codes = {warning["code"] for warning in snapshot["warnings"]}
+
+    assert {
+        "loader_pool_respawned",
+        "loader_pool_shutdown_live",
+        "loader_pool_pid_mismatch",
+    } <= codes
 
 
 def test_monitor_softly_ignores_malformed_strength_report(

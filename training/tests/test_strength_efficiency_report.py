@@ -577,6 +577,17 @@ def test_learner_summary_exposes_segment_utd_and_persistent_window_metrics() -> 
             },
             {
                 "timestamp_ns": 3,
+                "event": "replay_loader_pool_rebound",
+                "step": 14,
+                "loader_lifecycle": "process",
+                "loader_workers_effective": 8,
+                "loader_pool_starts": 1,
+                "loader_pool_rebinds": 2,
+                "loader_pool_shutdowns": 0,
+                "loader_worker_pids": [101, 102],
+            },
+            {
+                "timestamp_ns": 4,
                 "event": "replay_window_consumed",
                 "step": 15,
                 "window_batches_allocated": 100,
@@ -595,6 +606,11 @@ def test_learner_summary_exposes_segment_utd_and_persistent_window_metrics() -> 
     assert summary["segment_updates_per_new_sample"] == 1.2
     assert summary["utd_segment_target_updates_per_new_sample"] == 1.25
     assert summary["loader_workers_effective"] == 8
+    assert summary["loader_lifecycle"] == "process"
+    assert summary["loader_pool_starts"] == 1
+    assert summary["loader_pool_rebinds"] == 2
+    assert summary["loader_pool_shutdowns"] == 0
+    assert summary["loader_worker_pids"] == [101, 102]
     assert summary["window_reuse"] is True
     assert summary["window_reuse_spins"] == 1
     persistent = summary["persistent_window"]

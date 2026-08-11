@@ -3,8 +3,13 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import pickle
+import subprocess
+import sys
+import textwrap
 from dataclasses import dataclass
 from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -43,14 +48,19 @@ from startrain.inference import (
     InferenceResponse,
 )
 from startrain.learner import (
+    LOADER_LIFECYCLE_ENV,
     LazyShardReplayDataset,
     LearnerLoop,
+    PersistentReplayWorkerDataset,
+    RebindableReplayBatchSampler,
     ReplayWindowSession,
+    SpawnedReplayLoaderPool,
     UTDSegmentState,
     UniqueReplayBatchSampler,
     _maximum_cross_shard_groups,
     _weighted_ring_quotas,
     plateau_policy_decision,
+    resolve_loader_lifecycle,
 )
 from startrain.losses import LossWeights
 from startrain.model import GraphResTNet, ModelConfig, StarModelOutput
@@ -1338,6 +1348,417 @@ def test_short_replay_windows_disable_configured_workers() -> None:
     assert learner._effective_loader_workers(32) == 8
 
 
+def test_loader_lifecycle_switch_defaults_and_fails_fast(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv(LOADER_LIFECYCLE_ENV, raising=False)
+    assert resolve_loader_lifecycle() == "process"
+    assert resolve_loader_lifecycle("per_window") == "per_window"
+    monkeypatch.setenv(LOADER_LIFECYCLE_ENV, "window")
+    with pytest.raises(ValueError, match=LOADER_LIFECYCLE_ENV):
+        resolve_loader_lifecycle()
+
+
+def test_per_window_loader_lifecycle_keeps_rollback_behavior(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(LOADER_LIFECYCLE_ENV, "per_window")
+    identity = run_identity(tmp_path)
+    with ReplayStore(tmp_path / "per-window-replay") as store:
+        generation = store.lease_generation(identity, "actor-test")
+        append_replay(
+            store,
+            [
+                make_replay_sample(
+                    identity=identity,
+                    generation=generation,
+                    game_id=f"per-window-{index}",
+                )
+                for index in range(4)
+            ],
+            identity,
+            model_step=0,
+            generation=generation,
+        )
+        selection = store.select_recent_spans(
+            rings=(4,),
+            per_ring_quota=4,
+            run_id=identity.run_id,
+            generation_family=identity.generation_family,
+            current_model_step=0,
+            max_model_lag_steps=0,
+        )
+        learner = make_test_learner(
+            store,
+            identity,
+            tmp_path / "per-window-learner",
+            learner_config=LearnerConfig(device="cpu"),
+            data_config=DataConfig(
+                workers=1,
+                min_batches_for_workers=1,
+                ring_stratified=False,
+            ),
+        )
+
+        first = learner._loader(selection, batches=2)
+        second = learner._loader(selection, batches=2)
+
+        assert learner.loader_lifecycle == "per_window"
+        assert first is not second
+        assert first.num_workers == second.num_workers == 1
+        assert learner._loader_pool is None
+        assert learner.loader_pool_counters == {
+            "starts": 0,
+            "rebinds": 0,
+            "shutdowns": 0,
+        }
+
+
+def test_process_loader_pool_rebinds_stable_workers_and_discards_stale_batches(
+    tmp_path,
+) -> None:
+    identity = run_identity(tmp_path)
+    with ReplayStore(tmp_path / "pooled-replay") as store:
+        generation = store.lease_generation(identity, "actor-test")
+        append_replay(
+            store,
+            [
+                make_replay_sample(
+                    4,
+                    identity=identity,
+                    generation=generation,
+                    game_id=f"pooled-ring-four-{index}",
+                )
+                for index in range(4)
+            ],
+            identity,
+            model_step=0,
+            generation=generation,
+        )
+        append_replay(
+            store,
+            [
+                make_replay_sample(
+                    6,
+                    identity=identity,
+                    generation=generation,
+                    game_id=f"pooled-ring-six-{index}",
+                )
+                for index in range(4)
+            ],
+            identity,
+            model_step=0,
+            generation=generation,
+        )
+        ring_four = store.select_recent_spans(
+            rings=(4,),
+            per_ring_quota=4,
+            run_id=identity.run_id,
+            generation_family=identity.generation_family,
+            current_model_step=0,
+            max_model_lag_steps=0,
+        )
+        ring_six = store.select_recent_spans(
+            rings=(6,),
+            per_ring_quota=4,
+            run_id=identity.run_id,
+            generation_family=identity.generation_family,
+            current_model_step=0,
+            max_model_lag_steps=0,
+        )
+        learner = make_test_learner(
+            store,
+            identity,
+            tmp_path / "pooled-learner",
+            learner_config=LearnerConfig(
+                minimum_replay_samples=1,
+                recent_samples_per_ring=8,
+                max_replay_lag_steps=10,
+                steps_per_window=4,
+                candidate_interval=100,
+                device="cpu",
+            ),
+            data_config=DataConfig(
+                workers=1,
+                min_batches_for_workers=2,
+                ring_stratified=False,
+                d5_augmentation=False,
+                shard_cache_size=1,
+            ),
+        )
+
+        short_loader = learner._loader(ring_four, batches=1)
+        assert short_loader.num_workers == 0
+        assert learner._loader_pool is None
+
+        first = learner._open_replay_window(
+            ring_four,
+            batches=2,
+            refresh_reason="initial",
+        )
+        pool = learner._loader_pool
+        assert isinstance(pool, SpawnedReplayLoaderPool)
+        first_loader = first.loader
+        first_pids = pool.worker_pids
+        assert len(first_pids) == 1
+        assert first.suspend_for_gpu_pause() == 1
+        assert first.resume_after_gpu_pause() == 1
+        first_batch = first.next_batch()
+        first.batches_consumed += 1
+        assert first_batch.inputs.rings.tolist() == [4]
+
+        learner._close_replay_window(first, reason="early_refresh")
+        assert pool.worker_pids == first_pids
+        assert pool.shutdown_count == 0
+
+        second = learner._open_replay_window(
+            ring_six,
+            batches=2,
+            refresh_reason="early_refresh",
+        )
+        assert second.loader is first_loader
+        assert pool.worker_pids == first_pids
+        second_batch = second.next_batch()
+        second.batches_consumed += 1
+        assert second_batch.inputs.rings.tolist() == [6]
+        learner._close_replay_window(second, reason="test")
+
+        iterator = pool.loader._iterator
+        workers = tuple(iterator._workers)
+        assert learner.loader_pool_counters == {
+            "starts": 1,
+            "rebinds": 2,
+            "shutdowns": 0,
+        }
+        assert learner._shutdown_loader_pool() is None
+        assert learner._shutdown_loader_pool() is None
+        assert pool.shutdown_count == 1
+        assert all(not worker.is_alive() for worker in workers)
+        assert learner.loader_pool_counters == {
+            "starts": 1,
+            "rebinds": 2,
+            "shutdowns": 1,
+        }
+
+        recreated_loader = learner._loader(ring_six, batches=2)
+        recreated_pool = learner._loader_pool
+        assert isinstance(recreated_pool, SpawnedReplayLoaderPool)
+        assert recreated_pool is not pool
+        assert recreated_loader is recreated_pool.loader
+        assert learner._shutdown_loader_pool() is None
+        assert learner.loader_pool_counters["starts"] == 2
+        assert learner.loader_pool_counters["shutdowns"] == 2
+
+
+def test_spawned_loader_pool_multi_window_subprocess_soak(tmp_path) -> None:
+    shard = write_replay_shard(
+        tmp_path / "soak-shard.npz",
+        [make_replay_sample(game_id=f"soak-{index}", ply=index) for index in range(8)],
+    )
+    digest = hashlib.sha256(shard.read_bytes()).hexdigest()
+    script = tmp_path / "loader_pool_soak.py"
+    script.write_text(
+        textwrap.dedent(
+            """
+            from __future__ import annotations
+
+            import json
+            import sys
+            from pathlib import Path
+
+            from startrain.learner import (
+                LazyShardReplayDataset,
+                SpawnedReplayLoaderPool,
+                UniqueReplayBatchSampler,
+            )
+            from startrain.replay_store import ReplaySelection, ReplaySpan, ShardRecord
+
+
+            def main() -> None:
+                path = Path(sys.argv[1])
+                record = ShardRecord(
+                    shard_id=1,
+                    path=path,
+                    created_ns=1,
+                    sample_count=8,
+                    ring=4,
+                    phase_min=0,
+                    phase_max=7,
+                    model_version="sha256-" + "1" * 64,
+                    model_step=0,
+                    model_identity="sha256-" + "1" * 64,
+                    run_id="run-test",
+                    generation_family="family-test",
+                    actor_id="actor-test",
+                    generation=0,
+                    game_count=8,
+                    checksum_sha256=sys.argv[2],
+                    state="ready",
+                    quarantine_reason=None,
+                )
+                selection = ReplaySelection(
+                    (ReplaySpan(record, 0, 8),),
+                    {4: 8},
+                    1,
+                )
+                pool = SpawnedReplayLoaderPool(
+                    num_workers=1,
+                    augmentation_enabled=True,
+                    shard_cache_size=1,
+                    pin_memory=False,
+                    prefetch_factor=2,
+                )
+                stable_pids = None
+                try:
+                    for epoch in range(20):
+                        dataset = LazyShardReplayDataset(
+                            selection,
+                            seed=41,
+                            epoch=epoch,
+                            augmentation_enabled=True,
+                            shard_cache_size=1,
+                        )
+                        sampler = UniqueReplayBatchSampler(
+                            dataset,
+                            batch_size=1,
+                            batches=2,
+                            seed=41,
+                            epoch=epoch,
+                            ring_stratified=False,
+                        )
+                        pool.rebind(dataset, sampler)
+                        assert len(list(pool.loader)) == 2
+                        current_pids = pool.worker_pids
+                        if stable_pids is None:
+                            stable_pids = current_pids
+                        else:
+                            assert current_pids == stable_pids
+                        pool.quiesce()
+                finally:
+                    pool.shutdown()
+                print(json.dumps({"pids": stable_pids, "rebinds": 20}))
+
+
+            if __name__ == "__main__":
+                main()
+            """
+        ),
+        encoding="utf-8",
+    )
+    training_root = Path(__file__).parents[1]
+    python_path = str(training_root)
+    if inherited := os.environ.get("PYTHONPATH"):
+        python_path = f"{python_path}{os.pathsep}{inherited}"
+
+    completed = subprocess.run(
+        [sys.executable, str(script), str(shard), digest],
+        cwd=training_root,
+        env={**os.environ, "PYTHONPATH": python_path},
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    payload = json.loads(completed.stdout)
+    assert len(payload["pids"]) == 1
+    assert payload["rebinds"] == 20
+    diagnostics = completed.stderr.casefold()
+    assert "resource_tracker" not in diagnostics
+    assert "semlock" not in diagnostics
+    assert "filenotfounderror" not in diagnostics
+
+
+def test_learner_run_finally_shuts_process_pool_once(tmp_path) -> None:
+    class CountingPool:
+        worker_pids = (101,)
+
+        def __init__(self) -> None:
+            self.shutdowns = 0
+
+        def shutdown(self, *, strict: bool) -> None:
+            assert strict is False
+            self.shutdowns += 1
+
+    identity = run_identity(tmp_path)
+    with ReplayStore(tmp_path / "run-finally-replay") as store:
+        learner = make_test_learner(
+            store,
+            identity,
+            tmp_path / "run-finally-learner",
+            learner_config=LearnerConfig(device="cpu"),
+        )
+        pool = CountingPool()
+        learner._loader_pool = pool  # type: ignore[assignment]
+        learner._loader_pool_starts = 1
+
+        assert learner.run(steps=0) == 0
+        assert pool.shutdowns == 1
+        assert learner._loader_pool is None
+        assert learner._shutdown_loader_pool() is None
+        assert pool.shutdowns == 1
+        assert learner.loader_pool_counters == {
+            "starts": 1,
+            "rebinds": 0,
+            "shutdowns": 1,
+        }
+
+
+def test_learner_run_preserves_primary_error_when_pool_cleanup_fails(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    class FailingPool:
+        worker_pids = (101,)
+
+        def shutdown(self, *, strict: bool) -> None:
+            assert strict is False
+            raise RuntimeError("secondary pool cleanup failure")
+
+    def primary_failure(**_kwargs) -> bool:
+        raise ValueError("primary learner failure")
+
+    identity = run_identity(tmp_path)
+    with ReplayStore(tmp_path / "run-error-replay") as store:
+        learner = make_test_learner(
+            store,
+            identity,
+            tmp_path / "run-error-learner",
+            learner_config=LearnerConfig(device="cpu"),
+        )
+        learner._loader_pool = FailingPool()  # type: ignore[assignment]
+        monkeypatch.setattr(learner, "_gpu_pause_control", primary_failure)
+
+        with pytest.raises(ValueError, match="primary learner failure"):
+            learner.run(steps=1)
+
+        assert learner._loader_pool is None
+        assert learner.loader_pool_counters["shutdowns"] == 1
+
+
+def test_spawned_loader_pool_quiesce_failure_closes_pool() -> None:
+    class BrokenLoader:
+        def __init__(self) -> None:
+            self._iterator = object()
+
+        def __iter__(self):
+            raise TimeoutError("worker reset timed out")
+
+    pool = object.__new__(SpawnedReplayLoaderPool)
+    pool.batch_sampler = RebindableReplayBatchSampler()
+    pool.loader = BrokenLoader()  # type: ignore[assignment]
+    pool.closed = False
+    pool.shutdown_count = 0
+
+    with pytest.raises(RuntimeError, match="did not quiesce"):
+        pool.quiesce()
+
+    assert pool.closed is True
+    assert pool.shutdown_count == 1
+
+
 def test_device_prefetcher_suspend_preserves_iterator_position() -> None:
     class Source:
         def __init__(self, value: int) -> None:
@@ -1430,6 +1851,26 @@ def test_replay_window_shutdown_closes_workers_and_stop_clears_watermark(
     standalone.shutdown()
     standalone.shutdown()
     assert worker_iterator.shutdowns == 1
+
+    pooled_iterator = WorkerIterator()
+    pooled = ReplayWindowSession(
+        selection=ReplaySelection((), {}, 0),
+        loader=SimpleNamespace(_iterator=pooled_iterator),
+        prefetcher=SimpleNamespace(_stream=None),
+        batches_allocated=1,
+        effective_workers=1,
+        setup_seconds=0.0,
+        refresh_reason="test",
+        opened_step=0,
+        opened_epoch=0,
+        active_rings=(),
+        ring_weights=None,
+        recovery_boundary=None,
+        ring_weight_boundary=None,
+        shutdown_loader_workers=False,
+    )
+    pooled.shutdown()
+    assert pooled_iterator.shutdowns == 0
 
     class FailingStream:
         def synchronize(self) -> None:
@@ -2185,6 +2626,96 @@ def test_selfplay_snapshot_warmup_is_relative_to_training_segment() -> None:
     assert learner._selfplay_snapshot_interval() == 1
     learner.examples_consumed = 120
     assert learner._selfplay_snapshot_interval() == 3
+
+
+def test_immutable_replay_references_match_legacy_materialization_and_order(
+    tmp_path,
+) -> None:
+    identity = run_identity(tmp_path)
+    with ReplayStore(tmp_path / "reference-replay") as store:
+        generation = store.lease_generation(identity, "actor-test")
+        for shard_index in range(2):
+            append_replay(
+                store,
+                [
+                    make_replay_sample(
+                        identity=identity,
+                        generation=generation,
+                        game_id=f"reference-{shard_index}-{index}",
+                    )
+                    for index in range(2)
+                ],
+                identity,
+                model_step=0,
+                generation=generation,
+            )
+        selection = store.select_recent_spans(
+            rings=(4,),
+            per_ring_quota=4,
+            run_id=identity.run_id,
+            generation_family=identity.generation_family,
+            current_model_step=0,
+            max_model_lag_steps=0,
+        )
+
+    legacy = LazyShardReplayDataset(
+        selection,
+        seed=29,
+        epoch=3,
+        augmentation_enabled=True,
+        shard_cache_size=1,
+    )
+    worker = PersistentReplayWorkerDataset(
+        augmentation_enabled=True,
+        shard_cache_size=1,
+    )
+    sampler = UniqueReplayBatchSampler(
+        legacy,
+        batch_size=2,
+        batches=2,
+        seed=29,
+        epoch=3,
+        ring_stratified=False,
+    )
+    expected_indices = list(sampler)
+    adapter = RebindableReplayBatchSampler()
+    adapter.rebind(legacy, sampler)
+    reference_batches = list(adapter)
+
+    assert [
+        [reference.logical_index for reference in batch] for batch in reference_batches
+    ] == expected_indices
+    references = [reference for batch in reference_batches for reference in batch]
+    assert pickle.loads(pickle.dumps(references[0])) == references[0]
+
+    expected = [legacy[index] for batch in expected_indices for index in batch]
+    actual = worker.__getitems__(references)
+    assert [sample.game_id for sample in actual] == [
+        sample.game_id for sample in expected
+    ]
+    for legacy_sample, referenced_sample in zip(expected, actual, strict=True):
+        assert referenced_sample.rings == legacy_sample.rings
+        assert referenced_sample.to_move == legacy_sample.to_move
+        assert referenced_sample.moves_left == legacy_sample.moves_left
+        assert referenced_sample.target_mask == legacy_sample.target_mask
+        assert referenced_sample.outcome == legacy_sample.outcome
+        np.testing.assert_array_equal(referenced_sample.stones, legacy_sample.stones)
+        np.testing.assert_array_equal(referenced_sample.policy, legacy_sample.policy)
+        np.testing.assert_array_equal(
+            referenced_sample.soft_policy,
+            legacy_sample.soft_policy,
+        )
+        np.testing.assert_array_equal(
+            referenced_sample.final_ownership,
+            legacy_sample.final_ownership,
+        )
+        np.testing.assert_array_equal(
+            referenced_sample.final_alive,
+            legacy_sample.final_alive,
+        )
+    assert worker.shard_load_count >= 2
+    assert worker.checksum_verification_count == worker.shard_load_count
+    assert len(worker._cache) == worker.shard_cache_size == 1
 
 
 def test_lazy_replay_sampler_is_unique_deterministic_and_homogeneous(

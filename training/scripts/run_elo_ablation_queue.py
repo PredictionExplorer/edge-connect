@@ -57,6 +57,7 @@ SCHEMA_VERSION = 1
 DEPLOYMENT_REPORT = "startrain-elo-ablation-deployment"
 QUEUE_REPORT = "startrain-elo-ablation-queue"
 CONTINUITY_HANDOFF_REPORT = "startrain-continuity-handoff-request"
+_SEMANTIC_JSON_PIN = "json-fields-v1"
 _ARM_STATUSES = frozenset({"pending", "running", "completed", "failed", "quarantined"})
 _ISOLATED_FAILURE_DOMAINS = frozenset({"arm", "run", "workload"})
 _VALID_INTEGRITY_STATUSES = frozenset(
@@ -268,6 +269,36 @@ def _artifact(name: str, path: Path) -> dict[str, object]:
     }
 
 
+def _replay_initialization_fields(path: Path) -> dict[str, object]:
+    payload = _read_json(path)
+    schema_version = payload.get("schema_version")
+    if type(schema_version) is not int or schema_version != 1:
+        raise AblationQueueError("replay initialization schema is unsupported")
+    return {
+        "schema_version": schema_version,
+        "run_id": _string(
+            payload.get("run_id"),
+            "replay initialization run id",
+        ),
+        "generation_family": _string(
+            payload.get("generation_family"),
+            "replay initialization generation family",
+        ),
+    }
+
+
+def _replay_initialization_artifact(path: Path) -> dict[str, object]:
+    absolute = Path(os.path.abspath(path.expanduser()))
+    if not absolute.is_file():
+        raise AblationQueueError(f"replay_initialization does not exist: {absolute}")
+    return {
+        "name": "replay_initialization",
+        "path": str(absolute),
+        "pin": _SEMANTIC_JSON_PIN,
+        "fields": _replay_initialization_fields(absolute),
+    }
+
+
 def _unit_artifact(name: str, path: Path) -> dict[str, object]:
     absolute = Path(os.path.abspath(path.expanduser()))
     try:
@@ -444,8 +475,31 @@ def _seed_snapshot(source_root: Path) -> dict[str, object]:
         ("source_commit", source_root / "source-commit.txt"),
     )
     artifacts = [_artifact(name, path) for name, path in required]
-    artifacts.extend(_artifact(name, path) for name, path in optional if path.is_file())
+    for name, path in optional:
+        if not path.is_file():
+            continue
+        artifact = (
+            _replay_initialization_artifact(path)
+            if name == "replay_initialization"
+            else _artifact(name, path)
+        )
+        artifacts.append(artifact)
     champion = _read_json(source_root / "learner" / "champion.json")
+    initialization = next(
+        (
+            _mapping(artifact.get("fields"), "replay initialization fields")
+            for artifact in artifacts
+            if artifact.get("name") == "replay_initialization"
+        ),
+        None,
+    )
+    if initialization is not None and (
+        initialization.get("run_id") != identity.run_id
+        or initialization.get("generation_family") != identity.generation_family
+    ):
+        raise AblationQueueError(
+            "replay initialization identity disagrees with the seed run"
+        )
     return {
         "root": str(source_root),
         "coverage": "identity, model pointers, recovery pointer, and replay ledger",
@@ -466,6 +520,7 @@ def _profile_manifest_entry(
     treatment: Mapping[str, str],
     *,
     seed: Mapping[str, object],
+    expected_seed: int,
     source_winner_snapshot: object,
     futility_policy: object,
 ) -> dict[str, object]:
@@ -580,6 +635,14 @@ def _profile_manifest_entry(
         != run_root
     ):
         raise AblationQueueError(f"{label} profile run root disagrees")
+    if (
+        experiment.train.seed != expected_seed
+        or experiment.selfplay.seed != expected_seed
+        or experiment.arena.seed != expected_seed
+    ):
+        raise AblationQueueError(
+            f"{label} profile seed contract disagrees with the ablation plan"
+        )
     warm_start_path = run_root / "learner" / "champion-warm-start.json"
     if warm_start_path.is_file():
         warm_start = _read_json(warm_start_path)
@@ -630,6 +693,11 @@ def _profile_manifest_entry(
             "futility_policy": metadata.get("futility_policy"),
             "anchor": metadata.get("anchor"),
         },
+        "seed_contract": {
+            "train_seed": experiment.train.seed,
+            "selfplay_seed": experiment.selfplay.seed,
+            "arena_seed": experiment.arena.seed,
+        },
         "state_artifacts": state_artifacts,
     }
 
@@ -670,6 +738,7 @@ def generate_deployment_manifest(
     plan = _read_json(plan_file)
     if plan.get("report") != "startrain-elo-ablation-plan":
         raise AblationQueueError("unsupported ablation plan")
+    plan_seed = _positive_integer(plan.get("seed"), "ablation plan seed")
     treatments = _plan_treatments(plan)
     source_root = (
         Path(_string(plan.get("source_run_root"), "plan source run root"))
@@ -681,6 +750,7 @@ def generate_deployment_manifest(
         _profile_manifest_entry(
             treatment,
             seed=seed,
+            expected_seed=plan_seed,
             source_winner_snapshot=plan.get("source_winner_snapshot"),
             futility_policy=plan.get("futility_policy"),
         )
@@ -823,6 +893,7 @@ def generate_deployment_manifest(
         "units": units,
         "environment": _artifact("environment", environment_file),
         "queue": {
+            "seed": plan_seed,
             "state_path": str(resolved_state),
             "comparison_output": str(resolved_comparison),
             "continuity_handoff_output": str(resolved_handoff),
@@ -888,13 +959,38 @@ def _verify_artifact(raw: object, name: str) -> Path:
     return path
 
 
+def _verify_seed_artifact(raw: object, name: str) -> Path:
+    artifact = _mapping(raw, name)
+    pin = artifact.get("pin")
+    if pin is None:
+        return _verify_artifact(artifact, name)
+    if pin != _SEMANTIC_JSON_PIN:
+        raise AblationQueueError(f"{name} pin mode is unsupported")
+    if artifact.get("name") != "replay_initialization":
+        raise AblationQueueError(f"{name} semantic pin is not permitted")
+    path = Path(
+        os.path.abspath(
+            Path(_string(artifact.get("path"), f"{name} path")).expanduser()
+        )
+    )
+    if not path.is_file():
+        raise AblationQueueError(f"{name} is missing: {path}")
+    expected = dict(_mapping(artifact.get("fields"), f"{name} fields"))
+    observed = _replay_initialization_fields(path)
+    if observed != expected:
+        raise AblationQueueError(
+            f"{name} semantic fields changed: expected {expected}, observed {observed}"
+        )
+    return path
+
+
 def _verify_manifest_artifacts(manifest: Mapping[str, object]) -> int:
     count = 0
     _verify_artifact(manifest.get("plan"), "ablation plan")
     count += 1
     seed = _mapping(manifest.get("seed_snapshot"), "seed snapshot")
     for index, artifact in enumerate(_list(seed.get("artifacts"), "seed artifacts")):
-        _verify_artifact(artifact, f"seed artifact {index}")
+        _verify_seed_artifact(artifact, f"seed artifact {index}")
         count += 1
     profiles = _list(manifest.get("profiles"), "deployment profiles")
     for index, raw_profile in enumerate(profiles):
@@ -936,6 +1032,43 @@ def _verify_manifest_artifacts(manifest: Mapping[str, object]) -> int:
     return count + 1
 
 
+def _seed_artifacts_match(
+    frozen_value: object,
+    current_value: object,
+) -> bool:
+    frozen = _list(frozen_value, "frozen seed artifacts")
+    current = _list(current_value, "current seed artifacts")
+    if len(frozen) != len(current):
+        return False
+    current_by_name = {
+        _string(
+            _mapping(artifact, "current seed artifact").get("name"), "artifact name"
+        ): _mapping(artifact, "current seed artifact")
+        for artifact in current
+    }
+    if len(current_by_name) != len(current):
+        return False
+    for raw_frozen in frozen:
+        frozen_artifact = _mapping(raw_frozen, "frozen seed artifact")
+        name = _string(frozen_artifact.get("name"), "frozen artifact name")
+        current_artifact = current_by_name.get(name)
+        if current_artifact is None:
+            return False
+        if name == "replay_initialization" and frozen_artifact.get("pin") is None:
+            path = Path(
+                _string(
+                    current_artifact.get("path"),
+                    "current replay initialization path",
+                )
+            )
+            observed: Mapping[str, object] = _artifact(name, path)
+        else:
+            observed = current_artifact
+        if dict(observed) != dict(frozen_artifact):
+            return False
+    return True
+
+
 def _verify_manifest_semantics(manifest: Mapping[str, object]) -> None:
     seed = _mapping(manifest.get("seed_snapshot"), "seed snapshot")
     source_root = Path(_string(seed.get("root"), "seed root")).expanduser().resolve()
@@ -944,7 +1077,10 @@ def _verify_manifest_semantics(manifest: Mapping[str, object]) -> None:
         raise AblationQueueError("seed snapshot run identity changed")
     if current_seed["champion"] != seed.get("champion"):
         raise AblationQueueError("seed snapshot champion changed")
-    if current_seed["artifacts"] != seed.get("artifacts"):
+    if not _seed_artifacts_match(
+        seed.get("artifacts"),
+        current_seed["artifacts"],
+    ):
         raise AblationQueueError("seed snapshot artifact set changed")
     plan_path = Path(
         _string(
@@ -953,6 +1089,10 @@ def _verify_manifest_semantics(manifest: Mapping[str, object]) -> None:
         )
     )
     plan = _read_json(plan_path)
+    plan_seed = _positive_integer(plan.get("seed"), "ablation plan seed")
+    queue = _mapping(manifest.get("queue"), "deployment queue")
+    if queue.get("seed") != plan_seed:
+        raise AblationQueueError("deployment queue seed differs from the plan")
     planned_source = (
         Path(_string(plan.get("source_run_root"), "plan source run root"))
         .expanduser()
@@ -999,6 +1139,22 @@ def _verify_manifest_semantics(manifest: Mapping[str, object]) -> None:
             != run_root
         ):
             raise AblationQueueError(f"{label} profile run root changed")
+        seed_contract = _mapping(
+            profile_entry.get("seed_contract"),
+            f"{label} seed contract",
+        )
+        expected_seed_contract = {
+            "train_seed": plan_seed,
+            "selfplay_seed": plan_seed,
+            "arena_seed": plan_seed,
+        }
+        if (
+            dict(seed_contract) != expected_seed_contract
+            or experiment.train.seed != plan_seed
+            or experiment.selfplay.seed != plan_seed
+            or experiment.arena.seed != plan_seed
+        ):
+            raise AblationQueueError(f"{label} profile seed contract changed")
         frozen_metadata = _mapping(
             profile_entry.get("ablation_metadata"),
             f"{label} ablation metadata",
@@ -1243,6 +1399,8 @@ def _initial_state(
             "attempts": 0,
             "comparison_output": queue["comparison_output"],
             "comparison_status": None,
+            "comparison_sha256": None,
+            "selector_summary": None,
             "started_ns": None,
             "stopped_ns": None,
             "error": None,
@@ -1343,6 +1501,8 @@ def _load_or_create_state(
         finalization.get("attempts"),
         "queue finalization attempts",
     )
+    finalization.setdefault("comparison_sha256", None)
+    finalization.setdefault("selector_summary", None)
     raw_handoff = state.get("continuity_handoff")
     if raw_handoff is None:
         state["continuity_handoff"] = {
@@ -1744,6 +1904,37 @@ def _continuity_reason(state: Mapping[str, object]) -> str:
     return "queue_interrupted_or_pending"
 
 
+def _selector_summary(report: Mapping[str, object]) -> dict[str, object]:
+    raw_selector = report.get("selector")
+    selector = raw_selector if isinstance(raw_selector, Mapping) else {}
+    raw_snapshot = selector.get("winner_snapshot")
+    snapshot = raw_snapshot if isinstance(raw_snapshot, Mapping) else {}
+    raw_champion = snapshot.get("champion")
+    champion = raw_champion if isinstance(raw_champion, Mapping) else {}
+    return {
+        "status": selector.get("status", "unavailable"),
+        "ranking_objective": selector.get("ranking_objective"),
+        "ranking_metric": selector.get("ranking_metric"),
+        "winner_label": snapshot.get("label"),
+        "winner_model_identity": champion.get("model_identity"),
+        "winner_model_step": champion.get("model_step"),
+        "single_seed_evidence_only": True,
+        "adoption_authorized": False,
+    }
+
+
+def _comparison_handoff_evidence(
+    finalization: Mapping[str, object],
+) -> dict[str, object]:
+    return {
+        "path": finalization.get("comparison_output"),
+        "sha256": finalization.get("comparison_sha256"),
+        "status": finalization.get("comparison_status"),
+        "selector_summary": finalization.get("selector_summary"),
+        "adoption_authorized": False,
+    }
+
+
 def _request_continuity_handoff(
     *,
     state_path: Path,
@@ -1783,6 +1974,11 @@ def _request_continuity_handoff(
                 "queue_state": str(state_path),
             },
             "queue_status": state.get("queue_status"),
+            "finalization": {
+                "status": finalization.get("status"),
+                "error": finalization.get("error"),
+                "comparison": _comparison_handoff_evidence(finalization),
+            },
             "unreleased_arms": unreleased,
             "requires_safe_workload": True,
         }
@@ -1839,10 +2035,14 @@ def _request_continuity_handoff(
             "status": finalization.get("status"),
             "comparison_status": finalization.get("comparison_status"),
             "comparison_output": finalization.get("comparison_output"),
+            "comparison_sha256": finalization.get("comparison_sha256"),
+            "comparison": _comparison_handoff_evidence(finalization),
+            "selector_summary": finalization.get("selector_summary"),
             "error": finalization.get("error"),
         },
         "quarantined_arms": quarantined,
         "requires_safe_workload": state.get("queue_status") != "running",
+        "adoption_authorized": False,
     }
     output.parent.mkdir(parents=True, exist_ok=True)
     atomic_json(output, request)
@@ -1876,6 +2076,8 @@ def _finalize_locked(
         {
             "status": "running",
             "attempts": int(finalization.get("attempts", 0)) + 1,
+            "comparison_sha256": None,
+            "selector_summary": None,
             "started_ns": started_ns,
             "stopped_ns": None,
             "error": None,
@@ -1896,6 +2098,16 @@ def _finalize_locked(
             forced_ineligible=_forced_ineligible(state),
         )
         report["queue"] = {
+            "seed": _positive_integer(
+                queue.get("seed"),
+                "deployment queue seed",
+            ),
+            "source_commit": _commit(
+                _mapping(manifest.get("source"), "deployment source").get("commit"),
+                "deployment source commit",
+            ),
+            "manifest": state.get("manifest"),
+            "manifest_sha256": state.get("manifest_sha256"),
             "state_path": str(state_path),
             "queue_status": state.get("queue_status"),
             "arms": [
@@ -1933,6 +2145,8 @@ def _finalize_locked(
             .resolve()
         )
         atomic_json(output, report)
+        comparison_sha256 = _sha256(output)
+        selector_summary = _selector_summary(report)
     except (OSError, TypeError, ValueError, AblationQueueError) as error:
         finalization.update(
             {
@@ -1947,6 +2161,8 @@ def _finalize_locked(
         {
             "status": "completed",
             "comparison_status": report.get("status"),
+            "comparison_sha256": comparison_sha256,
+            "selector_summary": selector_summary,
             "stopped_ns": time.time_ns(),
             "error": None,
         }

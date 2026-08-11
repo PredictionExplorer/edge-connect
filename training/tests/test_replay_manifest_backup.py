@@ -73,6 +73,18 @@ def test_online_backup_rotates_and_restores_corrupt_manifest(tmp_path) -> None:
     assert (damaged[0] / "manifest.sqlite3").read_bytes() == b"not sqlite"
 
 
+def test_online_backup_preserves_create_once_initialization_marker(tmp_path) -> None:
+    run_root = tmp_path / "stable-marker-run"
+    _database(run_root, "durable")
+    marker = run_root / "replay" / "initialized.json"
+    before = marker.read_bytes()
+
+    create_backup(run_root, retain=2)
+    create_backup(run_root, retain=2)
+
+    assert marker.read_bytes() == before
+
+
 def test_missing_manifest_is_allowed_until_replay_initialization(tmp_path) -> None:
     run_root = tmp_path / "new-run"
     assert restore_if_corrupt(run_root) is None

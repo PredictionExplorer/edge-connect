@@ -6,6 +6,8 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
+import stat
 from collections.abc import Callable, Mapping, Sequence
 from copy import deepcopy
 from pathlib import Path
@@ -394,6 +396,48 @@ def _read_json(path: Path) -> dict[str, object]:
     return loaded
 
 
+def _read_verified_json_artifact(
+    path: Path,
+    expected_sha256: str,
+    *,
+    name: str,
+) -> dict[str, object]:
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise ValueError(f"winner snapshot {name} artifact is not a regular file")
+        chunks = []
+        while block := os.read(descriptor, 1024 * 1024):
+            chunks.append(block)
+        after = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    if (
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+    ) != (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+    ):
+        raise ValueError(f"winner snapshot {name} artifact changed while reading")
+    payload = b"".join(chunks)
+    if hashlib.sha256(payload).hexdigest() != expected_sha256:
+        raise ValueError(f"winner snapshot {name} artifact is stale")
+    try:
+        loaded = json.loads(payload)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError(f"winner snapshot {name} artifact is invalid JSON") from error
+    if not isinstance(loaded, dict):
+        raise ValueError(f"winner snapshot {name} artifact must contain an object")
+    return loaded
+
+
 def winner_snapshot_from_document(document: Mapping[str, object]) -> dict[str, object]:
     """Extract a direct snapshot or a comparator selector snapshot."""
     if document.get("status") == "verified" and "champion" in document:
@@ -437,6 +481,7 @@ def verify_winner_snapshot(
     champion_path = source / "learner" / "champion.json"
     run_artifact = snapshot.get("run_identity_artifact")
     champion_artifact = snapshot.get("champion_pointer_artifact")
+    loaded_artifacts: dict[str, dict[str, object]] = {}
     for name, artifact, expected_path in (
         ("run identity", run_artifact, run_path),
         ("champion pointer", champion_artifact, champion_path),
@@ -449,11 +494,15 @@ def verify_winner_snapshot(
             not isinstance(artifact_path, str)
             or Path(artifact_path).expanduser().resolve() != expected_path
             or not isinstance(digest, str)
-            or digest != _sha256(expected_path)
         ):
             raise ValueError(f"winner snapshot {name} artifact is stale")
-    current_run = _read_json(run_path)
-    current_champion = _read_json(champion_path)
+        loaded_artifacts[name] = _read_verified_json_artifact(
+            expected_path,
+            digest,
+            name=name,
+        )
+    current_run = loaded_artifacts["run identity"]
+    current_champion = loaded_artifacts["champion pointer"]
     if any(
         current_run.get(field) != run_identity.get(field)
         for field in ("run_id", "generation_family", "created_ns")

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 from dataclasses import dataclass
@@ -57,6 +58,7 @@ def _deployment(
     max_transient_retries: int = 2,
     warm_start: bool = False,
     replay_backup: bool = False,
+    initialized_marker: bool = False,
 ) -> DeploymentFixture:
     source = tmp_path / "seed"
     _write_json(
@@ -84,6 +86,16 @@ def _deployment(
             "updated_ns": 11,
         },
     )
+    if initialized_marker:
+        _write_json(
+            source / "replay" / "initialized.json",
+            {
+                "schema_version": 1,
+                "run_id": "shared-run",
+                "generation_family": "shared-family",
+                "initialized_ns": 2,
+            },
+        )
     profiles = tmp_path / "profiles"
     prepare_elo_ablation(
         base_config=CONFIGS / "h100-8gpu-throughput.yaml",
@@ -291,11 +303,19 @@ def test_manifest_pins_revision_and_all_launch_inputs(tmp_path: Path) -> None:
     manifest = json.loads(deployment.manifest.read_text(encoding="utf-8"))
 
     assert report["status"] == "verified"
-    assert report["artifact_count"] >= 13
+    artifact_count = report["artifact_count"]
+    assert type(artifact_count) is int
+    assert artifact_count >= 13
     assert manifest["source"]["commit"] == SOURCE_COMMIT
     assert len(manifest["profiles"]) == 2
     assert {unit["name"] for unit in manifest["units"]} == {"queue", "finalize"}
     assert manifest["seed_snapshot"]["run_identity"]["run_id"] == "shared-run"
+    assert manifest["queue"]["seed"] == 17
+    assert all(
+        profile["seed_contract"]
+        == {"train_seed": 17, "selfplay_seed": 17, "arena_seed": 17}
+        for profile in manifest["profiles"]
+    )
     assert manifest["environment"]["sha256"]
 
     with pytest.raises(AblationQueueError, match="mixed-revision"):
@@ -310,6 +330,76 @@ def test_manifest_pins_revision_and_all_launch_inputs(tmp_path: Path) -> None:
             current_source_commit=SOURCE_COMMIT,
             source_tree_clean=False,
         )
+
+
+def test_manifest_semantically_pins_replay_initialization_identity(
+    tmp_path: Path,
+) -> None:
+    deployment = _deployment(tmp_path, initialized_marker=True)
+    marker = deployment.source / "replay" / "initialized.json"
+    manifest = json.loads(deployment.manifest.read_text(encoding="utf-8"))
+    initialization = next(
+        artifact
+        for artifact in manifest["seed_snapshot"]["artifacts"]
+        if artifact["name"] == "replay_initialization"
+    )
+
+    assert initialization["pin"] == "json-fields-v1"
+    assert initialization["fields"] == {
+        "schema_version": 1,
+        "run_id": "shared-run",
+        "generation_family": "shared-family",
+    }
+
+    payload = json.loads(marker.read_text(encoding="utf-8"))
+    payload["initialized_ns"] = 999
+    _write_json(marker, payload)
+    assert (
+        verify_deployment_manifest(
+            deployment.manifest,
+            current_source_commit=SOURCE_COMMIT,
+            source_tree_clean=True,
+        )["status"]
+        == "verified"
+    )
+
+    payload["generation_family"] = "tampered-family"
+    _write_json(marker, payload)
+    with pytest.raises(AblationQueueError, match="semantic fields changed"):
+        verify_deployment_manifest(
+            deployment.manifest,
+            current_source_commit=SOURCE_COMMIT,
+            source_tree_clean=True,
+        )
+
+
+def test_legacy_byte_pinned_replay_initialization_manifest_still_verifies(
+    tmp_path: Path,
+) -> None:
+    deployment = _deployment(tmp_path, initialized_marker=True)
+    marker = deployment.source / "replay" / "initialized.json"
+    manifest = json.loads(deployment.manifest.read_text(encoding="utf-8"))
+    artifacts = manifest["seed_snapshot"]["artifacts"]
+    index = next(
+        index
+        for index, artifact in enumerate(artifacts)
+        if artifact["name"] == "replay_initialization"
+    )
+    artifacts[index] = {
+        "name": "replay_initialization",
+        "path": str(marker.resolve()),
+        "sha256": queue_module._sha256(marker),
+    }
+    deployment.manifest.write_text(json.dumps(manifest), encoding="utf-8")
+
+    assert (
+        verify_deployment_manifest(
+            deployment.manifest,
+            current_source_commit=SOURCE_COMMIT,
+            source_tree_clean=True,
+        )["status"]
+        == "verified"
+    )
 
 
 def test_manifest_optionally_pins_replay_backup_policy_and_units(
@@ -559,6 +649,18 @@ def test_queue_runs_exclusively_persists_completion_and_finalizes(
     assert handoff["action"] == "request_fallback"
     assert handoff["requested_action"] == "reconcile_training_continuity"
     assert handoff["source"]["queue_status"] == "completed"
+    assert handoff["adoption_authorized"] is False
+    assert handoff["finalization"]["comparison"]["path"] == str(
+        deployment.comparison.resolve()
+    )
+    assert (
+        handoff["finalization"]["comparison"]["sha256"]
+        == hashlib.sha256(deployment.comparison.read_bytes()).hexdigest()
+    )
+    assert (
+        handoff["finalization"]["selector_summary"]["single_seed_evidence_only"] is True
+    )
+    assert handoff["finalization"]["selector_summary"]["adoption_authorized"] is False
     with exclusive_queue_lock(deployment.state):
         with pytest.raises(QueueBusyError, match="another ablation queue"):
             with exclusive_queue_lock(deployment.state):
@@ -569,6 +671,66 @@ def test_queue_runs_exclusively_persists_completion_and_finalizes(
         with pytest.raises(QueueBusyError, match="another ablation execution"):
             with exclusive_execution_lock(execution_lock):
                 pass
+
+
+def test_verified_single_seed_winner_still_requests_only_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    deployment = _deployment(tmp_path)
+
+    def selected_report(
+        *_args: object,
+        **_kwargs: object,
+    ) -> dict[str, object]:
+        return {
+            "schema_version": 1,
+            "report": "startrain-elo-ablation-comparison",
+            "status": "complete",
+            "ranking_objective": "ring_10_only",
+            "ranking_metric": (
+                "ring10_only_champion_frontier_elo_lcb_per_total_provisioned_wall_hour"
+            ),
+            "selector": {
+                "status": "verified",
+                "ranking_objective": "ring_10_only",
+                "ranking_metric": (
+                    "ring10_only_champion_frontier_elo_lcb_per_"
+                    "total_provisioned_wall_hour"
+                ),
+                "winner_snapshot": {
+                    "label": "plateau-keep",
+                    "champion": {
+                        "model_identity": "selected-winner",
+                        "model_step": 200,
+                    },
+                },
+            },
+        }
+
+    monkeypatch.setattr(
+        queue_module,
+        "build_elo_ablation_comparison",
+        selected_report,
+    )
+    state = run_ablation_queue(
+        deployment.manifest,
+        arm_runner=lambda **_kwargs: _complete_report(),
+        current_source_commit=SOURCE_COMMIT,
+        source_tree_clean=True,
+    )
+    handoff = json.loads(deployment.handoff.read_text(encoding="utf-8"))
+
+    finalization = state["finalization"]
+    assert isinstance(finalization, dict)
+    assert finalization["comparison_status"] == "complete"
+    assert handoff["action"] == "request_fallback"
+    assert handoff["requested_action"] == "reconcile_training_continuity"
+    assert handoff["adoption_authorized"] is False
+    summary = handoff["finalization"]["selector_summary"]
+    assert summary["status"] == "verified"
+    assert summary["winner_label"] == "plateau-keep"
+    assert summary["adoption_authorized"] is False
 
 
 def test_queue_records_verified_final_replay_backups(
@@ -875,7 +1037,9 @@ def test_structured_isolated_fatal_arm_is_quarantined_and_queue_continues(
     assert arms["control"]["quarantine"]["isolated"] is True
     assert arms["control"]["quarantine"]["failure_domain"] == "arm"
     assert arms["plateau-keep"]["status"] == "completed"
-    assert state["finalization"]["status"] == "completed"
+    finalization = state["finalization"]
+    assert isinstance(finalization, dict)
+    assert finalization["status"] == "completed"
     assert handoff["reason"] == "queue_completed_with_quarantined_arms"
     assert handoff["quarantined_arms"][0]["treatment"] == "control"
 
