@@ -357,7 +357,9 @@ three-lane actor treatment for GPUs 1–6. The arena remains pause-shared on the
 single actor lane on GPU 7 in every deployable arm. Use
 `scripts/prepare_arena_occupancy_benchmark.py` plus
 `scripts/benchmark_arena_occupancy.py` for the separate fixed-manifest
-25-versus-50-pair occupancy test; its 50-pair arm is benchmark-only. See the
+25-versus-50-pair occupancy test. The benchmark never edits a profile; after
+the four-repeat H100 result cleared the systems gate, the ring-10-only profile
+adopted 50-pair continuations while generalist profiles retained 25. See the
 [Elo-per-hour ablation runbook](docs/elo-per-hour-ablation-runbook.md).
 
 Each per-seed queue returns to the verified last-known-good workload. Production

@@ -174,12 +174,9 @@ The queue comparator reads the empty guard-ring contract from the plan. If a
 comparison must be regenerated directly, pass `--no-guard-rings`; never add
 the generalist ring 4/6/8 floors to these runs.
 
-### Benchmark arena occupancy without changing promotion
+### Benchmark arena occupancy before changing promotion
 
-The production ring-10 profile already uses its largest validator-approved
-continuation wave: 25 pairs. A 50-pair continuation cannot be expressed as a
-deployable profile without weakening the continuous-service contract. Test the
-occupancy hypothesis against fixed manifests instead:
+Test continuation occupancy against fixed manifests before changing a profile:
 
 ```bash
 python scripts/prepare_arena_occupancy_benchmark.py \
@@ -198,13 +195,23 @@ python scripts/benchmark_arena_occupancy.py \
 ```
 
 The benchmark warms both strategies and counterbalances four paired repeats.
-Each repeat evaluates the same 50 pair indices as either two production-sized
-25-pair chunks or one benchmark-only 50-pair chunk. It records GPU utilization,
+Each repeat evaluates the same 50 pair indices as either two 25-pair chunks or
+one benchmark-only 50-pair chunk. It records GPU utilization,
 power, memory, evaluator rows/second, serialized inference time, queue wait,
 peak CUDA allocation, exact pair evidence, and runtime/device provenance. The
-50-pair arm is explicitly non-deployable. Different batch sizes use different
-batch-derived search seeds, so the report must not claim game-outcome
-equivalence or update a production profile.
+benchmark itself never edits or deploys a profile. Different batch sizes use
+different batch-derived search seeds, so the report must not claim game-outcome
+equivalence.
+
+The Aug 12, 2026 ring-10 H100 benchmark
+(`plan_digest=c95426e97f340829b10d6c6d40f5c0aab14f99bfb19b155b4c7201347b9ef6c6`)
+completed all four paired repeats. One 50-pair wave sustained 5,730 evaluator
+rows/s versus 3,846 for two 25-pair waves (1.490x), reduced mean wall time from
+7,130s to 4,786s, and raised mean GPU utilization by 8.49 points. The paired
+throughput ratio ranged from 1.472 to 1.510, clearing the 15% systems gate.
+Consequently the ring-10-only validator permits a continuation wave no larger
+than its 50-pair initial wave. Generalist throughput profiles retain the
+half-initial-wave cap; the benchmark does not justify changing them.
 
 Preparation requires a clean Git revision and no source `coordinator.lock`.
 Execution acquires the coordinator-compatible source lock for the benchmark

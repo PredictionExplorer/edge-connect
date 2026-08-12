@@ -229,7 +229,7 @@ arena:
   rings:
   - 10
   pairs_per_ring: 50
-  continuation_pairs_per_ring: 25
+  continuation_pairs_per_ring: 50
   simulations: 1024
   max_considered: 32
   c_visit: 50.0

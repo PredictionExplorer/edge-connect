@@ -180,6 +180,7 @@ def test_yaml_configs_load_strictly() -> None:
     )
     assert ring10_only.selfplay.rings == 10
     assert ring10_only.arena.rings == (10,)
+    assert ring10_only.arena.continuation_pairs_per_ring == 50
     assert ring10_only.arena.required_regression_rings == ()
     assert ring10_only.arena.per_ring_regression_floor_elo == {}
     assert ring10_only.arena.promotion_pair_ratios == {}
@@ -258,6 +259,16 @@ def test_yaml_configs_load_strictly() -> None:
                         throughput.orchestration.promotion,
                         finish_inflight_candidate=False,
                     ),
+                ),
+            )
+        )
+    with pytest.raises(ValueError, match="bounded continuation waves"):
+        validate_continuous_config(
+            replace(
+                throughput,
+                arena=replace(
+                    throughput.arena,
+                    continuation_pairs_per_ring=50,
                 ),
             )
         )

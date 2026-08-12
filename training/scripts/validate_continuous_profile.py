@@ -123,9 +123,14 @@ def _validate_safe_throughput_invariants(config: ExperimentConfig) -> None:
         raise ValueError("continuous service requires bounded lower-LR champion resets")
     arena = config.arena
     continuation = arena.continuation_pairs_per_ring or arena.pairs_per_ring
+    continuation_limit = (
+        arena.pairs_per_ring
+        if config.orchestration.training_objective == "ring10_only"
+        else max(1, arena.pairs_per_ring // 2)
+    )
     if (
         not config.orchestration.promotion.finish_inflight_candidate
-        or continuation > max(1, arena.pairs_per_ring // 2)
+        or continuation > continuation_limit
     ):
         raise ValueError(
             "continuous service requires resumable in-flight candidates and "
