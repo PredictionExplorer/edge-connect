@@ -138,6 +138,7 @@ def _deployment(
     scripts = training / "scripts"
     scripts.mkdir(parents=True)
     for name in (
+        "check_training_ipc.py",
         "run_elo_ablation_queue.py",
         "run_staged_elo_pipeline.py",
         "run_elo_ablation.py",
@@ -422,6 +423,7 @@ def test_manifest_optionally_pins_replay_backup_policy_and_units(
         "max_total_bytes": 20 * 1024 * 1024 * 1024,
     }
     assert {script["name"] for script in manifest["scripts"]} == {
+        "check_training_ipc",
         "run_elo_ablation_queue",
         "run_staged_elo_pipeline",
         "run_elo_ablation",
@@ -537,6 +539,7 @@ def test_systemd_queue_triggers_finalizer_for_both_outcomes() -> None:
 
     assert "OnSuccess=@FINALIZE_UNIT@" in queue
     assert "OnFailure=@FINALIZE_UNIT@" in queue
+    assert "check_training_ipc.py --user @USER@" in queue
     assert "run_elo_ablation_queue.py verify" in queue
     assert "RestartPreventExitStatus=2 3" in queue
     assert "run_elo_ablation_queue.py finalize" in finalizer

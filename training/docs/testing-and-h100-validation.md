@@ -116,6 +116,9 @@ The orchestration soak is complete only after it demonstrates:
 - one process-scoped learner loader-pool start, stable worker PIDs across at
   least 200 replay-window refreshes, and no `SemLock` or `resource_tracker`
   diagnostics;
+- repeated final SSH-session logout during pinned-memory transfers, with
+  effective logind `RemoveIPC=no`, no missing queue item, and no 120-second
+  DataLoader timeout;
 - replay writes, quarantine, restart, and checkpoint resume on the target NVMe;
 - at least one candidate-to-arena terminal decision;
 - bounded GPU memory and stable thermals;

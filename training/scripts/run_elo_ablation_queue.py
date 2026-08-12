@@ -70,6 +70,7 @@ _COMMIT_PATTERN = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 _BACKUP_SCRIPT_NAME = "replay_manifest_backup.py"
 _BASE_SCRIPT_NAMES = (
+    "check_training_ipc.py",
     "run_elo_ablation_queue.py",
     "run_staged_elo_pipeline.py",
     "run_elo_ablation.py",

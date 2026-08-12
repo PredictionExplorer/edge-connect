@@ -745,6 +745,27 @@ degraded launch also fails. This degradation is recorded as
 `learner_loader_degraded` and resets only after the configured stable-runtime
 window.
 
+PyTorch multiprocessing also requires the effective logind policy
+`RemoveIPC=no` for non-system service users. With `RemoveIPC=yes`, closing the
+last SSH/PAM session can unlink live DataLoader shared-memory and semaphore
+names, silently drop an in-flight queue item, and cause an unrecoverable batch
+timeout. Install a root-owned logind drop-in, enable linger for the training
+user, reload logind, and verify the D-Bus property:
+
+```bash
+sudo install -d -m 0755 /etc/systemd/logind.conf.d
+printf '[Login]\nRemoveIPC=no\n' |
+  sudo tee /etc/systemd/logind.conf.d/99-edgeconnect-training.conf >/dev/null
+sudo loginctl enable-linger "$USER"
+sudo systemctl kill -s HUP systemd-logind
+busctl get-property org.freedesktop.login1 /org/freedesktop/login1 \
+  org.freedesktop.login1.Manager RemoveIPC
+```
+
+The value must be `b false`. All shipped training and queue units run
+`scripts/check_training_ipc.py` before starting and fail closed if the effective
+policy can reap IPC for their configured user.
+
 The normal learner path uses one process-scoped spawned DataLoader pool per
 rank. Replay-window refreshes rebind a parent-side sampler to immutable,
 self-contained replay references; spawned workers therefore keep stable PIDs

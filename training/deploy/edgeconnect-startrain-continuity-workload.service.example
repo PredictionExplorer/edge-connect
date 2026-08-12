@@ -15,6 +15,7 @@ Environment=PYTHONDONTWRITEBYTECODE=1
 Environment=PYTHONPATH=@TRAINING_DIR@
 Environment=TORCH_NCCL_ASYNC_ERROR_HANDLING=1
 Environment=PATH=@TRAINING_DIR@/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStartPre=@TRAINING_DIR@/.venv/bin/python @TRAINING_DIR@/scripts/check_training_ipc.py --user @USER@
 ExecStartPre=@TRAINING_DIR@/.venv/bin/python @TRAINING_DIR@/scripts/reconcile_training_continuity.py verify --manifest @CONTINUITY_MANIFEST@ --workload @WORKLOAD_ID@
 ExecStartPre=@TRAINING_DIR@/.venv/bin/python @TRAINING_DIR@/scripts/validate_continuous_profile.py --config @PROFILE@
 ExecStartPre=@TRAINING_DIR@/.venv/bin/python @TRAINING_DIR@/scripts/preflight_run_state.py --run-root @RUN_ROOT@ --profile @PROFILE@ --apply
