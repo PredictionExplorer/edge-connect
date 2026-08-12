@@ -10,6 +10,7 @@ import json
 import os
 import shutil
 import time
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -178,6 +179,41 @@ def _prepare_utd_segment(
     }
     atomic_json(segment_path, payload)
     return payload
+
+
+def _archive_incompatible_champion_warm_start(
+    destination: Path,
+    *,
+    champion: Mapping[str, object],
+) -> dict[str, object] | None:
+    marker_path = destination / "learner" / "champion-warm-start.json"
+    if not marker_path.is_file():
+        return None
+    marker = _read_json(marker_path)
+    if (
+        marker.get("status") == "active"
+        and marker.get("source_model_identity") == champion.get("model_identity")
+        and marker.get("absolute_model_step") == champion.get("model_step")
+    ):
+        return None
+    parent = destination / "ablation-parent"
+    archived = parent / "inherited-champion-warm-start.json"
+    note = parent / "inherited-champion-warm-start-rotation.json"
+    if archived.exists() or note.exists():
+        raise FileExistsError("inherited champion warm-start archive already exists")
+    marker_path.replace(archived)
+    rotation: dict[str, object] = {
+        "schema_version": 1,
+        "reason": "inherited warm-start marker predates active ablation anchor",
+        "archived": str(archived),
+        "inherited_source_model_identity": marker.get("source_model_identity"),
+        "inherited_absolute_model_step": marker.get("absolute_model_step"),
+        "active_champion_model_identity": champion.get("model_identity"),
+        "active_champion_model_step": champion.get("model_step"),
+        "rotated_ns": time.time_ns(),
+    }
+    atomic_json(note, rotation)
+    return rotation
 
 
 def _plan_treatment(plan: dict[str, Any], treatment: str) -> dict[str, str]:
@@ -371,6 +407,10 @@ def fork_elo_ablation(
                 },
             )
         champion = _read_json(champion_path)
+        warm_start_rotation = _archive_incompatible_champion_warm_start(
+            destination,
+            champion=champion,
+        )
         if winner_snapshot is not None and verified_selection is None:
             selected = winner_snapshot["champion"]
             assert isinstance(selected, dict)
@@ -393,6 +433,7 @@ def fork_elo_ablation(
             "source_created_ns": identity.created_ns,
             "source_winner_snapshot": winner_snapshot,
             "source_manifest_selection": selection_metadata,
+            "inherited_champion_warm_start_rotation": warm_start_rotation,
             "training_objective": training_objective,
             "promotion_objective": promotion_objective,
             "per_ring_guarantees": plan.get("per_ring_guarantees", True),

@@ -186,6 +186,34 @@ def test_fork_preserves_nested_ablation_ancestry(tmp_path: Path) -> None:
     ).read_bytes() == b"old learner metrics\n"
 
 
+def test_fork_archives_incompatible_inherited_warm_start(tmp_path: Path) -> None:
+    source = _source_run(tmp_path)
+    _write_json(
+        source / "learner" / "champion-warm-start.json",
+        {
+            "schema_version": 1,
+            "status": "active",
+            "source_model_identity": "older-champion",
+            "absolute_model_step": 300_000,
+        },
+    )
+    plan = _plan(tmp_path, source)
+
+    metadata = fork_elo_ablation(
+        source_run_root=source,
+        plan_path=plan,
+        treatment="control",
+    )
+
+    destination = tmp_path / "runs" / "pilot-control-seed17"
+    assert not (destination / "learner" / "champion-warm-start.json").exists()
+    archived = destination / "ablation-parent" / "inherited-champion-warm-start.json"
+    assert json.loads(archived.read_text())["source_model_identity"] == "older-champion"
+    rotation = metadata["inherited_champion_warm_start_rotation"]
+    assert rotation["active_champion_model_identity"] == "champion-id"
+    assert rotation["active_champion_model_step"] == 364_000
+
+
 def test_fork_refuses_active_source_and_changed_profile(tmp_path: Path) -> None:
     source = _source_run(tmp_path)
     plan_path = _plan(tmp_path, source)
