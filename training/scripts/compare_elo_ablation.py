@@ -12,10 +12,16 @@ import statistics
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import cast
 
 import yaml
 
-from startrain.arena import bounded_confidence_sequence, elo_from_probability
+from startrain.arena import (
+    ARENA_RESULT_SCHEMA_VERSION,
+    ArenaPair,
+    bounded_confidence_sequence,
+    elo_from_probability,
+)
 from startrain.config import load_config
 
 if __package__:
@@ -30,6 +36,11 @@ DEFAULT_GUARD_RINGS = (4, 6, 8)
 DEFAULT_GUARD_FLOOR_ELO = -35.0
 CONFIDENCE_LEVEL = 0.95
 ONE_SIDED_95_NORMAL_QUANTILE = 1.6448536269514722
+PAIR_VALID_ERROR_PROBABILITY_PER_SIDE = (1.0 - CONFIDENCE_LEVEL) / 2.0
+PAIR_VALID_LOWER_BOUND_METHOD = "sum_of_geometric_alpha_spending_paired_anytime_bounds"
+RING10_ONLY_RANKING_METRIC = (
+    "ring10_only_pair_valid_champion_frontier_elo_lcb_per_total_provisioned_wall_hour"
+)
 _VALID_INTEGRITY_STATUSES = frozenset(
     {"ok", "pass", "passed", "valid", "verified", "healthy"}
 )
@@ -41,6 +52,7 @@ _LABEL_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 _TERMINAL_DECISIONS = frozenset(
     {"promote", "reject", "reject_ring_regression", "reject_max_pairs"}
 )
+_ATTEMPT_DECISIONS = frozenset((*_TERMINAL_DECISIONS, "superseded"))
 
 
 @dataclass
@@ -258,6 +270,11 @@ def _arena_results(
         return []
     results = []
     for path in sorted(arena.glob("*.json")):
+        if path.is_symlink() or path.resolve().parent != arena.resolve():
+            failures.append(
+                _failure(path, "arena result must be a regular in-root file")
+            )
+            continue
         payload = _read_json(path, failures=failures)
         if payload is None:
             continue
@@ -375,6 +392,64 @@ def _weighted_summary(
     }
 
 
+def _complete_pair_scores(
+    result: Mapping[str, object],
+    *,
+    ring: int,
+) -> tuple[tuple[float, ...] | None, str | None]:
+    if result.get("schema_version") != ARENA_RESULT_SCHEMA_VERSION:
+        return None, "arena result schema cannot prove complete-pair provenance"
+    raw_pairs = result.get("pairs")
+    if not isinstance(raw_pairs, Sequence) or isinstance(raw_pairs, str | bytes):
+        return None, "arena result raw pairs are missing"
+    selected: list[tuple[int, float]] = []
+    seen_pairs: set[tuple[int, int]] = set()
+    for index, raw_pair in enumerate(raw_pairs):
+        if not isinstance(raw_pair, Mapping):
+            return None, f"arena pair {index} is not an object"
+        pair_ring = raw_pair.get("ring")
+        pair_index = raw_pair.get("pair")
+        opening_seed = raw_pair.get("opening_seed")
+        opening_action = raw_pair.get("opening_action")
+        forced_opening = raw_pair.get("forced_opening")
+        outcomes = raw_pair.get("outcomes")
+        if (
+            type(pair_ring) is not int
+            or type(pair_index) is not int
+            or type(opening_seed) is not int
+            or (opening_action is not None and type(opening_action) is not int)
+            or type(forced_opening) is not bool
+            or not isinstance(outcomes, Sequence)
+            or isinstance(outcomes, str | bytes)
+            or len(outcomes) != 2
+            or any(type(outcome) is not int for outcome in outcomes)
+        ):
+            return None, f"arena pair {index} is invalid"
+        try:
+            pair = ArenaPair(
+                ring=pair_ring,
+                pair=pair_index,
+                opening_seed=opening_seed,
+                opening_action=opening_action,
+                forced_opening=forced_opening,
+                outcomes=cast(tuple[int, int], tuple(outcomes)),
+            )
+        except (TypeError, ValueError) as error:
+            return None, f"arena pair {index} is invalid: {error}"
+        key = (pair_ring, pair_index)
+        if key in seen_pairs:
+            return None, f"arena pair {key} is duplicated"
+        seen_pairs.add(key)
+        if pair_ring == ring:
+            selected.append((pair.pair, pair.score_rate))
+    if not selected:
+        return None, f"arena result has no complete ring-{ring} pairs"
+    ordered = sorted(selected)
+    if [pair_index for pair_index, _score in ordered] != list(range(len(ordered))):
+        return None, f"arena result ring-{ring} pair indices are not contiguous"
+    return tuple(score for _pair_index, score in ordered), None
+
+
 def _per_ring_evidence(
     result: Mapping[str, object],
     *,
@@ -433,13 +508,33 @@ def _terminal_evaluations(
         if not terminal:
             continue
         decision = promotion.get("decision")
-        if decision == "superseded":
-            continue
-        if not isinstance(decision, str) or decision not in _TERMINAL_DECISIONS:
+        if not isinstance(decision, str) or decision not in _ATTEMPT_DECISIONS:
             failures.append(
                 _failure(path, "terminal arena promotion decision is invalid")
             )
             continue
+        if decision == "superseded":
+            raw_pairs = result.get("pairs")
+            raw_weighted = result.get("weighted_aggregate") or promotion.get(
+                "weighted_aggregate"
+            )
+            block_scores = (
+                raw_weighted.get("block_scores")
+                if isinstance(raw_weighted, Mapping)
+                else None
+            )
+            has_pair_evidence = (
+                isinstance(raw_pairs, Sequence)
+                and not isinstance(raw_pairs, str | bytes)
+                and bool(raw_pairs)
+            )
+            has_weighted_evidence = (
+                isinstance(block_scores, Sequence)
+                and not isinstance(block_scores, str | bytes)
+                and bool(block_scores)
+            )
+            if not has_pair_evidence and not has_weighted_evidence:
+                continue
         completed_ns = _positive_timestamp(result.get("completed_ns"))
         if completed_ns is None:
             failures.append(
@@ -454,6 +549,40 @@ def _terminal_evaluations(
             failures=failures,
         )
         per_ring = _per_ring_evidence(result, path=path, failures=failures)
+        ring10_pair_scores = None
+        if "10" in per_ring:
+            ring10_pair_scores, pair_error = _complete_pair_scores(result, ring=10)
+            if ring10_pair_scores is None:
+                failures.append(
+                    _failure(
+                        path,
+                        f"ring 10 complete-pair evidence is invalid: {pair_error}",
+                    )
+                )
+        elif decision == "superseded":
+            raw_pairs = result.get("pairs")
+            if (
+                isinstance(raw_pairs, Sequence)
+                and not isinstance(raw_pairs, str | bytes)
+                and raw_pairs
+            ):
+                ring10_pair_scores, pair_error = _complete_pair_scores(
+                    result,
+                    ring=10,
+                )
+                failures.append(
+                    _failure(
+                        path,
+                        "evaluated superseded result lacks a ring-10 summary"
+                        + (f": {pair_error}" if pair_error else ""),
+                    )
+                )
+        artifact_path = Path(path)
+        arena_artifact = {
+            "path": path,
+            "bytes": artifact_path.stat().st_size,
+            "sha256": _sha256(artifact_path),
+        }
         guards = []
         for ring in guard_rings:
             floor = (
@@ -510,6 +639,8 @@ def _terminal_evaluations(
                 "guards": guards,
                 "weighted_aggregate": weighted,
                 "per_ring": per_ring,
+                "_ring10_pair_scores": ring10_pair_scores,
+                "arena_artifact": arena_artifact,
             }
         )
     return sorted(
@@ -1772,6 +1903,461 @@ def _champion_frontier(
     )
 
 
+def _pair_scores(
+    summary: Mapping[str, object],
+    pair_scores: object,
+) -> tuple[tuple[float, ...] | None, str | None]:
+    if (
+        not isinstance(pair_scores, Sequence)
+        or isinstance(pair_scores, str | bytes)
+        or not pair_scores
+        or any(score not in (0.0, 0.5, 1.0) for score in pair_scores)
+    ):
+        return None, "verified raw pair scores are missing"
+    scores = tuple(float(score) for score in pair_scores)
+    derived_counts = tuple(scores.count(score) for score in (0.0, 0.5, 1.0))
+    raw_counts = summary.get("pair_win_counts")
+    if not isinstance(raw_counts, Mapping):
+        return None, "pair win counts are missing"
+    counts = []
+    for wins in range(3):
+        count = _nonnegative_integer(raw_counts.get(str(wins), raw_counts.get(wins)))
+        if count is None:
+            return None, f"pair win count {wins} is invalid"
+        counts.append(count)
+    pairs = _nonnegative_integer(summary.get("pairs"))
+    if (
+        pairs is None
+        or pairs <= 0
+        or sum(counts) != pairs
+        or tuple(counts) != derived_counts
+        or pairs != len(scores)
+    ):
+        return None, "pair count disagrees with pair win counts"
+    games = _nonnegative_integer(summary.get("games"))
+    wins = _nonnegative_integer(summary.get("wins"))
+    losses = _nonnegative_integer(summary.get("losses"))
+    expected_wins = counts[1] + 2 * counts[2]
+    expected_losses = 2 * counts[0] + counts[1]
+    if games != 2 * pairs or wins != expected_wins or losses != expected_losses:
+        return None, "game outcomes disagree with complete role-reversed pairs"
+    score_rate = math.fsum(scores) / len(scores)
+    reported_score_rate = _number(summary.get("score_rate"))
+    reported_elo = _number(summary.get("elo_difference"))
+    expected_elo = elo_from_probability(score_rate)
+    if (
+        reported_score_rate is None
+        or not math.isclose(
+            reported_score_rate,
+            score_rate,
+            rel_tol=1e-12,
+            abs_tol=1e-12,
+        )
+        or reported_elo is None
+        or not math.isclose(
+            reported_elo,
+            expected_elo,
+            rel_tol=1e-12,
+            abs_tol=1e-9,
+        )
+    ):
+        return None, "reported score rate or Elo disagrees with complete pairs"
+    return scores, None
+
+
+def _ring10_pair_valid_frontier(
+    evaluations: Sequence[Mapping[str, object]],
+    *,
+    anchor_identity: str | None,
+    frontier: Mapping[str, object] | None,
+    source_evidence: Mapping[str, object] | None = None,
+) -> tuple[dict[str, object] | None, str | None]:
+    if anchor_identity is None:
+        return None, "common anchor identity is unavailable"
+    if frontier is None:
+        return None, "descriptive champion frontier is unavailable"
+
+    current = anchor_identity
+    point_gain = 0.0
+    lower_gain = 0.0
+    upper_gain = 0.0
+    promotions = []
+    attempts = []
+    for attempt_index, evaluation in enumerate(evaluations):
+        baseline = evaluation.get("baseline")
+        candidate = evaluation.get("candidate")
+        if baseline != current:
+            return (
+                None,
+                "pair-valid terminal candidate chain is not contiguous: "
+                f"expected baseline {current!r}, observed {baseline!r}",
+            )
+        if not isinstance(candidate, str) or not candidate:
+            return None, "pair-valid terminal candidate identity is invalid"
+        decision = evaluation.get("decision")
+        artifact = evaluation.get("arena_artifact")
+        if not isinstance(decision, str) or not isinstance(artifact, Mapping):
+            return None, f"candidate {candidate!r} lacks terminal artifact evidence"
+        attempts.append(
+            {
+                "attempt_index": attempt_index,
+                "baseline": baseline,
+                "candidate": candidate,
+                "decision": decision,
+                "completed_ns": evaluation.get("completed_ns"),
+                "arena_artifact": dict(artifact),
+            }
+        )
+        if decision != "promote":
+            continue
+        per_ring = evaluation.get("per_ring")
+        summary = (
+            per_ring.get("10", per_ring.get(10))
+            if isinstance(per_ring, Mapping)
+            else None
+        )
+        if not isinstance(summary, Mapping):
+            return None, f"promotion {candidate!r} lacks ring-10 pair evidence"
+        pair_scores, pair_error = _pair_scores(
+            summary,
+            evaluation.get("_ring10_pair_scores"),
+        )
+        if pair_scores is None:
+            return (
+                None,
+                f"promotion {candidate!r} has invalid ring-10 pair evidence: "
+                f"{pair_error}",
+            )
+        link_score_rate = math.fsum(pair_scores) / len(pair_scores)
+        link_elo = elo_from_probability(link_score_rate)
+        link_error_probability = PAIR_VALID_ERROR_PROBABILITY_PER_SIDE / (
+            2 ** (attempt_index + 1)
+        )
+        link_lower_score, link_upper_score = bounded_confidence_sequence(
+            pair_scores,
+            error_probability=link_error_probability,
+        )
+        link_lower = elo_from_probability(link_lower_score)
+        link_upper = elo_from_probability(link_upper_score)
+        point_gain += link_elo
+        lower_gain += link_lower
+        upper_gain += link_upper
+        promotions.append(
+            {
+                "from_identity": current,
+                "to_identity": candidate,
+                "completed_ns": evaluation.get("completed_ns"),
+                "path": evaluation.get("path"),
+                "ring_10_elo_difference": link_elo,
+                "ring_10_anytime_lower_elo": link_lower,
+                "ring_10_anytime_upper_elo": link_upper,
+                "link_error_probability_per_side": link_error_probability,
+                "complete_pairs": len(pair_scores),
+                "pair_score_counts": {
+                    "0": pair_scores.count(0.0),
+                    "1": pair_scores.count(0.5),
+                    "2": pair_scores.count(1.0),
+                },
+                "terminal_attempt_index": attempt_index,
+                "arena_artifact": dict(artifact),
+            }
+        )
+        current = candidate
+
+    if current != frontier.get("identity"):
+        return (
+            None,
+            "pair-valid frontier identity disagrees with descriptive frontier: "
+            f"{current!r} != {frontier.get('identity')!r}",
+        )
+    return (
+        {
+            **dict(frontier),
+            "pair_valid_elo_gained": point_gain,
+            "pair_valid_elo_one_sided_lower_bound": lower_gain,
+            "pair_valid_elo_one_sided_upper_bound": upper_gain,
+            "pair_valid_promotions": promotions,
+            "pair_valid_attempts": attempts,
+            "pair_valid_attempt_count": len(attempts),
+            "pair_valid_source": (
+                dict(source_evidence) if source_evidence is not None else None
+            ),
+            "pair_valid": True,
+            "pair_observation_unit": "complete-role-reversed-pair",
+            "lower_bound_method": PAIR_VALID_LOWER_BOUND_METHOD,
+            "familywise_error_probability_per_side": (
+                PAIR_VALID_ERROR_PROBABILITY_PER_SIDE
+            ),
+            "link_error_spending": (
+                "error_probability_per_side / 2^(terminal_attempt_index + 1)"
+            ),
+        },
+        None,
+    )
+
+
+def _verify_declared_pair_valid_frontier(
+    frontier: Mapping[str, object],
+) -> dict[str, float]:
+    """Recompute a persisted pair-valid frontier from pinned arena artifacts."""
+    if (
+        frontier.get("pair_valid") is not True
+        or frontier.get("pair_observation_unit") != "complete-role-reversed-pair"
+        or frontier.get("lower_bound_method") != PAIR_VALID_LOWER_BOUND_METHOD
+        or frontier.get("link_error_spending")
+        != "error_probability_per_side / 2^(terminal_attempt_index + 1)"
+    ):
+        raise ValueError("champion frontier is not pair-valid")
+    error_probability = _number(frontier.get("familywise_error_probability_per_side"))
+    if error_probability is None or not math.isclose(
+        error_probability,
+        PAIR_VALID_ERROR_PROBABILITY_PER_SIDE,
+        rel_tol=1e-15,
+        abs_tol=1e-15,
+    ):
+        raise ValueError("pair-valid frontier error probability is incompatible")
+    raw_attempts = frontier.get("pair_valid_attempts")
+    if not isinstance(raw_attempts, list) or frontier.get(
+        "pair_valid_attempt_count"
+    ) != len(raw_attempts):
+        raise ValueError("pair-valid terminal attempts are incomplete")
+    current: str | None = None
+    point_gain = 0.0
+    lower_gain = 0.0
+    upper_gain = 0.0
+    promotions = []
+    for attempt_index, raw_attempt in enumerate(raw_attempts):
+        if not isinstance(raw_attempt, Mapping):
+            raise ValueError("pair-valid terminal attempt is not an object")
+        baseline = raw_attempt.get("baseline")
+        candidate = raw_attempt.get("candidate")
+        decision = raw_attempt.get("decision")
+        completed_ns = raw_attempt.get("completed_ns")
+        if (
+            raw_attempt.get("attempt_index") != attempt_index
+            or not isinstance(baseline, str)
+            or not baseline
+            or not isinstance(candidate, str)
+            or not candidate
+            or decision not in _ATTEMPT_DECISIONS
+            or type(completed_ns) is not int
+            or completed_ns <= 0
+        ):
+            raise ValueError("pair-valid terminal attempt metadata is invalid")
+        if current is None:
+            current = baseline
+        if baseline != current:
+            raise ValueError("pair-valid terminal attempt chain is not contiguous")
+        artifact = raw_attempt.get("arena_artifact")
+        if not isinstance(artifact, Mapping):
+            raise ValueError("pair-valid terminal attempt artifact is missing")
+        artifact_path_value = artifact.get("path")
+        artifact_bytes = artifact.get("bytes")
+        artifact_sha256 = artifact.get("sha256")
+        if (
+            not isinstance(artifact_path_value, str)
+            or not artifact_path_value
+            or type(artifact_bytes) is not int
+            or artifact_bytes <= 0
+            or not isinstance(artifact_sha256, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", artifact_sha256)
+        ):
+            raise ValueError("pair-valid terminal attempt artifact is invalid")
+        artifact_path = Path(artifact_path_value).expanduser().resolve()
+        try:
+            payload = artifact_path.read_bytes()
+            result = json.loads(payload)
+        except (OSError, json.JSONDecodeError) as error:
+            raise ValueError(
+                f"cannot verify pair-valid arena artifact {artifact_path}: {error}"
+            ) from error
+        if (
+            len(payload) != artifact_bytes
+            or hashlib.sha256(payload).hexdigest() != artifact_sha256
+            or not isinstance(result, Mapping)
+            or result.get("candidate") != candidate
+            or result.get("baseline") != baseline
+            or result.get("completed_ns") != completed_ns
+            or result.get("terminal") is not True
+        ):
+            raise ValueError("pair-valid arena artifact changed or disagrees")
+        promotion = result.get("promotion")
+        if not isinstance(promotion, Mapping) or promotion.get("decision") != decision:
+            raise ValueError("pair-valid arena decision disagrees with its artifact")
+        raw_scores, pair_error = _complete_pair_scores(result, ring=10)
+        per_ring = result.get("per_ring")
+        summary = (
+            per_ring.get("10", per_ring.get(10))
+            if isinstance(per_ring, Mapping)
+            else None
+        )
+        pair_scores, summary_error = (
+            _pair_scores(summary, raw_scores)
+            if isinstance(summary, Mapping)
+            else (None, "ring-10 summary is missing")
+        )
+        if pair_scores is None:
+            raise ValueError(
+                f"pair-valid arena evidence is invalid: {pair_error or summary_error}"
+            )
+        if decision != "promote":
+            continue
+        link_score_rate = math.fsum(pair_scores) / len(pair_scores)
+        link_elo = elo_from_probability(link_score_rate)
+        link_error_probability = error_probability / (2 ** (attempt_index + 1))
+        link_lower_score, link_upper_score = bounded_confidence_sequence(
+            pair_scores,
+            error_probability=link_error_probability,
+        )
+        link_lower = elo_from_probability(link_lower_score)
+        link_upper = elo_from_probability(link_upper_score)
+        point_gain += link_elo
+        lower_gain += link_lower
+        upper_gain += link_upper
+        promotions.append(
+            {
+                "from_identity": current,
+                "to_identity": candidate,
+                "completed_ns": completed_ns,
+                "path": str(artifact_path),
+                "ring_10_elo_difference": link_elo,
+                "ring_10_anytime_lower_elo": link_lower,
+                "ring_10_anytime_upper_elo": link_upper,
+                "link_error_probability_per_side": link_error_probability,
+                "complete_pairs": len(pair_scores),
+                "pair_score_counts": {
+                    "0": pair_scores.count(0.0),
+                    "1": pair_scores.count(0.5),
+                    "2": pair_scores.count(1.0),
+                },
+                "terminal_attempt_index": attempt_index,
+                "arena_artifact": dict(artifact),
+            }
+        )
+        current = candidate
+    if current is None:
+        identity = frontier.get("identity")
+        current = identity if isinstance(identity, str) else None
+    if current != frontier.get("identity") or promotions != frontier.get(
+        "pair_valid_promotions"
+    ):
+        raise ValueError("pair-valid promoted frontier does not match its attempts")
+    expected = {
+        "point_gain": point_gain,
+        "lower_gain": lower_gain,
+        "upper_gain": upper_gain,
+    }
+    observed = {
+        "point_gain": _number(frontier.get("pair_valid_elo_gained")),
+        "lower_gain": _number(frontier.get("pair_valid_elo_one_sided_lower_bound")),
+        "upper_gain": _number(frontier.get("pair_valid_elo_one_sided_upper_bound")),
+    }
+    if any(
+        value is None
+        or not math.isclose(
+            float(value),
+            expected[name],
+            rel_tol=1e-12,
+            abs_tol=1e-9,
+        )
+        for name, value in observed.items()
+    ):
+        raise ValueError("pair-valid frontier totals disagree with arena artifacts")
+    return expected
+
+
+def verify_pair_valid_frontier(
+    frontier: Mapping[str, object],
+) -> dict[str, float]:
+    """Bind pair-valid evidence to every terminal arena attempt in its run."""
+    source = frontier.get("pair_valid_source")
+    if not isinstance(source, Mapping):
+        raise ValueError("pair-valid frontier source evidence is missing")
+    run_root_value = source.get("run_root")
+    arena_root_value = source.get("arena_root")
+    anchor_identity = source.get("anchor_identity")
+    started_ns = source.get("measurement_started_ns")
+    stopped_ns = source.get("measurement_stopped_ns")
+    if (
+        not isinstance(run_root_value, str)
+        or not run_root_value
+        or not isinstance(arena_root_value, str)
+        or not arena_root_value
+        or not isinstance(anchor_identity, str)
+        or not anchor_identity
+        or type(started_ns) is not int
+        or type(stopped_ns) is not int
+        or started_ns <= 0
+        or stopped_ns < started_ns
+    ):
+        raise ValueError("pair-valid frontier source evidence is invalid")
+    requested_run_root = Path(run_root_value).expanduser()
+    requested_arena_root = Path(arena_root_value).expanduser()
+    run_root = requested_run_root.resolve()
+    arena_root = requested_arena_root.resolve()
+    if (
+        requested_run_root.is_symlink()
+        or requested_arena_root.is_symlink()
+        or arena_root != (run_root / "arena").resolve()
+        or not arena_root.is_dir()
+    ):
+        raise ValueError("pair-valid frontier arena root is not a regular run artifact")
+    failures: list[dict[str, object]] = []
+    arena_results = [
+        result
+        for result in _arena_results(run_root, failures=failures)
+        if (completed_ns := _positive_timestamp(result.get("completed_ns"))) is None
+        or started_ns <= completed_ns <= stopped_ns
+    ]
+    evaluations = _terminal_evaluations(
+        arena_results,
+        guard_rings=(),
+        guard_floor_elo=DEFAULT_GUARD_FLOOR_ELO,
+        failures=failures,
+    )
+    if failures:
+        first = _normalized_failures(failures)[0]
+        raise ValueError(
+            "pair-valid source arena artifacts are invalid: "
+            f"{first['path']}: {first['error']}"
+        )
+    recomputed, error = _ring10_pair_valid_frontier(
+        evaluations,
+        anchor_identity=anchor_identity,
+        frontier={
+            "identity": frontier.get("identity"),
+            "step": frontier.get("step"),
+        },
+        source_evidence=source,
+    )
+    if recomputed is None:
+        raise ValueError(f"pair-valid frontier cannot be recomputed: {error}")
+    exact_fields = (
+        "pair_valid_attempt_count",
+        "pair_valid_attempts",
+        "pair_valid_promotions",
+        "pair_valid_source",
+        "link_error_spending",
+    )
+    if any(frontier.get(field) != recomputed.get(field) for field in exact_fields):
+        raise ValueError(
+            "pair-valid frontier omits or changes a terminal arena attempt"
+        )
+    recomputed_totals = _verify_declared_pair_valid_frontier(recomputed)
+    observed_totals = _verify_declared_pair_valid_frontier(frontier)
+    if any(
+        not math.isclose(
+            observed_totals[name],
+            recomputed_totals[name],
+            rel_tol=1e-12,
+            abs_tol=1e-9,
+        )
+        for name in recomputed_totals
+    ):
+        raise ValueError("pair-valid frontier differs from complete run evidence")
+    return recomputed_totals
+
+
 def _weighted_champion_frontier(
     evaluations: Sequence[Mapping[str, object]],
     *,
@@ -1808,16 +2394,11 @@ def _weighted_champion_frontier(
     point_gain = 0.0
     lower_gain = 0.0
     promotions = []
-    promoted_evaluations = [
-        evaluation
-        for evaluation in evaluations
-        if evaluation.get("decision") == "promote"
-    ]
     objective_document = json.loads(objective)
     familywise_error = _number(objective_document.get("lower_error_probability"))
     if familywise_error is None or not 0 < familywise_error < 1:
         return None, "weighted objective has invalid lower error probability", objective
-    for promotion_index, evaluation in enumerate(promoted_evaluations):
+    for attempt_index, evaluation in enumerate(evaluations):
         baseline = evaluation.get("baseline")
         candidate = evaluation.get("candidate")
         if baseline != current:
@@ -1827,6 +2408,8 @@ def _weighted_champion_frontier(
                 f"expected baseline {current!r}, observed {baseline!r}",
                 objective,
             )
+        if evaluation.get("decision") != "promote":
+            continue
         summary = evaluation.get("weighted_aggregate")
         assert isinstance(summary, Mapping)
         link_elo = _number(summary.get("elo_difference"))
@@ -1846,7 +2429,7 @@ def _weighted_champion_frontier(
                 f"weighted promotion {candidate!r} has invalid Elo evidence",
                 objective,
             )
-        link_error_probability = familywise_error / (2 ** (promotion_index + 1))
+        link_error_probability = familywise_error / (2 ** (attempt_index + 1))
         link_lower_score, _ = bounded_confidence_sequence(
             tuple(float(value) for value in raw_scores),
             error_probability=link_error_probability,
@@ -1866,6 +2449,7 @@ def _weighted_champion_frontier(
                 "weighted_anytime_lower_elo": link_lower,
                 "link_error_probability": link_error_probability,
                 "complete_blocks": summary.get("complete_blocks"),
+                "terminal_attempt_index": attempt_index,
             }
         )
         current = candidate
@@ -1883,7 +2467,7 @@ def _weighted_champion_frontier(
                 "sum_of_geometric_alpha_spending_anytime_lower_bounds"
             ),
             "familywise_error_probability": familywise_error,
-            "link_error_spending": "alpha / 2^(promotion_index + 1)",
+            "link_error_spending": "alpha / 2^(terminal_attempt_index + 1)",
         },
         None,
         objective,
@@ -2318,6 +2902,26 @@ def _analyze_treatment(
         evaluations,
         anchor_identity=anchor_identity,
     )
+    pair_valid_frontier = None
+    pair_valid_frontier_error = None
+    if training_objective == "ring10_only":
+        (
+            pair_valid_frontier,
+            pair_valid_frontier_error,
+        ) = _ring10_pair_valid_frontier(
+            evaluations,
+            anchor_identity=anchor_identity,
+            frontier=frontier,
+            source_evidence={
+                "run_root": str(root),
+                "arena_root": str((root / "arena").resolve()),
+                "anchor_identity": anchor_identity,
+                "measurement_started_ns": measurement_started_ns,
+                "measurement_stopped_ns": measurement_stopped_ns,
+            },
+        )
+        if pair_valid_frontier is not None:
+            frontier = pair_valid_frontier
     payload["champion_frontier"] = frontier
     (
         weighted_frontier,
@@ -2397,6 +3001,13 @@ def _analyze_treatment(
             reasons,
             "missing_champion_frontier",
             frontier_error or "ring-10 champion frontier is unavailable",
+        )
+    if training_objective == "ring10_only" and pair_valid_frontier is None:
+        _add_reason(
+            reasons,
+            "missing_pair_valid_champion_frontier",
+            pair_valid_frontier_error
+            or "ring-10 pair-valid champion frontier is unavailable",
         )
     if weighted_objective is not None and weighted_frontier is None:
         _add_reason(
@@ -2557,34 +3168,60 @@ def _analyze_treatment(
             else None
         ),
     }
-    frontier_rating = (
-        _number(frontier.get("rating_elo")) if frontier is not None else None
-    )
-    frontier_standard_error = (
-        _number(frontier.get("standard_error_elo")) if frontier is not None else None
-    )
-    frontier_gain = (
-        frontier_rating - anchor_rating
-        if frontier_rating is not None and anchor_rating is not None
-        else None
-    )
-    if (
-        frontier is not None
-        and frontier.get("identity") == anchor.get("identity")
-        and frontier_gain is not None
-    ):
-        frontier_gain_standard_error = 0.0
-    else:
-        frontier_gain_standard_error = (
-            anchor_standard_error + frontier_standard_error
-            if anchor_standard_error is not None and frontier_standard_error is not None
+    if training_objective == "ring10_only":
+        frontier_gain = (
+            _number(frontier.get("pair_valid_elo_gained"))
+            if frontier is not None
             else None
         )
-    frontier_lcb = (
-        frontier_gain - ONE_SIDED_95_NORMAL_QUANTILE * frontier_gain_standard_error
-        if frontier_gain is not None and frontier_gain_standard_error is not None
-        else None
-    )
+        frontier_lcb = (
+            _number(frontier.get("pair_valid_elo_one_sided_lower_bound"))
+            if frontier is not None
+            else None
+        )
+        frontier_ucb = (
+            _number(frontier.get("pair_valid_elo_one_sided_upper_bound"))
+            if frontier is not None
+            else None
+        )
+        frontier_gain_standard_error = None
+    else:
+        frontier_rating = (
+            _number(frontier.get("rating_elo")) if frontier is not None else None
+        )
+        frontier_standard_error = (
+            _number(frontier.get("standard_error_elo"))
+            if frontier is not None
+            else None
+        )
+        frontier_gain = (
+            frontier_rating - anchor_rating
+            if frontier_rating is not None and anchor_rating is not None
+            else None
+        )
+        if (
+            frontier is not None
+            and frontier.get("identity") == anchor.get("identity")
+            and frontier_gain is not None
+        ):
+            frontier_gain_standard_error = 0.0
+        else:
+            frontier_gain_standard_error = (
+                anchor_standard_error + frontier_standard_error
+                if anchor_standard_error is not None
+                and frontier_standard_error is not None
+                else None
+            )
+        frontier_lcb = (
+            frontier_gain - ONE_SIDED_95_NORMAL_QUANTILE * frontier_gain_standard_error
+            if frontier_gain is not None and frontier_gain_standard_error is not None
+            else None
+        )
+        frontier_ucb = (
+            frontier_gain + ONE_SIDED_95_NORMAL_QUANTILE * frontier_gain_standard_error
+            if frontier_gain is not None and frontier_gain_standard_error is not None
+            else None
+        )
     point_score = (
         frontier_gain / resource_wall_hours
         if frontier_gain is not None and resource_wall_hours is not None
@@ -2606,6 +3243,23 @@ def _analyze_treatment(
             frontier_gain_standard_error
         ),
         "champion_frontier_ring_10_elo_one_sided_95_lower_bound": frontier_lcb,
+        "champion_frontier_ring_10_elo_one_sided_95_upper_bound": frontier_ucb,
+        "pair_valid": training_objective == "ring10_only",
+        "pair_observation_unit": (
+            "complete-role-reversed-pair"
+            if training_objective == "ring10_only"
+            else None
+        ),
+        "lower_bound_method": (
+            frontier.get("lower_bound_method")
+            if training_objective == "ring10_only" and frontier is not None
+            else "normal_approximation_from_bradley_terry_standard_error"
+        ),
+        "familywise_error_probability_per_side": (
+            frontier.get("familywise_error_probability_per_side")
+            if training_objective == "ring10_only" and frontier is not None
+            else None
+        ),
         "total_provisioned_wall_hours": resource_wall_hours,
         "total_provisioned_gpu_hours": total_provisioned_gpu_hours,
         "guardrail_status": guardrails.get("status"),
@@ -2821,9 +3475,7 @@ def build_elo_ablation_comparison(
     legacy_metric_name = (
         "guarded_champion_frontier_ring_10_elo_lcb_per_total_provisioned_wall_hour"
     )
-    ring10_only_metric_name = (
-        "ring10_only_champion_frontier_elo_lcb_per_total_provisioned_wall_hour"
-    )
+    ring10_only_metric_name = RING10_ONLY_RANKING_METRIC
     weighted_metric_name = (
         "weighted_champion_frontier_elo_lcb_per_total_provisioned_wall_hour"
     )
@@ -2932,7 +3584,7 @@ def build_elo_ablation_comparison(
         serialized_winner_snapshot["ranking_metric"] = weighted_metric_name
     elif serialized_winner_snapshot is not None and ranking_objective == "ring_10_only":
         serialized_winner_snapshot["selection"] = (
-            "ring10_only_chronological_champion_frontier"
+            "ring10_only_pair_valid_chronological_champion_frontier"
         )
         serialized_winner_snapshot["ranking_metric"] = ring10_only_metric_name
     selector_verified = serialized_winner_snapshot is not None
@@ -2961,7 +3613,7 @@ def build_elo_ablation_comparison(
             "highest_ranked_chronological_weighted_champion_frontier"
             if ranking_objective == "weighted_aggregate"
             else (
-                "highest_ranked_chronological_ring10_only_champion_frontier"
+                "highest_ranked_chronological_ring10_only_pair_valid_champion_frontier"
                 if ranking_objective == "ring_10_only"
                 else "highest_ranked_chronological_champion_frontier"
             )
@@ -2976,6 +3628,20 @@ def build_elo_ablation_comparison(
         "ranking_objective": ranking_objective,
         "confidence": (
             {
+                "level": CONFIDENCE_LEVEL,
+                "sidedness": "two-sided-familywise",
+                "method": PAIR_VALID_LOWER_BOUND_METHOD,
+                "normal_quantile": None,
+                "observation_unit": "complete-role-reversed-pair",
+                "familywise_error_probability_per_side": (
+                    PAIR_VALID_ERROR_PROBABILITY_PER_SIDE
+                ),
+                "link_error_spending": (
+                    "error_probability_per_side / 2^(terminal_attempt_index + 1)"
+                ),
+            }
+            if ranking_objective == "ring_10_only"
+            else {
                 "level": CONFIDENCE_LEVEL,
                 "sidedness": "one-sided-lower",
                 "method": (

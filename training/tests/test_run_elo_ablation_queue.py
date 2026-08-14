@@ -676,6 +676,53 @@ def test_queue_runs_exclusively_persists_completion_and_finalizes(
                 pass
 
 
+def test_queue_can_reuse_verified_campaign_execution_lock(tmp_path: Path) -> None:
+    deployment = _deployment(tmp_path)
+    manifest = json.loads(deployment.manifest.read_text(encoding="utf-8"))
+    execution_lock = Path(manifest["queue"]["execution_lock_path"]).resolve()
+
+    with exclusive_execution_lock(execution_lock) as lease:
+        state = run_ablation_queue(
+            deployment.manifest,
+            arm_runner=lambda **_kwargs: _complete_report(),
+            current_source_commit=SOURCE_COMMIT,
+            source_tree_clean=True,
+            execution_lock_lease=lease,
+        )
+
+    assert state["queue_status"] == "completed"
+    with pytest.raises(AblationQueueError, match="lease differs"):
+        run_ablation_queue(
+            deployment.manifest,
+            arm_runner=lambda **_kwargs: _complete_report(),
+            current_source_commit=SOURCE_COMMIT,
+            source_tree_clean=True,
+            execution_lock_lease=lease,
+        )
+    with exclusive_execution_lock(tmp_path / "wrong.lock") as wrong_lease:
+        with pytest.raises(AblationQueueError, match="lease differs"):
+            run_ablation_queue(
+                deployment.manifest,
+                arm_runner=lambda **_kwargs: _complete_report(),
+                current_source_commit=SOURCE_COMMIT,
+                source_tree_clean=True,
+                execution_lock_lease=wrong_lease,
+            )
+
+
+def test_queue_rejects_external_manifest_pin_mismatch(tmp_path: Path) -> None:
+    deployment = _deployment(tmp_path)
+
+    with pytest.raises(AblationQueueError, match="external pin"):
+        run_ablation_queue(
+            deployment.manifest,
+            arm_runner=lambda **_kwargs: _complete_report(),
+            current_source_commit=SOURCE_COMMIT,
+            source_tree_clean=True,
+            expected_manifest_sha256="0" * 64,
+        )
+
+
 def test_verified_single_seed_winner_still_requests_only_fallback(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -692,14 +739,15 @@ def test_verified_single_seed_winner_still_requests_only_fallback(
             "status": "complete",
             "ranking_objective": "ring_10_only",
             "ranking_metric": (
-                "ring10_only_champion_frontier_elo_lcb_per_total_provisioned_wall_hour"
+                "ring10_only_pair_valid_champion_frontier_elo_lcb_"
+                "per_total_provisioned_wall_hour"
             ),
             "selector": {
                 "status": "verified",
                 "ranking_objective": "ring_10_only",
                 "ranking_metric": (
-                    "ring10_only_champion_frontier_elo_lcb_per_"
-                    "total_provisioned_wall_hour"
+                    "ring10_only_pair_valid_champion_frontier_elo_lcb_"
+                    "per_total_provisioned_wall_hour"
                 ),
                 "winner_snapshot": {
                     "label": "plateau-keep",

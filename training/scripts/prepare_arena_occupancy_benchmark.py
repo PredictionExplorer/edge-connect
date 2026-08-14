@@ -257,14 +257,14 @@ def _validate_profile(experiment: ExperimentConfig, *, gpu_index: int) -> None:
         raise ValueError("arena occupancy benchmark requires arena.rings: [10]")
     if (
         experiment.arena.pairs_per_ring != 50
-        or experiment.arena.continuation_pairs_per_ring != 25
+        or experiment.arena.continuation_pairs_per_ring != 50
         or experiment.arena.minimum_pairs_per_ring != 50
         or experiment.arena.max_pairs_per_ring != 200
         or experiment.arena.pair_chunk_size is not None
     ):
         raise ValueError(
             "arena occupancy benchmark requires the unchunked production "
-            "50/25/50 initial/continuation/minimum pair contract with a "
+            "50/50/50 initial/continuation/minimum pair contract with a "
             "200-pair range"
         )
     if experiment.orchestration.promotion.gpu_id != gpu_index:
@@ -317,8 +317,8 @@ def _arms() -> list[dict[str, object]]:
             "chunk_pair_count": 25,
             "chunks": 2,
             "concurrent_games": 50,
-            "production_equivalent": True,
-            "deployment_eligible": True,
+            "production_equivalent": False,
+            "deployment_eligible": False,
         },
         {
             "name": TREATMENT_ARM,
@@ -326,8 +326,8 @@ def _arms() -> list[dict[str, object]]:
             "chunk_pair_count": 50,
             "chunks": 1,
             "concurrent_games": 100,
-            "production_equivalent": False,
-            "deployment_eligible": False,
+            "production_equivalent": True,
+            "deployment_eligible": True,
         },
     ]
 
@@ -367,8 +367,8 @@ def _deployment_policy() -> dict[str, object]:
     return {
         "treatment_deployable": False,
         "reason": (
-            "the production continuous profile caps continuation waves at "
-            "25 pairs; the 50-pair arm is benchmark-only"
+            "the production continuous profile already uses 50-pair "
+            "continuation waves; this benchmark cannot authorize further changes"
         ),
         "outcome_equivalence_required": False,
     }

@@ -165,6 +165,9 @@ def test_prepare_freezes_registered_arena_occupancy_arms(
     ]
     assert [arm["total_pair_count"] for arm in payload["arms"]] == [50, 50]
     assert [arm["chunk_pair_count"] for arm in payload["arms"]] == [25, 50]
+    assert [arm["production_equivalent"] for arm in payload["arms"]] == [False, True]
+    assert [arm["deployment_eligible"] for arm in payload["arms"]] == [False, True]
+    assert payload["statistical_contract"]["continuation_pairs_per_ring"] == 50
     assert payload["schedule"] == [
         {
             "repeat": 0,
@@ -188,6 +191,7 @@ def test_prepare_freezes_registered_arena_occupancy_arms(
         },
     ]
     assert payload["deployment_policy"]["treatment_deployable"] is False
+    assert "already uses 50-pair" in payload["deployment_policy"]["reason"]
     assert payload["selection_plan"]["plan_digest"] == selection.plan_digest
     plan_path = output / "benchmark-plan.json"
     assert stat.S_IMODE(plan_path.stat().st_mode) == 0o444

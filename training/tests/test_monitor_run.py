@@ -222,6 +222,17 @@ def _install_ring10_runtime_evidence(root: Path) -> None:
 def test_collect_snapshot_reports_healthy_run(tmp_path, monkeypatch) -> None:
     now_ns = 10_000_000_000
     root = _fixture(tmp_path, now_ns=now_ns)
+    (root / "learner" / "model-history.jsonl").write_text(
+        json.dumps(
+            {
+                "model_identity": "candidate",
+                "model_step": 10,
+                "published_ns": now_ns - 2_000_000_000,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
     _write_json(
         root / "arena" / "evaluation.json",
         {
@@ -258,6 +269,9 @@ def test_collect_snapshot_reports_healthy_run(tmp_path, monkeypatch) -> None:
     assert snapshot["replay"]["states"]["ready"]["samples"] == 1000
     assert snapshot["replay"]["games"] == 1
     assert snapshot["arena_history"]["recent"][-1]["elo_difference"] == 42.0
+    assert snapshot["arena_history"]["candidate_publications"] == 1
+    assert snapshot["arena_history"]["candidate_arrival_service_ratio"] == 1
+    assert snapshot["arena_history"]["recent"][-1]["publish_to_terminal_seconds"] == 2
     assert snapshot["arena_history"]["recent"][-1]["per_ring_elo"]["10"] == 25.0
     assert "learner=10/100" in monitor.format_text(snapshot)
     assert "elo=42.00" in monitor.format_text(snapshot)
@@ -827,6 +841,45 @@ def test_replay_query_is_read_only(tmp_path) -> None:
     assert before == after
 
 
+def test_replay_reports_sample_weighted_model_step_lag(tmp_path) -> None:
+    root = _fixture(tmp_path, now_ns=10_000_000_000)
+    path = root / "replay" / "manifest.sqlite3"
+    connection = sqlite3.connect(path)
+    connection.execute(
+        "ALTER TABLE shards ADD COLUMN model_step INTEGER NOT NULL DEFAULT 0"
+    )
+    connection.execute("UPDATE shards SET model_step = 80")
+    connection.execute(
+        """
+        INSERT INTO shards(state, sample_count, ring, model_step)
+        VALUES ('ready', 3000, 4, 95)
+        """
+    )
+    connection.execute(
+        """
+        INSERT INTO shards(state, sample_count, ring, model_step)
+        VALUES ('ready', 500, 4, 105)
+        """
+    )
+    connection.commit()
+    connection.close()
+
+    result, error = monitor._replay_status(path, current_model_step=100)
+
+    assert error is None
+    assert result["model_step_lag"] == {
+        "current_model_step": 100,
+        "ready_samples": 4500,
+        "ahead_samples": 500,
+        "ahead_max_steps": 5,
+        "minimum": -5,
+        "weighted_mean": pytest.approx(7.222222222222222),
+        "weighted_p50": 5,
+        "weighted_p90": 20,
+        "maximum": 20,
+    }
+
+
 def test_run_monitor_once_emits_one_json_record(tmp_path, monkeypatch, capsys) -> None:
     monkeypatch.setattr(
         monitor,
@@ -850,6 +903,138 @@ def test_run_monitor_once_emits_one_json_record(tmp_path, monkeypatch, capsys) -
     lines = capsys.readouterr().out.splitlines()
     assert len(lines) == 1
     assert json.loads(lines[0])["status"] == "OK"
+
+
+def test_run_monitor_persists_durable_jsonl_telemetry(
+    tmp_path,
+    monkeypatch,
+    capsys,
+) -> None:
+    monkeypatch.setattr(
+        monitor,
+        "collect_snapshot",
+        lambda _root, unit=None, profile_path=None: {
+            "schema_version": 1,
+            "timestamp": "2026-07-11T00:00:00Z",
+            "status": "OK",
+            "gpus": [{"index": 0, "utilization.gpu": 75.0}],
+            "warnings": [],
+        },
+    )
+    output = tmp_path / "telemetry" / "monitor.jsonl"
+
+    monitor.run_monitor(
+        tmp_path,
+        profile_path=None,
+        unit="unit",
+        interval=5,
+        once=True,
+        output_format="text",
+        stop_requested=lambda: False,
+        telemetry_output=output,
+    )
+
+    persisted = [json.loads(line) for line in output.read_text().splitlines()]
+    assert persisted[0]["gpus"][0]["utilization.gpu"] == 75.0
+    assert len(capsys.readouterr().out.splitlines()) == 1
+
+
+def test_telemetry_append_repairs_partial_tail(tmp_path) -> None:
+    output = tmp_path / "monitor.jsonl"
+    output.write_bytes(b'{"status":"OLD"}\n{"partial":')
+
+    monitor._append_snapshot_jsonl(output, {"status": "OK"})
+
+    assert [json.loads(line)["status"] for line in output.read_text().splitlines()] == [
+        "OLD",
+        "OK",
+    ]
+
+
+def test_telemetry_tail_repair_preserves_history_beyond_scan_window(tmp_path) -> None:
+    output = tmp_path / "monitor.jsonl"
+    output.write_bytes(b'{"status":"OLD"}\n{"partial":"' + b"x" * (1024 * 1024 + 128))
+
+    monitor._append_snapshot_jsonl(output, {"status": "OK"})
+
+    assert [json.loads(line)["status"] for line in output.read_text().splitlines()] == [
+        "OLD",
+        "OK",
+    ]
+
+
+def test_telemetry_failure_does_not_stop_stdout_monitor(
+    tmp_path,
+    monkeypatch,
+    capsys,
+) -> None:
+    monkeypatch.setattr(
+        monitor,
+        "collect_snapshot",
+        lambda _root, unit=None, profile_path=None: {
+            "schema_version": 1,
+            "timestamp": "2026-07-11T00:00:00Z",
+            "status": "OK",
+            "warnings": [],
+        },
+    )
+    monkeypatch.setattr(
+        monitor,
+        "_append_snapshot_jsonl",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("disk unavailable")),
+    )
+
+    monitor.run_monitor(
+        tmp_path,
+        profile_path=None,
+        unit=None,
+        interval=5,
+        once=True,
+        output_format="jsonl",
+        stop_requested=lambda: False,
+        telemetry_output=tmp_path / "telemetry.jsonl",
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "WARN"
+    assert payload["warnings"][-1]["code"] == "telemetry_persistence_failed"
+
+
+def test_arena_latency_retains_pre_measurement_publication(tmp_path) -> None:
+    now_ns = 10_000_000_000
+    root = _fixture(tmp_path, now_ns=now_ns)
+    (root / "learner" / "model-history.jsonl").write_text(
+        json.dumps(
+            {
+                "model_identity": "candidate",
+                "model_step": 10,
+                "published_ns": now_ns - 2_000_000_000,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    _write_json(
+        root / "arena" / "evaluation.json",
+        {
+            "candidate": "candidate",
+            "baseline": "baseline",
+            "completed_ns": now_ns,
+            "promotion": {"decision": "promote"},
+            "aggregate": {
+                "elo_difference": 42.0,
+                "wins": 60,
+                "losses": 40,
+                "games": 100,
+            },
+            "per_ring": {"10": {"elo_difference": 42.0}},
+        },
+    )
+
+    history = monitor._arena_history(root, started_ns=now_ns - 1_000_000_000)
+
+    assert history["candidate_publications"] == 0
+    assert history["recent"][0]["publish_to_terminal_seconds"] == 2
 
 
 def test_monitor_shows_headline_segment_loader_and_result_kind_counts(

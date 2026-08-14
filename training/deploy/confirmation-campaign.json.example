@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "report": "startrain-elo-confirmation-campaign",
+  "state_path": "/var/lib/edgeconnect/elo-confirmation/campaign-state.json",
+  "seeds": [
+    {
+      "seed": 17,
+      "deployment_manifest": "/var/lib/edgeconnect/elo-confirmation/seed17/deployment.json",
+      "deployment_sha256": "<sha256>"
+    },
+    {
+      "seed": 18,
+      "deployment_manifest": "/var/lib/edgeconnect/elo-confirmation/seed18/deployment.json",
+      "deployment_sha256": "<sha256>"
+    },
+    {
+      "seed": 19,
+      "deployment_manifest": "/var/lib/edgeconnect/elo-confirmation/seed19/deployment.json",
+      "deployment_sha256": "<sha256>"
+    }
+  ],
+  "cross_seed": {
+    "policy": "/var/lib/edgeconnect/elo-confirmation/adoption-policy.json",
+    "policy_sha256": "<sha256>",
+    "output": "/var/lib/edgeconnect/elo-confirmation/cross-seed-comparison.json"
+  }
+}

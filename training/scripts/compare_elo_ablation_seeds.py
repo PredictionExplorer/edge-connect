@@ -20,14 +20,20 @@ import yaml
 
 if __package__:
     from .compare_elo_ablation import (
-        ONE_SIDED_95_NORMAL_QUANTILE,
+        PAIR_VALID_ERROR_PROBABILITY_PER_SIDE,
+        PAIR_VALID_LOWER_BOUND_METHOD,
         REPORT_NAME as PER_SEED_REPORT,
+        RING10_ONLY_RANKING_METRIC,
+        verify_pair_valid_frontier,
     )
     from .prepare_elo_ablation import verify_winner_snapshot
 else:
     from compare_elo_ablation import (
-        ONE_SIDED_95_NORMAL_QUANTILE,
+        PAIR_VALID_ERROR_PROBABILITY_PER_SIDE,
+        PAIR_VALID_LOWER_BOUND_METHOD,
         REPORT_NAME as PER_SEED_REPORT,
+        RING10_ONLY_RANKING_METRIC,
+        verify_pair_valid_frontier,
     )
     from prepare_elo_ablation import verify_winner_snapshot
 
@@ -38,10 +44,10 @@ REQUIRED_SEEDS = (17, 18, 19)
 RANKING_OBJECTIVE = "ring_10_only"
 TRAINING_OBJECTIVE = "ring10_only"
 PROMOTION_OBJECTIVE = "ring_10_only"
-RANKING_METRIC = "ring10_only_champion_frontier_elo_lcb_per_total_provisioned_wall_hour"
+RANKING_METRIC = RING10_ONLY_RANKING_METRIC
 TIME_BASIS = "measurement_started_ns_to_resource_released_ns"
 METRIC_SELECTION = "chronological_promotions_only"
-LCB_GATE_METHOD = "minimum_per_seed_conservative_difference_lcb"
+LCB_GATE_METHOD = "minimum_per_seed_paired_anytime_difference_lcb"
 MINIMUM_POLICY_MEDIAN_IMPROVEMENT = 0.20
 REQUIRED_CANARY_HOURS = 24.0
 REQUIRED_CANARY_GATES = frozenset(
@@ -101,7 +107,7 @@ class AdoptionPolicy:
 class _Metric:
     point_score: float
     lower_bound_score: float
-    conservative_standard_error_score: float
+    upper_bound_score: float
     total_provisioned_wall_hours: float
     winner_snapshot: dict[str, object]
     frontier: dict[str, object]
@@ -809,7 +815,6 @@ def _treatment_metric(
     treatment: Mapping[str, object],
     *,
     label: str,
-    normal_quantile: float,
     verify_snapshot_live: bool,
 ) -> _Metric:
     if (
@@ -824,7 +829,7 @@ def _treatment_metric(
         or treatment.get("ranking_objective") != RANKING_OBJECTIVE
     ):
         raise _ConfirmationError(f"{label} objective contract is incompatible")
-    hours, _started_ns, _cutoff_ns, _released_ns = _measurement_evidence(
+    hours, started_ns, cutoff_ns, _released_ns = _measurement_evidence(
         treatment,
         label=label,
     )
@@ -834,8 +839,24 @@ def _treatment_metric(
         or metric.get("objective") != TRAINING_OBJECTIVE
         or metric.get("time_basis") != TIME_BASIS
         or metric.get("selection") != METRIC_SELECTION
+        or metric.get("pair_valid") is not True
+        or metric.get("pair_observation_unit") != "complete-role-reversed-pair"
+        or metric.get("lower_bound_method") != PAIR_VALID_LOWER_BOUND_METHOD
     ):
         raise _ConfirmationError(f"{label} deployment metric contract is incompatible")
+    error_probability = _positive(
+        metric.get("familywise_error_probability_per_side"),
+        f"{label} familywise error probability",
+    )
+    if not math.isclose(
+        error_probability,
+        PAIR_VALID_ERROR_PROBABILITY_PER_SIDE,
+        rel_tol=1e-15,
+        abs_tol=1e-15,
+    ):
+        raise _ConfirmationError(
+            f"{label} familywise error probability is incompatible"
+        )
     metric_hours = _positive(
         metric.get("total_provisioned_wall_hours"),
         f"{label} metric wall hours",
@@ -848,28 +869,24 @@ def _treatment_metric(
         metric.get("champion_frontier_ring_10_elo_gained"),
         f"{label} frontier Elo gain",
     )
-    standard_error = _finite(
-        metric.get("champion_frontier_ring_10_elo_gain_conservative_standard_error"),
-        f"{label} frontier conservative standard error",
-    )
-    if standard_error < 0:
-        raise _ConfirmationError(
-            f"{label} frontier conservative standard error is negative"
-        )
     lower_gain = _finite(
         metric.get("champion_frontier_ring_10_elo_one_sided_95_lower_bound"),
         f"{label} frontier Elo lower bound",
     )
-    expected_lower_gain = gain - normal_quantile * standard_error
+    upper_gain = _finite(
+        metric.get("champion_frontier_ring_10_elo_one_sided_95_upper_bound"),
+        f"{label} frontier Elo upper bound",
+    )
     for observed, expected, field in (
         (point_score, gain / hours, "point score"),
         (lower_score, lower_gain / hours, "LCB score"),
-        (lower_gain, expected_lower_gain, "frontier lower bound"),
     ):
         if not math.isclose(observed, expected, rel_tol=1e-9, abs_tol=1e-9):
             raise _ConfirmationError(f"{label} {field} is internally inconsistent")
-    if lower_score > point_score:
-        raise _ConfirmationError(f"{label} LCB score exceeds its point score")
+    if lower_gain > gain or gain > upper_gain:
+        raise _ConfirmationError(
+            f"{label} pair-valid interval does not contain its point estimate"
+        )
     frontier = _mapping(
         treatment.get("champion_frontier"),
         f"{label} champion frontier",
@@ -883,31 +900,64 @@ def _treatment_metric(
         raise _ConfirmationError(f"{label} champion frontier step is invalid")
     if not frontier_identity:
         raise _ConfirmationError(f"{label} champion frontier identity is invalid")
+    if (
+        frontier.get("pair_valid") is not True
+        or frontier.get("pair_observation_unit") != "complete-role-reversed-pair"
+        or frontier.get("lower_bound_method") != PAIR_VALID_LOWER_BOUND_METHOD
+    ):
+        raise _ConfirmationError(f"{label} champion frontier is not pair-valid")
+    source = _mapping(
+        frontier.get("pair_valid_source"),
+        f"{label} pair-valid source",
+    )
+    treatment_root = (
+        Path(_string(treatment.get("run_root"), f"{label} treatment run root"))
+        .expanduser()
+        .resolve()
+    )
     anchor = _mapping(treatment.get("anchor"), f"{label} anchor")
-    anchor_rating = _finite(anchor.get("rating_elo"), f"{label} anchor rating")
-    anchor_standard_error = _finite(
-        anchor.get("standard_error_elo"),
-        f"{label} anchor standard error",
+    if (
+        Path(_string(source.get("run_root"), f"{label} pair-valid run root"))
+        .expanduser()
+        .resolve()
+        != treatment_root
+        or Path(_string(source.get("arena_root"), f"{label} pair-valid arena root"))
+        .expanduser()
+        .resolve()
+        != (treatment_root / "arena").resolve()
+        or source.get("anchor_identity") != anchor.get("identity")
+        or source.get("measurement_started_ns") != started_ns
+        or source.get("measurement_stopped_ns") != cutoff_ns
+    ):
+        raise _ConfirmationError(
+            f"{label} pair-valid source differs from validated treatment context"
+        )
+    frontier_error_probability = _positive(
+        frontier.get("familywise_error_probability_per_side"),
+        f"{label} frontier familywise error probability",
     )
-    frontier_rating = _finite(
-        frontier.get("rating_elo"),
-        f"{label} frontier rating",
-    )
-    frontier_standard_error = _finite(
-        frontier.get("standard_error_elo"),
-        f"{label} frontier standard error",
-    )
-    if anchor_standard_error < 0 or frontier_standard_error < 0:
-        raise _ConfirmationError(f"{label} anchor/frontier uncertainty is negative")
-    recomputed_gain = frontier_rating - anchor_rating
-    recomputed_standard_error = anchor_standard_error + frontier_standard_error
-    recomputed_lower_gain = (
-        recomputed_gain - normal_quantile * recomputed_standard_error
-    )
+    if not math.isclose(
+        frontier_error_probability,
+        PAIR_VALID_ERROR_PROBABILITY_PER_SIDE,
+        rel_tol=1e-15,
+        abs_tol=1e-15,
+    ):
+        raise _ConfirmationError(
+            f"{label} frontier familywise error probability is incompatible"
+        )
+    try:
+        verified_frontier = verify_pair_valid_frontier(frontier)
+    except ValueError as error:
+        raise _ConfirmationError(
+            f"{label} pair-valid frontier verification failed: {error}"
+        ) from error
+    recomputed_gain = verified_frontier["point_gain"]
+    recomputed_lower_gain = verified_frontier["lower_gain"]
+    recomputed_upper_gain = verified_frontier["upper_gain"]
     for observed, expected, field in (
         (gain, recomputed_gain, "frontier gain"),
-        (standard_error, recomputed_standard_error, "frontier standard error"),
         (lower_gain, recomputed_lower_gain, "frontier lower bound"),
+        (upper_gain, recomputed_upper_gain, "frontier upper bound"),
     ):
         if not math.isclose(observed, expected, rel_tol=1e-9, abs_tol=1e-9):
             raise _ConfirmationError(
@@ -922,7 +972,7 @@ def _treatment_metric(
     return _Metric(
         point_score=point_score,
         lower_bound_score=lower_score,
-        conservative_standard_error_score=standard_error / hours,
+        upper_bound_score=upper_gain / hours,
         total_provisioned_wall_hours=hours,
         winner_snapshot=snapshot,
         frontier=json.loads(json.dumps(dict(frontier), allow_nan=False)),
@@ -933,7 +983,6 @@ def _source_contract(
     document: Mapping[str, object],
     *,
     provisioned_gpus: int,
-    normal_quantile: float,
 ) -> dict[str, object]:
     guardrails = _mapping(
         document.get("guardrail_configuration"),
@@ -954,7 +1003,11 @@ def _source_contract(
         "provisioned_gpus": provisioned_gpus,
         "time_basis": TIME_BASIS,
         "metric_selection": METRIC_SELECTION,
-        "source_one_sided_normal_quantile": normal_quantile,
+        "pair_observation_unit": "complete-role-reversed-pair",
+        "pair_valid_lower_bound_method": PAIR_VALID_LOWER_BOUND_METHOD,
+        "familywise_error_probability_per_side": (
+            PAIR_VALID_ERROR_PROBABILITY_PER_SIDE
+        ),
     }
 
 
@@ -981,15 +1034,23 @@ def _validate_confirmation(
     if errors:
         raise _ConfirmationError("complete per-seed comparison contains errors")
     confidence = _mapping(document.get("confidence"), "per-seed confidence")
-    normal_quantile = _positive(
-        confidence.get("normal_quantile"),
-        "per-seed one-sided normal quantile",
+    confidence_error_probability = _positive(
+        confidence.get("familywise_error_probability_per_side"),
+        "per-seed familywise error probability",
     )
-    if confidence.get("sidedness") != "one-sided-lower" or not math.isclose(
-        normal_quantile,
-        ONE_SIDED_95_NORMAL_QUANTILE,
-        rel_tol=1e-15,
-        abs_tol=1e-15,
+    if (
+        confidence.get("sidedness") != "two-sided-familywise"
+        or confidence.get("method") != PAIR_VALID_LOWER_BOUND_METHOD
+        or confidence.get("normal_quantile") is not None
+        or confidence.get("observation_unit") != "complete-role-reversed-pair"
+        or confidence.get("link_error_spending")
+        != "error_probability_per_side / 2^(terminal_attempt_index + 1)"
+        or not math.isclose(
+            confidence_error_probability,
+            PAIR_VALID_ERROR_PROBABILITY_PER_SIDE,
+            rel_tol=1e-15,
+            abs_tol=1e-15,
+        )
     ):
         raise _ConfirmationError("per-seed confidence contract is incompatible")
     queue = _mapping(document.get("queue"), "per-seed queue evidence")
@@ -1101,13 +1162,11 @@ def _validate_confirmation(
     control = _treatment_metric(
         control_treatment,
         label=policy.control_treatment,
-        normal_quantile=normal_quantile,
         verify_snapshot_live=False,
     )
     candidate = _treatment_metric(
         candidate_treatment,
         label=policy.candidate_treatment,
-        normal_quantile=normal_quantile,
         verify_snapshot_live=True,
     )
     selector = _mapping(document.get("selector"), "per-seed selector")
@@ -1136,16 +1195,12 @@ def _validate_confirmation(
             "control point Elo/hour must be positive for relative improvement"
         )
     difference_point = candidate.point_score - control.point_score
-    difference_standard_error = (
-        candidate.conservative_standard_error_score
-        + control.conservative_standard_error_score
-    )
-    difference_lcb = difference_point - normal_quantile * difference_standard_error
+    difference_lcb = candidate.lower_bound_score - control.upper_bound_score
+    difference_ucb = candidate.upper_bound_score - control.lower_bound_score
     relative_improvement = difference_point / control.point_score
     contract = _source_contract(
         document,
         provisioned_gpus=provisioned_gpus,
-        normal_quantile=normal_quantile,
     )
     record = {
         "seed": seed,
@@ -1163,9 +1218,7 @@ def _validate_confirmation(
                 control.lower_bound_score
             ),
             "point_elo_per_total_provisioned_wall_hour": control.point_score,
-            "conservative_standard_error_per_total_provisioned_wall_hour": (
-                control.conservative_standard_error_score
-            ),
+            "upper_elo_per_total_provisioned_wall_hour": control.upper_bound_score,
             "total_provisioned_wall_hours": control.total_provisioned_wall_hours,
             "champion_frontier": control.frontier,
         },
@@ -1175,23 +1228,20 @@ def _validate_confirmation(
                 candidate.lower_bound_score
             ),
             "point_elo_per_total_provisioned_wall_hour": candidate.point_score,
-            "conservative_standard_error_per_total_provisioned_wall_hour": (
-                candidate.conservative_standard_error_score
-            ),
+            "upper_elo_per_total_provisioned_wall_hour": candidate.upper_bound_score,
             "total_provisioned_wall_hours": candidate.total_provisioned_wall_hours,
             "champion_frontier": candidate.frontier,
             "verified_winner_snapshot": candidate.winner_snapshot,
         },
         "advantage": {
             "point_elo_per_hour": difference_point,
-            "conservative_standard_error_per_hour": difference_standard_error,
             "one_sided_lower_bound_elo_per_hour": difference_lcb,
+            "one_sided_upper_bound_elo_per_hour": difference_ucb,
             "relative_point_elo_per_hour_improvement": relative_improvement,
             "method": (
-                "candidate_minus_control_point_advantage_less_source_quantile_times_"
-                "sum_of_conservative_rate_standard_errors"
+                "candidate_pair_valid_lower_bound_minus_control_pair_valid_upper_bound"
             ),
-            "source_one_sided_normal_quantile": normal_quantile,
+            "familywise_error_probability": (2 * PAIR_VALID_ERROR_PROBABILITY_PER_SIDE),
         },
     }
     return _SeedConfirmation(

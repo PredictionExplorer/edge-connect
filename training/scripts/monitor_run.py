@@ -4,9 +4,11 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import json
 import math
+import os
 import shutil
 import signal
 import sqlite3
@@ -45,6 +47,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--interval", type=float, default=60.0)
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--format", choices=("text", "jsonl"), default="text")
+    parser.add_argument(
+        "--telemetry-output",
+        type=Path,
+        help="append every full snapshot as durable JSONL; use --interval 5 for 5s GPU telemetry",
+    )
     return parser
 
 
@@ -555,7 +562,11 @@ def _number_string(value: str) -> float | None:
     return result if math.isfinite(result) else None
 
 
-def _replay_status(path: Path) -> tuple[dict[str, object], str | None]:
+def _replay_status(
+    path: Path,
+    *,
+    current_model_step: int | None = None,
+) -> tuple[dict[str, object], str | None]:
     if not path.is_file():
         return {}, "replay_manifest_missing"
     uri = f"{path.resolve().as_uri()}?mode=ro"
@@ -587,16 +598,110 @@ def _replay_status(path: Path) -> tuple[dict[str, object], str | None]:
             )
         }
         games = int(connection.execute("SELECT COUNT(*) FROM games").fetchone()[0])
+        columns = {
+            str(row["name"]) for row in connection.execute("PRAGMA table_info(shards)")
+        }
+        model_step_lag = None
+        if current_model_step is not None and "model_step" in columns:
+            step_rows = [
+                (int(row["model_step"]), int(row["samples"]))
+                for row in connection.execute(
+                    """
+                    SELECT model_step, COALESCE(SUM(sample_count), 0) AS samples
+                    FROM shards
+                    WHERE state = 'ready'
+                    GROUP BY model_step
+                    ORDER BY model_step DESC
+                    """,
+                )
+                if int(row["samples"]) > 0
+            ]
+            total_samples = sum(samples for _step, samples in step_rows)
+            ahead_samples = sum(
+                samples for step, samples in step_rows if step > current_model_step
+            )
+
+            def weighted_lag_quantile(quantile: float) -> int | None:
+                if not total_samples:
+                    return None
+                threshold = total_samples * quantile
+                observed = 0
+                for step, samples in step_rows:
+                    observed += samples
+                    if observed >= threshold:
+                        return current_model_step - step
+                return current_model_step - step_rows[-1][0]
+
+            weighted_mean_lag = (
+                sum(
+                    (current_model_step - step) * samples for step, samples in step_rows
+                )
+                / total_samples
+                if total_samples
+                else None
+            )
+            model_step_lag = {
+                "current_model_step": current_model_step,
+                "ready_samples": total_samples,
+                "ahead_samples": ahead_samples,
+                "ahead_max_steps": (
+                    max(
+                        0,
+                        max(
+                            (step - current_model_step for step, _samples in step_rows),
+                            default=0,
+                        ),
+                    )
+                ),
+                "minimum": (
+                    current_model_step - step_rows[0][0] if step_rows else None
+                ),
+                "weighted_mean": weighted_mean_lag,
+                "weighted_p50": weighted_lag_quantile(0.50),
+                "weighted_p90": weighted_lag_quantile(0.90),
+                "maximum": (
+                    current_model_step - step_rows[-1][0] if step_rows else None
+                ),
+            }
         connection.rollback()
         connection.close()
     except (OSError, sqlite3.Error) as error:
         return {}, f"replay_query_failed:{type(error).__name__}"
-    return {"states": states, "samples_by_ring": rings, "games": games}, None
+    return {
+        "states": states,
+        "samples_by_ring": rings,
+        "games": games,
+        "model_step_lag": model_step_lag,
+    }, None
 
 
-def _arena_history(run_root: Path, *, limit: int = 5) -> dict[str, object]:
+def _arena_history(
+    run_root: Path,
+    *,
+    limit: int = 5,
+    started_ns: int | None = None,
+) -> dict[str, object]:
     learner_root = run_root / "learner"
     steps: dict[str, int] = {}
+    all_publications: dict[str, int] = {}
+    publications: dict[str, int] = {}
+    for row in _recent_jsonl(
+        learner_root / "model-history.jsonl",
+        maximum_bytes=16 * 1024 * 1024,
+    ):
+        identity = row.get("model_identity")
+        step = row.get("model_step")
+        published_ns = row.get("published_ns")
+        if isinstance(identity, str) and isinstance(step, int):
+            steps[identity] = step
+        if (
+            isinstance(identity, str)
+            and isinstance(published_ns, int)
+            and not isinstance(published_ns, bool)
+        ):
+            all_publications[identity] = published_ns
+            if started_ns is None or published_ns >= started_ns:
+                publications[identity] = published_ns
     for manifest_path in (learner_root / "manifests").glob("manifest-*.json"):
         manifest = _read_json(manifest_path, attempts=1) or {}
         identity = manifest.get("model_identity")
@@ -661,6 +766,14 @@ def _arena_history(run_root: Path, *, limit: int = 5) -> dict[str, object]:
                 stat.st_size,
                 summary,
             )
+        evidence_ns = summary.get("completed_ns", summary.get("started_ns"))
+        if (
+            started_ns is not None
+            and isinstance(evidence_ns, int)
+            and not isinstance(evidence_ns, bool)
+            and evidence_ns < started_ns
+        ):
+            continue
         decision = summary.get("decision")
         if decision == "superseded":
             superseded += 1
@@ -678,13 +791,21 @@ def _arena_history(run_root: Path, *, limit: int = 5) -> dict[str, object]:
             lower_score = float(confidence[0])
             if 0 < lower_score < 1:
                 lower_elo = 400 * math.log10(lower_score / (1 - lower_score))
+        candidate = str(summary.get("candidate"))
+        published_ns = all_publications.get(candidate)
         completed.append(
             {
                 "result_kind": summary.get("result_kind", "promotion"),
                 "result_category": summary.get("result_category", "promotion"),
                 "completed_ns": completed_ns,
-                "candidate_step": steps.get(str(summary.get("candidate"))),
+                "candidate_step": steps.get(candidate),
                 "baseline_step": steps.get(str(summary.get("baseline"))),
+                "candidate_published_ns": published_ns,
+                "publish_to_terminal_seconds": (
+                    (completed_ns - published_ns) / 1_000_000_000
+                    if published_ns is not None and completed_ns >= published_ns
+                    else None
+                ),
                 "decision": decision,
                 "elo_difference": aggregate.get("elo_difference"),
                 "elo_lower": lower_elo,
@@ -713,11 +834,18 @@ def _arena_history(run_root: Path, *, limit: int = 5) -> dict[str, object]:
         for row in completed
     )
     promotion_evaluations = result_category_counts["promotion"]
+    candidate_publications = len(publications)
     return {
         "completed_evaluations": len(completed),
         "result_kind_counts": result_kind_counts,
         "result_category_counts": result_category_counts,
         "promotion_evaluations": promotion_evaluations,
+        "candidate_publications": candidate_publications,
+        "candidate_arrival_service_ratio": (
+            candidate_publications / promotion_evaluations
+            if promotion_evaluations
+            else None
+        ),
         "crossplay_evaluations": result_category_counts["crossplay"],
         "promotions": sum(row.get("decision") == "promote" for row in completed),
         "rejections": sum(
@@ -1525,7 +1653,16 @@ def collect_snapshot(
         ],
     }
 
-    replay, replay_error = _replay_status(root / "replay" / "manifest.sqlite3")
+    raw_learner_step = learner.get("step")
+    current_model_step = (
+        raw_learner_step
+        if isinstance(raw_learner_step, int) and not isinstance(raw_learner_step, bool)
+        else None
+    )
+    replay, replay_error = _replay_status(
+        root / "replay" / "manifest.sqlite3",
+        current_model_step=current_model_step,
+    )
     if replay_error:
         _add_warning(warnings, "WARN", "replay_query", replay_error)
     replay_states = _mapping(replay.get("states"))
@@ -1801,7 +1938,22 @@ def collect_snapshot(
     learner["selfplay_examples_published"] = cadence.get("selfplay_examples")
 
     arena = _read_json(root / "arena" / "promotion-status.json") or {}
-    arena_history = _arena_history(root)
+    raw_measurement_started_ns = ablation_metadata.get("measurement_started_ns")
+    measurement_started_ns = (
+        raw_measurement_started_ns
+        if isinstance(raw_measurement_started_ns, int)
+        and not isinstance(raw_measurement_started_ns, bool)
+        else objective_started_ns
+    )
+    arena_history = _arena_history(root, started_ns=measurement_started_ns)
+    arena_worker = _mapping(worker_map.get("arena-promotion"))
+    gpu7_actor = _mapping(worker_map.get("actor-gpu-7"))
+    arena_history["current_occupancy"] = {
+        "arena_running": arena_worker.get("state") == "running",
+        "gpu7_actor_paused": gpu7_actor.get("state") == "paused",
+        "arena_pid": arena_worker.get("pid"),
+        "gpu7_actor_pid": gpu7_actor.get("pid"),
+    }
     arena_config = _mapping(profile.get("arena"))
     weighted_promotion = _weighted_arena_progress(arena_config, arena_history)
     arena_history["weighted"] = weighted_promotion
@@ -2140,6 +2292,46 @@ def _seconds(value: object) -> str:
     return f"{number:.4f}s" if abs(number) < 0.01 else f"{_compact(number)}s"
 
 
+def _append_snapshot_jsonl(path: Path, snapshot: Mapping[str, object]) -> None:
+    output = path.expanduser().resolve()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    created = not output.exists()
+    line = (json.dumps(snapshot, sort_keys=True, separators=(",", ":")) + "\n").encode(
+        "utf-8"
+    )
+    with output.open("a+b") as stream:
+        fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+        try:
+            size = stream.seek(0, os.SEEK_END)
+            if size:
+                stream.seek(size - 1)
+                if stream.read(1) != b"\n":
+                    scan_end = size
+                    complete_offset = 0
+                    while scan_end > 0:
+                        scan_start = max(0, scan_end - 1024 * 1024)
+                        stream.seek(scan_start)
+                        block = stream.read(scan_end - scan_start)
+                        last_newline = block.rfind(b"\n")
+                        if last_newline >= 0:
+                            complete_offset = scan_start + last_newline + 1
+                            break
+                        scan_end = scan_start
+                    stream.truncate(complete_offset)
+            stream.seek(0, os.SEEK_END)
+            stream.write(line)
+            stream.flush()
+            os.fsync(stream.fileno())
+        finally:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+    if created:
+        directory = os.open(output.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+
+
 def run_monitor(
     run_root: Path,
     *,
@@ -2150,6 +2342,7 @@ def run_monitor(
     output_format: str,
     stop_requested: Callable[[], bool],
     continuity_state_path: Path | None = None,
+    telemetry_output: Path | None = None,
 ) -> None:
     next_tick = time.monotonic()
     while not stop_requested():
@@ -2181,11 +2374,24 @@ def run_monitor(
                     }
                 ],
             }
-        line = (
-            json.dumps(snapshot, sort_keys=True, separators=(",", ":"))
-            if output_format == "jsonl"
-            else format_text(snapshot)
-        )
+        if telemetry_output is not None:
+            try:
+                _append_snapshot_jsonl(telemetry_output, snapshot)
+            except OSError as error:
+                raw_warnings = snapshot.get("warnings")
+                warnings = raw_warnings if isinstance(raw_warnings, list) else []
+                warnings.append(
+                    {
+                        "severity": "WARN",
+                        "code": "telemetry_persistence_failed",
+                        "message": f"{type(error).__name__}: {error}",
+                    }
+                )
+                snapshot["warnings"] = warnings
+                if snapshot.get("status") == "OK":
+                    snapshot["status"] = "WARN"
+        serialized = json.dumps(snapshot, sort_keys=True, separators=(",", ":"))
+        line = serialized if output_format == "jsonl" else format_text(snapshot)
         print(line, flush=True)
         if once:
             return
@@ -2218,6 +2424,7 @@ def main(argv: list[str] | None = None) -> int:
         output_format=arguments.format,
         stop_requested=lambda: stopped,
         continuity_state_path=arguments.continuity_state,
+        telemetry_output=arguments.telemetry_output,
     )
     return 0
 

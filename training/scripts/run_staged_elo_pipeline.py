@@ -7,6 +7,8 @@ import argparse
 import hashlib
 import json
 import math
+import os
+import time
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -14,6 +16,11 @@ from typing import Any
 from startrain.runtime import atomic_json
 
 if __package__:
+    from .compare_elo_ablation_seeds import (
+        REQUIRED_SEEDS,
+        PinnedComparison,
+        build_cross_seed_comparison,
+    )
     from .fork_elo_ablation import fork_elo_ablation
     from .prepare_champion_warm_start import prepare_champion_warm_start
     from .prepare_elo_ablation import (
@@ -26,8 +33,17 @@ if __package__:
         verify_winner_snapshot,
         winner_snapshot_from_document,
     )
-    from .run_elo_ablation_queue import run_ablation_queue
+    from .run_elo_ablation_queue import (
+        exclusive_execution_lock,
+        exclusive_queue_lock,
+        run_ablation_queue,
+    )
 else:
+    from compare_elo_ablation_seeds import (
+        REQUIRED_SEEDS,
+        PinnedComparison,
+        build_cross_seed_comparison,
+    )
     from fork_elo_ablation import fork_elo_ablation
     from prepare_champion_warm_start import prepare_champion_warm_start
     from prepare_elo_ablation import (
@@ -40,15 +56,22 @@ else:
         verify_winner_snapshot,
         winner_snapshot_from_document,
     )
-    from run_elo_ablation_queue import run_ablation_queue
+    from run_elo_ablation_queue import (
+        exclusive_execution_lock,
+        exclusive_queue_lock,
+        run_ablation_queue,
+    )
 
 SCHEMA_VERSION = 1
 PIPELINE_REPORT = "startrain-staged-elo-pipeline"
 PIPELINE_STATE_REPORT = "startrain-staged-elo-pipeline-state"
 FUTILITY_REPORT = "startrain-elo-futility-policy"
 FUTILITY_EVALUATION_REPORT = "startrain-elo-futility-evaluation"
+CONFIRMATION_CAMPAIGN_REPORT = "startrain-elo-confirmation-campaign"
+CONFIRMATION_CAMPAIGN_STATE_REPORT = "startrain-elo-confirmation-campaign-state"
 
 QueueRunner = Callable[..., dict[str, object]]
+CrossSeedBuilder = Callable[..., dict[str, object]]
 Preparer = Callable[..., dict[str, object]]
 Forker = Callable[..., dict[str, object]]
 WarmStarter = Callable[..., dict[str, object]]
@@ -60,8 +83,10 @@ class StagedEloPipelineError(RuntimeError):
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--pipeline", type=Path, required=True)
-    parser.add_argument("--stage-index", type=int, required=True)
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--pipeline", type=Path)
+    source.add_argument("--confirmation-campaign", type=Path)
+    parser.add_argument("--stage-index", type=int)
     return parser
 
 
@@ -77,12 +102,49 @@ def _read_json(path: Path) -> dict[str, Any]:
     return loaded
 
 
+def _read_json_with_digest(path: Path) -> tuple[dict[str, Any], str]:
+    try:
+        payload = path.read_bytes()
+        loaded = json.loads(payload)
+    except (OSError, json.JSONDecodeError) as error:
+        raise StagedEloPipelineError(
+            f"cannot read JSON object {path}: {type(error).__name__}: {error}"
+        ) from error
+    if not isinstance(loaded, dict):
+        raise StagedEloPipelineError(f"{path} must contain a JSON object")
+    return loaded, hashlib.sha256(payload).hexdigest()
+
+
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as stream:
         for block in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def _write_immutable_json(path: Path, document: Mapping[str, object]) -> None:
+    output = path.expanduser().resolve()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    temporary = output.with_name(f".{output.name}.{os.getpid()}.{time.time_ns()}.tmp")
+    serialized = json.dumps(document, indent=2, sort_keys=True, allow_nan=False) + "\n"
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            descriptor = -1
+            stream.write(serialized)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.link(temporary, output)
+        directory = os.open(output.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        temporary.unlink(missing_ok=True)
 
 
 def _mapping(value: object, name: str) -> dict[str, Any]:
@@ -717,10 +779,583 @@ def advance_staged_elo_pipeline(
     return state
 
 
-def _error_document(error: Exception) -> dict[str, object]:
+def _sha256_pin(value: object, name: str) -> str:
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value.lower())
+    ):
+        raise StagedEloPipelineError(f"{name} must be a SHA-256 digest")
+    return value.lower()
+
+
+def _campaign_seed_specs(
+    campaign: Mapping[str, object],
+) -> tuple[list[dict[str, object]], Path, set[Path]]:
+    raw_seeds = _list(campaign.get("seeds"), "confirmation campaign seeds")
+    specs = []
+    observed_seeds = []
+    execution_locks: set[Path] = set()
+    protected_paths: list[Path] = []
+    for index, raw_seed in enumerate(raw_seeds):
+        seed_spec = _mapping(raw_seed, f"confirmation seed {index}")
+        seed = seed_spec.get("seed")
+        if type(seed) is not int:
+            raise StagedEloPipelineError("confirmation seed must be an integer")
+        manifest_path = (
+            Path(
+                _string(
+                    seed_spec.get("deployment_manifest"),
+                    f"seed {seed} deployment manifest",
+                )
+            )
+            .expanduser()
+            .resolve()
+        )
+        manifest_sha256 = _sha256_pin(
+            seed_spec.get("deployment_sha256"),
+            f"seed {seed} deployment SHA-256",
+        )
+        if not manifest_path.is_file():
+            raise StagedEloPipelineError(
+                f"seed {seed} deployment manifest is missing or changed"
+            )
+        manifest, observed_manifest_sha256 = _read_json_with_digest(manifest_path)
+        if observed_manifest_sha256 != manifest_sha256:
+            raise StagedEloPipelineError(
+                f"seed {seed} deployment manifest is missing or changed"
+            )
+        queue = _mapping(manifest.get("queue"), f"seed {seed} deployment queue")
+        if queue.get("seed") != seed:
+            raise StagedEloPipelineError(
+                f"seed {seed} deployment queue declares a different seed"
+            )
+        execution_lock = (
+            Path(
+                _string(
+                    queue.get("execution_lock_path"),
+                    f"seed {seed} execution lock",
+                )
+            )
+            .expanduser()
+            .resolve()
+        )
+        comparison_output = (
+            Path(
+                _string(
+                    queue.get("comparison_output"),
+                    f"seed {seed} comparison output",
+                )
+            )
+            .expanduser()
+            .resolve()
+        )
+        queue_state_path = (
+            Path(
+                _string(
+                    queue.get("state_path"),
+                    f"seed {seed} queue state",
+                )
+            )
+            .expanduser()
+            .resolve()
+        )
+        handoff_output = (
+            Path(
+                _string(
+                    queue.get("continuity_handoff_output"),
+                    f"seed {seed} continuity handoff output",
+                )
+            )
+            .expanduser()
+            .resolve()
+        )
+        execution_locks.add(execution_lock)
+        protected_paths.extend(
+            (
+                manifest_path,
+                queue_state_path,
+                comparison_output,
+                handoff_output,
+            )
+        )
+        observed_seeds.append(seed)
+        specs.append(
+            {
+                "seed": seed,
+                "deployment_manifest": manifest_path,
+                "deployment_sha256": manifest_sha256,
+                "comparison_output": comparison_output,
+                "execution_lock": execution_lock,
+                "queue_state_path": queue_state_path,
+                "handoff_output": handoff_output,
+            }
+        )
+    if tuple(sorted(observed_seeds)) != REQUIRED_SEEDS or len(
+        set(observed_seeds)
+    ) != len(observed_seeds):
+        raise StagedEloPipelineError(
+            f"confirmation campaign seeds must be exactly {list(REQUIRED_SEEDS)}"
+        )
+    if len(execution_locks) != 1:
+        raise StagedEloPipelineError(
+            "all confirmation seeds must share one host execution lock"
+        )
+    if len(set(protected_paths)) != len(protected_paths):
+        raise StagedEloPipelineError(
+            "confirmation seed manifests, states, comparisons, and handoffs "
+            "must use distinct paths"
+        )
+
+    def seed_order(spec: Mapping[str, object]) -> int:
+        raw_seed = spec.get("seed")
+        assert type(raw_seed) is int
+        return raw_seed
+
+    specs.sort(key=seed_order)
+    return specs, next(iter(execution_locks)), set(protected_paths)
+
+
+def _campaign_state(
+    *,
+    state_path: Path,
+    campaign_path: Path,
+    campaign_sha256: str,
+) -> dict[str, object]:
+    if state_path.is_file():
+        state = _read_json(state_path)
+        if (
+            state.get("schema_version") != SCHEMA_VERSION
+            or state.get("report") != CONFIRMATION_CAMPAIGN_STATE_REPORT
+            or state.get("campaign") != str(campaign_path)
+            or state.get("campaign_sha256") != campaign_sha256
+        ):
+            raise StagedEloPipelineError(
+                "confirmation campaign state does not match its immutable campaign"
+            )
+        if not isinstance(state.get("seeds"), list):
+            raise StagedEloPipelineError("confirmation campaign seed state is invalid")
+        return state
     return {
         "schema_version": SCHEMA_VERSION,
-        "report": PIPELINE_STATE_REPORT,
+        "report": CONFIRMATION_CAMPAIGN_STATE_REPORT,
+        "status": "pending",
+        "campaign": str(campaign_path),
+        "campaign_sha256": campaign_sha256,
+        "seeds": [],
+        "cross_seed": None,
+        "automatic_adoption_authorized": False,
+    }
+
+
+def _campaign_seed_record(
+    state: Mapping[str, object],
+    seed: int,
+) -> dict[str, object] | None:
+    records = state.get("seeds")
+    if not isinstance(records, list):
+        return None
+    return next(
+        (
+            dict(record)
+            for record in records
+            if isinstance(record, Mapping) and record.get("seed") == seed
+        ),
+        None,
+    )
+
+
+def _upsert_campaign_seed(
+    state: dict[str, object],
+    record: Mapping[str, object],
+) -> None:
+    records = _list(state.get("seeds"), "confirmation campaign seed state")
+    seed = record.get("seed")
+    state["seeds"] = [
+        *[
+            existing
+            for existing in records
+            if not isinstance(existing, Mapping) or existing.get("seed") != seed
+        ],
+        dict(record),
+    ]
+    cast_records = state["seeds"]
+    assert isinstance(cast_records, list)
+
+    def seed_order(existing: object) -> int:
+        raw_seed = existing.get("seed") if isinstance(existing, Mapping) else None
+        return raw_seed if type(raw_seed) is int else -1
+
+    cast_records.sort(key=seed_order)
+
+
+def _verified_completed_queue(
+    queue_state: Mapping[str, object],
+    *,
+    seed: int,
+    handoff_output: Path,
+    manifest_path: Path,
+) -> None:
+    finalization = _mapping(
+        queue_state.get("finalization"),
+        f"seed {seed} queue finalization",
+    )
+    if (
+        queue_state.get("queue_status") != "completed"
+        or finalization.get("status") != "completed"
+        or finalization.get("comparison_status") != "complete"
+    ):
+        raise StagedEloPipelineError(
+            f"seed {seed} queue did not complete with a verified comparison"
+        )
+    arms = _list(queue_state.get("arms"), f"seed {seed} queue arms")
+    if not arms:
+        raise StagedEloPipelineError(f"seed {seed} queue has no completed arms")
+    for arm in arms:
+        if not isinstance(arm, Mapping):
+            raise StagedEloPipelineError(f"seed {seed} queue arm is invalid")
+        cutoff_ns = arm.get("measurement_cutoff_ns")
+        released_ns = arm.get("resource_released_ns")
+        teardown = arm.get("teardown")
+        completion_status = arm.get("completion_status")
+        clean_completion = (
+            completion_status == "complete" and arm.get("teardown_status") == "clean"
+        )
+        verified_warning = (
+            completion_status == "complete_with_warning"
+            and arm.get("failure_phase") == "post_cutoff"
+            and arm.get("integrity_status")
+            in {"ok", "pass", "passed", "valid", "verified", "healthy"}
+            and arm.get("teardown_status") not in {"resources_not_released", None}
+        )
+        if (
+            arm.get("status") != "completed"
+            or not (clean_completion or verified_warning)
+            or type(cutoff_ns) is not int
+            or cutoff_ns <= 0
+            or type(released_ns) is not int
+            or released_ns < cutoff_ns
+            or not isinstance(teardown, Mapping)
+            or teardown.get("process_group_released") is not True
+            or teardown.get("resource_released_ns") != released_ns
+        ):
+            raise StagedEloPipelineError(
+                f"seed {seed} queue did not prove ordered arm resource release"
+            )
+    handoff = _mapping(
+        queue_state.get("continuity_handoff"),
+        f"seed {seed} continuity handoff",
+    )
+    if (
+        handoff.get("requested") is not True
+        or handoff.get("status") != "requested"
+        or handoff.get("action") != "request_fallback"
+        or handoff.get("requested_action") != "reconcile_training_continuity"
+        or handoff.get("reason") != "queue_completed"
+        or Path(str(handoff.get("path"))).expanduser().resolve() != handoff_output
+        or not handoff_output.is_file()
+    ):
+        raise StagedEloPipelineError(
+            f"seed {seed} queue did not preserve verified LKG fallback"
+        )
+    persisted_handoff = _read_json(handoff_output)
+    source = persisted_handoff.get("source")
+    if (
+        persisted_handoff.get("schema_version") != SCHEMA_VERSION
+        or persisted_handoff.get("report") != "startrain-continuity-handoff-request"
+        or persisted_handoff.get("requested") is not True
+        or persisted_handoff.get("status") != "requested"
+        or persisted_handoff.get("action") != "request_fallback"
+        or persisted_handoff.get("requested_action") != "reconcile_training_continuity"
+        or persisted_handoff.get("reason") != "queue_completed"
+        or not isinstance(source, Mapping)
+        or source.get("kind") != "elo_ablation_queue"
+        or Path(str(source.get("manifest"))).expanduser().resolve()
+        != manifest_path.expanduser().resolve()
+        or source.get("queue_status") != "completed"
+    ):
+        raise StagedEloPipelineError(
+            f"seed {seed} durable continuity fallback is invalid"
+        )
+
+
+def run_confirmation_campaign(
+    campaign_path: Path,
+    *,
+    queue_runner: QueueRunner = run_ablation_queue,
+    cross_seed_builder: CrossSeedBuilder = build_cross_seed_comparison,
+) -> dict[str, object]:
+    """Run three pinned seed queues under one host lock, then compare them."""
+    path = campaign_path.expanduser().resolve()
+    campaign, campaign_sha256 = _read_json_with_digest(path)
+    if (
+        campaign.get("schema_version") != SCHEMA_VERSION
+        or campaign.get("report") != CONFIRMATION_CAMPAIGN_REPORT
+    ):
+        raise StagedEloPipelineError("unsupported confirmation campaign")
+    state_path = (
+        Path(_string(campaign.get("state_path"), "campaign state path"))
+        .expanduser()
+        .resolve()
+    )
+    cross_seed = _mapping(campaign.get("cross_seed"), "campaign cross-seed plan")
+    policy_path = (
+        Path(_string(cross_seed.get("policy"), "campaign adoption policy"))
+        .expanduser()
+        .resolve()
+    )
+    policy_sha256 = _sha256_pin(
+        cross_seed.get("policy_sha256"),
+        "campaign adoption policy SHA-256",
+    )
+    output_path = (
+        Path(_string(cross_seed.get("output"), "campaign cross-seed output"))
+        .expanduser()
+        .resolve()
+    )
+    if not policy_path.is_file() or _sha256(policy_path) != policy_sha256:
+        raise StagedEloPipelineError("campaign adoption policy is missing or changed")
+    specs, execution_lock_path, protected_paths = _campaign_seed_specs(campaign)
+    all_paths = [
+        *protected_paths,
+        path,
+        state_path,
+        policy_path,
+        output_path,
+        execution_lock_path,
+    ]
+    if len(set(all_paths)) != len(all_paths):
+        raise StagedEloPipelineError(
+            "campaign, state, policy, lock, manifests, queue states, comparisons, "
+            "handoffs, and cross-seed output must use distinct paths"
+        )
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    campaign_state_lock = exclusive_queue_lock(state_path)
+    campaign_state_lock.__enter__()
+    state: dict[str, object] | None = None
+    pinned_comparisons: list[PinnedComparison] = []
+    try:
+        with exclusive_execution_lock(execution_lock_path) as execution_lock_lease:
+            locked_campaign, locked_campaign_sha256 = _read_json_with_digest(path)
+            if locked_campaign_sha256 != campaign_sha256 or locked_campaign != campaign:
+                raise StagedEloPipelineError(
+                    "confirmation campaign changed before lock acquisition"
+                )
+            if _sha256(policy_path) != policy_sha256:
+                raise StagedEloPipelineError(
+                    "campaign adoption policy changed before execution"
+                )
+            state = _campaign_state(
+                state_path=state_path,
+                campaign_path=path,
+                campaign_sha256=campaign_sha256,
+            )
+            previous_cross_seed = state.get("cross_seed")
+            state["status"] = "running"
+            for stale in (
+                "error",
+                "continuity_fallback_expected",
+                "operator_execution_required",
+            ):
+                state.pop(stale, None)
+            atomic_json(state_path, state)
+            for spec in specs:
+                raw_seed = spec["seed"]
+                assert type(raw_seed) is int
+                seed = raw_seed
+                manifest_path = spec["deployment_manifest"]
+                comparison_output = spec["comparison_output"]
+                queue_state_path = spec["queue_state_path"]
+                handoff_output = spec["handoff_output"]
+                assert isinstance(manifest_path, Path)
+                assert isinstance(comparison_output, Path)
+                assert isinstance(queue_state_path, Path)
+                assert isinstance(handoff_output, Path)
+                manifest_sha256 = str(spec["deployment_sha256"])
+                existing = _campaign_seed_record(state, seed)
+                if existing is not None and existing.get("status") == "completed":
+                    comparison_sha256 = _sha256_pin(
+                        existing.get("comparison_sha256"),
+                        f"seed {seed} comparison SHA-256",
+                    )
+                    if (
+                        existing.get("deployment_sha256") != manifest_sha256
+                        or not comparison_output.is_file()
+                        or _sha256(comparison_output) != comparison_sha256
+                    ):
+                        raise StagedEloPipelineError(
+                            f"seed {seed} completed campaign evidence changed"
+                        )
+                    if not queue_state_path.is_file():
+                        raise StagedEloPipelineError(
+                            f"seed {seed} completed queue state is missing"
+                        )
+                    _verified_completed_queue(
+                        _read_json(queue_state_path),
+                        seed=seed,
+                        handoff_output=handoff_output,
+                        manifest_path=manifest_path,
+                    )
+                    pinned_comparisons.append(
+                        PinnedComparison(seed, comparison_output, comparison_sha256)
+                    )
+                    continue
+                if _sha256(manifest_path) != manifest_sha256:
+                    raise StagedEloPipelineError(
+                        f"seed {seed} deployment manifest changed before execution"
+                    )
+                _upsert_campaign_seed(
+                    state,
+                    {
+                        "seed": seed,
+                        "status": "running",
+                        "deployment_manifest": str(manifest_path),
+                        "deployment_sha256": manifest_sha256,
+                        "comparison": str(comparison_output),
+                    },
+                )
+                atomic_json(state_path, state)
+                queue_state = queue_runner(
+                    manifest_path,
+                    execution_lock_lease=execution_lock_lease,
+                    expected_manifest_sha256=manifest_sha256,
+                )
+                _verified_completed_queue(
+                    queue_state,
+                    seed=seed,
+                    handoff_output=handoff_output,
+                    manifest_path=manifest_path,
+                )
+                if not queue_state_path.is_file():
+                    raise StagedEloPipelineError(
+                        f"seed {seed} durable queue state is missing"
+                    )
+                _verified_completed_queue(
+                    _read_json(queue_state_path),
+                    seed=seed,
+                    handoff_output=handoff_output,
+                    manifest_path=manifest_path,
+                )
+                if not comparison_output.is_file():
+                    raise StagedEloPipelineError(
+                        f"seed {seed} comparison output is missing"
+                    )
+                comparison_sha256 = _sha256(comparison_output)
+                pinned_comparisons.append(
+                    PinnedComparison(seed, comparison_output, comparison_sha256)
+                )
+                _upsert_campaign_seed(
+                    state,
+                    {
+                        "seed": seed,
+                        "status": "completed",
+                        "deployment_manifest": str(manifest_path),
+                        "deployment_sha256": manifest_sha256,
+                        "comparison": str(comparison_output),
+                        "comparison_sha256": comparison_sha256,
+                        "queue_status": queue_state.get("queue_status"),
+                        "resource_release_verified": True,
+                        "continuity_fallback_preserved": True,
+                    },
+                )
+                atomic_json(state_path, state)
+            report = cross_seed_builder(
+                pinned_comparisons,
+                policy_path=policy_path,
+                policy_sha256=policy_sha256,
+            )
+            report_semantic_sha256 = hashlib.sha256(
+                json.dumps(
+                    report,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                ).encode("utf-8")
+            ).hexdigest()
+            previous_cross = (
+                previous_cross_seed
+                if isinstance(previous_cross_seed, Mapping)
+                else None
+            )
+            if output_path.is_file():
+                previous_status = (
+                    previous_cross.get("status") if previous_cross is not None else None
+                )
+                previous_digest = (
+                    previous_cross.get("sha256") if previous_cross is not None else None
+                )
+                previous_semantic_sha256 = (
+                    previous_cross.get("report_semantic_sha256")
+                    if previous_cross is not None
+                    else None
+                )
+                pinned_completed = (
+                    previous_status in {"eligible", "ineligible"}
+                    and isinstance(previous_digest, str)
+                    and _sha256(output_path) == previous_digest
+                )
+                recoverable_publish = (
+                    previous_status == "publishing"
+                    and previous_semantic_sha256 == report_semantic_sha256
+                )
+                if (
+                    not (pinned_completed or recoverable_publish)
+                    or _read_json(output_path) != report
+                ):
+                    raise StagedEloPipelineError(
+                        "existing cross-seed output is unpinned or differs from evidence"
+                    )
+            else:
+                state["cross_seed"] = {
+                    "output": str(output_path),
+                    "status": "publishing",
+                    "report_semantic_sha256": report_semantic_sha256,
+                }
+                atomic_json(state_path, state)
+                _write_immutable_json(output_path, report)
+            output_sha256 = _sha256(output_path)
+            state.update(
+                {
+                    "status": "completed",
+                    "cross_seed": {
+                        "output": str(output_path),
+                        "sha256": output_sha256,
+                        "status": report.get("status"),
+                        "eligible": report.get("eligible"),
+                        "report_semantic_sha256": report_semantic_sha256,
+                    },
+                    "automatic_adoption_authorized": False,
+                    "operator_execution_required": True,
+                }
+            )
+            state.pop("continuity_fallback_expected", None)
+            atomic_json(state_path, state)
+            return state
+    except Exception as error:
+        if state is not None:
+            state.update(
+                {
+                    "status": "failed",
+                    "error": f"{type(error).__name__}: {error}",
+                    "continuity_fallback_expected": True,
+                    "automatic_adoption_authorized": False,
+                }
+            )
+            state.pop("operator_execution_required", None)
+            atomic_json(state_path, state)
+        raise
+    finally:
+        campaign_state_lock.__exit__(None, None, None)
+
+
+def _error_document(
+    error: Exception,
+    *,
+    report: str = PIPELINE_STATE_REPORT,
+) -> dict[str, object]:
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "report": report,
         "status": "error",
         "error": f"{type(error).__name__}: {error}",
     }
@@ -729,10 +1364,21 @@ def _error_document(error: Exception) -> dict[str, object]:
 def main(argv: list[str] | None = None) -> int:
     arguments = _parser().parse_args(argv)
     try:
-        state = advance_staged_elo_pipeline(
-            arguments.pipeline,
-            stage_index=arguments.stage_index,
-        )
+        if arguments.confirmation_campaign is not None:
+            if arguments.stage_index is not None:
+                raise StagedEloPipelineError(
+                    "--stage-index cannot be used with --confirmation-campaign"
+                )
+            state = run_confirmation_campaign(arguments.confirmation_campaign)
+        else:
+            if arguments.stage_index is None:
+                raise StagedEloPipelineError(
+                    "--stage-index is required with --pipeline"
+                )
+            state = advance_staged_elo_pipeline(
+                arguments.pipeline,
+                stage_index=arguments.stage_index,
+            )
     except (
         FileExistsError,
         FileNotFoundError,
@@ -741,7 +1387,18 @@ def main(argv: list[str] | None = None) -> int:
         TypeError,
         ValueError,
     ) as error:
-        print(json.dumps(_error_document(error), sort_keys=True, allow_nan=False))
+        error_report = (
+            CONFIRMATION_CAMPAIGN_STATE_REPORT
+            if arguments.confirmation_campaign is not None
+            else PIPELINE_STATE_REPORT
+        )
+        print(
+            json.dumps(
+                _error_document(error, report=error_report),
+                sort_keys=True,
+                allow_nan=False,
+            )
+        )
         return 2
     print(json.dumps(state, sort_keys=True, allow_nan=False))
     return 0

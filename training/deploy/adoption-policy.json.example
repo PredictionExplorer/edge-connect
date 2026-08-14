@@ -16,7 +16,7 @@
   },
   "minimum_median_point_elo_per_hour_improvement": 0.2,
   "cross_seed_lcb_gate": {
-    "method": "minimum_per_seed_conservative_difference_lcb",
+    "method": "minimum_per_seed_paired_anytime_difference_lcb",
     "minimum_advantage_elo_per_hour": 0.0,
     "require_strictly_positive": true
   },

@@ -15,7 +15,7 @@ import sqlite3
 import subprocess
 import time
 from collections.abc import Callable, Iterator, Mapping
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -68,6 +68,7 @@ _CLEAN_TEARDOWN_STATUSES = frozenset(
 )
 _COMMIT_PATTERN = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
+_EXECUTION_LOCK_LEASE_TOKEN = object()
 _BACKUP_SCRIPT_NAME = "replay_manifest_backup.py"
 _BASE_SCRIPT_NAMES = (
     "check_training_ipc.py",
@@ -86,6 +87,45 @@ class AblationQueueError(RuntimeError):
 
 class QueueBusyError(AblationQueueError):
     """Raised when another queue process owns the exclusive state lock."""
+
+
+class ExecutionLockLease:
+    """Opaque proof that this process currently owns one host execution lock."""
+
+    __slots__ = ("_active", "_descriptor", "_token", "path")
+
+    def __init__(
+        self,
+        path: Path,
+        descriptor: int,
+        *,
+        token: object,
+    ) -> None:
+        if token is not _EXECUTION_LOCK_LEASE_TOKEN:
+            raise TypeError("execution lock leases can only be acquired")
+        self.path = path
+        self._descriptor = descriptor
+        self._token = token
+        self._active = True
+
+    def _invalidate(self) -> None:
+        self._active = False
+
+    def verify(self, expected_path: Path) -> None:
+        if (
+            self._token is not _EXECUTION_LOCK_LEASE_TOKEN
+            or not self._active
+            or self.path != expected_path.expanduser().resolve()
+        ):
+            raise AblationQueueError(
+                "active execution lock lease differs from the deployment manifest"
+            )
+        try:
+            os.fstat(self._descriptor)
+        except OSError as error:
+            raise AblationQueueError(
+                "execution lock lease is no longer active"
+            ) from error
 
 
 class ArmRunner(Protocol):
@@ -921,9 +961,24 @@ def generate_deployment_manifest(
     return manifest
 
 
-def _load_deployment_manifest(path: Path) -> tuple[Path, dict[str, Any]]:
+def _load_deployment_manifest(
+    path: Path,
+    *,
+    expected_sha256: str | None = None,
+) -> tuple[Path, dict[str, Any]]:
     manifest_path = path.expanduser().resolve()
-    manifest = _read_json(manifest_path)
+    try:
+        payload = manifest_path.read_bytes()
+        manifest = json.loads(payload)
+    except (OSError, json.JSONDecodeError) as error:
+        raise AblationQueueError(
+            f"cannot read JSON object {manifest_path}: {type(error).__name__}: {error}"
+        ) from error
+    if not isinstance(manifest, dict):
+        raise AblationQueueError(f"{manifest_path} must contain a JSON object")
+    observed_sha256 = hashlib.sha256(payload).hexdigest()
+    if expected_sha256 is not None and observed_sha256 != expected_sha256:
+        raise AblationQueueError("deployment manifest differs from its external pin")
     if (
         manifest.get("schema_version") != SCHEMA_VERSION
         or manifest.get("report") != DEPLOYMENT_REPORT
@@ -1225,9 +1280,13 @@ def verify_deployment_manifest(
     *,
     current_source_commit: str | None = None,
     source_tree_clean: bool | None = None,
+    expected_manifest_sha256: str | None = None,
 ) -> dict[str, object]:
     """Verify revision identity and every launch-critical artifact digest."""
-    resolved_path, manifest = _load_deployment_manifest(manifest_path)
+    resolved_path, manifest = _load_deployment_manifest(
+        manifest_path,
+        expected_sha256=expected_manifest_sha256,
+    )
     source = _mapping(manifest.get("source"), "deployment source")
     expected_commit = _commit(source.get("commit"), "deployment source commit")
     training_dir = (
@@ -1566,13 +1625,32 @@ def exclusive_queue_lock(state_path: Path) -> Iterator[Path]:
 
 
 @contextmanager
-def exclusive_execution_lock(lock_path: Path) -> Iterator[Path]:
+def exclusive_execution_lock(lock_path: Path) -> Iterator[ExecutionLockLease]:
     """Prevent distinct ablation deployments from sharing one host."""
-    with _exclusive_lock(
-        lock_path.expanduser().resolve(),
-        "ablation execution",
-    ) as acquired:
-        yield acquired
+    resolved = lock_path.expanduser().resolve()
+    resolved.parent.mkdir(parents=True, exist_ok=True)
+    descriptor = os.open(resolved, os.O_RDWR | os.O_CREAT, 0o600)
+    lease: ExecutionLockLease | None = None
+    try:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise QueueBusyError(
+                f"another ablation execution owns {resolved}"
+            ) from error
+        lease = ExecutionLockLease(
+            resolved,
+            descriptor,
+            token=_EXECUTION_LOCK_LEASE_TOKEN,
+        )
+        yield lease
+    finally:
+        if lease is not None:
+            lease._invalidate()
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
 
 
 def _state_arms(state: Mapping[str, object]) -> list[dict[str, Any]]:
@@ -2341,18 +2419,30 @@ def run_ablation_queue(
     current_source_commit: str | None = None,
     source_tree_clean: bool | None = None,
     sleep: Callable[[float], None] = time.sleep,
+    execution_lock_lease: ExecutionLockLease | None = None,
+    expected_manifest_sha256: str | None = None,
 ) -> dict[str, object]:
     """Run pending arms exclusively and resume stale running state safely."""
-    resolved_manifest, manifest = _load_deployment_manifest(manifest_path)
+    resolved_manifest, manifest = _load_deployment_manifest(
+        manifest_path,
+        expected_sha256=expected_manifest_sha256,
+    )
     queue = _queue_config(manifest)
     policy = _mapping(queue.get("policy"), "queue policy")
     replay_backup_policy = _replay_backup_policy(queue)
     state_path = _state_path(manifest)
-    execution_lock_path = Path(
-        _string(queue.get("execution_lock_path"), "execution lock path")
+    execution_lock_path = (
+        Path(_string(queue.get("execution_lock_path"), "execution lock path"))
+        .expanduser()
+        .resolve()
     )
+    if execution_lock_lease is not None:
+        execution_lock_lease.verify(execution_lock_path)
+        execution_lock_context = nullcontext(execution_lock_lease)
+    else:
+        execution_lock_context = exclusive_execution_lock(execution_lock_path)
     with (
-        exclusive_execution_lock(execution_lock_path),
+        execution_lock_context,
         exclusive_queue_lock(state_path),
     ):
         state = _load_or_create_state(
@@ -2365,6 +2455,7 @@ def run_ablation_queue(
                 resolved_manifest,
                 current_source_commit=current_source_commit,
                 source_tree_clean=source_tree_clean,
+                expected_manifest_sha256=expected_manifest_sha256,
             )
             _reconcile_arms(state)
             _ensure_terminal_replay_backups(
@@ -2400,6 +2491,7 @@ def run_ablation_queue(
                     resolved_manifest,
                     current_source_commit=current_source_commit,
                     source_tree_clean=source_tree_clean,
+                    expected_manifest_sha256=expected_manifest_sha256,
                 )
                 pending["status"] = "running"
                 pending["attempts"] = int(pending.get("attempts", 0)) + 1

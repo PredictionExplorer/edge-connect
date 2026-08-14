@@ -870,7 +870,20 @@ Stop only the monitor with:
 screen -S "$MONITOR_SESSION" -X quit
 ```
 
-For structured ingestion, use `--format jsonl`. A one-shot status check is:
+For durable phase-aware telemetry, run a second monitor at five-second cadence:
+
+```bash
+"$MONITOR_PYTHON" -u "$MONITOR_TRAINING/scripts/monitor_run.py" \
+  --run-root "$RUN_ROOT" --profile "$PROFILE" --unit "$UNIT" \
+  --interval 5 --format jsonl \
+  --telemetry-output "$RUN_ROOT/status/monitor-5s.jsonl"
+```
+
+This retains GPU utilization/power, learner UTD inputs, replay model-step lag,
+candidate arrival/service ratio, supersession, and arena/GPU7 occupancy. Do not
+infer useful Elo efficiency from GPU utilization alone.
+
+For structured stdout ingestion, use `--format jsonl`. A one-shot status check is:
 
 ```bash
 "$MONITOR_PYTHON" -u "$MONITOR_TRAINING/scripts/monitor_run.py" \

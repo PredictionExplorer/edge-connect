@@ -6,11 +6,15 @@ from pathlib import Path
 
 import pytest
 
+from scripts.run_elo_ablation_queue import QueueBusyError, exclusive_execution_lock
 from scripts.run_staged_elo_pipeline import (
+    CONFIRMATION_CAMPAIGN_REPORT,
     StagedEloPipelineError,
     advance_staged_elo_pipeline,
     build_futility_policy,
     evaluate_futility,
+    run_confirmation_campaign,
+    _verified_completed_queue,
 )
 
 CONFIGS = Path(__file__).parents[1] / "configs"
@@ -153,6 +157,55 @@ def _completed_queue(_manifest: Path) -> dict[str, object]:
             "comparison_status": "complete",
         },
     }
+
+
+def _confirmation_campaign(tmp_path: Path) -> tuple[Path, Path]:
+    execution_lock = tmp_path / "host-execution.lock"
+    policy = tmp_path / "adoption-policy.json"
+    _write_json(policy, {"policy": "fixture"})
+    seeds = []
+    for seed in (17, 18, 19):
+        comparison = tmp_path / f"comparison-seed{seed}.json"
+        queue_state = tmp_path / f"queue-seed{seed}.json"
+        handoff = tmp_path / f"handoff-seed{seed}.json"
+        manifest = tmp_path / f"deployment-seed{seed}.json"
+        _write_json(
+            manifest,
+            {
+                "schema_version": 1,
+                "report": "startrain-elo-ablation-deployment",
+                "queue": {
+                    "seed": seed,
+                    "execution_lock_path": str(execution_lock),
+                    "comparison_output": str(comparison),
+                    "state_path": str(queue_state),
+                    "continuity_handoff_output": str(handoff),
+                },
+            },
+        )
+        seeds.append(
+            {
+                "seed": seed,
+                "deployment_manifest": str(manifest),
+                "deployment_sha256": hashlib.sha256(manifest.read_bytes()).hexdigest(),
+            }
+        )
+    campaign = tmp_path / "confirmation-campaign.json"
+    _write_json(
+        campaign,
+        {
+            "schema_version": 1,
+            "report": CONFIRMATION_CAMPAIGN_REPORT,
+            "state_path": str(tmp_path / "confirmation-campaign-state.json"),
+            "seeds": seeds,
+            "cross_seed": {
+                "policy": str(policy),
+                "policy_sha256": hashlib.sha256(policy.read_bytes()).hexdigest(),
+                "output": str(tmp_path / "cross-seed-comparison.json"),
+            },
+        },
+    )
+    return campaign, tmp_path / "confirmation-campaign-state.json"
 
 
 def _winner_warm_start(
@@ -387,3 +440,342 @@ def test_weighted_futility_accepts_empty_guards_and_aggregate_evidence() -> None
     assert result["reason"] == "cannot_beat_control"
     assert result["control_objective"] == "weighted_aggregate"
     assert result["promotion_allowed"] is False
+
+
+def test_confirmation_campaign_runs_pinned_seeds_without_idle_handoff(
+    tmp_path: Path,
+) -> None:
+    campaign, state_path = _confirmation_campaign(tmp_path)
+    calls: list[int] = []
+
+    def queue_runner(
+        manifest_path: Path,
+        *,
+        execution_lock_lease,
+        expected_manifest_sha256: str,
+    ) -> dict[str, object]:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        queue = manifest["queue"]
+        seed = int(queue["seed"])
+        assert execution_lock_lease.path == Path(queue["execution_lock_path"]).resolve()
+        assert hashlib.sha256(manifest_path.read_bytes()).hexdigest() == (
+            expected_manifest_sha256
+        )
+        calls.append(seed)
+        _write_json(Path(queue["comparison_output"]), {"seed": seed})
+        handoff = {
+            "schema_version": 1,
+            "report": "startrain-continuity-handoff-request",
+            "status": "requested",
+            "requested": True,
+            "action": "request_fallback",
+            "requested_action": "reconcile_training_continuity",
+            "reason": "queue_completed",
+            "path": queue["continuity_handoff_output"],
+            "source": {
+                "kind": "elo_ablation_queue",
+                "manifest": str(manifest_path.resolve()),
+                "queue_status": "completed",
+            },
+        }
+        _write_json(Path(queue["continuity_handoff_output"]), handoff)
+        queue_state = {
+            "queue_status": "completed",
+            "arms": [
+                {
+                    "status": "completed",
+                    "completion_status": "complete",
+                    "measurement_cutoff_ns": seed,
+                    "resource_released_ns": seed + 1,
+                    "teardown_status": "clean",
+                    "teardown": {
+                        "process_group_released": True,
+                        "resource_released_ns": seed + 1,
+                    },
+                }
+            ],
+            "finalization": {
+                "status": "completed",
+                "comparison_status": "complete",
+            },
+            "continuity_handoff": handoff,
+        }
+        _write_json(Path(queue["state_path"]), queue_state)
+        return queue_state
+
+    def cross_seed_builder(comparisons, *, policy_path, policy_sha256):
+        assert [comparison.seed for comparison in comparisons] == [17, 18, 19]
+        assert policy_path.name == "adoption-policy.json"
+        assert hashlib.sha256(policy_path.read_bytes()).hexdigest() == policy_sha256
+        return {
+            "schema_version": 1,
+            "report": "startrain-elo-ablation-cross-seed-comparison",
+            "status": "eligible",
+            "eligible": True,
+        }
+
+    first = run_confirmation_campaign(
+        campaign,
+        queue_runner=queue_runner,
+        cross_seed_builder=cross_seed_builder,
+    )
+    second = run_confirmation_campaign(
+        campaign,
+        queue_runner=queue_runner,
+        cross_seed_builder=cross_seed_builder,
+    )
+
+    assert calls == [17, 18, 19]
+    assert first == second
+    assert first["status"] == "completed"
+    assert first["cross_seed"]["eligible"] is True
+    assert first["automatic_adoption_authorized"] is False
+    assert json.loads(state_path.read_text(encoding="utf-8")) == first
+
+
+def test_confirmation_campaign_failure_preserves_fallback_expectation(
+    tmp_path: Path,
+) -> None:
+    campaign, state_path = _confirmation_campaign(tmp_path)
+
+    def failed_queue(
+        _manifest_path: Path,
+        *,
+        execution_lock_lease,
+        expected_manifest_sha256: str,
+    ) -> dict[str, object]:
+        assert execution_lock_lease.path.name == "host-execution.lock"
+        assert len(expected_manifest_sha256) == 64
+        return {
+            "queue_status": "failed",
+            "arms": [{"status": "failed", "resource_released_ns": 1}],
+            "finalization": {
+                "status": "completed",
+                "comparison_status": "incomplete",
+            },
+            "continuity_handoff": {
+                "status": "requested",
+                "requested": True,
+            },
+        }
+
+    with pytest.raises(StagedEloPipelineError, match="did not complete"):
+        run_confirmation_campaign(
+            campaign,
+            queue_runner=failed_queue,
+            cross_seed_builder=lambda *_args, **_kwargs: {},
+        )
+
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state["status"] == "failed"
+    assert state["continuity_fallback_expected"] is True
+    assert state["automatic_adoption_authorized"] is False
+
+
+def test_confirmation_campaign_rejects_path_alias_and_seed_mismatch(
+    tmp_path: Path,
+) -> None:
+    aliased, _state_path = _confirmation_campaign(tmp_path / "alias")
+    document = json.loads(aliased.read_text(encoding="utf-8"))
+    document["state_path"] = document["seeds"][0]["deployment_manifest"]
+    _write_json(aliased, document)
+    with pytest.raises(StagedEloPipelineError, match="distinct paths"):
+        run_confirmation_campaign(aliased)
+
+    mismatched, _state_path = _confirmation_campaign(tmp_path / "seed")
+    document = json.loads(mismatched.read_text(encoding="utf-8"))
+    manifest_path = Path(document["seeds"][0]["deployment_manifest"])
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["queue"]["seed"] = 18
+    _write_json(manifest_path, manifest)
+    document["seeds"][0]["deployment_sha256"] = hashlib.sha256(
+        manifest_path.read_bytes()
+    ).hexdigest()
+    _write_json(mismatched, document)
+    with pytest.raises(StagedEloPipelineError, match="different seed"):
+        run_confirmation_campaign(mismatched)
+
+
+def test_busy_confirmation_campaign_does_not_overwrite_state(tmp_path: Path) -> None:
+    campaign, state_path = _confirmation_campaign(tmp_path)
+    document = json.loads(campaign.read_text(encoding="utf-8"))
+    manifest = json.loads(
+        Path(document["seeds"][0]["deployment_manifest"]).read_text(encoding="utf-8")
+    )
+    execution_lock = Path(manifest["queue"]["execution_lock_path"])
+
+    with exclusive_execution_lock(execution_lock):
+        with pytest.raises(QueueBusyError):
+            run_confirmation_campaign(campaign)
+
+    assert not state_path.exists()
+
+
+def test_confirmation_campaign_recovers_published_output_after_state_crash(
+    tmp_path: Path,
+) -> None:
+    campaign, state_path = _confirmation_campaign(tmp_path)
+    calls: list[int] = []
+
+    def queue_runner(
+        manifest_path: Path,
+        *,
+        execution_lock_lease,
+        expected_manifest_sha256: str,
+    ) -> dict[str, object]:
+        assert hashlib.sha256(manifest_path.read_bytes()).hexdigest() == (
+            expected_manifest_sha256
+        )
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        queue = manifest["queue"]
+        seed = int(queue["seed"])
+        calls.append(seed)
+        _write_json(Path(queue["comparison_output"]), {"seed": seed})
+        handoff = {
+            "schema_version": 1,
+            "report": "startrain-continuity-handoff-request",
+            "status": "requested",
+            "requested": True,
+            "action": "request_fallback",
+            "requested_action": "reconcile_training_continuity",
+            "reason": "queue_completed",
+            "path": queue["continuity_handoff_output"],
+            "source": {
+                "kind": "elo_ablation_queue",
+                "manifest": str(manifest_path.resolve()),
+                "queue_status": "completed",
+            },
+        }
+        _write_json(Path(queue["continuity_handoff_output"]), handoff)
+        queue_state = {
+            "queue_status": "completed",
+            "arms": [
+                {
+                    "status": "completed",
+                    "completion_status": "complete",
+                    "measurement_cutoff_ns": seed,
+                    "resource_released_ns": seed + 1,
+                    "teardown_status": "clean",
+                    "teardown": {
+                        "process_group_released": True,
+                        "resource_released_ns": seed + 1,
+                    },
+                }
+            ],
+            "finalization": {
+                "status": "completed",
+                "comparison_status": "complete",
+            },
+            "continuity_handoff": handoff,
+        }
+        _write_json(Path(queue["state_path"]), queue_state)
+        return queue_state
+
+    def cross_seed_builder(_comparisons, *, policy_path, policy_sha256):
+        assert hashlib.sha256(policy_path.read_bytes()).hexdigest() == policy_sha256
+        return {
+            "schema_version": 1,
+            "report": "startrain-elo-ablation-cross-seed-comparison",
+            "status": "eligible",
+            "eligible": True,
+        }
+
+    completed = run_confirmation_campaign(
+        campaign,
+        queue_runner=queue_runner,
+        cross_seed_builder=cross_seed_builder,
+    )
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    state["status"] = "running"
+    state["cross_seed"] = {
+        "output": completed["cross_seed"]["output"],
+        "status": "publishing",
+        "report_semantic_sha256": completed["cross_seed"]["report_semantic_sha256"],
+    }
+    _write_json(state_path, state)
+
+    recovered = run_confirmation_campaign(
+        campaign,
+        queue_runner=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("completed seeds must not rerun")
+        ),
+        cross_seed_builder=cross_seed_builder,
+    )
+
+    assert calls == [17, 18, 19]
+    assert recovered["status"] == "completed"
+    assert recovered["cross_seed"]["sha256"] == completed["cross_seed"]["sha256"]
+
+    with pytest.raises(RuntimeError, match="synthetic finalization failure"):
+        run_confirmation_campaign(
+            campaign,
+            queue_runner=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("completed seeds must not rerun")
+            ),
+            cross_seed_builder=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                RuntimeError("synthetic finalization failure")
+            ),
+        )
+    failed = json.loads(state_path.read_text(encoding="utf-8"))
+    assert failed["status"] == "failed"
+    assert failed["cross_seed"]["sha256"] == completed["cross_seed"]["sha256"]
+
+    recovered_again = run_confirmation_campaign(
+        campaign,
+        queue_runner=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("completed seeds must not rerun")
+        ),
+        cross_seed_builder=cross_seed_builder,
+    )
+    assert recovered_again["cross_seed"]["sha256"] == completed["cross_seed"]["sha256"]
+
+
+def test_campaign_accepts_verified_post_cutoff_teardown_warning(
+    tmp_path: Path,
+) -> None:
+    manifest = tmp_path / "deployment.json"
+    _write_json(manifest, {"manifest": "fixture"})
+    handoff_path = tmp_path / "handoff.json"
+    handoff = {
+        "schema_version": 1,
+        "report": "startrain-continuity-handoff-request",
+        "status": "requested",
+        "requested": True,
+        "action": "request_fallback",
+        "requested_action": "reconcile_training_continuity",
+        "reason": "queue_completed",
+        "path": str(handoff_path),
+        "source": {
+            "kind": "elo_ablation_queue",
+            "manifest": str(manifest),
+            "queue_status": "completed",
+        },
+    }
+    _write_json(handoff_path, handoff)
+    queue_state = {
+        "queue_status": "completed",
+        "arms": [
+            {
+                "status": "completed",
+                "completion_status": "complete_with_warning",
+                "failure_phase": "post_cutoff",
+                "integrity_status": "verified",
+                "measurement_cutoff_ns": 10,
+                "resource_released_ns": 11,
+                "teardown_status": "unexpected_exit",
+                "teardown": {
+                    "process_group_released": True,
+                    "resource_released_ns": 11,
+                },
+            }
+        ],
+        "finalization": {"status": "completed", "comparison_status": "complete"},
+        "continuity_handoff": handoff,
+    }
+
+    _verified_completed_queue(
+        queue_state,
+        seed=17,
+        handoff_output=handoff_path,
+        manifest_path=manifest,
+    )

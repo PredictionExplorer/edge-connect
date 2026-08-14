@@ -2,14 +2,19 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, cast
 
 import pytest
 import yaml
+from startrain.arena import bounded_confidence_sequence, elo_from_probability
 
-from scripts.compare_elo_ablation import ONE_SIDED_95_NORMAL_QUANTILE
+from scripts.compare_elo_ablation import (
+    PAIR_VALID_ERROR_PROBABILITY_PER_SIDE,
+    PAIR_VALID_LOWER_BOUND_METHOD,
+)
 from scripts.compare_elo_ablation_seeds import (
     LCB_GATE_METHOD,
     PER_SEED_REPORT,
@@ -113,17 +118,132 @@ def _treatment(
     champion = snapshot["champion"]
     assert isinstance(champion, dict)
     hours = 10.0
-    gain = point_score * hours
+    target_gain = point_score * hours
     standard_error = standard_error_score * hours
-    lower_gain = gain - ONE_SIDED_95_NORMAL_QUANTILE * standard_error
+    pair_count = max(50, round(25 / (standard_error_score**2)))
+    target_score_rate = 1.0 / (1.0 + 10.0 ** (-target_gain / 400.0))
+    wins = round(target_score_rate * 2 * pair_count)
+    two_win_pairs = max(0, wins - pair_count)
+    one_win_pairs = wins - 2 * two_win_pairs
+    zero_win_pairs = pair_count - one_win_pairs - two_win_pairs
+    pair_scores = [0.0] * zero_win_pairs + [0.5] * one_win_pairs + [1.0] * two_win_pairs
+    score_rate = math.fsum(pair_scores) / pair_count
+    gain = elo_from_probability(score_rate)
+    link_error_probability = PAIR_VALID_ERROR_PROBABILITY_PER_SIDE / 2
+    lower_score, upper_score = bounded_confidence_sequence(
+        pair_scores,
+        error_probability=link_error_probability,
+    )
+    lower_gain = elo_from_probability(lower_score)
+    upper_gain = elo_from_probability(upper_score)
     started_ns = seed * 100 * HOUR_NS
     cutoff_ns = started_ns + 9 * HOUR_NS
     released_ns = started_ns + 10 * HOUR_NS
+    completed_ns = started_ns + HOUR_NS
+    raw_pairs = []
+    for outcomes, count in (
+        ((-1, -1), zero_win_pairs),
+        ((1, -1), one_win_pairs),
+        ((1, 1), two_win_pairs),
+    ):
+        for _ in range(count):
+            pair = len(raw_pairs)
+            raw_pairs.append(
+                {
+                    "ring": 10,
+                    "pair": pair,
+                    "opening_seed": pair,
+                    "opening_action": None,
+                    "forced_opening": False,
+                    "outcomes": list(outcomes),
+                }
+            )
+    summary = {
+        "pairs": pair_count,
+        "games": 2 * pair_count,
+        "wins": wins,
+        "losses": 2 * pair_count - wins,
+        "pair_win_counts": {
+            "0": zero_win_pairs,
+            "1": one_win_pairs,
+            "2": two_win_pairs,
+        },
+        "score_rate": score_rate,
+        "elo_difference": gain,
+    }
+    artifact_path = root / "arena" / "candidate-vs-anchor.json"
+    _write_json(
+        artifact_path,
+        {
+            "schema_version": 3,
+            "candidate": champion["model_identity"],
+            "baseline": anchor,
+            "completed_ns": completed_ns,
+            "terminal": True,
+            "aggregate": summary,
+            "per_ring": {"10": summary},
+            "promotion": {"decision": "promote"},
+            "pairs": raw_pairs,
+        },
+    )
+    artifact = {
+        "path": str(artifact_path.resolve()),
+        "bytes": artifact_path.stat().st_size,
+        "sha256": _sha256(artifact_path),
+    }
+    attempt = {
+        "attempt_index": 0,
+        "baseline": anchor,
+        "candidate": champion["model_identity"],
+        "decision": "promote",
+        "completed_ns": completed_ns,
+        "arena_artifact": artifact,
+    }
+    pair_valid_promotion = {
+        "from_identity": anchor,
+        "to_identity": champion["model_identity"],
+        "completed_ns": completed_ns,
+        "path": str(artifact_path.resolve()),
+        "ring_10_elo_difference": gain,
+        "ring_10_anytime_lower_elo": lower_gain,
+        "ring_10_anytime_upper_elo": upper_gain,
+        "link_error_probability_per_side": link_error_probability,
+        "complete_pairs": pair_count,
+        "pair_score_counts": {
+            "0": zero_win_pairs,
+            "1": one_win_pairs,
+            "2": two_win_pairs,
+        },
+        "terminal_attempt_index": 0,
+        "arena_artifact": artifact,
+    }
     frontier = {
         "identity": champion["model_identity"],
         "step": champion["model_step"],
         "rating_elo": gain,
         "standard_error_elo": standard_error,
+        "pair_valid": True,
+        "pair_observation_unit": "complete-role-reversed-pair",
+        "pair_valid_elo_gained": gain,
+        "pair_valid_elo_one_sided_lower_bound": lower_gain,
+        "pair_valid_elo_one_sided_upper_bound": upper_gain,
+        "pair_valid_promotions": [pair_valid_promotion],
+        "pair_valid_attempts": [attempt],
+        "pair_valid_attempt_count": 1,
+        "pair_valid_source": {
+            "run_root": str(root.resolve()),
+            "arena_root": str((root / "arena").resolve()),
+            "anchor_identity": anchor,
+            "measurement_started_ns": started_ns,
+            "measurement_stopped_ns": cutoff_ns,
+        },
+        "lower_bound_method": PAIR_VALID_LOWER_BOUND_METHOD,
+        "familywise_error_probability_per_side": (
+            PAIR_VALID_ERROR_PROBABILITY_PER_SIDE
+        ),
+        "link_error_spending": (
+            "error_probability_per_side / 2^(terminal_attempt_index + 1)"
+        ),
         "promotion_count": 1,
         "promotions": [],
         "selection": "chronological_promotions_from_common_anchor",
@@ -174,12 +294,17 @@ def _treatment(
             "name": RANKING_METRIC,
             "objective": "ring10_only",
             "value": lower_gain / hours,
-            "point_value": point_score,
+            "point_value": gain / hours,
             "champion_frontier_ring_10_elo_gained": gain,
-            "champion_frontier_ring_10_elo_gain_conservative_standard_error": (
-                standard_error
-            ),
+            "champion_frontier_ring_10_elo_gain_conservative_standard_error": (None),
             "champion_frontier_ring_10_elo_one_sided_95_lower_bound": lower_gain,
+            "champion_frontier_ring_10_elo_one_sided_95_upper_bound": upper_gain,
+            "pair_valid": True,
+            "pair_observation_unit": "complete-role-reversed-pair",
+            "lower_bound_method": PAIR_VALID_LOWER_BOUND_METHOD,
+            "familywise_error_probability_per_side": (
+                PAIR_VALID_ERROR_PROBABILITY_PER_SIDE
+            ),
             "total_provisioned_wall_hours": hours,
             "total_provisioned_gpu_hours": 80,
             "time_basis": "measurement_started_ns_to_resource_released_ns",
@@ -297,9 +422,16 @@ def _comparison(
         "ranking_objective": "ring_10_only",
         "confidence": {
             "level": 0.95,
-            "sidedness": "one-sided-lower",
-            "method": "source conservative normal bound",
-            "normal_quantile": ONE_SIDED_95_NORMAL_QUANTILE,
+            "sidedness": "two-sided-familywise",
+            "method": PAIR_VALID_LOWER_BOUND_METHOD,
+            "normal_quantile": None,
+            "observation_unit": "complete-role-reversed-pair",
+            "familywise_error_probability_per_side": (
+                PAIR_VALID_ERROR_PROBABILITY_PER_SIDE
+            ),
+            "link_error_spending": (
+                "error_probability_per_side / 2^(terminal_attempt_index + 1)"
+            ),
         },
         "compute_accounting": {
             "provisioned_gpus": 8,
@@ -321,7 +453,9 @@ def _comparison(
             "ranking_metric": RANKING_METRIC,
             "ranking_objective": "ring_10_only",
             "winner_snapshot": candidate_snapshot,
-            "selection": ("highest_ranked_chronological_ring10_only_champion_frontier"),
+            "selection": (
+                "highest_ranked_chronological_ring10_only_pair_valid_champion_frontier"
+            ),
             "non_promoted_endpoints_are_diagnostic_only": True,
         },
         "errors": [],
@@ -477,12 +611,30 @@ def test_valid_three_seed_candidate_is_eligible(tmp_path: Path) -> None:
     assert report["eligible"] is True
     assert [record["seed"] for record in report["per_seed"]] == [17, 18, 19]
     aggregate = report["aggregate"]
+    first_seed = report["per_seed"][0]
+    control_point = first_seed["control"]["point_elo_per_total_provisioned_wall_hour"]
+    candidate_point = first_seed["candidate"][
+        "point_elo_per_total_provisioned_wall_hour"
+    ]
+    expected_relative = (candidate_point - control_point) / control_point
     assert aggregate["median_relative_point_elo_per_hour_improvement"] == pytest.approx(
-        0.30
+        expected_relative
     )
+    assert expected_relative > 0.29
     assert aggregate["minimum_per_seed_one_sided_lcb_advantage_elo_per_hour"] > 0
     assert aggregate["cross_seed_confidence"]["level"] is None
     assert aggregate["cross_seed_confidence"]["pooled_interval"] is False
+    first_advantage = first_seed["advantage"]
+    assert first_advantage["one_sided_lower_bound_elo_per_hour"] == pytest.approx(
+        first_seed["candidate"][
+            "primary_ring10_only_champion_frontier_lcb_per_total_provisioned_wall_hour"
+        ]
+        - first_seed["control"]["upper_elo_per_total_provisioned_wall_hour"]
+    )
+    assert first_advantage["method"] == (
+        "candidate_pair_valid_lower_bound_minus_control_pair_valid_upper_bound"
+    )
+    assert first_advantage["familywise_error_probability"] == pytest.approx(0.05)
     assert report["selector"]["status"] == "verified"
     assert report["selector"]["source_seed"] == 18
     assert report["selector"]["latest_terminal_candidates_ranked"] is False
@@ -617,7 +769,7 @@ def test_below_twenty_percent_improvement_is_ineligible(tmp_path: Path) -> None:
     report = _build(evidence)
 
     gate = report["gates"]["minimum_median_point_improvement"]
-    assert gate["observed"] == pytest.approx(0.19)
+    assert gate["observed"] == pytest.approx(0.19, abs=0.003)
     assert gate["passed"] is False
     assert report["eligible"] is False
 
@@ -637,6 +789,41 @@ def test_nonpositive_lcb_advantage_is_ineligible(tmp_path: Path) -> None:
     assert lcb_gate["observed"] <= 0
     assert lcb_gate["passed"] is False
     assert report["eligible"] is False
+
+
+def test_self_declared_pair_valid_frontier_without_attempt_evidence_is_ineligible(
+    tmp_path: Path,
+) -> None:
+    evidence = _evidence(tmp_path)
+
+    def strip_attempt_evidence(report: dict[str, Any]) -> None:
+        candidate = report["treatments"][0]["champion_frontier"]
+        candidate["pair_valid_attempts"] = []
+        candidate["pair_valid_attempt_count"] = 0
+
+    _rewrite_comparison(evidence, 18, strip_attempt_evidence)
+
+    report = _build(evidence)
+
+    assert report["eligible"] is False
+    assert "pair-valid frontier verification failed" in report["errors"][0]["message"]
+
+
+def test_pair_valid_source_must_match_treatment_measurement_context(
+    tmp_path: Path,
+) -> None:
+    evidence = _evidence(tmp_path)
+
+    def narrow_source_window(report: dict[str, Any]) -> None:
+        source = report["treatments"][0]["champion_frontier"]["pair_valid_source"]
+        source["measurement_started_ns"] += 1
+
+    _rewrite_comparison(evidence, 18, narrow_source_window)
+
+    report = _build(evidence)
+
+    assert report["eligible"] is False
+    assert "differs from validated treatment context" in report["errors"][0]["message"]
 
 
 def test_unverified_candidate_snapshot_is_ineligible(tmp_path: Path) -> None:

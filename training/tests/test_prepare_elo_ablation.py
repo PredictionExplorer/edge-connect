@@ -12,6 +12,7 @@ from scripts.prepare_elo_ablation import (
     DEFAULT_TREATMENTS,
     RING10_EFFICIENCY_TREATMENTS,
     RING10_ONLY_TREATMENTS,
+    RING10_OPTIMIZATION_TREATMENTS,
     SYSTEM_TREATMENTS,
     WEIGHTED_TREATMENTS,
     main,
@@ -199,11 +200,12 @@ def test_prepare_generates_optional_system_screening_profiles(tmp_path: Path) ->
         treatments=SYSTEM_TREATMENTS,
     )
 
-    actor_batch = load_config(output / "actor-batch-160.yaml")
-    assert actor_batch.orchestration.actor_games_per_batch == 160
-    assert {gpu.actor_batch_size for gpu in actor_batch.orchestration.actor_gpus} == {
-        160
-    }
+    for size in (128, 160, 192):
+        actor_batch = load_config(output / f"actor-batch-{size}.yaml")
+        assert actor_batch.orchestration.actor_games_per_batch == size
+        assert {
+            gpu.actor_batch_size for gpu in actor_batch.orchestration.actor_gpus
+        } == {size}
     actor_lanes = load_config(output / "actor-lanes-3.yaml")
     assert sorted(gpu.actor_lanes for gpu in actor_lanes.orchestration.actor_gpus) == [
         1,
@@ -415,6 +417,58 @@ def test_ring10_efficiency_suite_rejects_control_topology_drift(
     assert not (tmp_path / "profiles").exists()
 
 
+def test_prepare_generates_ring10_cadence_and_freshness_suite(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source-run"
+    source.mkdir()
+    output = tmp_path / "ring10-optimization-profiles"
+
+    manifest = prepare_elo_ablation(
+        base_config=CONFIGS / "h100-8gpu-ring10-only.yaml",
+        output_dir=output,
+        run_root_parent=tmp_path / "ring10-optimization-runs",
+        run_id="shared-parent-run",
+        source_run_root=source,
+        prefix="ring10-optimization",
+        seed=17,
+        wall_budget_hours=8,
+        leaf_budget=2_000_000_000,
+        guard_floor_elo=-35,
+        treatments=RING10_OPTIMIZATION_TREATMENTS,
+        guard_rings=(),
+        suite="ring10-optimization",
+    )
+
+    assert manifest["suite"] == "ring10-optimization"
+    assert manifest["training_objective"] == "ring10_only"
+    assert [item["treatment"] for item in _treatment_records(manifest)] == list(
+        RING10_OPTIMIZATION_TREATMENTS
+    )
+    control = load_config(output / "ring10-optimization-control.yaml")
+    cadence = load_config(output / "ring10-cadence-5m.yaml")
+    freshness = load_config(output / "ring10-freshness-50.yaml")
+    for profile in (control, cadence, freshness):
+        assert profile.learner.target_updates_per_new_sample == 1.0
+        assert profile.orchestration.training_objective == "ring10_only"
+        assert profile.arena.rings == (10,)
+        assert profile.arena.pairs_per_ring == 50
+        assert profile.arena.continuation_pairs_per_ring == 50
+        assert sum(gpu.actor_lanes for gpu in profile.orchestration.actor_gpus) == 13
+    assert control.learner.candidate_interval_examples == 2_000_000
+    assert cadence.learner.candidate_interval_examples == 5_000_000
+    assert freshness.learner.candidate_interval_examples == 2_000_000
+    assert control.orchestration.model_refresh.selfplay_source == "champion"
+    assert cadence.orchestration.model_refresh.selfplay_source == "champion"
+    assert (
+        freshness.orchestration.model_refresh.selfplay_source
+        == "candidate_champion_mix"
+    )
+    assert freshness.orchestration.model_refresh.candidate_probability == 0.5
+    assert freshness.orchestration.model_refresh.history_probability == 0.0
+    assert freshness.learner.selfplay_snapshot_interval_examples == 3_000_000
+
+
 def test_resolve_treatments_keeps_suites_fail_closed() -> None:
     assert (
         resolve_treatments(
@@ -422,6 +476,13 @@ def test_resolve_treatments_keeps_suites_fail_closed() -> None:
             treatments=None,
         )
         == RING10_EFFICIENCY_TREATMENTS
+    )
+    assert (
+        resolve_treatments(
+            suite="ring10-optimization",
+            treatments=None,
+        )
+        == RING10_OPTIMIZATION_TREATMENTS
     )
     with pytest.raises(ValueError, match="cannot be combined"):
         resolve_treatments(

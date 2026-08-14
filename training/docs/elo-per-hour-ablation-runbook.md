@@ -472,6 +472,17 @@ metric is guarded champion-frontier ring-10 Elo lower bound per total
 provisioned wall hour. The latest terminal candidate remains a diagnostic and
 is never cherry-picked as the deployed winner.
 
+For `ring10_only`, the deployment metric is pair-valid. Each complete
+role-reversed pair is one bounded observation. The comparator recomputes
+anytime-valid lower and upper Elo bounds from persisted pair-win counts and
+spends the per-side familywise error geometrically across every chronological
+terminal candidate attempt before inspecting its decision. Rejected candidates
+therefore consume error budget even though only promoted links contribute Elo
+to the frontier. Arena artifacts are content-verified and their raw schema-v3
+pairs are revalidated during cross-seed confirmation. The game-level
+Bradley-Terry ladder remains useful as a descriptive diagnostic, but it is not
+authorized for ranking or adoption.
+
 For a weighted-only plan, pass `--no-guard-rings`. When every arm exposes the
 same weighted objective, the comparator instead ranks chronological promoted
 champion frontiers by weighted Elo lower bound per total provisioned wall hour.
@@ -496,12 +507,56 @@ python scripts/compare_elo_ablation_seeds.py \
 ```
 
 The cross-seed gate does not invent a pooled confidence interval. It requires a
-strictly positive conservative candidate-minus-control lower bound in every
-seed and at least 20% median point Elo/hour improvement. It selects the median
+strictly positive pair-valid candidate-minus-control lower bound in every seed
+and at least 20% median point Elo/hour improvement. The per-seed difference
+bound is the candidate frontier lower bound minus the control frontier upper
+bound, so arbitrary within-pair dependence is retained. It selects the median
 candidate seed only after all gates pass. `prepare_ablation_adoption.py` then
 verifies every pinned input and emits an immutable fresh-root 24-hour canary
 plan; it never mutates a treatment root or authorizes direct production
 adoption.
+
+To run the three pinned seed queues without an avoidable fallback/start gap,
+render `deploy/confirmation-campaign.json.example` and invoke:
+
+```bash
+python scripts/run_staged_elo_pipeline.py \
+  --confirmation-campaign /absolute/path/to/confirmation-campaign.json
+```
+
+All three deployment manifests must share one host execution lock. The
+campaign holds that lock across seeds, lets each queue finalize, back up replay,
+release every arm resource, and request verified LKG fallback, then starts the
+next seed immediately. A failure releases the campaign lock so continuity can
+activate LKG. Completion writes the cross-seed report but still sets
+`automatic_adoption_authorized: false`.
+
+For the next one-factor ring-10 screen, `--suite ring10-optimization` freezes
+UTD at 1.0 and compares:
+
+- `ring10-optimization-control`: 2M-example candidate cadence, champion self-play
+- `ring10-cadence-5m`: 5M-example candidate cadence
+- `ring10-freshness-50`: 2M cadence and a 50/50 candidate/champion self-play mix
+
+Do not combine cadence and freshness until each independently improves
+pair-valid frontier Elo/hour. For systems-only screening,
+`actor-batch-128`, `actor-batch-160`, and `actor-batch-192` provide the bounded
+batch sweep.
+
+Persist operational telemetry during every confirmation:
+
+```bash
+python scripts/monitor_run.py \
+  --run-root /absolute/path/to/run \
+  --profile /absolute/path/to/profile-elo-ablation.yaml \
+  --interval 5 \
+  --format jsonl \
+  --telemetry-output /absolute/path/to/status/monitor-5s.jsonl
+```
+
+The snapshot records GPU telemetry, UTD and learner duty inputs, replay
+model-step lag, candidate arrival/service ratio, supersession, and current arena
+GPU7 occupancy.
 
 For dependent experiment stages, use `run_staged_elo_pipeline.py`. It accepts
 only a hash-verified upstream winner snapshot and refuses a downstream fork

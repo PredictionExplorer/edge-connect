@@ -13,7 +13,11 @@ from scripts.compare_elo_ablation import (
     DEFAULT_GUARD_FLOOR_ELO,
     DEFAULT_GUARD_RINGS,
     ONE_SIDED_95_NORMAL_QUANTILE,
+    PAIR_VALID_ERROR_PROBABILITY_PER_SIDE,
+    PAIR_VALID_LOWER_BOUND_METHOD,
     REPORT_NAME,
+    RING10_ONLY_RANKING_METRIC,
+    _ring10_pair_valid_frontier,
     _weighted_champion_frontier,
     build_elo_ablation_comparison,
     main,
@@ -202,13 +206,48 @@ def _run_fixture(
         for ring in DEFAULT_GUARD_RINGS
         if ring not in omitted_guard_rings
     }
+    pairs = (ring_wins + ring_losses) // 2
+    two_win_pairs = max(0, ring_wins - pairs)
+    one_win_pairs = ring_wins - 2 * two_win_pairs
+    zero_win_pairs = pairs - one_win_pairs - two_win_pairs
+    pair_win_counts = {
+        "0": zero_win_pairs,
+        "1": one_win_pairs,
+        "2": two_win_pairs,
+    }
+    raw_pairs = []
+    for outcomes, count in (
+        ((-1, -1), zero_win_pairs),
+        ((1, -1), one_win_pairs),
+        ((1, 1), two_win_pairs),
+    ):
+        for _ in range(count):
+            pair = len(raw_pairs)
+            raw_pairs.append(
+                {
+                    "ring": 10,
+                    "pair": pair,
+                    "opening_seed": pair,
+                    "opening_action": None,
+                    "forced_opening": False,
+                    "outcomes": list(outcomes),
+                }
+            )
+    score_rate = ring_wins / (ring_wins + ring_losses)
+    ring_elo = elo_from_probability(score_rate)
     per_ring = {
         str(ring): {
             "wins": ring_wins,
             "losses": ring_losses,
             "games": ring_wins + ring_losses,
-            "elo_difference": 0.0,
+            "pairs": pairs,
+            "pair_win_counts": pair_win_counts,
+            "score_rate": score_rate,
+            "elo_difference": ring_elo,
             "anytime_elo_interval": [-100.0, 100.0],
+            "anytime_error_probability_per_side": (
+                PAIR_VALID_ERROR_PROBABILITY_PER_SIDE
+            ),
         }
         for ring in arena_rings
     }
@@ -229,14 +268,21 @@ def _run_fixture(
             "wins": ring_wins,
             "losses": ring_losses,
             "games": ring_wins + ring_losses,
-            "elo_difference": 0.0,
+            "pairs": pairs,
+            "pair_win_counts": pair_win_counts,
+            "score_rate": score_rate,
+            "elo_difference": ring_elo,
             "anytime_elo_interval": [-100.0, 100.0],
+            "anytime_error_probability_per_side": (
+                PAIR_VALID_ERROR_PROBABILITY_PER_SIDE
+            ),
         },
         "per_ring": per_ring,
         "promotion": {
             "decision": decision,
             "ring_floors": ring_floors,
         },
+        "pairs": raw_pairs,
     }
     if weighted_elo is not None:
         lower = weighted_elo - 10 if weighted_lower is None else weighted_lower
@@ -790,10 +836,19 @@ def test_ring10_only_comparison_uses_distinct_objective_name(tmp_path: Path) -> 
 
     assert report["status"] == "complete"
     assert report["ranking_objective"] == "ring_10_only"
-    assert report["ranking_metric"].startswith("ring10_only_champion_frontier")
+    assert report["ranking_metric"] == RING10_ONLY_RANKING_METRIC
     assert report["selector"]["ranking_objective"] == "ring_10_only"
     assert report["selector"]["winner_snapshot"]["selection"] == (
-        "ring10_only_chronological_champion_frontier"
+        "ring10_only_pair_valid_chronological_champion_frontier"
+    )
+    stronger_result = _by_label(report)["stronger"]
+    frontier = stronger_result["champion_frontier"]
+    metric = stronger_result["deployment_metric"]
+    assert frontier["pair_valid"] is True
+    assert frontier["lower_bound_method"] == PAIR_VALID_LOWER_BOUND_METHOD
+    assert metric["pair_valid"] is True
+    assert metric["value"] == pytest.approx(
+        frontier["pair_valid_elo_one_sided_lower_bound"] / 8
     )
     assert all(
         treatment["training_objective"] == "ring10_only"
@@ -897,6 +952,74 @@ def test_ring10_comparison_rejects_all_ring_arena_evidence(tmp_path: Path) -> No
     )
 
 
+@pytest.mark.parametrize("mutation", ("elo", "schema", "raw-pairs"))
+def test_ring10_pair_valid_comparison_rejects_unverified_pair_evidence(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    valid = _run_fixture(tmp_path, "valid", arena_rings=(10,))
+    invalid = _run_fixture(tmp_path, "invalid", arena_rings=(10,))
+    for root in (valid, invalid):
+        _install_ablation_metadata(
+            root,
+            training_objective="ring10_only",
+            promotion_objective="ring_10_only",
+        )
+    result_path = invalid / "arena" / "candidate-vs-anchor.json"
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+    if mutation == "elo":
+        result["per_ring"]["10"]["elo_difference"] = 0.0
+    elif mutation == "schema":
+        result["schema_version"] = 2
+    else:
+        result["pairs"] = result["pairs"][:-1]
+    result_path.write_text(json.dumps(result), encoding="utf-8")
+
+    report = build_elo_ablation_comparison(
+        {"valid": valid, "invalid": invalid},
+        guard_rings=(),
+    )
+    invalid_treatment = _by_label(report)["invalid"]
+
+    assert report["status"] == "incomplete"
+    assert invalid_treatment["eligible"] is False
+    assert "missing_pair_valid_champion_frontier" in _reason_codes(invalid_treatment)
+
+
+def test_evaluated_superseded_attempt_without_summary_fails_closed(
+    tmp_path: Path,
+) -> None:
+    valid = _run_fixture(tmp_path, "valid", arena_rings=(10,))
+    malformed = _run_fixture(
+        tmp_path,
+        "malformed",
+        decision="superseded",
+        arena_rings=(10,),
+    )
+    for root in (valid, malformed):
+        _install_ablation_metadata(
+            root,
+            training_objective="ring10_only",
+            promotion_objective="ring_10_only",
+        )
+    result_path = malformed / "arena" / "candidate-vs-anchor.json"
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+    result["per_ring"] = {}
+    result_path.write_text(json.dumps(result), encoding="utf-8")
+
+    report = build_elo_ablation_comparison(
+        {"valid": valid, "malformed": malformed},
+        guard_rings=(),
+    )
+    treatment = _by_label(report)["malformed"]
+
+    assert treatment["eligible"] is False
+    assert any(
+        "evaluated superseded result lacks a ring-10 summary" in failure["error"]
+        for failure in treatment["parse_failures"]
+    )
+
+
 def test_comparison_rejects_mixed_training_objectives(tmp_path: Path) -> None:
     generalist = _run_fixture(tmp_path, "generalist")
     ring10_only = _run_fixture(tmp_path, "ring10-only", arena_rings=(10,))
@@ -952,10 +1075,24 @@ def test_weighted_frontier_uses_familywise_alpha_spending_across_promotions() ->
             },
         },
         {
+            "decision": "reject_max_pairs",
+            "baseline": "champion-1",
+            "candidate": "rejected",
+            "completed_ns": 2,
+            "path": "rejected.json",
+            "weighted_aggregate": {
+                "objective": objective,
+                "elo_difference": -20.0,
+                "one_sided_lower_elo": -100.0,
+                "complete_blocks": 15,
+                "block_scores": [0.4] * 15,
+            },
+        },
+        {
             "decision": "promote",
             "baseline": "champion-1",
             "candidate": "champion-2",
-            "completed_ns": 2,
+            "completed_ns": 3,
             "path": "second.json",
             "weighted_aggregate": {
                 "objective": objective,
@@ -977,7 +1114,7 @@ def test_weighted_frontier_uses_familywise_alpha_spending_across_promotions() ->
     )
     second_lower, _ = bounded_confidence_sequence(
         second_scores,
-        error_probability=0.0125,
+        error_probability=0.00625,
     )
 
     assert error is None
@@ -990,8 +1127,111 @@ def test_weighted_frontier_uses_familywise_alpha_spending_across_promotions() ->
     )
     assert [row["link_error_probability"] for row in frontier["promotions"]] == [
         0.025,
-        0.0125,
+        0.00625,
     ]
+
+
+def test_ring10_frontier_uses_complete_pairs_and_familywise_spending() -> None:
+    def summary(counts: tuple[int, int, int]) -> dict[str, object]:
+        pairs = sum(counts)
+        wins = counts[1] + 2 * counts[2]
+        losses = 2 * counts[0] + counts[1]
+        score_rate = wins / (2 * pairs)
+        return {
+            "pairs": pairs,
+            "games": 2 * pairs,
+            "wins": wins,
+            "losses": losses,
+            "pair_win_counts": {
+                "0": counts[0],
+                "1": counts[1],
+                "2": counts[2],
+            },
+            "score_rate": score_rate,
+            "elo_difference": elo_from_probability(score_rate),
+        }
+
+    first = summary((8, 24, 28))
+    second = summary((6, 20, 34))
+    first_scores = [0.0] * 8 + [0.5] * 24 + [1.0] * 28
+    second_scores = [0.0] * 6 + [0.5] * 20 + [1.0] * 34
+    evaluations = [
+        {
+            "decision": "promote",
+            "baseline": "anchor",
+            "candidate": "champion-1",
+            "completed_ns": 1,
+            "path": "first.json",
+            "per_ring": {"10": first},
+            "_ring10_pair_scores": first_scores,
+            "arena_artifact": {
+                "path": "first.json",
+                "bytes": 1,
+                "sha256": "a" * 64,
+            },
+        },
+        {
+            "decision": "reject_max_pairs",
+            "baseline": "champion-1",
+            "candidate": "rejected",
+            "completed_ns": 2,
+            "path": "rejected.json",
+            "per_ring": {},
+            "arena_artifact": {
+                "path": "rejected.json",
+                "bytes": 1,
+                "sha256": "c" * 64,
+            },
+        },
+        {
+            "decision": "promote",
+            "baseline": "champion-1",
+            "candidate": "champion-2",
+            "completed_ns": 3,
+            "path": "second.json",
+            "per_ring": {"10": second},
+            "_ring10_pair_scores": second_scores,
+            "arena_artifact": {
+                "path": "second.json",
+                "bytes": 1,
+                "sha256": "b" * 64,
+            },
+        },
+    ]
+
+    frontier, error = _ring10_pair_valid_frontier(
+        evaluations,
+        anchor_identity="anchor",
+        frontier={"identity": "champion-2", "step": 20},
+    )
+    first_lower, first_upper = bounded_confidence_sequence(
+        first_scores,
+        error_probability=PAIR_VALID_ERROR_PROBABILITY_PER_SIDE / 2,
+    )
+    second_lower, second_upper = bounded_confidence_sequence(
+        second_scores,
+        error_probability=PAIR_VALID_ERROR_PROBABILITY_PER_SIDE / 8,
+    )
+
+    assert error is None
+    assert frontier is not None
+    assert frontier["pair_valid_elo_gained"] == pytest.approx(
+        first["elo_difference"] + second["elo_difference"]
+    )
+    assert frontier["pair_valid_elo_one_sided_lower_bound"] == pytest.approx(
+        elo_from_probability(first_lower) + elo_from_probability(second_lower)
+    )
+    assert frontier["pair_valid_elo_one_sided_upper_bound"] == pytest.approx(
+        elo_from_probability(first_upper) + elo_from_probability(second_upper)
+    )
+    assert [
+        row["link_error_probability_per_side"]
+        for row in frontier["pair_valid_promotions"]
+    ] == [
+        PAIR_VALID_ERROR_PROBABILITY_PER_SIDE / 2,
+        PAIR_VALID_ERROR_PROBABILITY_PER_SIDE / 8,
+    ]
+    assert frontier["pair_valid_attempt_count"] == 3
 
 
 def test_comparison_refuses_mixed_weighted_and_legacy_objectives(

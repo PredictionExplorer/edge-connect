@@ -33,7 +33,9 @@ DEFAULT_TREATMENTS = (
     "search-quality",
 )
 SYSTEM_TREATMENTS = (
+    "actor-batch-128",
     "actor-batch-160",
+    "actor-batch-192",
     "actor-lanes-3",
     "learner-batch-768",
     "learner-batch-1024",
@@ -54,11 +56,19 @@ RING10_EFFICIENCY_TREATMENTS = (
     "ring10-learner-slack-64",
     "ring10-actor-lanes-3",
 )
+RING10_OPTIMIZATION_TREATMENTS = (
+    "ring10-optimization-control",
+    "ring10-cadence-5m",
+    "ring10-freshness-50",
+)
 RING10_ONLY_TREATMENTS = ("ring10-only",)
-RING10_OBJECTIVE_TREATMENTS = frozenset(RING10_EFFICIENCY_TREATMENTS)
+RING10_OBJECTIVE_TREATMENTS = frozenset(
+    (*RING10_EFFICIENCY_TREATMENTS, *RING10_OPTIMIZATION_TREATMENTS)
+)
 RING10_EFFICIENCY_VARIANTS = frozenset(RING10_EFFICIENCY_TREATMENTS[1:])
 TREATMENT_SUITES = {
     "ring10-efficiency": RING10_EFFICIENCY_TREATMENTS,
+    "ring10-optimization": RING10_OPTIMIZATION_TREATMENTS,
 }
 GUARD_RINGS = (4, 6, 8)
 WEIGHTED_PROMOTION_PAIR_RATIOS = {4: 1, 6: 1, 8: 1, 10: 7}
@@ -106,6 +116,7 @@ def _parser() -> argparse.ArgumentParser:
             *CLEAN_TREATMENTS,
             *WEIGHTED_TREATMENTS,
             *RING10_EFFICIENCY_TREATMENTS,
+            *RING10_OPTIMIZATION_TREATMENTS,
         ),
         dest="treatments",
     )
@@ -219,6 +230,45 @@ def _ring_ten_actor_lanes_three(config: RawConfig) -> None:
     _actor_lanes_three(config)
 
 
+def _ring_ten_optimization_control(config: RawConfig) -> None:
+    _ring_ten_only(config)
+    learner = _mapping(config, "learner")
+    learner["target_updates_per_new_sample"] = 1.0
+    learner["candidate_interval_examples"] = 2_000_000
+    refresh = _mapping(_mapping(config, "orchestration"), "model_refresh")
+    refresh.update(
+        {
+            "selfplay_source": "champion",
+            "history_probability": 0.0,
+        }
+    )
+
+
+def _ring_ten_cadence_five_million(config: RawConfig) -> None:
+    _ring_ten_optimization_control(config)
+    _mapping(config, "learner")["candidate_interval_examples"] = 5_000_000
+
+
+def _ring_ten_freshness_fifty(config: RawConfig) -> None:
+    _ring_ten_optimization_control(config)
+    learner = _mapping(config, "learner")
+    learner.update(
+        {
+            "selfplay_snapshot_interval_examples": 3_000_000,
+            "selfplay_snapshot_warmup_examples": 20_000_000,
+            "selfplay_snapshot_warmup_interval_examples": 1_000_000,
+        }
+    )
+    refresh = _mapping(_mapping(config, "orchestration"), "model_refresh")
+    refresh.update(
+        {
+            "selfplay_source": "candidate_champion_mix",
+            "candidate_probability": 0.5,
+            "history_probability": 0.0,
+        }
+    )
+
+
 def _search_quality(config: RawConfig) -> None:
     selfplay = _mapping(config, "selfplay")
     selfplay.update(
@@ -234,18 +284,18 @@ def _search_quality(config: RawConfig) -> None:
     )
 
 
-def _actor_batch_160(config: RawConfig) -> None:
+def _actor_batch(config: RawConfig, size: int) -> None:
     selfplay = _mapping(config, "selfplay")
-    selfplay["batch_size"] = 160
-    selfplay["games"] = 160
+    selfplay["batch_size"] = size
+    selfplay["games"] = size
     orchestration = _mapping(config, "orchestration")
-    orchestration["actor_games_per_batch"] = 160
+    orchestration["actor_games_per_batch"] = size
     workers = orchestration.get("gpus")
     if not isinstance(workers, list):
         raise ValueError("orchestration.gpus must be a list")
     for worker in workers:
         if isinstance(worker, dict) and worker.get("role") == "actor":
-            worker["actor_batch_size"] = 160
+            worker["actor_batch_size"] = size
 
 
 def _actor_lanes_three(config: RawConfig) -> None:
@@ -357,7 +407,9 @@ TREATMENTS: dict[str, Treatment] = {
     "freshness-mix": _freshness_mix,
     "ring10-70": _ring_ten_seventy,
     "search-quality": _search_quality,
-    "actor-batch-160": _actor_batch_160,
+    "actor-batch-128": lambda config: _actor_batch(config, 128),
+    "actor-batch-160": lambda config: _actor_batch(config, 160),
+    "actor-batch-192": lambda config: _actor_batch(config, 192),
     "actor-lanes-3": _actor_lanes_three,
     "learner-batch-768": lambda config: _learner_batch(config, 768),
     "learner-batch-1024": lambda config: _learner_batch(config, 1024),
@@ -371,6 +423,9 @@ TREATMENTS: dict[str, Treatment] = {
     "ring10-only": _ring_ten_only,
     "ring10-learner-slack-64": _ring_ten_learner_slack,
     "ring10-actor-lanes-3": _ring_ten_actor_lanes_three,
+    "ring10-optimization-control": _ring_ten_optimization_control,
+    "ring10-cadence-5m": _ring_ten_cadence_five_million,
+    "ring10-freshness-50": _ring_ten_freshness_fifty,
 }
 
 
@@ -621,9 +676,9 @@ def _validate_ring10_efficiency_base(experiment: ExperimentConfig) -> None:
     validate_continuous_config(experiment)
     orchestration = experiment.orchestration
     if orchestration.training_objective != "ring10_only":
-        raise ValueError("ring10-efficiency suite requires a ring10_only base profile")
+        raise ValueError("ring10 suites require a ring10_only base profile")
     if orchestration.allow_colocated_workers:
-        raise ValueError("ring10-efficiency control must not colocate workers")
+        raise ValueError("ring10 control must not colocate workers")
     learners = orchestration.learner_gpus
     if (
         len(learners) != 1
@@ -631,10 +686,10 @@ def _validate_ring10_efficiency_base(experiment: ExperimentConfig) -> None:
         or learners[0].cpu_threads != 16
         or learners[0].cpu_affinity != "0-103"
     ):
-        raise ValueError("ring10-efficiency control requires the H100 learner layout")
+        raise ValueError("ring10 control requires the H100 learner layout")
     actors = {gpu.gpu_id: gpu for gpu in orchestration.actor_gpus}
     if set(actors) != set(range(1, 8)):
-        raise ValueError("ring10-efficiency control requires actor GPUs 1 through 7")
+        raise ValueError("ring10 control requires actor GPUs 1 through 7")
     for gpu_id, actor in actors.items():
         expected_affinity = "0-103" if gpu_id <= 3 else "104-207"
         expected_lanes = 1 if gpu_id == 7 else 2
@@ -644,16 +699,14 @@ def _validate_ring10_efficiency_base(experiment: ExperimentConfig) -> None:
             or actor.actor_lanes != expected_lanes
             or actor.cpu_affinity != expected_affinity
         ):
-            raise ValueError(
-                f"ring10-efficiency control actor GPU {gpu_id} topology drifted"
-            )
+            raise ValueError(f"ring10 control actor GPU {gpu_id} topology drifted")
     promotion = orchestration.promotion
     if (
         orchestration.actor_games_per_batch != 128
         or promotion.gpu_id != 7
         or not promotion.pause_sharing_mode
     ):
-        raise ValueError("ring10-efficiency control promotion topology drifted")
+        raise ValueError("ring10 control promotion topology drifted")
 
 
 def _validate_inputs(
@@ -823,7 +876,7 @@ def prepare_elo_ablation(
     )
     base_sha256 = _sha256(base)
     raw_base = _load_raw(base)
-    if suite == "ring10-efficiency" or any(
+    if suite in {"ring10-efficiency", "ring10-optimization"} or any(
         treatment in RING10_EFFICIENCY_VARIANTS for treatment in treatments
     ):
         _validate_ring10_efficiency_base(load_config(base))
