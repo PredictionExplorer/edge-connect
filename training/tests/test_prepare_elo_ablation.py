@@ -112,7 +112,7 @@ def test_prepare_generates_strict_one_factor_profiles(tmp_path: Path) -> None:
     }
     for name, profile in profiles.items():
         assert profile.orchestration.training_objective == "generalist"
-        assert profile.train.seed == profile.selfplay.seed == 23
+        assert profile.train.seed == profile.selfplay.seed == profile.arena.seed == 23
         assert profile.orchestration.run_id == "shared-parent-run"
         assert profile.orchestration.directories.root.endswith(f"pilot-{name}-seed23")
         assert profile.arena.per_ring_regression_floor_elo == {

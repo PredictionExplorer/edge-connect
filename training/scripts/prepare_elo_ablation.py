@@ -745,6 +745,7 @@ def _configure_common(
 ) -> None:
     _mapping(raw, "train")["seed"] = seed
     _mapping(raw, "selfplay")["seed"] = seed
+    _mapping(raw, "arena")["seed"] = seed
     orchestration = _mapping(raw, "orchestration")
     orchestration["run_id"] = run_id
     _mapping(orchestration, "directories")["root"] = str(run_root)
@@ -776,7 +777,11 @@ def _validate_profile(
         raise ValueError("generated run root did not round-trip")
     if loaded.orchestration.run_id != expected_run_id:
         raise ValueError("generated run ID did not round-trip")
-    if loaded.train.seed != expected_seed or loaded.selfplay.seed != expected_seed:
+    if (
+        loaded.train.seed != expected_seed
+        or loaded.selfplay.seed != expected_seed
+        or loaded.arena.seed != expected_seed
+    ):
         raise ValueError("generated treatment seeds did not round-trip")
     if loaded.orchestration.training_objective != expected_training_objective:
         raise ValueError("generated treatment training objective did not round-trip")
