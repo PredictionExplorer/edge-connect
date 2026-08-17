@@ -13,8 +13,10 @@ Environment=PYTHONUNBUFFERED=1
 Environment=PYTHONDONTWRITEBYTECODE=1
 Environment=PYTHONPATH=@TRAINING_DIR@
 Environment=PATH=@TRAINING_DIR@/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStartPre=/usr/bin/touch @OPERATOR_HOLD@
 ExecStartPre=@TRAINING_DIR@/.venv/bin/python @TRAINING_DIR@/scripts/check_training_ipc.py --user @USER@
 ExecStart=@TRAINING_DIR@/.venv/bin/python @TRAINING_DIR@/scripts/run_staged_elo_pipeline.py --confirmation-campaign @CONFIRMATION_CAMPAIGN@
+ExecStopPost=/usr/bin/rm -f @OPERATOR_HOLD@
 Restart=on-failure
 RestartPreventExitStatus=2 3
 RestartSec=30
