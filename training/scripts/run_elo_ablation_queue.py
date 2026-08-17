@@ -435,9 +435,11 @@ def _validate_replay_backup_units(
 
 
 def _git_revision(training_dir: Path) -> tuple[str, bool]:
+    repository_root = training_dir.expanduser().resolve().parent
+    safe_directory = f"safe.directory={repository_root}"
     try:
         commit = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
+            ["git", "-c", safe_directory, "rev-parse", "HEAD"],
             cwd=training_dir,
             check=True,
             capture_output=True,
@@ -445,7 +447,14 @@ def _git_revision(training_dir: Path) -> tuple[str, bool]:
             timeout=10,
         ).stdout.strip()
         status = subprocess.run(
-            ["git", "status", "--porcelain", "--untracked-files=all"],
+            [
+                "git",
+                "-c",
+                safe_directory,
+                "status",
+                "--porcelain",
+                "--untracked-files=all",
+            ],
             cwd=training_dir,
             check=True,
             capture_output=True,
