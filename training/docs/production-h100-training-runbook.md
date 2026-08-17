@@ -1072,6 +1072,79 @@ current candidate/champion, arena-referenced manifests, and recent recovery
 checkpoints remain protected. Whole-volume loss and persistent GPU/driver
 failure still require operator intervention.
 
+## Whole-host disaster recovery and off-host backups
+
+Host continuity and `replay_manifest_backup.py` do not survive loss of the
+instance volume. Keep the active run on local ext4/NVMe for SQLite correctness,
+and write immutable disaster snapshots to an attached Lambda filesystem:
+
+```bash
+export DR_ROOT=/lambda/nfs/<filesystem>/edgeconnect-dr/<workload-id>
+export DR_MOUNT=/lambda/nfs/<filesystem>
+
+python scripts/training_disaster_recovery.py snapshot \
+  --run-root "$RUN_ROOT" \
+  --profile "$PROFILE" \
+  --backup-root "$DR_ROOT" \
+  --expected-backup-mount "$DR_MOUNT"
+
+python scripts/training_disaster_recovery.py verify \
+  --backup-root "$DR_ROOT" \
+  --run-id "$RUN_ID"
+```
+
+The snapshot command creates a verified SQLite online backup, freezes its
+ready-shard cutoff, verifies every referenced shard against the ledger, and
+copies replay, identity, profile, model, recovery, cadence, arena, and status
+artifacts into content-addressed objects. It publishes the immutable snapshot
+manifest and `latest.json` only after end-to-end verification.
+
+Render and enable
+`deploy/edgeconnect-startrain-disaster-backup.{service,timer}.example` for a
+15-minute RPO. Distinct ablation roots retain one run identity, so give every
+arm a distinct disaster-backup root and `@BACKUP_ID@`; never let two roots
+publish into the same snapshot namespace.
+
+Pull the latest snapshot to a separate Mac hourly:
+
+```bash
+python scripts/pull_training_snapshot.py \
+  --host ubuntu@<training-ip> \
+  --remote-backup-root "$DR_ROOT" \
+  --local-backup-root "$HOME/Backups/EdgeConnectTraining/<workload-id>" \
+  --known-hosts-file "$HOME/.ssh/edgeconnect-training-known_hosts" \
+  --run-id "$RUN_ID" \
+  --ack-remote-path "$DR_ROOT/acknowledgements/<mac-name>.json"
+```
+
+Install the rendered
+`deploy/com.edgeconnect.training-backup.plist.example` with `launchctl`.
+`monitor_run.py --disaster-backup-root "$DR_ROOT"` reports snapshot and Mac
+acknowledgement age. A stale acknowledgement is an alert only; training does
+not stop automatically. Lambda filesystem snapshots target a 15-minute RPO,
+while the independent Mac RPO applies only while that Mac is online. Versioned
+object storage remains the recommended unattended third failure domain.
+
+Restore only into an absent destination. Preserve the frozen source profile;
+for a drill or a host with a different absolute root, request a separately
+checksummed relocated profile:
+
+```bash
+python scripts/training_disaster_recovery.py restore \
+  --snapshot "$DR_ROOT/snapshots/$RUN_ID/latest.json" \
+  --backup-root "$DR_ROOT" \
+  --destination /local/ext4/disposable-restore \
+  --relocate-profile
+
+python scripts/preflight_run_state.py \
+  --run-root /local/ext4/disposable-restore \
+  --profile /local/ext4/disposable-restore/profile-relocated.yaml
+```
+
+Run that disposable restore drill at least monthly. Garbage collection is a
+dry run unless `--apply` is explicit; it retains latest/hourly/daily/monthly
+generations and deletes only unreferenced content older than the grace period.
+
 ## 19. Troubleshooting
 
 ### Aggregate SRAM threshold or uncorrectable ECC

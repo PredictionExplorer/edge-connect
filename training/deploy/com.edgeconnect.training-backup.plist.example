@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.edgeconnect.training-backup.@BACKUP_ID@</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>@PYTHON@</string>
+    <string>@SCRIPT@</string>
+    <string>--host</string>
+    <string>@HOST@</string>
+    <string>--remote-backup-root</string>
+    <string>@REMOTE_BACKUP_ROOT@</string>
+    <string>--local-backup-root</string>
+    <string>@LOCAL_BACKUP_ROOT@</string>
+    <string>--known-hosts-file</string>
+    <string>@KNOWN_HOSTS_FILE@</string>
+    <string>--run-id</string>
+    <string>@RUN_ID@</string>
+    <string>--ack-remote-path</string>
+    <string>@ACK_REMOTE_PATH@</string>
+  </array>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PYTHONUNBUFFERED</key>
+    <string>1</string>
+    <key>PYTHONDONTWRITEBYTECODE</key>
+    <string>1</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StartInterval</key>
+  <integer>3600</integer>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>LowPriorityIO</key>
+  <true/>
+  <key>Umask</key>
+  <integer>63</integer>
+
+  <key>StandardOutPath</key>
+  <string>@LOG_DIR@/training-backup-@BACKUP_ID@.stdout.log</string>
+  <key>StandardErrorPath</key>
+  <string>@LOG_DIR@/training-backup-@BACKUP_ID@.stderr.log</string>
+</dict>
+</plist>

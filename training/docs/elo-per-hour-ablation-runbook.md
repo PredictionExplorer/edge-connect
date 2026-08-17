@@ -558,6 +558,22 @@ The snapshot records GPU telemetry, UTD and learner duty inputs, replay
 model-step lag, candidate arrival/service ratio, supersession, and current arena
 GPU7 occupancy.
 
+Every campaign arm also needs its own rendered
+`edgeconnect-startrain-disaster-backup` service/timer and distinct backup root.
+Forked arms intentionally share a run ID and generation family, so sharing one
+disaster-backup namespace would make `latest.json` ambiguous. Run the timer
+every 15 minutes so an arm release loses at most one snapshot interval, and
+pull each active arm's immutable snapshot to the independent Mac at least
+hourly.
+
+The campaign and queue control plane is separate from every arm. Keep its
+campaign config, policy, deployment manifests, queue states, comparisons, and
+handoff requests under one local state root; exclude runtime `.lock` files and
+snapshot that root every five minutes with `control_plane_backup.py`. Use the
+campaign backup service/timer templates and an additional Mac pull job with the
+`confirmation-campaign` namespace. A model snapshot alone cannot resume which
+seed or arm the campaign was running.
+
 For dependent experiment stages, use `run_staged_elo_pipeline.py`. It accepts
 only a hash-verified upstream winner snapshot and refuses a downstream fork
 whose champion anchor or canonical stage specification is stale. Every

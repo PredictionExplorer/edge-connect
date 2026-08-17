@@ -1,0 +1,13 @@
+[Unit]
+Description=Periodic EdgeConnect StarTrain disaster-recovery snapshot
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=14min
+AccuracySec=15s
+RandomizedDelaySec=30s
+Persistent=true
+Unit=edgeconnect-startrain-@BACKUP_ID@-disaster-backup.service
+
+[Install]
+WantedBy=timers.target

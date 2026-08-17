@@ -17,7 +17,7 @@ import sys
 import time
 from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import yaml
 
@@ -30,6 +30,8 @@ else:
 
 SEVERITY = {"OK": 0, "WARN": 1, "ERROR": 2}
 CONTINUITY_STALE_SECONDS = 180.0
+DISASTER_BACKUP_STALE_SECONDS = 30.0 * 60.0
+OFFSITE_ACK_STALE_SECONDS = 2.0 * 60.0 * 60.0
 _DIGEST_CACHE: dict[Path, tuple[int, int, int, str]] = {}
 _ARENA_RESULT_CACHE: dict[Path, tuple[int, int, dict[str, object]]] = {}
 
@@ -43,6 +45,11 @@ def _parser() -> argparse.ArgumentParser:
         "--continuity-state",
         type=Path,
         help="host-level continuity-state JSON outside the run root",
+    )
+    parser.add_argument(
+        "--disaster-backup-root",
+        type=Path,
+        help="content-addressed disaster-recovery backup root",
     )
     parser.add_argument("--interval", type=float, default=60.0)
     parser.add_argument("--once", action="store_true")
@@ -131,6 +138,232 @@ def _continuity_status(
         "last_transition": payload.get("last_transition"),
         "last_alert": payload.get("last_alert"),
         "quarantine_records": payload.get("quarantine_records"),
+    }
+
+
+def _disaster_recovery_status(
+    path: Path | None,
+    *,
+    run_id: object,
+    run_root: Path | None = None,
+    now_ns: int,
+) -> dict[str, object]:
+    if path is None:
+        return {"configured": False}
+    root = path.expanduser().resolve()
+    active_root = run_root.expanduser().resolve() if run_root is not None else None
+    run_identity = (
+        _read_json(active_root / "run.json") if active_root is not None else None
+    )
+    namespace = _read_json(root / "namespace.json")
+    if (
+        not isinstance(run_id, str)
+        or not run_id
+        or active_root is None
+        or run_identity is None
+        or run_identity.get("run_id") != run_id
+        or namespace is None
+        or namespace.get("report") != "startrain-disaster-recovery-namespace"
+        or namespace.get("schema_version") != 1
+        or namespace.get("run_id") != run_id
+        or namespace.get("generation_family") != run_identity.get("generation_family")
+        or namespace.get("source_run_root") != str(active_root)
+    ):
+        return {
+            "configured": True,
+            "valid": False,
+            "backup_root": str(root),
+            "reason": "namespace_or_run_identity_invalid",
+        }
+    latest_path = root / "snapshots" / run_id / "latest.json"
+    latest = _read_json(latest_path)
+    if (
+        latest is None
+        or latest.get("report") != "startrain-disaster-recovery-latest"
+        or latest.get("schema_version") != 1
+        or latest.get("run_id") != run_id
+    ):
+        return {
+            "configured": True,
+            "valid": False,
+            "backup_root": str(root),
+            "latest_path": str(latest_path),
+            "reason": "latest_pointer_invalid",
+        }
+    filename = latest.get("path")
+    digest = latest.get("sha256")
+    expected_bytes = latest.get("bytes")
+    created_ns = latest.get("created_ns")
+    if (
+        not isinstance(filename, str)
+        or Path(filename).name != filename
+        or not isinstance(digest, str)
+        or len(digest) != 64
+        or any(character not in "0123456789abcdef" for character in digest)
+        or isinstance(expected_bytes, bool)
+        or not isinstance(expected_bytes, int)
+        or expected_bytes <= 0
+        or isinstance(created_ns, bool)
+        or not isinstance(created_ns, int)
+        or created_ns <= 0
+        or created_ns > now_ns
+    ):
+        return {
+            "configured": True,
+            "valid": False,
+            "backup_root": str(root),
+            "latest_path": str(latest_path),
+            "reason": "latest_pointer_evidence_invalid",
+        }
+    snapshot_path = latest_path.parent / filename
+    snapshot_valid, _ = _verified_artifact(
+        snapshot_path,
+        expected_bytes=expected_bytes,
+        expected_sha256=digest,
+    )
+    snapshot = _read_json(snapshot_path) if snapshot_valid else None
+    if (
+        snapshot is None
+        or snapshot.get("report") != "startrain-disaster-recovery-snapshot"
+        or snapshot.get("schema_version") != 1
+        or snapshot.get("run_id") != run_id
+        or snapshot.get("created_ns") != created_ns
+    ):
+        return {
+            "configured": True,
+            "valid": False,
+            "backup_root": str(root),
+            "latest_path": str(latest_path),
+            "snapshot_path": str(snapshot_path),
+            "reason": "snapshot_invalid",
+        }
+    snapshot_age = max(0.0, (now_ns - created_ns) / 1_000_000_000)
+    source = snapshot.get("source")
+    if not isinstance(source, dict) or source.get("run_root") != str(active_root):
+        return {
+            "configured": True,
+            "valid": False,
+            "backup_root": str(root),
+            "latest_path": str(latest_path),
+            "snapshot_path": str(snapshot_path),
+            "reason": "snapshot_workload_root_invalid",
+        }
+    replay_backup = source.get("replay_backup") if isinstance(source, dict) else None
+    cutoff_ns = (
+        replay_backup.get(
+            "cutoff_started_ns",
+            replay_backup.get("created_ns"),
+        )
+        if isinstance(replay_backup, dict)
+        else None
+    )
+    cutoff_age = (
+        max(0.0, (now_ns - cutoff_ns) / 1_000_000_000)
+        if isinstance(cutoff_ns, int)
+        and not isinstance(cutoff_ns, bool)
+        and 0 < cutoff_ns <= created_ns
+        else None
+    )
+    if cutoff_age is None:
+        return {
+            "configured": True,
+            "valid": False,
+            "backup_root": str(root),
+            "latest_path": str(latest_path),
+            "snapshot_path": str(snapshot_path),
+            "reason": "snapshot_cutoff_invalid",
+        }
+    latest_ack: dict[str, object] | None = None
+    latest_ack_completed_ns: int | None = None
+    acknowledgements = root / "acknowledgements"
+    if acknowledgements.is_dir() and not acknowledgements.is_symlink():
+        for candidate in sorted(acknowledgements.glob("*.json")):
+            payload = _read_json(candidate)
+            if (
+                payload is None
+                or payload.get("report")
+                != "startrain-disaster-recovery-acknowledgement"
+                or payload.get("schema_version") != 1
+                or payload.get("local_verification_status") != "verified"
+            ):
+                continue
+            acknowledged_path = payload.get("snapshot_path")
+            acknowledged_sha256 = payload.get("snapshot_sha256")
+            if (
+                not isinstance(acknowledged_path, str)
+                or not isinstance(acknowledged_sha256, str)
+                or len(acknowledged_sha256) != 64
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in acknowledged_sha256
+                )
+            ):
+                continue
+            relative = PurePosixPath(acknowledged_path)
+            if (
+                relative.is_absolute()
+                or len(relative.parts) != 3
+                or relative.parts[:2] != ("snapshots", run_id)
+                or any(part in {"", ".", ".."} for part in relative.parts)
+            ):
+                continue
+            acknowledged_snapshot_path = root.joinpath(*relative.parts)
+            acknowledged_snapshot = _read_json(acknowledged_snapshot_path)
+            try:
+                acknowledged_bytes = acknowledged_snapshot_path.stat().st_size
+            except OSError:
+                continue
+            acknowledged_valid, _ = _verified_artifact(
+                acknowledged_snapshot_path,
+                expected_bytes=acknowledged_bytes,
+                expected_sha256=acknowledged_sha256,
+            )
+            if (
+                not acknowledged_valid
+                or acknowledged_snapshot is None
+                or acknowledged_snapshot.get("report")
+                != "startrain-disaster-recovery-snapshot"
+                or acknowledged_snapshot.get("run_id") != run_id
+            ):
+                continue
+            completed_ns = payload.get("completed_ns")
+            if (
+                isinstance(completed_ns, bool)
+                or not isinstance(completed_ns, int)
+                or completed_ns <= 0
+                or completed_ns > now_ns
+            ):
+                continue
+            if (
+                latest_ack_completed_ns is None
+                or completed_ns > latest_ack_completed_ns
+            ):
+                latest_ack = {**payload, "path": str(candidate)}
+                latest_ack_completed_ns = completed_ns
+    catalog = snapshot.get("catalog")
+    return {
+        "configured": True,
+        "valid": True,
+        "backup_root": str(root),
+        "latest_path": str(latest_path),
+        "snapshot_path": str(snapshot_path),
+        "snapshot_sha256": digest,
+        "snapshot_created_ns": created_ns,
+        "snapshot_age_seconds": snapshot_age,
+        "source_cutoff_ns": cutoff_ns,
+        "source_cutoff_age_seconds": cutoff_age,
+        "catalog_files": len(catalog) if isinstance(catalog, dict) else None,
+        "offsite_acknowledgement": latest_ack,
+        "offsite_acknowledges_current_snapshot": (
+            latest_ack is not None
+            and latest_ack.get("snapshot_sha256") == digest
+            and latest_ack.get("snapshot_path") == f"snapshots/{run_id}/{filename}"
+        ),
+        "offsite_ack_age_seconds": (
+            max(0.0, (now_ns - latest_ack_completed_ns) / 1_000_000_000)
+            if latest_ack_completed_ns is not None
+            else None
+        ),
     }
 
 
@@ -1096,6 +1329,7 @@ def collect_snapshot(
     unit: str | None = None,
     profile_path: Path | None = None,
     continuity_state_path: Path | None = None,
+    disaster_backup_root: Path | None = None,
     now_ns: int | None = None,
 ) -> dict[str, object]:
     root = run_root.expanduser().resolve()
@@ -2113,6 +2347,53 @@ def collect_snapshot(
             "continuity_blocked",
             f"host-level continuity phase is {phase}",
         )
+    disaster_recovery = _disaster_recovery_status(
+        disaster_backup_root,
+        run_id=orchestration.get("run_id"),
+        run_root=root,
+        now_ns=now,
+    )
+    if (
+        disaster_recovery.get("configured")
+        and disaster_recovery.get("valid") is not True
+    ):
+        _add_warning(
+            warnings,
+            "ERROR",
+            "disaster_backup_invalid",
+            "off-host disaster-recovery snapshot is missing or invalid",
+        )
+    disaster_age = disaster_recovery.get("source_cutoff_age_seconds")
+    if (
+        disaster_recovery.get("valid") is True
+        and isinstance(disaster_age, int | float)
+        and float(disaster_age) > DISASTER_BACKUP_STALE_SECONDS
+    ):
+        _add_warning(
+            warnings,
+            "ERROR",
+            "disaster_backup_stale",
+            f"latest off-host snapshot age={float(disaster_age):.0f}s",
+        )
+    acknowledgement_age = disaster_recovery.get("offsite_ack_age_seconds")
+    if disaster_recovery.get("valid") is True and acknowledgement_age is None:
+        _add_warning(
+            warnings,
+            "WARN",
+            "offsite_backup_unacknowledged",
+            "latest disaster snapshot has no verified Mac acknowledgement",
+        )
+    elif (
+        isinstance(acknowledgement_age, int | float)
+        and float(acknowledgement_age) > OFFSITE_ACK_STALE_SECONDS
+    ):
+        _add_warning(
+            warnings,
+            "WARN",
+            "offsite_backup_stale",
+            f"latest verified Mac acknowledgement age="
+            f"{float(acknowledgement_age):.0f}s",
+        )
 
     status = max(
         (item["severity"] for item in warnings),
@@ -2151,6 +2432,7 @@ def collect_snapshot(
         "gpus": gpus,
         "gpu_health": hardware_health,
         "continuity": continuity,
+        "disaster_recovery": disaster_recovery,
         "warnings": warnings,
     }
 
@@ -2220,6 +2502,10 @@ def format_text(snapshot: Mapping[str, object]) -> str:
         segment_target = learner.get("target_updates_per_new_sample")
     continuity = snapshot.get("continuity")
     continuity = continuity if isinstance(continuity, Mapping) else {}
+    disaster_recovery = snapshot.get("disaster_recovery")
+    disaster_recovery = (
+        disaster_recovery if isinstance(disaster_recovery, Mapping) else {}
+    )
     return (
         f"{snapshot.get('timestamp')} {snapshot.get('status')} "
         f"objective={snapshot.get('training_objective', 'generalist')} "
@@ -2252,6 +2538,8 @@ def format_text(snapshot: Mapping[str, object]) -> str:
         f"failure={failure.get('failure_class', '-')} "
         f"continuity={continuity.get('phase', 'n/a')} "
         f"active_workload={continuity.get('active_workload_id', 'n/a')} "
+        f"dr_age={_seconds(disaster_recovery.get('source_cutoff_age_seconds'))} "
+        f"mac_ack_age={_seconds(disaster_recovery.get('offsite_ack_age_seconds'))} "
         f"warnings={warning_codes or '-'}"
     )
 
@@ -2342,25 +2630,40 @@ def run_monitor(
     output_format: str,
     stop_requested: Callable[[], bool],
     continuity_state_path: Path | None = None,
+    disaster_backup_root: Path | None = None,
     telemetry_output: Path | None = None,
 ) -> None:
     next_tick = time.monotonic()
     while not stop_requested():
         try:
-            snapshot = (
-                collect_snapshot(
+            if continuity_state_path is not None and disaster_backup_root is not None:
+                snapshot = collect_snapshot(
                     run_root,
                     unit=unit,
                     profile_path=profile_path,
+                    continuity_state_path=continuity_state_path,
+                    disaster_backup_root=disaster_backup_root,
                 )
-                if continuity_state_path is None
-                else collect_snapshot(
+            elif continuity_state_path is not None:
+                snapshot = collect_snapshot(
                     run_root,
                     unit=unit,
                     profile_path=profile_path,
                     continuity_state_path=continuity_state_path,
                 )
-            )
+            elif disaster_backup_root is not None:
+                snapshot = collect_snapshot(
+                    run_root,
+                    unit=unit,
+                    profile_path=profile_path,
+                    disaster_backup_root=disaster_backup_root,
+                )
+            else:
+                snapshot = collect_snapshot(
+                    run_root,
+                    unit=unit,
+                    profile_path=profile_path,
+                )
         except Exception as error:  # monitor must report and continue
             snapshot = {
                 "schema_version": 1,
@@ -2424,6 +2727,7 @@ def main(argv: list[str] | None = None) -> int:
         output_format=arguments.format,
         stop_requested=lambda: stopped,
         continuity_state_path=arguments.continuity_state,
+        disaster_backup_root=arguments.disaster_backup_root,
         telemetry_output=arguments.telemetry_output,
     )
     return 0

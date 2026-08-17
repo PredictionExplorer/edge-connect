@@ -1,0 +1,13 @@
+[Unit]
+Description=Periodic EdgeConnect confirmation-campaign control-plane backup
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+AccuracySec=15s
+RandomizedDelaySec=30s
+Persistent=true
+Unit=edgeconnect-startrain-campaign-backup.service
+
+[Install]
+WantedBy=timers.target

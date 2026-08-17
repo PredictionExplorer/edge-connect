@@ -1216,3 +1216,201 @@ def test_monitor_derives_aggregate_headline_from_legacy_report(tmp_path) -> None
     assert status["headline_elo"] == 300.0
     assert status["headline_source"] == "aggregate"
     assert status["headline_confidence_interval"] == [250.0, 350.0]
+
+
+def test_disaster_recovery_status_verifies_snapshot_and_mac_ack(tmp_path) -> None:
+    now_ns = 200_000_000_000
+    run_id = "run-1"
+    backup_root = tmp_path / "backup"
+    active_root = tmp_path / "run"
+    _write_json(
+        active_root / "run.json",
+        {
+            "schema_version": 1,
+            "run_id": run_id,
+            "generation_family": "family-1",
+            "created_ns": 1,
+        },
+    )
+    _write_json(
+        backup_root / "namespace.json",
+        {
+            "schema_version": 1,
+            "report": "startrain-disaster-recovery-namespace",
+            "run_id": run_id,
+            "generation_family": "family-1",
+            "source_run_root": str(active_root),
+        },
+    )
+    run_snapshots = backup_root / "snapshots" / run_id
+    snapshot = {
+        "schema_version": 1,
+        "report": "startrain-disaster-recovery-snapshot",
+        "run_id": run_id,
+        "generation_family": "family-1",
+        "created_ns": now_ns - 60_000_000_000,
+        "source": {
+            "run_root": str(active_root),
+            "replay_backup": {
+                "created_ns": now_ns - 90_000_000_000,
+            },
+        },
+        "catalog": {"run.json": {"sha256": "a" * 64, "bytes": 1, "kind": "run"}},
+    }
+    snapshot_payload = (
+        json.dumps(snapshot, sort_keys=True, separators=(",", ":")) + "\n"
+    ).encode()
+    snapshot_sha256 = hashlib.sha256(snapshot_payload).hexdigest()
+    snapshot_name = f"{snapshot['created_ns']}-{snapshot_sha256}.json"
+    run_snapshots.mkdir(parents=True)
+    (run_snapshots / snapshot_name).write_bytes(snapshot_payload)
+    _write_json(
+        run_snapshots / "latest.json",
+        {
+            "schema_version": 1,
+            "report": "startrain-disaster-recovery-latest",
+            "run_id": run_id,
+            "generation_family": "family-1",
+            "path": snapshot_name,
+            "sha256": snapshot_sha256,
+            "bytes": len(snapshot_payload),
+            "created_ns": snapshot["created_ns"],
+        },
+    )
+    _write_json(
+        backup_root / "acknowledgements" / "mac.json",
+        {
+            "schema_version": 1,
+            "report": "startrain-disaster-recovery-acknowledgement",
+            "snapshot_sha256": snapshot_sha256,
+            "snapshot_path": f"snapshots/{run_id}/{snapshot_name}",
+            "completed_ns": now_ns - 30_000_000_000,
+            "mac_hostname": "mac",
+            "local_verification_status": "verified",
+        },
+    )
+
+    status = monitor._disaster_recovery_status(
+        backup_root,
+        run_id=run_id,
+        run_root=active_root,
+        now_ns=now_ns,
+    )
+
+    assert status["valid"] is True
+    assert status["snapshot_age_seconds"] == 60.0
+    assert status["source_cutoff_age_seconds"] == 90.0
+    assert status["offsite_ack_age_seconds"] == 30.0
+    assert status["catalog_files"] == 1
+
+    newer = {
+        **snapshot,
+        "created_ns": now_ns - 10_000_000_000,
+        "source": {
+            "run_root": str(active_root),
+            "replay_backup": {
+                "created_ns": now_ns - 20_000_000_000,
+            },
+        },
+    }
+    newer_payload = (
+        json.dumps(newer, sort_keys=True, separators=(",", ":")) + "\n"
+    ).encode()
+    newer_sha256 = hashlib.sha256(newer_payload).hexdigest()
+    newer_name = f"{newer['created_ns']}-{newer_sha256}.json"
+    (run_snapshots / newer_name).write_bytes(newer_payload)
+    _write_json(
+        run_snapshots / "latest.json",
+        {
+            "schema_version": 1,
+            "report": "startrain-disaster-recovery-latest",
+            "run_id": run_id,
+            "generation_family": "family-1",
+            "path": newer_name,
+            "sha256": newer_sha256,
+            "bytes": len(newer_payload),
+            "created_ns": newer["created_ns"],
+        },
+    )
+
+    pending = monitor._disaster_recovery_status(
+        backup_root,
+        run_id=run_id,
+        run_root=active_root,
+        now_ns=now_ns,
+    )
+
+    assert pending["valid"] is True
+    assert pending["offsite_ack_age_seconds"] == 30.0
+    assert pending["offsite_acknowledges_current_snapshot"] is False
+
+    other_root = tmp_path / "other-run"
+    _write_json(
+        other_root / "run.json",
+        {
+            "schema_version": 1,
+            "run_id": run_id,
+            "generation_family": "family-1",
+            "created_ns": 1,
+        },
+    )
+    wrong_workload = monitor._disaster_recovery_status(
+        backup_root,
+        run_id=run_id,
+        run_root=other_root,
+        now_ns=now_ns,
+    )
+    assert wrong_workload["valid"] is False
+    assert wrong_workload["reason"] == "namespace_or_run_identity_invalid"
+
+
+def test_disaster_recovery_status_rejects_tampered_snapshot(tmp_path) -> None:
+    now_ns = 20_000_000_000
+    run_id = "run-1"
+    active_root = tmp_path / "run"
+    _write_json(
+        active_root / "run.json",
+        {
+            "schema_version": 1,
+            "run_id": run_id,
+            "generation_family": "family-1",
+            "created_ns": 1,
+        },
+    )
+    _write_json(
+        tmp_path / "namespace.json",
+        {
+            "schema_version": 1,
+            "report": "startrain-disaster-recovery-namespace",
+            "run_id": run_id,
+            "generation_family": "family-1",
+            "source_run_root": str(active_root),
+        },
+    )
+    run_snapshots = tmp_path / "snapshots" / run_id
+    run_snapshots.mkdir(parents=True)
+    snapshot_name = f"1-{'a' * 64}.json"
+    (run_snapshots / snapshot_name).write_text("{}\n", encoding="utf-8")
+    _write_json(
+        run_snapshots / "latest.json",
+        {
+            "schema_version": 1,
+            "report": "startrain-disaster-recovery-latest",
+            "run_id": run_id,
+            "generation_family": "family-1",
+            "path": snapshot_name,
+            "sha256": "a" * 64,
+            "bytes": 3,
+            "created_ns": 1,
+        },
+    )
+
+    status = monitor._disaster_recovery_status(
+        tmp_path,
+        run_id=run_id,
+        run_root=active_root,
+        now_ns=now_ns,
+    )
+
+    assert status["valid"] is False
+    assert status["reason"] == "snapshot_invalid"

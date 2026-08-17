@@ -1,0 +1,42 @@
+[Unit]
+Description=EdgeConnect StarTrain disaster-recovery snapshot
+ConditionPathIsDirectory=@RUN_ROOT@
+ConditionPathIsDirectory=@BACKUP_ROOT@
+ConditionPathIsMountPoint=@BACKUP_MOUNT@
+RequiresMountsFor=@BACKUP_MOUNT@
+After=remote-fs.target
+
+[Service]
+Type=oneshot
+User=@USER@
+WorkingDirectory=@TRAINING_DIR@
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONPATH=@TRAINING_DIR@
+ExecStart=@TRAINING_DIR@/.venv/bin/python @TRAINING_DIR@/scripts/training_disaster_recovery.py snapshot --run-root @RUN_ROOT@ --profile @PROFILE@ --backup-root @BACKUP_ROOT@ --expected-backup-mount @BACKUP_MOUNT@
+TimeoutStartSec=30min
+Nice=10
+IOSchedulingClass=idle
+UMask=0077
+NoNewPrivileges=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateTmp=true
+PrivateDevices=true
+PrivateNetwork=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=@BACKUP_ROOT@ @RUN_ROOT@/recovery/replay-manifest
+ProtectClock=true
+ProtectControlGroups=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
