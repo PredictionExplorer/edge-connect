@@ -3,7 +3,7 @@ Description=Periodic EdgeConnect StarTrain disaster-recovery snapshot
 
 [Timer]
 OnBootSec=5min
-OnUnitActiveSec=14min
+OnCalendar=*:0/14
 AccuracySec=15s
 RandomizedDelaySec=30s
 Persistent=true
