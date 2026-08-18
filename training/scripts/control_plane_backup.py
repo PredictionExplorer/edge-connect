@@ -71,6 +71,8 @@ def _source_files(root: Path) -> tuple[list[Path], dict[str, tuple[int, ...]]]:
             raise DisasterRecoveryError(
                 f"control-plane path is not a regular file: {relative}"
             )
+        if metadata.st_size <= 0:
+            raise DisasterRecoveryError(f"control-plane file is empty: {relative}")
         logical = PurePosixPath(relative.as_posix())
         if logical.is_absolute() or any(
             part in {"", ".", ".."} for part in logical.parts
@@ -216,9 +218,11 @@ def _commit_payload(
 
 
 def _is_committed(path: Path, backup: Path) -> bool:
-    payload, _, digest, size = _snapshot_document(path, backup, full_objects=False)
     marker = path.with_name(f"{path.name}.commit")
-    return marker.is_file() and marker.read_bytes() == _commit_payload(
+    if not marker.is_file():
+        return False
+    payload, _, digest, size = _snapshot_document(path, backup, full_objects=False)
+    return marker.read_bytes() == _commit_payload(
         path,
         payload,
         digest,
@@ -280,7 +284,7 @@ def create_control_snapshot(
                     )[0].get("created_ns"),
                 )
                 for candidate in snapshots.glob("*.json")
-                if candidate.name != "latest.json"
+                if candidate.name != "latest.json" and _is_committed(candidate, backup)
             ),
             default=0,
         )

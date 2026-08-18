@@ -60,6 +60,61 @@ def test_control_snapshot_verify_restore_and_deduplicate(tmp_path: Path) -> None
     assert not (restored / "campaign.json.lock").exists()
 
 
+def test_control_snapshot_rejects_empty_source_before_publication(
+    tmp_path: Path,
+) -> None:
+    source = _source(tmp_path)
+    backup = tmp_path / "backup"
+    empty = source / "partial.json"
+    empty.write_bytes(b"")
+
+    with pytest.raises(control.DisasterRecoveryError, match="file is empty"):
+        control.create_control_snapshot(
+            source,
+            backup,
+            namespace_id="confirmation-campaign",
+            enforce_separate_filesystem=False,
+        )
+
+    assert not list((backup / "snapshots").glob("**/*.json"))
+    empty.unlink()
+    snapshot = control.create_control_snapshot(
+        source,
+        backup,
+        namespace_id="confirmation-campaign",
+        enforce_separate_filesystem=False,
+    )
+    assert snapshot.is_file()
+
+
+def test_control_snapshot_ignores_uncommitted_invalid_document(
+    tmp_path: Path,
+) -> None:
+    source = _source(tmp_path)
+    backup = tmp_path / "backup"
+    first = control.create_control_snapshot(
+        source,
+        backup,
+        namespace_id="confirmation-campaign",
+        enforce_separate_filesystem=False,
+    )
+    invalid_payload = json.loads(first.read_text())
+    next(iter(invalid_payload["catalog"].values()))["bytes"] = 0
+    invalid = first.with_name("9999999999999999999-" + "f" * 64 + ".json")
+    invalid.write_bytes(control._canonical_json(invalid_payload))
+
+    assert control._is_committed(invalid, backup) is False
+    second = control.create_control_snapshot(
+        source,
+        backup,
+        namespace_id="confirmation-campaign",
+        enforce_separate_filesystem=False,
+    )
+
+    assert second != first
+    assert control.verify_control_snapshot(second, backup)["status"] == "ok"
+
+
 def test_control_latest_pointer_rejects_stale_snapshot(tmp_path: Path) -> None:
     source = _source(tmp_path)
     backup = tmp_path / "backup"
