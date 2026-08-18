@@ -252,6 +252,12 @@ def fork_elo_ablation(
     plan = _read_json(plan_file)
     if plan.get("report") != "startrain-elo-ablation-plan":
         raise ValueError("unsupported ablation plan")
+    initialization = plan.get("initialization", "fork")
+    if initialization != "fork":
+        raise ValueError(
+            "scratch architecture plans require isolated scratch-root "
+            "initialization and cannot fork model/replay state"
+        )
     configured_source = plan.get("source_run_root")
     if (
         not isinstance(configured_source, str)

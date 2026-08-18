@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 import warnings
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Literal
 
 import torch
@@ -38,6 +40,169 @@ class OptimizerConfig:
             raise ValueError("muon_momentum must be in [0, 1)")
         if self.muon_ns_steps < 1:
             raise ValueError("muon_ns_steps must be positive")
+
+
+@dataclass(frozen=True, slots=True)
+class OptimizerRoutingGroup:
+    """Stable, initialization-independent metadata for one parameter route."""
+
+    name: str
+    algorithm: str
+    weight_decay: float
+    parameter_tensors: int
+    parameter_elements: int
+    parameter_names: tuple[str, ...]
+
+    def as_dict(self, *, include_parameter_names: bool = False) -> dict[str, object]:
+        values: dict[str, object] = {
+            "name": self.name,
+            "algorithm": self.algorithm,
+            "weight_decay": self.weight_decay,
+            "parameter_tensors": self.parameter_tensors,
+            "parameter_elements": self.parameter_elements,
+        }
+        if include_parameter_names:
+            values["parameter_names"] = list(self.parameter_names)
+        return values
+
+
+@dataclass(frozen=True, slots=True)
+class OptimizerRoutingMetadata:
+    """Auditable routing identity attached to optimizers built by this module."""
+
+    schema_version: int
+    requested_kind: str
+    implementation: str
+    fallback_used: bool
+    optimizer_config: OptimizerConfig
+    routing_hash: str
+    groups: tuple[OptimizerRoutingGroup, ...]
+
+    @property
+    def parameter_tensors(self) -> int:
+        return sum(group.parameter_tensors for group in self.groups)
+
+    @property
+    def parameter_elements(self) -> int:
+        return sum(group.parameter_elements for group in self.groups)
+
+    def as_dict(self, *, include_parameter_names: bool = False) -> dict[str, object]:
+        return {
+            "schema_version": self.schema_version,
+            "requested_kind": self.requested_kind,
+            "implementation": self.implementation,
+            "fallback_used": self.fallback_used,
+            "optimizer_config": asdict(self.optimizer_config),
+            "routing_hash": self.routing_hash,
+            "parameter_tensors": self.parameter_tensors,
+            "parameter_elements": self.parameter_elements,
+            "groups": [
+                group.as_dict(include_parameter_names=include_parameter_names)
+                for group in self.groups
+            ],
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class OptimizerGroupDiagnostics:
+    """Observed norms for one optimizer group and one completed update."""
+
+    group_index: int
+    name: str
+    algorithm: str
+    parameter_tensors: int
+    parameter_elements: int
+    configured_learning_rate: float
+    weight_norm: float
+    gradient_norm: float
+    update_norm: float
+    effective_learning_rate: float | None
+    update_to_weight_ratio: float | None
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "group_index": self.group_index,
+            "name": self.name,
+            "algorithm": self.algorithm,
+            "parameter_tensors": self.parameter_tensors,
+            "parameter_elements": self.parameter_elements,
+            "configured_learning_rate": self.configured_learning_rate,
+            "weight_norm": self.weight_norm,
+            "gradient_norm": self.gradient_norm,
+            "update_norm": self.update_norm,
+            "effective_learning_rate": self.effective_learning_rate,
+            "update_to_weight_ratio": self.update_to_weight_ratio,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class _OptimizerGroupDiagnosticTensors:
+    group_index: int
+    name: str
+    algorithm: str
+    parameter_tensors: int
+    parameter_elements: int
+    configured_learning_rate: float
+    weight_norm: Tensor
+    gradient_norm: Tensor
+    update_norm: Tensor
+
+
+@dataclass(frozen=True, slots=True)
+class OptimizerStepDiagnostics:
+    """Device-resident diagnostics, synchronized only when converted to host."""
+
+    groups: tuple[_OptimizerGroupDiagnosticTensors, ...]
+
+    def to_host(self) -> tuple[OptimizerGroupDiagnostics, ...]:
+        output: list[OptimizerGroupDiagnostics] = []
+        for group in self.groups:
+            weight_norm, gradient_norm, update_norm = (
+                group.weight_norm.detach().float(),
+                group.gradient_norm.detach().float(),
+                group.update_norm.detach().float(),
+            )
+            values = (
+                torch.stack((weight_norm, gradient_norm, update_norm)).cpu().tolist()
+            )
+            observed_effective_lr = (
+                float(values[2] / values[1]) if values[1] > 0 else None
+            )
+            update_to_weight = float(values[2] / values[0]) if values[0] > 0 else None
+            output.append(
+                OptimizerGroupDiagnostics(
+                    group_index=group.group_index,
+                    name=group.name,
+                    algorithm=group.algorithm,
+                    parameter_tensors=group.parameter_tensors,
+                    parameter_elements=group.parameter_elements,
+                    configured_learning_rate=group.configured_learning_rate,
+                    weight_norm=float(values[0]),
+                    gradient_norm=float(values[1]),
+                    update_norm=float(values[2]),
+                    effective_learning_rate=observed_effective_lr,
+                    update_to_weight_ratio=update_to_weight,
+                )
+            )
+        return tuple(output)
+
+
+@dataclass(frozen=True, slots=True)
+class _OptimizerGroupSnapshot:
+    descriptor: OptimizerRoutingGroup
+    parameters: tuple[nn.Parameter, ...]
+    values_before: tuple[Tensor, ...]
+    configured_learning_rate: float
+    weight_norm: Tensor
+    gradient_norm: Tensor
+
+
+@dataclass(frozen=True, slots=True)
+class OptimizerDiagnosticSnapshot:
+    """Pre-step values needed to observe an optimizer's actual update."""
+
+    optimizer_id: int
+    groups: tuple[_OptimizerGroupSnapshot, ...]
 
 
 def _zeroth_power_newton_schulz(gradient: Tensor, steps: int) -> Tensor:
@@ -240,6 +405,229 @@ def split_decay_parameters(
     return decay, no_decay
 
 
+def _routing_metadata(
+    *,
+    requested_kind: str,
+    implementation: str,
+    fallback_used: bool,
+    config: OptimizerConfig,
+    groups: list[tuple[str, str, float, list[tuple[str, nn.Parameter]]]],
+) -> OptimizerRoutingMetadata:
+    canonical_groups: list[dict[str, object]] = []
+    routing_groups: list[OptimizerRoutingGroup] = []
+    for name, algorithm, weight_decay, parameters in groups:
+        canonical_parameters = [
+            {
+                "name": parameter_name,
+                "shape": list(parameter.shape),
+                "elements": parameter.numel(),
+            }
+            for parameter_name, parameter in parameters
+        ]
+        canonical_groups.append(
+            {
+                "name": name,
+                "algorithm": algorithm,
+                "weight_decay": float(weight_decay),
+                "parameters": canonical_parameters,
+            }
+        )
+        routing_groups.append(
+            OptimizerRoutingGroup(
+                name=name,
+                algorithm=algorithm,
+                weight_decay=float(weight_decay),
+                parameter_tensors=len(parameters),
+                parameter_elements=sum(
+                    parameter.numel() for _, parameter in parameters
+                ),
+                parameter_names=tuple(
+                    parameter_name for parameter_name, _ in parameters
+                ),
+            )
+        )
+    canonical = {
+        "schema_version": 1,
+        "requested_kind": requested_kind,
+        "implementation": implementation,
+        "fallback_used": fallback_used,
+        "optimizer_config": asdict(config),
+        "groups": canonical_groups,
+    }
+    digest = hashlib.sha256(
+        json.dumps(
+            canonical,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    return OptimizerRoutingMetadata(
+        schema_version=1,
+        requested_kind=requested_kind,
+        implementation=implementation,
+        fallback_used=fallback_used,
+        optimizer_config=config,
+        routing_hash=f"sha256-{digest}",
+        groups=tuple(routing_groups),
+    )
+
+
+def _attach_routing_metadata(
+    optimizer: torch.optim.Optimizer,
+    metadata: OptimizerRoutingMetadata,
+) -> torch.optim.Optimizer:
+    if len(metadata.groups) != len(optimizer.param_groups):
+        raise RuntimeError("optimizer routing metadata does not match parameter groups")
+    setattr(optimizer, "_startrain_routing_metadata", metadata)
+    return optimizer
+
+
+def optimizer_routing_metadata(
+    optimizer: torch.optim.Optimizer,
+) -> OptimizerRoutingMetadata:
+    """Return the immutable routing identity recorded by ``build_optimizer``."""
+
+    metadata = getattr(optimizer, "_startrain_routing_metadata", None)
+    if not isinstance(metadata, OptimizerRoutingMetadata):
+        raise ValueError("optimizer has no StarTrain routing metadata")
+    if len(metadata.groups) != len(optimizer.param_groups):
+        raise ValueError("optimizer parameter groups changed after routing")
+    return metadata
+
+
+def optimizer_checkpoint_contract(
+    optimizer: torch.optim.Optimizer,
+) -> dict[str, object] | None:
+    """Return a strict primitive-only optimizer identity for checkpoints."""
+
+    try:
+        metadata = optimizer_routing_metadata(optimizer)
+    except ValueError:
+        return None
+    return metadata.as_dict(include_parameter_names=True)
+
+
+def _runtime_routing_groups(
+    optimizer: torch.optim.Optimizer,
+) -> tuple[OptimizerRoutingGroup, ...]:
+    metadata = getattr(optimizer, "_startrain_routing_metadata", None)
+    if isinstance(metadata, OptimizerRoutingMetadata):
+        if len(metadata.groups) != len(optimizer.param_groups):
+            raise ValueError("optimizer parameter groups changed after routing")
+        return metadata.groups
+    groups: list[OptimizerRoutingGroup] = []
+    for index, group in enumerate(optimizer.param_groups):
+        parameters = tuple(group["params"])
+        groups.append(
+            OptimizerRoutingGroup(
+                name=f"group_{index}",
+                algorithm=str(
+                    group.get("algorithm", optimizer.__class__.__name__.lower())
+                ),
+                weight_decay=float(group.get("weight_decay", 0.0)),
+                parameter_tensors=len(parameters),
+                parameter_elements=sum(parameter.numel() for parameter in parameters),
+                parameter_names=(),
+            )
+        )
+    return tuple(groups)
+
+
+def _squared_norm(tensors: list[Tensor], *, like: Tensor) -> Tensor:
+    total = torch.zeros((), device=like.device, dtype=torch.float32)
+    for tensor in tensors:
+        values = tensor.detach()
+        if values.is_sparse:
+            values = values.coalesce().values()
+        total.add_(values.float().square().sum())
+    return total
+
+
+@torch.no_grad()
+def capture_optimizer_diagnostic_snapshot(
+    optimizer: torch.optim.Optimizer,
+) -> OptimizerDiagnosticSnapshot:
+    """Capture pre-step values for sampled, implementation-neutral diagnostics."""
+
+    descriptors = _runtime_routing_groups(optimizer)
+    snapshots: list[_OptimizerGroupSnapshot] = []
+    for index, (group, descriptor) in enumerate(
+        zip(optimizer.param_groups, descriptors, strict=True)
+    ):
+        parameters = tuple(group["params"])
+        if not parameters:
+            raise ValueError(f"optimizer group {index} is empty")
+        first = parameters[0]
+        snapshots.append(
+            _OptimizerGroupSnapshot(
+                descriptor=descriptor,
+                parameters=parameters,
+                values_before=tuple(
+                    parameter.detach().clone(memory_format=torch.preserve_format)
+                    for parameter in parameters
+                ),
+                configured_learning_rate=float(group["lr"]),
+                weight_norm=_squared_norm(list(parameters), like=first).sqrt(),
+                gradient_norm=_squared_norm(
+                    [
+                        parameter.grad
+                        for parameter in parameters
+                        if parameter.grad is not None
+                    ],
+                    like=first,
+                ).sqrt(),
+            )
+        )
+    return OptimizerDiagnosticSnapshot(id(optimizer), tuple(snapshots))
+
+
+@torch.no_grad()
+def finalize_optimizer_step_diagnostics(
+    optimizer: torch.optim.Optimizer,
+    snapshot: OptimizerDiagnosticSnapshot,
+) -> OptimizerStepDiagnostics:
+    """Measure the actual parameter delta after an arbitrary optimizer step."""
+
+    if snapshot.optimizer_id != id(optimizer):
+        raise ValueError("optimizer diagnostic snapshot belongs to another optimizer")
+    if len(snapshot.groups) != len(optimizer.param_groups):
+        raise ValueError("optimizer groups changed during diagnostic sampling")
+    diagnostics: list[_OptimizerGroupDiagnosticTensors] = []
+    for index, (group, before) in enumerate(
+        zip(optimizer.param_groups, snapshot.groups, strict=True)
+    ):
+        parameters = tuple(group["params"])
+        if len(parameters) != len(before.parameters) or any(
+            actual is not expected
+            for actual, expected in zip(parameters, before.parameters, strict=True)
+        ):
+            raise ValueError("optimizer parameters changed during diagnostic sampling")
+        update_squared = _squared_norm(
+            [
+                parameter.detach().float() - previous.detach().float()
+                for parameter, previous in zip(
+                    parameters, before.values_before, strict=True
+                )
+            ],
+            like=parameters[0],
+        )
+        descriptor = before.descriptor
+        diagnostics.append(
+            _OptimizerGroupDiagnosticTensors(
+                group_index=index,
+                name=descriptor.name,
+                algorithm=descriptor.algorithm,
+                parameter_tensors=descriptor.parameter_tensors,
+                parameter_elements=descriptor.parameter_elements,
+                configured_learning_rate=before.configured_learning_rate,
+                weight_norm=before.weight_norm,
+                gradient_norm=before.gradient_norm,
+                update_norm=update_squared.sqrt(),
+            )
+        )
+    return OptimizerStepDiagnostics(tuple(diagnostics))
+
+
 def build_optimizer(
     model: nn.Module,
     config: OptimizerConfig = OptimizerConfig(),
@@ -252,10 +640,31 @@ def build_optimizer(
     if not all_parameters:
         raise ValueError("model has no trainable parameters")
     if config.kind == "adamw":
-        return _native_adamw(
+        optimizer = _native_adamw(
             [parameter for _, parameter in decay_named],
             [parameter for _, parameter in no_decay_named],
             config,
+        )
+        return _attach_routing_metadata(
+            optimizer,
+            _routing_metadata(
+                requested_kind=config.kind,
+                implementation="torch_adamw",
+                fallback_used=False,
+                config=config,
+                groups=[
+                    *(
+                        [("adamw_decay", "adamw", config.weight_decay, decay_named)]
+                        if decay_named
+                        else []
+                    ),
+                    *(
+                        [("adamw_no_decay", "adamw", 0.0, no_decay_named)]
+                        if no_decay_named
+                        else []
+                    ),
+                ],
+            ),
         )
 
     adamw_name_fragments = (
@@ -267,15 +676,17 @@ def build_optimizer(
         "head",
         "embedding",
     )
-    muon_params: list[nn.Parameter] = []
-    adamw_decay_params: list[nn.Parameter] = []
+    muon_named: list[tuple[str, nn.Parameter]] = []
+    adamw_decay_named: list[tuple[str, nn.Parameter]] = []
     for name, parameter in decay_named:
         use_muon = (
             parameter.ndim == 2
             and parameter.numel() >= config.min_muon_elements
             and not any(fragment in name.lower() for fragment in adamw_name_fragments)
         )
-        (muon_params if use_muon else adamw_decay_params).append(parameter)
+        (muon_named if use_muon else adamw_decay_named).append((name, parameter))
+    muon_params = [parameter for _, parameter in muon_named]
+    adamw_decay_params = [parameter for _, parameter in adamw_decay_named]
     adamw_no_decay_params = [parameter for _, parameter in no_decay_named]
 
     if not muon_params:
@@ -286,17 +697,67 @@ def build_optimizer(
             RuntimeWarning,
             stacklevel=2,
         )
-        return _native_adamw(
+        optimizer = _native_adamw(
             [parameter for _, parameter in decay_named],
             adamw_no_decay_params,
             config,
         )
+        return _attach_routing_metadata(
+            optimizer,
+            _routing_metadata(
+                requested_kind=config.kind,
+                implementation="torch_adamw",
+                fallback_used=True,
+                config=config,
+                groups=[
+                    *(
+                        [("adamw_decay", "adamw", config.weight_decay, decay_named)]
+                        if decay_named
+                        else []
+                    ),
+                    *(
+                        [("adamw_no_decay", "adamw", 0.0, no_decay_named)]
+                        if no_decay_named
+                        else []
+                    ),
+                ],
+            ),
+        )
     try:
-        return MuonAdamW(
+        optimizer = MuonAdamW(
             muon_params=muon_params,
             adamw_decay_params=adamw_decay_params,
             adamw_no_decay_params=adamw_no_decay_params,
             config=config,
+        )
+        return _attach_routing_metadata(
+            optimizer,
+            _routing_metadata(
+                requested_kind=config.kind,
+                implementation="muon_adamw",
+                fallback_used=False,
+                config=config,
+                groups=[
+                    ("muon", "muon", config.weight_decay, muon_named),
+                    *(
+                        [
+                            (
+                                "adamw_decay",
+                                "adamw",
+                                config.weight_decay,
+                                adamw_decay_named,
+                            )
+                        ]
+                        if adamw_decay_named
+                        else []
+                    ),
+                    *(
+                        [("adamw_no_decay", "adamw", 0.0, no_decay_named)]
+                        if no_decay_named
+                        else []
+                    ),
+                ],
+            ),
         )
     except (RuntimeError, TypeError, ValueError) as exc:
         if not config.fallback_to_adamw:
@@ -306,8 +767,29 @@ def build_optimizer(
             RuntimeWarning,
             stacklevel=2,
         )
-        return _native_adamw(
+        optimizer = _native_adamw(
             [parameter for _, parameter in decay_named],
             adamw_no_decay_params,
             config,
+        )
+        return _attach_routing_metadata(
+            optimizer,
+            _routing_metadata(
+                requested_kind=config.kind,
+                implementation="torch_adamw",
+                fallback_used=True,
+                config=config,
+                groups=[
+                    *(
+                        [("adamw_decay", "adamw", config.weight_decay, decay_named)]
+                        if decay_named
+                        else []
+                    ),
+                    *(
+                        [("adamw_no_decay", "adamw", 0.0, no_decay_named)]
+                        if no_decay_named
+                        else []
+                    ),
+                ],
+            ),
         )

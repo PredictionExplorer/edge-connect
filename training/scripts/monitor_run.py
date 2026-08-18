@@ -1641,6 +1641,23 @@ def collect_snapshot(
                 "loader_pool_pid_mismatch",
                 "loader worker PID count differs from effective worker count",
             )
+    nonfinite_losses = _number(learner_metric.get("nonfinite_loss_count"))
+    nonfinite_gradients = _number(learner_metric.get("nonfinite_gradient_count"))
+    if (nonfinite_losses or 0) > 0 or (nonfinite_gradients or 0) > 0:
+        _add_warning(
+            warnings,
+            "ERROR",
+            "learner_nonfinite",
+            "learner reported non-finite loss or gradient events",
+        )
+    clipping_frequency = _number(learner_metric.get("gradient_clipping_frequency"))
+    if clipping_frequency is not None and clipping_frequency > 0.5:
+        _add_warning(
+            warnings,
+            "WARN",
+            "gradient_clipping_high",
+            f"gradient clipping frequency={clipping_frequency:.1%}",
+        )
     learner = {
         "step": learner_heartbeat.get("step", learner_metric.get("step")),
         "target_steps": target_steps,
@@ -1690,6 +1707,40 @@ def collect_snapshot(
         "active_ring_weights": learner_heartbeat.get("active_ring_weights"),
         "losses": losses,
         "gradient_norm": learner_metric.get("gradient_norm"),
+        "gradient_clipped": learner_metric.get("gradient_clipped"),
+        "gradient_clipped_steps": learner_metric.get("gradient_clipped_steps"),
+        "gradient_clipping_frequency": learner_metric.get(
+            "gradient_clipping_frequency"
+        ),
+        "nonfinite_loss_count": learner_metric.get("nonfinite_loss_count"),
+        "nonfinite_gradient_count": learner_metric.get("nonfinite_gradient_count"),
+        "optimizer_routing": learner_metric.get("optimizer_routing"),
+        "optimizer_routing_hash": learner_metric.get("optimizer_routing_hash"),
+        "optimizer_parameter_tensors": learner_metric.get(
+            "optimizer_parameter_tensors"
+        ),
+        "optimizer_parameter_elements": learner_metric.get(
+            "optimizer_parameter_elements"
+        ),
+        "optimizer_groups": learner_metric.get("optimizer_groups"),
+        "optimizer_weight_norm": learner_metric.get("optimizer_weight_norm"),
+        "optimizer_update_norm": learner_metric.get("optimizer_update_norm"),
+        "scheduler": learner_metric.get("scheduler"),
+        "scheduler_age_steps": learner_metric.get("scheduler_age_steps"),
+        "scheduler_segment": learner_metric.get("scheduler_segment"),
+        "scheduler_segment_position": learner_metric.get("scheduler_segment_position"),
+        "ema": learner_metric.get("ema"),
+        "raw_vs_ema_distance": learner_metric.get("raw_vs_ema_distance"),
+        "raw_vs_ema_relative_distance": learner_metric.get(
+            "raw_vs_ema_relative_distance"
+        ),
+        "ema_effective_turnover": learner_metric.get("ema_effective_turnover"),
+        "ema_interval_effective_turnover": learner_metric.get(
+            "ema_interval_effective_turnover"
+        ),
+        "replay_minimum_shard_id_exclusive": learner_metric.get(
+            "replay_minimum_shard_id_exclusive"
+        ),
         "feature_path": learner_metric.get("feature_path"),
     }
     if ring10_objective_active:

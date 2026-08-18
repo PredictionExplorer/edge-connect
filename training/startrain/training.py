@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from typing import Any, cast
 
 import torch
-from torch import nn
+from torch import Tensor, nn
 
 from .checkpoint import ExponentialMovingAverage
 from .config import SchedulerConfig
@@ -16,14 +16,172 @@ from .contracts import SCORE_MARGIN_MAX, SCORE_MARGIN_MIN
 from .device import resolve_compile
 from .features import EncodedBatch
 from .losses import LossWeights, compute_losses
+from .optim import (
+    OptimizerGroupDiagnostics,
+    OptimizerStepDiagnostics,
+    capture_optimizer_diagnostic_snapshot,
+    finalize_optimizer_step_diagnostics,
+)
 from .replay import ReplayBatch
+
+
+class NonFiniteTrainingError(FloatingPointError):
+    """Fatal non-finite step carrying counters for durable reporting."""
+
+    def __init__(
+        self,
+        *,
+        nonfinite_loss_count: int,
+        nonfinite_gradient_count: int,
+    ) -> None:
+        super().__init__(
+            "non-finite training loss or gradient norm on at least one rank"
+        )
+        self.nonfinite_loss_count = nonfinite_loss_count
+        self.nonfinite_gradient_count = nonfinite_gradient_count
 
 
 @dataclass(frozen=True, slots=True)
 class HostTrainStepMetrics:
     losses: dict[str, float]
     gradient_norm: float
+    gradient_clipped: bool
+    nonfinite_loss_count: int
+    nonfinite_gradient_count: int
     learning_rates: tuple[float, ...]
+    optimizer_groups: tuple[OptimizerGroupDiagnostics, ...]
+    scheduler: "SchedulerDiagnostics | None"
+    ema: "EMADiagnostics | None"
+
+
+@dataclass(frozen=True, slots=True)
+class SchedulerDiagnostics:
+    age_steps: int
+    segment: str
+    segment_step: int
+    segment_length_steps: int | None
+    segment_position: float | None
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "age_steps": self.age_steps,
+            "segment": self.segment,
+            "segment_step": self.segment_step,
+            "segment_length_steps": self.segment_length_steps,
+            "segment_position": self.segment_position,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class EMADiagnostics:
+    decay: float
+    num_updates: int
+    raw_norm: float
+    ema_norm: float
+    distance_norm: float
+    relative_distance: float | None
+    effective_turnover: float
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "decay": self.decay,
+            "num_updates": self.num_updates,
+            "raw_norm": self.raw_norm,
+            "ema_norm": self.ema_norm,
+            "distance_norm": self.distance_norm,
+            "relative_distance": self.relative_distance,
+            "effective_turnover": self.effective_turnover,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class _EMADiagnosticTensors:
+    decay: float
+    num_updates: int
+    raw_norm: Tensor
+    ema_norm: Tensor
+    distance_norm: Tensor
+
+    def to_host(self) -> EMADiagnostics:
+        raw_norm, ema_norm, distance_norm = (
+            torch.stack(
+                (
+                    self.raw_norm.detach().float(),
+                    self.ema_norm.detach().float(),
+                    self.distance_norm.detach().float(),
+                )
+            )
+            .cpu()
+            .tolist()
+        )
+        return EMADiagnostics(
+            decay=self.decay,
+            num_updates=self.num_updates,
+            raw_norm=float(raw_norm),
+            ema_norm=float(ema_norm),
+            distance_norm=float(distance_norm),
+            relative_distance=(
+                float(distance_norm / raw_norm) if raw_norm > 0 else None
+            ),
+            effective_turnover=ema_effective_turnover(self.decay, self.num_updates),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class IntervalTrainMetrics:
+    steps: int
+    gradient_clipped_steps: int
+    gradient_clipping_frequency: float
+    nonfinite_loss_count: int
+    nonfinite_gradient_count: int
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "steps": self.steps,
+            "gradient_clipped_steps": self.gradient_clipped_steps,
+            "gradient_clipping_frequency": self.gradient_clipping_frequency,
+            "nonfinite_loss_count": self.nonfinite_loss_count,
+            "nonfinite_gradient_count": self.nonfinite_gradient_count,
+        }
+
+
+class TrainMetricAccumulator:
+    """Accumulate cheap device scalars without synchronizing each train step."""
+
+    def __init__(self) -> None:
+        self.steps = 0
+        self._counts: Tensor | None = None
+
+    def update(self, result: "TrainStepResult") -> None:
+        values = torch.stack(
+            (
+                result.gradient_clipped_tensor.detach(),
+                result.nonfinite_loss_count_tensor.detach().bool(),
+                result.nonfinite_gradient_count_tensor.detach().bool(),
+            )
+        ).to(dtype=torch.int64)
+        if self._counts is None:
+            self._counts = values
+        else:
+            self._counts.add_(values)
+        self.steps += 1
+
+    def to_host(self) -> IntervalTrainMetrics:
+        if self.steps == 0:
+            return IntervalTrainMetrics(0, 0, 0.0, 0, 0)
+        assert self._counts is not None
+        clipped, nonfinite_loss, nonfinite_gradient = self._counts.cpu().tolist()
+        return IntervalTrainMetrics(
+            steps=self.steps,
+            gradient_clipped_steps=int(clipped),
+            gradient_clipping_frequency=float(clipped / self.steps),
+            nonfinite_loss_count=int(nonfinite_loss),
+            nonfinite_gradient_count=int(nonfinite_gradient),
+        )
+
+    def reset(self) -> None:
+        self.steps = 0
+        self._counts = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -32,7 +190,13 @@ class TrainStepResult:
 
     loss_tensors: dict[str, torch.Tensor]
     gradient_norm_tensor: torch.Tensor
+    gradient_clipped_tensor: torch.Tensor
+    nonfinite_loss_count_tensor: torch.Tensor
+    nonfinite_gradient_count_tensor: torch.Tensor
     learning_rates: tuple[float, ...]
+    optimizer_diagnostics: OptimizerStepDiagnostics | None = None
+    scheduler_diagnostics: SchedulerDiagnostics | None = None
+    ema_diagnostics: _EMADiagnosticTensors | None = None
 
     def to_host(self) -> HostTrainStepMetrics:
         names = tuple(self.loss_tensors)
@@ -40,13 +204,30 @@ class TrainStepResult:
             (
                 *(self.loss_tensors[name].detach().float() for name in names),
                 self.gradient_norm_tensor.detach().float(),
+                self.gradient_clipped_tensor.detach().float(),
+                self.nonfinite_loss_count_tensor.detach().float(),
+                self.nonfinite_gradient_count_tensor.detach().float(),
             )
         )
         host_values = values.cpu().tolist()
         return HostTrainStepMetrics(
-            losses=dict(zip(names, host_values[:-1], strict=True)),
-            gradient_norm=float(host_values[-1]),
+            losses=dict(zip(names, host_values[:-4], strict=True)),
+            gradient_norm=float(host_values[-4]),
+            gradient_clipped=bool(host_values[-3]),
+            nonfinite_loss_count=int(host_values[-2]),
+            nonfinite_gradient_count=int(host_values[-1]),
             learning_rates=self.learning_rates,
+            optimizer_groups=(
+                self.optimizer_diagnostics.to_host()
+                if self.optimizer_diagnostics is not None
+                else ()
+            ),
+            scheduler=self.scheduler_diagnostics,
+            ema=(
+                self.ema_diagnostics.to_host()
+                if self.ema_diagnostics is not None
+                else None
+            ),
         )
 
     @property
@@ -346,7 +527,102 @@ def build_scheduler(
         cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
         return config.min_lr_ratio + (1.0 - config.min_lr_ratio) * cosine
 
-    return torch.optim.lr_scheduler.LambdaLR(optimizer, multiplier)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, multiplier)
+    setattr(
+        scheduler,
+        "_startrain_scheduler_config",
+        {
+            "warmup_steps": config.warmup_steps,
+            "total_steps": config.total_steps,
+            "min_lr_ratio": config.min_lr_ratio,
+        },
+    )
+    return scheduler
+
+
+def scheduler_diagnostics(
+    scheduler: torch.optim.lr_scheduler.LRScheduler,
+) -> SchedulerDiagnostics:
+    """Describe scheduler age and position within its configured segment."""
+
+    age = max(0, int(scheduler.last_epoch))
+    raw_config = getattr(scheduler, "_startrain_scheduler_config", None)
+    if not isinstance(raw_config, dict):
+        return SchedulerDiagnostics(age, "unknown", age, None, None)
+    try:
+        config = SchedulerConfig(**raw_config)
+    except (TypeError, ValueError):
+        return SchedulerDiagnostics(age, "unknown", age, None, None)
+    if config.warmup_steps and age < config.warmup_steps:
+        length = config.warmup_steps
+        return SchedulerDiagnostics(
+            age_steps=age,
+            segment="warmup",
+            segment_step=age,
+            segment_length_steps=length,
+            segment_position=age / length,
+        )
+    if age < config.total_steps:
+        length = config.total_steps - config.warmup_steps
+        step = max(0, age - config.warmup_steps)
+        return SchedulerDiagnostics(
+            age_steps=age,
+            segment="cosine",
+            segment_step=step,
+            segment_length_steps=length,
+            segment_position=min(1.0, step / max(1, length)),
+        )
+    return SchedulerDiagnostics(
+        age_steps=age,
+        segment="floor",
+        segment_step=max(0, age - config.total_steps),
+        segment_length_steps=None,
+        segment_position=1.0,
+    )
+
+
+def ema_effective_turnover(decay: float, updates: int) -> float:
+    """Return the fraction of EMA weight replaced over ``updates`` updates."""
+
+    if not 0 <= decay < 1:
+        raise ValueError("EMA decay must be in [0, 1)")
+    if isinstance(updates, bool) or not isinstance(updates, int) or updates < 0:
+        raise ValueError("EMA updates must be a non-negative integer")
+    if updates == 0:
+        return 0.0
+    if decay == 0:
+        return 1.0
+    return -math.expm1(updates * math.log(decay))
+
+
+@torch.no_grad()
+def _collect_ema_diagnostics(
+    model: nn.Module,
+    ema: ExponentialMovingAverage,
+) -> _EMADiagnosticTensors:
+    model_state = model.state_dict()
+    if not ema.shadow:
+        raise ValueError("EMA state is empty")
+    first_average = next(iter(ema.shadow.values()))
+    raw_squared = torch.zeros((), device=first_average.device, dtype=torch.float32)
+    ema_squared = torch.zeros_like(raw_squared)
+    distance_squared = torch.zeros_like(raw_squared)
+    for name, average in ema.shadow.items():
+        source = model_state.get(name)
+        if source is None or source.shape != average.shape:
+            raise ValueError("model state does not match EMA state")
+        raw = source.detach().to(device=average.device, dtype=torch.float32)
+        average_float = average.detach().float()
+        raw_squared.add_(raw.square().sum())
+        ema_squared.add_(average_float.square().sum())
+        distance_squared.add_((raw - average_float).square().sum())
+    return _EMADiagnosticTensors(
+        decay=ema.decay,
+        num_updates=ema.num_updates,
+        raw_norm=raw_squared.sqrt(),
+        ema_norm=ema_squared.sqrt(),
+        distance_norm=distance_squared.sqrt(),
+    )
 
 
 def train_step(
@@ -360,6 +636,7 @@ def train_step(
     scheduler: torch.optim.lr_scheduler.LRScheduler | None = None,
     ema: ExponentialMovingAverage | None = None,
     trusted_batch: bool = False,
+    collect_diagnostics: bool = False,
 ) -> TrainStepResult:
     if precision not in ("fp32", "bf16"):
         raise ValueError("precision must be fp32 or bf16")
@@ -389,28 +666,61 @@ def train_step(
             score_margin_max=SCORE_MARGIN_MAX,
             weights=loss_weights,
             validate_targets=not trusted_batch,
+            include_diagnostics=collect_diagnostics,
         )
     total = losses["total"]
     total.backward()
     gradient_norm = torch.nn.utils.clip_grad_norm_(
         original_model.parameters(), gradient_clip_norm, error_if_nonfinite=False
     )
-    finite = torch.stack(
-        (torch.isfinite(total).all(), torch.isfinite(gradient_norm).all())
-    ).to(dtype=torch.int32)
+    gradient_clipped = gradient_norm > gradient_clip_norm
+    loss_is_finite = torch.isfinite(total).all()
+    gradient_is_finite = torch.isfinite(gradient_norm).all()
+    nonfinite_loss_count = (~loss_is_finite).to(dtype=torch.int64)
+    nonfinite_gradient_count = (~gradient_is_finite).to(dtype=torch.int64)
+    finite = torch.stack((loss_is_finite, gradient_is_finite)).to(dtype=torch.int32)
+    nonfinite_counts = torch.stack((nonfinite_loss_count, nonfinite_gradient_count))
     if torch.distributed.is_available() and torch.distributed.is_initialized():
         torch.distributed.all_reduce(finite, op=torch.distributed.ReduceOp.MIN)
-    if not bool(finite.all()):
-        raise FloatingPointError(
-            "non-finite training loss or gradient norm on at least one rank"
+        torch.distributed.all_reduce(
+            nonfinite_counts,
+            op=torch.distributed.ReduceOp.SUM,
         )
+    if not bool(finite.all()):
+        raise NonFiniteTrainingError(
+            nonfinite_loss_count=int(nonfinite_counts[0].item()),
+            nonfinite_gradient_count=int(nonfinite_counts[1].item()),
+        )
+    optimizer_snapshot = (
+        capture_optimizer_diagnostic_snapshot(optimizer)
+        if collect_diagnostics
+        else None
+    )
     optimizer.step()
+    optimizer_diagnostics = (
+        finalize_optimizer_step_diagnostics(optimizer, optimizer_snapshot)
+        if optimizer_snapshot is not None
+        else None
+    )
     if scheduler is not None:
         scheduler.step()
     if ema is not None:
         ema.update(original_model)
+    ema_diagnostics = (
+        _collect_ema_diagnostics(original_model, ema)
+        if collect_diagnostics and ema is not None
+        else None
+    )
     return TrainStepResult(
         loss_tensors=losses,
         gradient_norm_tensor=gradient_norm,
+        gradient_clipped_tensor=gradient_clipped,
+        nonfinite_loss_count_tensor=nonfinite_loss_count,
+        nonfinite_gradient_count_tensor=nonfinite_gradient_count,
         learning_rates=tuple(float(group["lr"]) for group in optimizer.param_groups),
+        optimizer_diagnostics=optimizer_diagnostics,
+        scheduler_diagnostics=(
+            scheduler_diagnostics(scheduler) if scheduler is not None else None
+        ),
+        ema_diagnostics=ema_diagnostics,
     )

@@ -5,6 +5,7 @@ import subprocess
 import sys
 from collections.abc import Callable
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -169,3 +170,165 @@ def test_python_module_entrypoints_fail_cleanly_without_arguments() -> None:
     )
     assert starserve.returncode == 0
     assert "usage:" in starserve.stdout.lower()
+
+
+def test_arena_architecture_mode_is_explicit_and_diagnostic_only(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    config = Path(__file__).parents[1] / "configs" / "small.yaml"
+    candidate_manifest = SimpleNamespace(
+        path=tmp_path / "candidate-manifest.json",
+        artifact_manifest=None,
+        manifest_sha256="a" * 64,
+        manifest_bytes=101,
+        model_identity="sha256-" + "a" * 64,
+        model_version="sha256-" + "a" * 64,
+    )
+    baseline_manifest = SimpleNamespace(
+        path=tmp_path / "baseline-manifest.json",
+        artifact_manifest=None,
+        manifest_sha256="b" * 64,
+        manifest_bytes=102,
+        model_identity="sha256-" + "b" * 64,
+        model_version="sha256-" + "b" * 64,
+    )
+    manifests = {
+        "candidate.json": candidate_manifest,
+        "baseline.json": baseline_manifest,
+    }
+    evaluator_modes = []
+    writes = []
+    common_contract = {
+        "rules_hash_wire": "fnv1a64:test",
+        "feature_schema_hash": 1,
+        "action_layout_version": 1,
+        "game": {"mode": "double", "pie_rule": False, "rings": (4, 6, 8, 10)},
+    }
+
+    monkeypatch.setattr(
+        cli_module,
+        "load_model_manifest",
+        lambda path: manifests[str(path)],
+    )
+
+    def extract(manifest, **_options):
+        return SimpleNamespace(
+            model_config={
+                "width": 16 if manifest is candidate_manifest else 24,
+            },
+            evaluation_contract=common_contract,
+        )
+
+    monkeypatch.setattr(cli_module, "extract_verified_manifest_config", extract)
+
+    def load_evaluator(
+        _experiment,
+        manifest,
+        *,
+        device,
+        allow_heterogeneous_model=False,
+    ):
+        evaluator_modes.append((manifest, device, allow_heterogeneous_model))
+        return SimpleNamespace(model_version=manifest.model_version)
+
+    monkeypatch.setattr(cli_module, "load_manifest_evaluator", load_evaluator)
+    monkeypatch.setattr(
+        cli_module,
+        "load_star_native",
+        lambda *, required: SimpleNamespace(required=required),
+    )
+
+    class DiagnosticArena:
+        def __init__(self, **_options):
+            pass
+
+        def run(self):
+            return {
+                "schema_version": 3,
+                "candidate": candidate_manifest.model_identity,
+                "baseline": baseline_manifest.model_identity,
+                "baseline_metadata": {"kind": "checkpoint"},
+                "aggregate": {"pairs": 1},
+                "promotion": {"decision": "promote"},
+                "pairs": [],
+                "games": [],
+            }
+
+    monkeypatch.setattr(cli_module, "ArenaRunner", DiagnosticArena)
+    monkeypatch.setattr(
+        cli_module,
+        "atomic_json",
+        lambda path, payload: writes.append((Path(path), payload)),
+    )
+
+    arena_main(
+        [
+            "--config",
+            str(config),
+            "--candidate",
+            "candidate.json",
+            "--baseline",
+            "baseline.json",
+            "--output",
+            str(tmp_path / "homogeneous.json"),
+            "--device",
+            "cpu",
+        ]
+    )
+    capsys.readouterr()
+    assert evaluator_modes[-2:] == [
+        (candidate_manifest, "cpu", False),
+        (baseline_manifest, "cpu", False),
+    ]
+    assert writes[-1][1]["promotion"]["decision"] == "promote"
+
+    arena_main(
+        [
+            "--config",
+            str(config),
+            "--candidate",
+            "candidate.json",
+            "--baseline",
+            "baseline.json",
+            "--output",
+            str(tmp_path / "architecture.json"),
+            "--device",
+            "cpu",
+            "--evaluation-mode",
+            "architecture",
+        ]
+    )
+    summary = json.loads(capsys.readouterr().out)
+    assert evaluator_modes[-2:] == [
+        (candidate_manifest, "cpu", True),
+        (baseline_manifest, "cpu", True),
+    ]
+    result = writes[-1][1]
+    assert result["diagnostic_only"] is True
+    assert result["promotion_authorized"] is False
+    assert result["adoption_authorized"] is False
+    assert result["diagnostic_assessment"]["decision"] == "promote"
+    assert result["promotion"] == {
+        "decision": "evaluation",
+        "authorized": False,
+        "reason": "architecture evaluations cannot promote models",
+    }
+    assert summary["decision"] == "evaluation"
+
+    with pytest.raises(SystemExit):
+        arena_main(
+            [
+                "--config",
+                str(config),
+                "--candidate",
+                "candidate.json",
+                "--baseline-kind",
+                "uniform",
+                "--output",
+                str(tmp_path / "invalid.json"),
+                "--evaluation-mode",
+                "architecture",
+            ]
+        )

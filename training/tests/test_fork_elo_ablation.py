@@ -94,6 +94,21 @@ def _plan(tmp_path: Path, source: Path) -> Path:
     return output / "ablation-plan.json"
 
 
+def test_fork_rejects_scratch_architecture_plan(tmp_path: Path) -> None:
+    source = _source_run(tmp_path)
+    plan_path = _plan(tmp_path, source)
+    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    plan["initialization"] = "scratch"
+    plan_path.write_text(json.dumps(plan), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="scratch-root"):
+        fork_elo_ablation(
+            source_run_root=source,
+            plan_path=plan_path,
+            treatment="control",
+        )
+
+
 def _winner_snapshot(source: Path) -> dict[str, object]:
     run_path = source / "run.json"
     champion_path = source / "learner" / "champion.json"

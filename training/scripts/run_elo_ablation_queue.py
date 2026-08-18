@@ -788,6 +788,10 @@ def generate_deployment_manifest(
     plan = _read_json(plan_file)
     if plan.get("report") != "startrain-elo-ablation-plan":
         raise AblationQueueError("unsupported ablation plan")
+    if plan.get("initialization", "fork") != "fork":
+        raise AblationQueueError(
+            "scratch architecture plans require run_architecture_ablation_queue.py"
+        )
     plan_seed = _positive_integer(plan.get("seed"), "ablation plan seed")
     treatments = _plan_treatments(plan)
     source_root = (

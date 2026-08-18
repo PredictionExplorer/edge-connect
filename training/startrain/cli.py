@@ -19,6 +19,7 @@ from .arena import ArenaRunner, internal_elo_target_assessment
 from .baselines import FROZEN_BASELINE_CHOICES, create_frozen_baseline
 from .checkpoint import (
     discover_resume_checkpoints,
+    extract_verified_manifest_config,
     load_ema_checkpoint,
     load_model_manifest,
     write_model_pointer,
@@ -50,6 +51,8 @@ from .runtime import (
     require_active_selection_cutover,
 )
 from .selfplay import SelfPlayActor, SelfPlayConfig, SelfPlayIdentity
+
+ARCHITECTURE_EVALUATION_RESULT_KIND = "architecture_evaluation"
 
 
 def selfplay_main(argv: list[str] | None = None) -> None:
@@ -448,6 +451,15 @@ def arena_main(argv: list[str] | None = None) -> None:
     parser.add_argument("--output", required=True)
     parser.add_argument("--device", default="auto", help="cuda, mps, cpu, or auto")
     parser.add_argument(
+        "--evaluation-mode",
+        choices=("promotion", "architecture"),
+        default="promotion",
+        help=(
+            "promotion requires the configured model architecture; architecture "
+            "explicitly permits heterogeneous checkpoint models and is diagnostic-only"
+        ),
+    )
+    parser.add_argument(
         "--target-elo-lcb",
         type=float,
         help="optional internal Elo target for the paired anytime-valid lower bound",
@@ -463,6 +475,11 @@ def arena_main(argv: list[str] | None = None) -> None:
         parser.error("--baseline is required when --baseline-kind=checkpoint")
     if arguments.baseline_kind != "checkpoint" and arguments.baseline:
         parser.error("--baseline cannot be combined with a frozen --baseline-kind")
+    if (
+        arguments.evaluation_mode == "architecture"
+        and arguments.baseline_kind != "checkpoint"
+    ):
+        parser.error("--evaluation-mode=architecture requires a checkpoint baseline")
     if arguments.target_rings and arguments.target_elo_lcb is None:
         parser.error("--target-rings requires --target-elo-lcb")
     arguments.device = resolve_device_string(arguments.device)
@@ -474,14 +491,45 @@ def arena_main(argv: list[str] | None = None) -> None:
         if arguments.baseline_kind == "checkpoint"
         else None
     )
-    candidate = load_manifest_evaluator(
-        experiment, candidate_manifest, device=arguments.device
-    )
-    checkpoint_baseline = (
-        load_manifest_evaluator(experiment, baseline_manifest, device=arguments.device)
-        if baseline_manifest is not None
-        else None
-    )
+    architecture_configs = None
+    if arguments.evaluation_mode == "architecture":
+        assert baseline_manifest is not None
+        candidate_config = extract_verified_manifest_config(
+            candidate_manifest,
+            expected_game_config=asdict(experiment.game),
+        )
+        baseline_config = extract_verified_manifest_config(
+            baseline_manifest,
+            expected_game_config=asdict(experiment.game),
+        )
+        if candidate_config.evaluation_contract != baseline_config.evaluation_contract:
+            raise ValueError(
+                "heterogeneous models have incompatible evaluation contracts"
+            )
+        architecture_configs = (candidate_config, baseline_config)
+        candidate = load_manifest_evaluator(
+            experiment,
+            candidate_manifest,
+            device=arguments.device,
+            allow_heterogeneous_model=True,
+        )
+        checkpoint_baseline = load_manifest_evaluator(
+            experiment,
+            baseline_manifest,
+            device=arguments.device,
+            allow_heterogeneous_model=True,
+        )
+    else:
+        candidate = load_manifest_evaluator(
+            experiment, candidate_manifest, device=arguments.device
+        )
+        checkpoint_baseline = (
+            load_manifest_evaluator(
+                experiment, baseline_manifest, device=arguments.device
+            )
+            if baseline_manifest is not None
+            else None
+        )
     native = load_star_native(required=True)
     assert native is not None
     if arguments.baseline_kind == "checkpoint":
@@ -505,6 +553,61 @@ def arena_main(argv: list[str] | None = None) -> None:
             baseline_search=baseline.search_budget,
             baseline_metadata=baseline.result_metadata(),
         ).run()
+    if arguments.evaluation_mode == "architecture":
+        assert baseline_manifest is not None
+        assert architecture_configs is not None
+        candidate_config, baseline_config = architecture_configs
+        diagnostic_assessment = result.get("promotion")
+        if not isinstance(diagnostic_assessment, dict):
+            raise RuntimeError("arena result omitted its diagnostic assessment")
+        result.update(
+            {
+                "result_kind": ARCHITECTURE_EVALUATION_RESULT_KIND,
+                "evaluation_mode": "architecture",
+                "diagnostic_only": True,
+                "promotion_authorized": False,
+                "adoption_authorized": False,
+                "candidate_manifest": str(
+                    (
+                        candidate_manifest.artifact_manifest or candidate_manifest.path
+                    ).resolve()
+                ),
+                "candidate_manifest_sha256": candidate_manifest.manifest_sha256,
+                "candidate_manifest_bytes": candidate_manifest.manifest_bytes,
+                "baseline_manifest": str(
+                    (
+                        baseline_manifest.artifact_manifest or baseline_manifest.path
+                    ).resolve()
+                ),
+                "baseline_manifest_sha256": baseline_manifest.manifest_sha256,
+                "baseline_manifest_bytes": baseline_manifest.manifest_bytes,
+                "model_configs": {
+                    "candidate": candidate_config.model_config,
+                    "baseline": baseline_config.model_config,
+                },
+                "evaluation_contract": candidate_config.evaluation_contract,
+                "evaluator_contract": {
+                    "device_type": arguments.device.split(":", 1)[0],
+                    "precision": experiment.train.precision,
+                    "score_utility_weight": (experiment.selfplay.score_utility_weight),
+                    "compile_enabled": experiment.train.compile,
+                    "compile_dynamic": (
+                        experiment.orchestration.model_refresh.inference_compile_dynamic
+                    ),
+                    "compile_mode": (
+                        experiment.orchestration.model_refresh.inference_compile_mode
+                    ),
+                    "fullgraph": True,
+                },
+                "arena_contract": asdict(experiment.arena),
+                "diagnostic_assessment": dict(diagnostic_assessment),
+                "promotion": {
+                    "decision": "evaluation",
+                    "authorized": False,
+                    "reason": "architecture evaluations cannot promote models",
+                },
+            }
+        )
     if arguments.target_elo_lcb is not None:
         target_rings = tuple(arguments.target_rings or experiment.arena.rings)
         unavailable = sorted(set(target_rings) - set(experiment.arena.rings))

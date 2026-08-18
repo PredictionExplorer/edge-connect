@@ -820,6 +820,10 @@ def test_warm_start_uses_archived_non_champion_ema_with_fresh_state(
         torch.testing.assert_close(prepared["ema"]["shadow"][name], expected)
     assert prepared["optimizer"]["state"] == {}
     assert prepared["ema"]["num_updates"] == 0
+    child_config = load_config(child / "profile-elo-ablation.yaml")
+    assert prepared["ema"]["decay"] == child_config.train.resolved_ema_decay(
+        len(child_config.orchestration.learner_gpus)
+    )
     assert prepared["step"] == plan.candidates[1].model_step
     cutover = json.loads(
         (child / "learner" / "selection-cutover.json").read_text(encoding="utf-8")

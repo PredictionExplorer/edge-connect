@@ -2,28 +2,32 @@
 
 from __future__ import annotations
 
-import json
 import hashlib
+import json
+import math
 import os
 import re
 import tempfile
 import time
+import warnings
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import torch
 from torch import Tensor, nn
 
 from .contracts import (
+    ACTION_LAYOUT_SCHEMA_ID,
+    ACTION_LAYOUT_VERSION,
     FEATURE_SCHEMA_HASH,
     RULES_HASH,
     RULES_HASH_WIRE,
     RULES_SCHEMA_ID,
 )
-from .model import MODEL_SCHEMA_VERSION
+from .model import MODEL_SCHEMA_VERSION, ModelConfig
 from .runtime import append_jsonl, atomic_json, validate_identifier
 
 CHECKPOINT_FORMAT = "startrain.checkpoint"
@@ -55,6 +59,52 @@ class ModelManifest:
     manifest_sha256: str = ""
     manifest_bytes: int = 0
     role: str = "direct"
+
+
+@dataclass(frozen=True, slots=True)
+class VerifiedModelConfig:
+    """Normalized architecture and immutable evaluation contracts."""
+
+    model: ModelConfig
+    game_mode: str
+    pie_rule: bool
+    rings: tuple[int, ...]
+    checkpoint_format: str = CHECKPOINT_FORMAT
+    checkpoint_version: int = CHECKPOINT_VERSION
+    rules_schema: str = RULES_SCHEMA_ID
+    rules_hash: int = RULES_HASH
+    rules_hash_wire: str = RULES_HASH_WIRE
+    feature_schema_hash: int = FEATURE_SCHEMA_HASH
+    action_layout_schema: str = ACTION_LAYOUT_SCHEMA_ID
+    action_layout_version: int = ACTION_LAYOUT_VERSION
+    model_schema_version: int = MODEL_SCHEMA_VERSION
+
+    @property
+    def model_config(self) -> dict[str, object]:
+        return asdict(self.model)
+
+    @property
+    def game_config(self) -> dict[str, object]:
+        return {
+            "mode": self.game_mode,
+            "pie_rule": self.pie_rule,
+            "rings": self.rings,
+        }
+
+    @property
+    def evaluation_contract(self) -> dict[str, object]:
+        return {
+            "checkpoint_format": self.checkpoint_format,
+            "checkpoint_version": self.checkpoint_version,
+            "rules_schema": self.rules_schema,
+            "rules_hash": self.rules_hash,
+            "rules_hash_wire": self.rules_hash_wire,
+            "feature_schema_hash": self.feature_schema_hash,
+            "action_layout_schema": self.action_layout_schema,
+            "action_layout_version": self.action_layout_version,
+            "model_schema_version": self.model_schema_version,
+            "game": self.game_config,
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -127,9 +177,13 @@ class ExponentialMovingAverage:
     @torch.no_grad()
     def copy_to(self, model: nn.Module) -> None:
         model_state = model.state_dict()
+        if not set(self.shadow) <= set(model_state):
+            missing = sorted(set(self.shadow) - set(model_state))
+            raise ValueError(f"model is missing EMA values: {missing}")
         for name, average in self.shadow.items():
-            if name not in model_state:
-                raise ValueError(f"model is missing EMA value {name}")
+            if model_state[name].shape != average.shape:
+                raise ValueError(f"invalid model tensor for EMA value {name}")
+        for name, average in self.shadow.items():
             model_state[name].copy_(
                 average.to(
                     device=model_state[name].device, dtype=model_state[name].dtype
@@ -160,7 +214,12 @@ class ExponentialMovingAverage:
             "shadow": self.shadow,
         }
 
-    def load_state_dict(self, state: Mapping[str, Any]) -> None:
+    def load_state_dict(
+        self,
+        state: Mapping[str, Any],
+        *,
+        expected_decay: float | None = None,
+    ) -> None:
         if int(state.get("version", -1)) != EMA_VERSION:
             raise ValueError("unsupported EMA state version")
         loaded_shadow = state.get("shadow")
@@ -168,12 +227,35 @@ class ExponentialMovingAverage:
             raise ValueError("EMA shadow state is missing")
         if set(loaded_shadow) != set(self.shadow):
             raise ValueError("EMA keys do not match the model")
-        self.decay = float(state["decay"])
-        self.num_updates = int(state["num_updates"])
+        decay = state.get("decay")
+        num_updates = state.get("num_updates")
+        if (
+            isinstance(decay, bool)
+            or not isinstance(decay, int | float)
+            or not math.isfinite(float(decay))
+            or not 0 <= float(decay) < 1
+        ):
+            raise ValueError("EMA decay is invalid")
+        if type(num_updates) is not int or num_updates < 0:
+            raise ValueError("EMA update count is invalid")
+        if expected_decay is not None and not math.isclose(
+            float(decay),
+            expected_decay,
+            rel_tol=0.0,
+            abs_tol=1e-15,
+        ):
+            raise ValueError(
+                "checkpoint EMA decay differs from configured training decay"
+            )
         for name, average in self.shadow.items():
             value = loaded_shadow[name]
             if not isinstance(value, Tensor) or value.shape != average.shape:
                 raise ValueError(f"invalid EMA tensor for {name}")
+        self.decay = float(decay)
+        self.num_updates = num_updates
+        for name, average in self.shadow.items():
+            value = loaded_shadow[name]
+            assert isinstance(value, Tensor)
             average.copy_(value.to(device=average.device, dtype=average.dtype))
 
     @torch.no_grad()
@@ -210,6 +292,11 @@ def save_checkpoint(
         raise ValueError("step and epoch must be non-negative")
     destination = Path(destination)
     destination.parent.mkdir(parents=True, exist_ok=True)
+    optimizer_routing = None
+    if optimizer is not None:
+        from .optim import optimizer_checkpoint_contract
+
+        optimizer_routing = optimizer_checkpoint_contract(optimizer)
     payload = {
         "format": CHECKPOINT_FORMAT,
         "version": CHECKPOINT_VERSION,
@@ -217,11 +304,14 @@ def save_checkpoint(
         "rules_hash": RULES_HASH,
         "rules_hash_wire": RULES_HASH_WIRE,
         "feature_schema_hash": FEATURE_SCHEMA_HASH,
+        "action_layout_schema": ACTION_LAYOUT_SCHEMA_ID,
+        "action_layout_version": ACTION_LAYOUT_VERSION,
         "model_schema_version": MODEL_SCHEMA_VERSION,
         "step": int(step),
         "epoch": int(epoch),
         "model": model.state_dict(),
         "optimizer": optimizer.state_dict() if optimizer is not None else None,
+        "optimizer_routing": optimizer_routing,
         "scheduler": scheduler.state_dict() if scheduler is not None else None,
         "ema": ema.state_dict() if ema is not None else None,
         "config": dict(config or {}),
@@ -272,6 +362,8 @@ def load_checkpoint(
     metadata_validator: Callable[[Mapping[str, Any]], object] | None = None,
 ) -> dict[str, Any]:
     checkpoint_path = Path(source)
+    if (use_ema_weights or require_ema) and not strict:
+        raise ValueError("EMA checkpoint loading must be strict")
     if expected_sha256 is not None or expected_bytes is not None:
         verify_file(
             checkpoint_path,
@@ -294,17 +386,48 @@ def load_checkpoint(
         "epoch": int(payload["epoch"]),
         "config": payload["config"],
         "extra": payload["extra"],
+        "optimizer_routing": payload.get("optimizer_routing"),
     }
     if metadata_validator is not None:
-        metadata_validator(metadata)
-    model.load_state_dict(payload["model"], strict=strict)
+        validator = metadata_validator
+    else:
+        validator = None
+    evaluation_ema: ExponentialMovingAverage | None = None
     if use_ema_weights:
+        if not isinstance(ema_payload, Mapping):
+            raise ValueError("checkpoint EMA state is invalid")
         evaluation_ema = ExponentialMovingAverage(model)
         evaluation_ema.load_state_dict(ema_payload)
+    if strict:
+        _validate_strict_model_state(model, payload["model"])
+    if validator is not None:
+        validator(metadata)
+    model.load_state_dict(payload["model"], strict=strict)
+    if evaluation_ema is not None:
         evaluation_ema.copy_to(model)
     if optimizer is not None:
         if payload["optimizer"] is None:
             raise ValueError("checkpoint has no optimizer state")
+        from .optim import optimizer_checkpoint_contract
+
+        configured_optimizer = optimizer_checkpoint_contract(optimizer)
+        checkpoint_optimizer = payload.get("optimizer_routing")
+        if configured_optimizer is None and checkpoint_optimizer is not None:
+            raise ValueError(
+                "checkpoint optimizer routing cannot be validated by this optimizer"
+            )
+        if configured_optimizer is not None:
+            if checkpoint_optimizer is None:
+                warnings.warn(
+                    "legacy checkpoint has no optimizer routing contract",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+            elif checkpoint_optimizer != configured_optimizer:
+                raise ValueError(
+                    "checkpoint optimizer routing or hyperparameters differ "
+                    "from the configured optimizer"
+                )
         optimizer.load_state_dict(payload["optimizer"])
     if scheduler is not None:
         if payload["scheduler"] is None:
@@ -313,7 +436,7 @@ def load_checkpoint(
     if ema is not None:
         if payload["ema"] is None:
             raise ValueError("checkpoint has no EMA state")
-        ema.load_state_dict(payload["ema"])
+        ema.load_state_dict(payload["ema"], expected_decay=ema.decay)
     return metadata
 
 
@@ -413,6 +536,169 @@ def inspect_checkpoint(
         "has_scheduler": payload["scheduler"] is not None,
         "has_ema": payload["ema"] is not None,
     }
+
+
+def normalize_model_config(config: Mapping[str, Any]) -> dict[str, object]:
+    """Return a strict, default-complete model configuration."""
+
+    if not isinstance(config, Mapping):
+        raise ValueError("checkpoint model configuration is missing")
+    values = dict(config)
+    if any(not isinstance(key, str) for key in values):
+        raise ValueError("checkpoint model configuration keys must be strings")
+    defaults = asdict(ModelConfig())
+    unknown = set(values) - set(defaults)
+    if unknown:
+        raise ValueError(
+            "checkpoint model configuration has unsupported keys: "
+            + ", ".join(sorted(unknown))
+        )
+    normalized: dict[str, object] = {}
+    for name, default in defaults.items():
+        value = values.get(name, default)
+        if type(default) is int:
+            if type(value) is not int:
+                raise ValueError(
+                    f"checkpoint model configuration {name} must be integer"
+                )
+            normalized[name] = value
+        elif type(default) is float:
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, int | float)
+                or not math.isfinite(float(value))
+            ):
+                raise ValueError(
+                    f"checkpoint model configuration {name} must be finite"
+                )
+            normalized[name] = float(value)
+        elif type(default) is str:
+            if type(value) is not str:
+                raise ValueError(
+                    f"checkpoint model configuration {name} must be string"
+                )
+            normalized[name] = value
+        else:
+            raise RuntimeError(f"unsupported ModelConfig field type for {name}")
+    try:
+        model = cast(Any, ModelConfig)(**normalized)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"checkpoint model configuration is invalid: {exc}") from exc
+    return asdict(model)
+
+
+def extract_verified_checkpoint_config(
+    source: str | Path,
+    *,
+    map_location: torch.device | str = "cpu",
+    expected_game_config: Mapping[str, Any] | None = None,
+    expected_run_id: str | None = None,
+    expected_generation_family: str | None = None,
+    expected_sha256: str | None = None,
+    expected_bytes: int | None = None,
+    require_ema: bool = True,
+) -> VerifiedModelConfig:
+    """Extract architecture metadata only after all checkpoint checks pass."""
+
+    metadata = inspect_checkpoint(
+        source,
+        map_location=map_location,
+        expected_game_config=expected_game_config,
+        expected_run_id=expected_run_id,
+        expected_generation_family=expected_generation_family,
+        expected_sha256=expected_sha256,
+        expected_bytes=expected_bytes,
+    )
+    if require_ema and not metadata["has_ema"]:
+        raise ValueError("checkpoint has no EMA weights")
+    config = metadata["config"]
+    if not isinstance(config, Mapping):
+        raise ValueError("checkpoint configuration is missing")
+    model_config = normalize_model_config(_mapping_value(config, "model"))
+    game_config = _normalize_game_config(_mapping_value(config, "game"))
+    rings = game_config["rings"]
+    if not isinstance(rings, tuple):
+        raise RuntimeError("normalized game rings are not a tuple")
+    return VerifiedModelConfig(
+        model=cast(Any, ModelConfig)(**model_config),
+        game_mode=str(game_config["mode"]),
+        pie_rule=bool(game_config["pie_rule"]),
+        rings=rings,
+    )
+
+
+def extract_verified_manifest_config(
+    manifest: ModelManifest | str | Path,
+    *,
+    map_location: torch.device | str = "cpu",
+    expected_game_config: Mapping[str, Any] | None = None,
+    require_ema: bool = True,
+) -> VerifiedModelConfig:
+    """Verify an immutable manifest and extract its checkpoint architecture."""
+
+    supplied = manifest if isinstance(manifest, ModelManifest) else None
+    if supplied is None:
+        verified_manifest = load_model_manifest(cast(str | Path, manifest))
+    else:
+        artifact = supplied.artifact_manifest or supplied.path
+        verified_manifest = load_model_manifest(artifact)
+        supplied_identity = (
+            supplied.model_identity,
+            supplied.model_version,
+            supplied.model_step,
+            supplied.published_ns,
+            supplied.run_id,
+            supplied.generation_family,
+            supplied.checkpoint.resolve(),
+            supplied.checkpoint_sha256,
+            supplied.checkpoint_bytes,
+            (supplied.artifact_manifest or supplied.path).resolve(),
+            supplied.manifest_sha256,
+            supplied.manifest_bytes,
+        )
+        verified_identity = (
+            verified_manifest.model_identity,
+            verified_manifest.model_version,
+            verified_manifest.model_step,
+            verified_manifest.published_ns,
+            verified_manifest.run_id,
+            verified_manifest.generation_family,
+            verified_manifest.checkpoint.resolve(),
+            verified_manifest.checkpoint_sha256,
+            verified_manifest.checkpoint_bytes,
+            (verified_manifest.artifact_manifest or verified_manifest.path).resolve(),
+            verified_manifest.manifest_sha256,
+            verified_manifest.manifest_bytes,
+        )
+        if supplied_identity != verified_identity:
+            raise ValueError("model manifest identity changed during verification")
+    metadata = inspect_checkpoint(
+        verified_manifest.checkpoint,
+        map_location=map_location,
+        expected_game_config=expected_game_config,
+        expected_run_id=verified_manifest.run_id,
+        expected_generation_family=verified_manifest.generation_family,
+        expected_sha256=verified_manifest.checkpoint_sha256,
+        expected_bytes=verified_manifest.checkpoint_bytes,
+    )
+    if int(metadata["step"]) != verified_manifest.model_step:
+        raise ValueError("manifest and checkpoint step disagree")
+    if require_ema and not metadata["has_ema"]:
+        raise ValueError("checkpoint has no EMA weights")
+    config = metadata["config"]
+    if not isinstance(config, Mapping):
+        raise ValueError("checkpoint configuration is missing")
+    model_config = normalize_model_config(_mapping_value(config, "model"))
+    game_config = _normalize_game_config(_mapping_value(config, "game"))
+    rings = game_config["rings"]
+    if not isinstance(rings, tuple):
+        raise RuntimeError("normalized game rings are not a tuple")
+    return VerifiedModelConfig(
+        model=cast(Any, ModelConfig)(**model_config),
+        game_mode=str(game_config["mode"]),
+        pie_rule=bool(game_config["pie_rule"]),
+        rings=rings,
+    )
 
 
 def load_model_manifest(path: str | Path) -> ModelManifest:
@@ -1237,6 +1523,8 @@ def _parse_model_manifest(
         checkpoint = artifact.parent / checkpoint
     checkpoint = checkpoint.resolve()
     checkpoint_sha256 = _sha256_text(payload.get("checkpoint_sha256"))
+    if model_identity != f"sha256-{checkpoint_sha256}":
+        raise ValueError("model identity does not match its checkpoint")
     checkpoint_bytes = _positive_int(
         "checkpoint_bytes", payload.get("checkpoint_bytes")
     )
@@ -1458,6 +1746,24 @@ def collect_model_garbage(
     return metrics
 
 
+def _validate_strict_model_state(
+    model: nn.Module,
+    state: Mapping[str, Any],
+) -> None:
+    expected = model.state_dict()
+    if set(state) != set(expected):
+        missing = sorted(set(expected) - set(state))
+        unexpected = sorted(set(state) - set(expected))
+        raise ValueError(
+            "checkpoint model keys do not match: "
+            f"missing={missing}, unexpected={unexpected}"
+        )
+    for name, expected_value in expected.items():
+        value = state[name]
+        if not isinstance(value, Tensor) or value.shape != expected_value.shape:
+            raise ValueError(f"checkpoint model tensor is incompatible: {name}")
+
+
 def _validate_checkpoint_payload(
     payload: object,
     *,
@@ -1478,6 +1784,14 @@ def _validate_checkpoint_payload(
         raise ValueError("checkpoint rules hash identifier is incompatible")
     if payload.get("feature_schema_hash") != FEATURE_SCHEMA_HASH:
         raise ValueError("checkpoint feature schema hash is incompatible")
+    if payload.get("action_layout_schema", ACTION_LAYOUT_SCHEMA_ID) != (
+        ACTION_LAYOUT_SCHEMA_ID
+    ):
+        raise ValueError("checkpoint action layout schema is incompatible")
+    if payload.get("action_layout_version", ACTION_LAYOUT_VERSION) != (
+        ACTION_LAYOUT_VERSION
+    ):
+        raise ValueError("checkpoint action layout version is incompatible")
     if payload.get("model_schema_version") != MODEL_SCHEMA_VERSION:
         raise ValueError("checkpoint model schema is incompatible")
     required = {
@@ -1496,6 +1810,19 @@ def _validate_checkpoint_payload(
         raise ValueError("checkpoint model state is invalid")
     if not isinstance(payload["extra"], Mapping):
         raise ValueError("checkpoint extra metadata is invalid")
+    optimizer_routing = payload.get("optimizer_routing")
+    if optimizer_routing is not None and not isinstance(
+        optimizer_routing,
+        Mapping,
+    ):
+        raise ValueError("checkpoint optimizer routing metadata is invalid")
+    ema = payload["ema"]
+    if ema is not None and (
+        not isinstance(ema, Mapping)
+        or ema.get("version") != EMA_VERSION
+        or not isinstance(ema.get("shadow"), Mapping)
+    ):
+        raise ValueError("checkpoint EMA state is invalid")
     for name in ("step", "epoch"):
         value = payload[name]
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:
@@ -1505,15 +1832,15 @@ def _validate_checkpoint_payload(
         raise ValueError("checkpoint configuration is missing")
     if expected_model_config is not None:
         actual_model = config.get("model")
-        if not isinstance(actual_model, Mapping) or dict(actual_model) != dict(
-            expected_model_config
-        ):
+        if not isinstance(actual_model, Mapping) or normalize_model_config(
+            actual_model
+        ) != normalize_model_config(expected_model_config):
             raise ValueError("checkpoint model/feature configuration is incompatible")
     if expected_game_config is not None:
         actual_game = config.get("game")
-        if not isinstance(actual_game, Mapping) or dict(actual_game) != dict(
-            expected_game_config
-        ):
+        if not isinstance(actual_game, Mapping) or _normalize_game_config(
+            actual_game
+        ) != _normalize_game_config(expected_game_config):
             raise ValueError("checkpoint game/rules configuration is incompatible")
     extra = payload["extra"]
     if expected_run_id is not None and extra.get("run_id") != expected_run_id:
@@ -1523,3 +1850,34 @@ def _validate_checkpoint_payload(
         and extra.get("generation_family") != expected_generation_family
     ):
         raise ValueError("checkpoint generation family is incompatible")
+
+
+def _mapping_value(config: Mapping[str, Any], name: str) -> Mapping[str, Any]:
+    value = config.get(name)
+    if not isinstance(value, Mapping):
+        raise ValueError(f"checkpoint {name} configuration is missing")
+    return value
+
+
+def _normalize_game_config(config: Mapping[str, Any]) -> dict[str, object]:
+    values = dict(config)
+    unknown = set(values) - {"mode", "pie_rule", "rings"}
+    if unknown:
+        raise ValueError(
+            "checkpoint game configuration has unsupported keys: "
+            + ", ".join(sorted(str(key) for key in unknown))
+        )
+    mode = values.get("mode", "double")
+    pie_rule = values.get("pie_rule", False)
+    rings = values.get("rings", (4, 6, 8, 10))
+    if not isinstance(mode, str) or mode != "double":
+        raise ValueError("checkpoint game mode is incompatible")
+    if type(pie_rule) is not bool or pie_rule:
+        raise ValueError("checkpoint pie-rule configuration is incompatible")
+    if (
+        not isinstance(rings, (list, tuple))
+        or any(type(ring) is not int for ring in rings)
+        or tuple(rings) != (4, 6, 8, 10)
+    ):
+        raise ValueError("checkpoint game rings are incompatible")
+    return {"mode": mode, "pie_rule": pie_rule, "rings": tuple(rings)}

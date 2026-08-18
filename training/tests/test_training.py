@@ -1,3 +1,4 @@
+import copy
 from contextlib import nullcontext
 from dataclasses import replace
 from pathlib import Path
@@ -35,8 +36,13 @@ from startrain.scoring import PlayerScore, ScoreResult
 from startrain.topology import get_topology
 from startrain.training import (
     DeviceBatchPrefetcher,
+    NonFiniteTrainingError,
+    TrainMetricAccumulator,
+    TrainStepResult,
     build_scheduler,
+    ema_effective_turnover,
     maybe_compile_model,
+    scheduler_diagnostics,
     train_step,
     unwrap_model,
 )
@@ -67,6 +73,47 @@ def test_scheduler_holds_minimum_rate_after_configured_horizon() -> None:
         optimizer.step()
         scheduler.step()
     assert optimizer.param_groups[0]["lr"] == pytest.approx(0.05)
+
+
+def test_scheduler_diagnostics_track_age_and_segment_position() -> None:
+    parameter = torch.nn.Parameter(torch.ones(()))
+    optimizer = torch.optim.SGD([parameter], lr=1.0)
+    scheduler = build_scheduler(
+        optimizer,
+        SchedulerConfig(warmup_steps=2, total_steps=4, min_lr_ratio=0.1),
+    )
+    initial = scheduler_diagnostics(scheduler)
+    assert initial.age_steps == 0
+    assert initial.segment == "warmup"
+    assert initial.segment_position == 0.0
+
+    for _ in range(2):
+        optimizer.step()
+        scheduler.step()
+    cosine = scheduler_diagnostics(scheduler)
+    assert cosine.age_steps == 2
+    assert cosine.segment == "cosine"
+    assert cosine.segment_step == 0
+    assert cosine.segment_position == 0.0
+
+    for _ in range(2):
+        optimizer.step()
+        scheduler.step()
+    floor = scheduler_diagnostics(scheduler)
+    assert floor.age_steps == 4
+    assert floor.segment == "floor"
+    assert floor.segment_position == 1.0
+
+
+def test_ema_effective_turnover_is_stable_and_strict() -> None:
+    assert ema_effective_turnover(0.9, 0) == 0.0
+    assert ema_effective_turnover(0.9, 2) == pytest.approx(0.19)
+    assert ema_effective_turnover(0.0, 10) == 1.0
+    with pytest.raises(ValueError, match="decay"):
+        ema_effective_turnover(1.0, 1)
+    for invalid in (-1, True, 1.5):
+        with pytest.raises(ValueError, match="updates"):
+            ema_effective_turnover(0.9, invalid)  # type: ignore[arg-type]
 
 
 def sample(rings: int = 4) -> ReplaySample:
@@ -637,7 +684,7 @@ def test_bf16_compiled_train_step_scheduler_and_checkpoint(tmp_path) -> None:
     restored_scheduler = build_scheduler(
         restored_optimizer, SchedulerConfig(warmup_steps=1, total_steps=10)
     )
-    restored_ema = ExponentialMovingAverage(restored)
+    restored_ema = ExponentialMovingAverage(restored, decay=0.9)
     metadata = load_checkpoint(
         path,
         model=restored,
@@ -666,6 +713,98 @@ def test_bf16_compiled_train_step_scheduler_and_checkpoint(tmp_path) -> None:
     torch.save(payload, old_path)
     with pytest.raises(ValueError, match="checkpoint version"):
         load_checkpoint(old_path, model=tiny_model())
+
+
+def test_sampled_diagnostics_do_not_change_train_step_numerics() -> None:
+    torch.manual_seed(29)
+    baseline = tiny_model()
+    instrumented = copy.deepcopy(baseline)
+    baseline_optimizer = build_optimizer(
+        baseline,
+        OptimizerConfig(kind="adamw", adamw_lr=1e-3),
+    )
+    instrumented_optimizer = build_optimizer(
+        instrumented,
+        OptimizerConfig(kind="adamw", adamw_lr=1e-3),
+    )
+    scheduler_config = SchedulerConfig(warmup_steps=1, total_steps=10)
+    baseline_scheduler = build_scheduler(baseline_optimizer, scheduler_config)
+    instrumented_scheduler = build_scheduler(
+        instrumented_optimizer,
+        scheduler_config,
+    )
+    baseline_ema = ExponentialMovingAverage(baseline, decay=0.9)
+    instrumented_ema = ExponentialMovingAverage(instrumented, decay=0.9)
+    batch = collate_replay_samples([sample()])
+
+    baseline_result = train_step(
+        baseline,
+        batch,
+        baseline_optimizer,
+        scheduler=baseline_scheduler,
+        ema=baseline_ema,
+    )
+    instrumented_result = train_step(
+        instrumented,
+        batch,
+        instrumented_optimizer,
+        scheduler=instrumented_scheduler,
+        ema=instrumented_ema,
+        collect_diagnostics=True,
+    )
+
+    for name, value in baseline.state_dict().items():
+        torch.testing.assert_close(
+            value,
+            instrumented.state_dict()[name],
+            atol=0,
+            rtol=0,
+        )
+    assert baseline_result.losses == {
+        name: value
+        for name, value in instrumented_result.losses.items()
+        if not name.startswith("clinch_")
+    }
+    assert any(name.startswith("clinch_") for name in instrumented_result.loss_tensors)
+    assert baseline_result.learning_rates == instrumented_result.learning_rates
+    host = instrumented_result.to_host()
+    assert host.nonfinite_loss_count == 0
+    assert host.nonfinite_gradient_count == 0
+    assert len(host.optimizer_groups) == len(instrumented_optimizer.param_groups)
+    assert all(group.update_norm > 0 for group in host.optimizer_groups)
+    assert host.scheduler is not None
+    assert host.scheduler.age_steps == 1
+    assert host.ema is not None
+    assert host.ema.num_updates == 1
+    assert host.ema.distance_norm > 0
+    assert host.ema.effective_turnover == pytest.approx(0.1)
+
+
+def test_train_metric_accumulator_reports_clipping_frequency_without_step_sync() -> (
+    None
+):
+    def result(*, clipped: bool, loss_nonfinite: int = 0) -> TrainStepResult:
+        return TrainStepResult(
+            loss_tensors={"total": torch.tensor(1.0)},
+            gradient_norm_tensor=torch.tensor(2.0),
+            gradient_clipped_tensor=torch.tensor(clipped),
+            nonfinite_loss_count_tensor=torch.tensor(loss_nonfinite),
+            nonfinite_gradient_count_tensor=torch.tensor(0),
+            learning_rates=(0.1,),
+        )
+
+    accumulator = TrainMetricAccumulator()
+    accumulator.update(result(clipped=True))
+    accumulator.update(result(clipped=False, loss_nonfinite=1))
+    metrics = accumulator.to_host()
+
+    assert metrics.steps == 2
+    assert metrics.gradient_clipped_steps == 1
+    assert metrics.gradient_clipping_frequency == pytest.approx(0.5)
+    assert metrics.nonfinite_loss_count == 1
+    assert metrics.nonfinite_gradient_count == 0
+    accumulator.reset()
+    assert accumulator.to_host().steps == 0
 
 
 def test_public_train_step_validates_untrusted_target_weights() -> None:
@@ -697,17 +836,25 @@ def test_train_step_fails_all_ranks_before_optimizer_mutation(
 
     def reject_one_rank(tensor: torch.Tensor, **_kwargs) -> None:
         reductions.append(tensor.clone())
-        tensor[0] = 0
+        if tensor.dtype == torch.int32:
+            tensor[0] = 0
+        else:
+            tensor[0] = 1
 
     monkeypatch.setattr(torch.distributed, "all_reduce", reject_one_rank)
     before = {
         name: value.detach().clone() for name, value in model.state_dict().items()
     }
 
-    with pytest.raises(FloatingPointError, match="at least one rank"):
+    with pytest.raises(
+        NonFiniteTrainingError,
+        match="at least one rank",
+    ) as captured:
         train_step(model, batch, optimizer)
 
-    assert len(reductions) == 1
+    assert captured.value.nonfinite_loss_count == 1
+    assert captured.value.nonfinite_gradient_count == 0
+    assert len(reductions) == 2
     for name, value in model.state_dict().items():
         torch.testing.assert_close(value, before[name])
 

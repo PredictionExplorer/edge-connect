@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import json
 import os
+import sqlite3
 import stat
 from collections.abc import Callable, Mapping, Sequence
 from copy import deepcopy
@@ -16,6 +17,7 @@ from typing import Any
 import yaml
 
 from startrain.config import ExperimentConfig, load_config
+from startrain.model import model_parameter_count
 
 if __package__:
     from .validate_continuous_profile import validate_continuous_config
@@ -61,14 +63,63 @@ RING10_OPTIMIZATION_TREATMENTS = (
     "ring10-cadence-5m",
     "ring10-freshness-50",
 )
+RING10_TRAINING_DYNAMICS_TREATMENTS = (
+    "ring10-dynamics-control",
+    "ring10-dynamics-adamw",
+    "ring10-dynamics-ema-1m",
+    "ring10-dynamics-freshness-50",
+    "ring10-dynamics-clinch-outcome-only",
+)
+RING10_ATTENTION_TREATMENTS = (
+    "ring10-attention-control",
+    "ring10-attention-full-kv",
+)
+RING10_RELATIONAL_TREATMENTS = (
+    "ring10-relational-control",
+    "ring10-relational-local-heavy",
+    "ring10-relational-source-gated",
+)
+RING10_CAPACITY_TREATMENTS = (
+    "ring10-capacity-control",
+    "ring10-capacity-depth-7",
+    "ring10-capacity-width-512",
+)
 RING10_ONLY_TREATMENTS = ("ring10-only",)
 RING10_OBJECTIVE_TREATMENTS = frozenset(
-    (*RING10_EFFICIENCY_TREATMENTS, *RING10_OPTIMIZATION_TREATMENTS)
+    (
+        *RING10_EFFICIENCY_TREATMENTS,
+        *RING10_OPTIMIZATION_TREATMENTS,
+        *RING10_TRAINING_DYNAMICS_TREATMENTS,
+        *RING10_ATTENTION_TREATMENTS,
+        *RING10_RELATIONAL_TREATMENTS,
+        *RING10_CAPACITY_TREATMENTS,
+    )
 )
 RING10_EFFICIENCY_VARIANTS = frozenset(RING10_EFFICIENCY_TREATMENTS[1:])
 TREATMENT_SUITES = {
     "ring10-efficiency": RING10_EFFICIENCY_TREATMENTS,
     "ring10-optimization": RING10_OPTIMIZATION_TREATMENTS,
+    "ring10-training-dynamics": RING10_TRAINING_DYNAMICS_TREATMENTS,
+    "ring10-attention-reallocation": RING10_ATTENTION_TREATMENTS,
+    "ring10-relational": RING10_RELATIONAL_TREATMENTS,
+    "ring10-capacity": RING10_CAPACITY_TREATMENTS,
+}
+SCRATCH_INITIALIZATION_TREATMENTS = frozenset(
+    (
+        *RING10_ATTENTION_TREATMENTS,
+        *RING10_RELATIONAL_TREATMENTS,
+        *RING10_CAPACITY_TREATMENTS,
+    )
+)
+EXPECTED_ARCHITECTURE_PARAMETERS = {
+    "ring10-attention-control": 10_476_983,
+    "ring10-attention-full-kv": 10_476_983,
+    "ring10-relational-control": 10_476_983,
+    "ring10-relational-local-heavy": 10_476_953,
+    "ring10-relational-source-gated": 10_476_983,
+    "ring10-capacity-control": 10_476_983,
+    "ring10-capacity-depth-7": 14_614_199,
+    "ring10-capacity-width-512": 18_556_727,
 }
 GUARD_RINGS = (4, 6, 8)
 WEIGHTED_PROMOTION_PAIR_RATIOS = {4: 1, 6: 1, 8: 1, 10: 7}
@@ -117,6 +168,10 @@ def _parser() -> argparse.ArgumentParser:
             *WEIGHTED_TREATMENTS,
             *RING10_EFFICIENCY_TREATMENTS,
             *RING10_OPTIMIZATION_TREATMENTS,
+            *RING10_TRAINING_DYNAMICS_TREATMENTS,
+            *RING10_ATTENTION_TREATMENTS,
+            *RING10_RELATIONAL_TREATMENTS,
+            *RING10_CAPACITY_TREATMENTS,
         ),
         dest="treatments",
     )
@@ -267,6 +322,120 @@ def _ring_ten_freshness_fifty(config: RawConfig) -> None:
             "history_probability": 0.0,
         }
     )
+
+
+def _ring_ten_dynamics_control(config: RawConfig) -> None:
+    _ring_ten_optimization_control(config)
+    _mapping(config, "optimizer")["kind"] = "muon_adamw"
+    _mapping(config, "train")["ema_half_life_examples"] = None
+    _mapping(config, "selfplay")["clinch_auxiliary_targets"] = "synthetic"
+    refresh = _mapping(_mapping(config, "orchestration"), "model_refresh")
+    refresh.update(
+        {
+            "selfplay_source": "champion",
+            "candidate_probability": 0.0,
+            "history_probability": 0.0,
+        }
+    )
+
+
+def _ring_ten_dynamics_adamw(config: RawConfig) -> None:
+    _ring_ten_dynamics_control(config)
+    _mapping(config, "optimizer")["kind"] = "adamw"
+
+
+def _ring_ten_dynamics_ema_one_million(config: RawConfig) -> None:
+    _ring_ten_dynamics_control(config)
+    _mapping(config, "train")["ema_half_life_examples"] = 1_000_000
+
+
+def _ring_ten_dynamics_freshness_fifty(config: RawConfig) -> None:
+    _ring_ten_dynamics_control(config)
+    _mapping(_mapping(config, "orchestration"), "model_refresh").update(
+        {
+            "selfplay_source": "candidate_champion_mix",
+            "candidate_probability": 0.5,
+            "history_probability": 0.0,
+        }
+    )
+
+
+def _ring_ten_dynamics_clinch_outcome_only(config: RawConfig) -> None:
+    _ring_ten_dynamics_control(config)
+    _mapping(config, "selfplay")["clinch_auxiliary_targets"] = "outcome_only"
+
+
+def _ring_ten_attention_control(config: RawConfig) -> None:
+    _ring_ten_optimization_control(config)
+    model = _mapping(config, "model")
+    model.update(
+        {
+            "width": 384,
+            "rrt_groups": 5,
+            "attention_heads": 12,
+            "kv_heads": 3,
+            "bottleneck_ratio": 0.5,
+            "ff_multiplier": 2.5,
+            "dropout": 0.0,
+            "rms_norm_eps": 1e-6,
+            "local_operator": "mean",
+            "local_blocks_per_group": 2,
+        }
+    )
+
+
+def _ring_ten_attention_full_kv(config: RawConfig) -> None:
+    _ring_ten_attention_control(config)
+    _mapping(config, "model").update(
+        {
+            "kv_heads": 12,
+            "ff_multiplier": 2.0,
+        }
+    )
+
+
+def _ring_ten_relational_control(config: RawConfig) -> None:
+    _ring_ten_attention_full_kv(config)
+
+
+def _ring_ten_relational_local_heavy(config: RawConfig) -> None:
+    _ring_ten_relational_control(config)
+    _mapping(config, "model").update(
+        {
+            "bottleneck_ratio": 35 / 64,
+            "ff_multiplier": 419 / 384,
+            "local_blocks_per_group": 3,
+        }
+    )
+
+
+def _ring_ten_relational_source_gated(config: RawConfig) -> None:
+    _ring_ten_relational_control(config)
+    _mapping(config, "model").update(
+        {
+            "local_operator": "source_gated",
+            "ff_multiplier": 5 / 3,
+        }
+    )
+
+
+def _ring_ten_capacity_control(config: RawConfig) -> None:
+    _ring_ten_attention_control(config)
+
+
+def _ring_ten_capacity_depth_seven(config: RawConfig) -> None:
+    _ring_ten_capacity_control(config)
+    _mapping(config, "model")["rrt_groups"] = 7
+
+
+def _ring_ten_capacity_width_512(config: RawConfig) -> None:
+    _ring_ten_capacity_control(config)
+    model = _mapping(config, "model")
+    query_heads = int(model["attention_heads"])
+    kv_heads = int(model["kv_heads"])
+    model["width"] = 512
+    model["attention_heads"] = 16
+    model["kv_heads"] = 16 if kv_heads == query_heads else 4
 
 
 def _search_quality(config: RawConfig) -> None:
@@ -426,6 +595,19 @@ TREATMENTS: dict[str, Treatment] = {
     "ring10-optimization-control": _ring_ten_optimization_control,
     "ring10-cadence-5m": _ring_ten_cadence_five_million,
     "ring10-freshness-50": _ring_ten_freshness_fifty,
+    "ring10-dynamics-control": _ring_ten_dynamics_control,
+    "ring10-dynamics-adamw": _ring_ten_dynamics_adamw,
+    "ring10-dynamics-ema-1m": _ring_ten_dynamics_ema_one_million,
+    "ring10-dynamics-freshness-50": _ring_ten_dynamics_freshness_fifty,
+    "ring10-dynamics-clinch-outcome-only": (_ring_ten_dynamics_clinch_outcome_only),
+    "ring10-attention-control": _ring_ten_attention_control,
+    "ring10-attention-full-kv": _ring_ten_attention_full_kv,
+    "ring10-relational-control": _ring_ten_relational_control,
+    "ring10-relational-local-heavy": _ring_ten_relational_local_heavy,
+    "ring10-relational-source-gated": _ring_ten_relational_source_gated,
+    "ring10-capacity-control": _ring_ten_capacity_control,
+    "ring10-capacity-depth-7": _ring_ten_capacity_depth_seven,
+    "ring10-capacity-width-512": _ring_ten_capacity_width_512,
 }
 
 
@@ -442,6 +624,24 @@ def _sha256(path: Path) -> str:
         for block in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def _source_replay_cutoff(source_run_root: Path) -> int:
+    manifest = source_run_root / "replay" / "manifest.sqlite3"
+    if not manifest.is_file() or manifest.is_symlink():
+        raise ValueError("training-dynamics suite requires a source replay manifest")
+    try:
+        uri = f"{manifest.resolve().as_uri()}?mode=ro"
+        with sqlite3.connect(uri, uri=True, timeout=30.0) as connection:
+            row = connection.execute(
+                "SELECT COALESCE(MAX(id), 0) FROM shards WHERE state = 'ready'"
+            ).fetchone()
+    except sqlite3.Error as error:
+        raise ValueError(f"cannot read source replay cutoff: {error}") from error
+    cutoff = int(row[0]) if row is not None else 0
+    if cutoff < 0:
+        raise ValueError("source replay cutoff cannot be negative")
+    return cutoff
 
 
 def _read_json(path: Path) -> dict[str, object]:
@@ -855,6 +1055,15 @@ def prepare_elo_ablation(
         raise FileNotFoundError(f"base config does not exist: {base}")
     if not source.is_dir():
         raise FileNotFoundError(f"source run root does not exist: {source}")
+    scratch_treatments = [
+        treatment in SCRATCH_INITIALIZATION_TREATMENTS for treatment in treatments
+    ]
+    if any(scratch_treatments) and not all(scratch_treatments):
+        raise ValueError(
+            "scratch architecture and forked training treatments require "
+            "separate ablation plans"
+        )
+    initialization = "scratch" if all(scratch_treatments) else "fork"
     training_objective = training_objective_for_treatments(treatments)
     promotion_objective = promotion_objective_for_treatments(treatments)
     inferred_guard_rings = blocking_guard_rings(treatments)
@@ -881,43 +1090,75 @@ def prepare_elo_ablation(
     )
     base_sha256 = _sha256(base)
     raw_base = _load_raw(base)
-    if suite in {"ring10-efficiency", "ring10-optimization"} or any(
-        treatment in RING10_EFFICIENCY_VARIANTS for treatment in treatments
+    if (suite is not None and suite.startswith("ring10-")) or any(
+        treatment in RING10_EFFICIENCY_VARIANTS
+        or treatment in RING10_TRAINING_DYNAMICS_TREATMENTS
+        or treatment in SCRATCH_INITIALIZATION_TREATMENTS
+        for treatment in treatments
     ):
         _validate_ring10_efficiency_base(load_config(base))
+    replay_cutoff = (
+        _source_replay_cutoff(source)
+        if any(
+            treatment in RING10_TRAINING_DYNAMICS_TREATMENTS for treatment in treatments
+        )
+        else None
+    )
     destination.mkdir(parents=True)
     generated = []
     for treatment_name in treatments:
         run_root = root_parent / f"{prefix}-{treatment_name}-seed{seed}"
+        treatment_run_id = (
+            "scratch-"
+            + hashlib.sha256(
+                f"{run_id}:{suite}:{treatment_name}:{seed}".encode("utf-8")
+            ).hexdigest()[:24]
+            if initialization == "scratch"
+            else run_id
+        )
         profile = deepcopy(raw_base)
         _mapping(profile, "orchestration")["training_objective"] = training_objective
         _configure_common(
             profile,
             run_root=run_root,
-            run_id=run_id,
+            run_id=treatment_run_id,
             seed=seed,
             guard_floor_elo=guard_floor_elo,
         )
         TREATMENTS[treatment_name](profile)
+        if replay_cutoff is not None:
+            _mapping(profile, "learner")["minimum_replay_shard_id_exclusive"] = (
+                replay_cutoff
+            )
         profile_path = destination / f"{treatment_name}.yaml"
         profile_path.write_text(
             yaml.safe_dump(profile, sort_keys=False),
             encoding="utf-8",
         )
-        _validate_profile(
+        loaded_profile = _validate_profile(
             profile_path,
             expected_root=run_root,
-            expected_run_id=run_id,
+            expected_run_id=treatment_run_id,
             expected_seed=seed,
             guard_floor_elo=guard_floor_elo,
             expected_training_objective=training_objective,
             expected_promotion_objective=promotion_objective,
         )
+        expected_parameters = EXPECTED_ARCHITECTURE_PARAMETERS.get(treatment_name)
+        if (
+            expected_parameters is not None
+            and model_parameter_count(loaded_profile.model) != expected_parameters
+        ):
+            raise ValueError(
+                f"{treatment_name} parameter contract differs from "
+                f"{expected_parameters}"
+            )
         generated.append(
             {
                 "treatment": treatment_name,
                 "training_objective": training_objective,
                 "promotion_objective": promotion_objective,
+                "run_id": treatment_run_id,
                 "profile": str(profile_path),
                 "profile_sha256": _sha256(profile_path),
                 "run_root": str(run_root),
@@ -927,9 +1168,11 @@ def prepare_elo_ablation(
         "schema_version": SCHEMA_VERSION,
         "report": REPORT_NAME,
         "suite": suite,
+        "initialization": initialization,
         "base_config": str(base),
         "base_config_sha256": base_sha256,
         "source_run_root": str(source),
+        "source_replay_cutoff": replay_cutoff,
         "source_winner_snapshot": verified_winner,
         "futility_policy": registered_futility,
         "run_id": run_id,

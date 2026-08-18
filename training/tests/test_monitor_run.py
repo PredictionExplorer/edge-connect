@@ -1218,6 +1218,49 @@ def test_monitor_derives_aggregate_headline_from_legacy_report(tmp_path) -> None
     assert status["headline_confidence_interval"] == [250.0, 350.0]
 
 
+def test_monitor_surfaces_optimizer_ema_and_training_health(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    now_ns = 10_000_000_000
+    root = _fixture(tmp_path, now_ns=now_ns)
+    metric_path = root / "learner" / "metrics.jsonl"
+    metric = json.loads(metric_path.read_text(encoding="utf-8").splitlines()[-1])
+    metric.update(
+        {
+            "gradient_clipped": True,
+            "gradient_clipped_steps": 8,
+            "gradient_clipping_frequency": 0.8,
+            "nonfinite_loss_count": 1,
+            "nonfinite_gradient_count": 0,
+            "optimizer_routing_hash": "sha256-" + "a" * 64,
+            "optimizer_weight_norm": 10.0,
+            "optimizer_update_norm": 0.1,
+            "scheduler_age_steps": 42,
+            "scheduler_segment": "cosine",
+            "scheduler_segment_position": 0.25,
+            "raw_vs_ema_distance": 2.0,
+            "raw_vs_ema_relative_distance": 0.2,
+            "ema_effective_turnover": 0.5,
+            "ema_interval_effective_turnover": 0.01,
+            "replay_minimum_shard_id_exclusive": 123,
+        }
+    )
+    metric_path.write_text(json.dumps(metric) + "\n", encoding="utf-8")
+    _healthy_dependencies(monkeypatch)
+
+    snapshot: Any = monitor.collect_snapshot(root, now_ns=now_ns)
+    learner = snapshot["learner"]
+    codes = {warning["code"] for warning in snapshot["warnings"]}
+
+    assert learner["optimizer_routing_hash"].endswith("a" * 64)
+    assert learner["scheduler_age_steps"] == 42
+    assert learner["ema_effective_turnover"] == 0.5
+    assert learner["replay_minimum_shard_id_exclusive"] == 123
+    assert {"learner_nonfinite", "gradient_clipping_high"} <= codes
+    assert snapshot["status"] == "ERROR"
+
+
 def test_disaster_recovery_status_verifies_snapshot_and_mac_ack(tmp_path) -> None:
     now_ns = 200_000_000_000
     run_id = "run-1"

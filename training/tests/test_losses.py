@@ -154,6 +154,71 @@ def test_policy_confidence_weights_affect_only_policy_heads() -> None:
         )
 
 
+def test_clinch_conditioned_losses_retain_policy_and_outcome_when_auxiliaries_masked() -> (
+    None
+):
+    output = outputs()
+    target = targets()
+    target.policy[:, 0] = 1
+    target.soft_policy[:, 0] = 1
+    target.policy_mask[:] = True
+    target.soft_policy_mask[:] = True
+    target.outcome[:] = torch.tensor([1, 0])
+    target.outcome_mask[:] = True
+    target = replace(target, clinch_mask=torch.tensor([True, False]))
+    legal = torch.ones(2, 3, dtype=torch.bool)
+    nodes = torch.ones(2, 3, dtype=torch.bool)
+
+    outcome_only = compute_losses(
+        output,
+        target,
+        legal_action_mask=legal,
+        node_mask=nodes,
+        include_diagnostics=True,
+    )
+    assert outcome_only["clinch_policy"].item() == pytest.approx(math.log(3))
+    assert outcome_only["clinch_soft_policy"].item() == pytest.approx(math.log(3))
+    assert outcome_only["clinch_outcome"].item() == pytest.approx(math.log(2))
+    assert outcome_only["clinch_score_margin"].item() == 0
+    assert outcome_only["clinch_ownership"].item() == 0
+    assert outcome_only["clinch_alive"].item() == 0
+    assert outcome_only["clinch_samples"].item() == 1
+    assert outcome_only["clinch_policy_available"].item() == 1
+    assert outcome_only["clinch_outcome_available"].item() == 1
+    assert outcome_only["clinch_score_margin_available"].item() == 0
+    assert outcome_only["clinch_ownership_available"].item() == 0
+    assert outcome_only["clinch_alive_available"].item() == 0
+
+    target.score_margin[0] = 0
+    target.score_margin_mask[0] = True
+    target.ownership[0] = 0
+    target.ownership_mask[0] = True
+    target.alive[0] = 1
+    target.alive_mask[0] = True
+    synthetic = compute_losses(
+        output,
+        target,
+        legal_action_mask=legal,
+        node_mask=nodes,
+        include_diagnostics=True,
+    )
+    assert synthetic["clinch_score_margin"].item() == pytest.approx(math.log(303))
+    assert synthetic["clinch_ownership"].item() == pytest.approx(math.log(3))
+    assert synthetic["clinch_alive"].item() == pytest.approx(math.log(2))
+    assert synthetic["clinch_score_margin_available"].item() == 1
+    assert synthetic["clinch_ownership_available"].item() == 1
+    assert synthetic["clinch_alive_available"].item() == 1
+    torch.testing.assert_close(
+        synthetic["total"],
+        outcome_only["total"]
+        + (
+            0.25 * synthetic["score_margin"]
+            + 0.25 * synthetic["ownership"]
+            + 0.1 * synthetic["alive"]
+        ),
+    )
+
+
 @pytest.mark.parametrize("head", ["ownership", "alive"])
 def test_spatial_losses_average_each_sample_before_weighting(head: str) -> None:
     output = outputs()

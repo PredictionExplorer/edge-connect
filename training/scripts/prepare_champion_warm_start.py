@@ -720,8 +720,12 @@ def prepare_champion_warm_start(
         "created_ns": time.time_ns(),
     }
 
+    world_size = max(1, len(experiment.orchestration.learner_gpus))
     model = GraphResTNet(experiment.model)
-    ema = ExponentialMovingAverage(model, decay=experiment.train.ema_decay)
+    ema = ExponentialMovingAverage(
+        model,
+        decay=experiment.train.resolved_ema_decay(world_size),
+    )
     load_ema_weights_for_warm_start(
         warm_source.checkpoint,
         model=model,
@@ -789,7 +793,6 @@ def prepare_champion_warm_start(
                     "existing champion warm-start history artifact is incompatible"
                 )
             atomic_json(archive, replaced_marker)
-        world_size = max(1, len(experiment.orchestration.learner_gpus))
         prepared = create_recovery_checkpoint_artifact(
             learner_root,
             model=model,

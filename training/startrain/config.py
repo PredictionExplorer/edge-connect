@@ -91,6 +91,7 @@ class TrainConfig:
     compile: bool | Literal["auto"] = False
     seed: int = 17
     ema_decay: float = 0.999
+    ema_half_life_examples: float | None = None
     gradient_clip_norm: float = 1.0
     scheduler: SchedulerConfig = SchedulerConfig()
 
@@ -105,11 +106,24 @@ class TrainConfig:
             raise ConfigError("compile must be boolean or 'auto'")
         if not 0 <= self.ema_decay < 1:
             raise ConfigError("ema_decay must be in [0, 1)")
+        if self.ema_half_life_examples is not None and (
+            isinstance(self.ema_half_life_examples, bool)
+            or not isinstance(self.ema_half_life_examples, int | float)
+            or not math.isfinite(float(self.ema_half_life_examples))
+            or self.ema_half_life_examples <= 0
+        ):
+            raise ConfigError("ema_half_life_examples must be finite and positive")
 
     def global_batch_size(self, world_size: int) -> int:
         if world_size <= 0:
             raise ValueError("world_size must be positive")
         return self.per_rank_batch_size * world_size
+
+    def resolved_ema_decay(self, world_size: int) -> float:
+        if self.ema_half_life_examples is None:
+            return self.ema_decay
+        batch = self.global_batch_size(world_size)
+        return 0.5 ** (batch / float(self.ema_half_life_examples))
 
 
 @dataclass(frozen=True, slots=True)
@@ -150,6 +164,7 @@ class LearnerConfig:
     minimum_unique_samples_per_ring: int = 1
     use_ring_mixture_curriculum: bool = False
     max_replay_lag_steps: int = 50_000
+    minimum_replay_shard_id_exclusive: int | None = None
     steps_per_window: int = 100
     candidate_interval: int = 1_000
     candidate_interval_examples: int | None = None
@@ -182,6 +197,12 @@ class LearnerConfig:
         )
         if any(value <= 0 for value in values) or self.max_replay_lag_steps < 0:
             raise ConfigError("learner loop intervals and windows are invalid")
+        if self.minimum_replay_shard_id_exclusive is not None and (
+            isinstance(self.minimum_replay_shard_id_exclusive, bool)
+            or not isinstance(self.minimum_replay_shard_id_exclusive, int)
+            or self.minimum_replay_shard_id_exclusive < 0
+        ):
+            raise ConfigError("minimum_replay_shard_id_exclusive must be non-negative")
         if self.minimum_unique_samples_per_ring > self.recent_samples_per_ring:
             raise ConfigError("per-ring minimum cannot exceed the recent quota")
         if self.candidate_interval_examples is not None and (

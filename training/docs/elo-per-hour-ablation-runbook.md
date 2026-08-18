@@ -531,6 +531,59 @@ next seed immediately. A failure releases the campaign lock so continuity can
 activate LKG. Completion writes the cross-seed report but still sets
 `automatic_adoption_authorized: false`.
 
+Pin `seed_boundary_hold_path` in the campaign when operator review is required
+between seeds. Requesting a hold does not interrupt the active seed:
+
+```bash
+python scripts/run_staged_elo_pipeline.py \
+  --confirmation-campaign /absolute/path/to/confirmation-campaign.json \
+  --seed-boundary-action request \
+  --hold-reason "inspect finalized seed before spending the next seed"
+```
+
+After the active seed finalizes and releases resources, the campaign records
+`status: paused`, the completed and next seeds, the hold digest, and
+`operator_resume_required`, then exits successfully without launching the next
+queue. Continuity may resume the verified LKG while the campaign is paused.
+Inspect immutable comparison and backup evidence, then either leave the hold in
+place or release and restart the same campaign:
+
+```bash
+python scripts/run_staged_elo_pipeline.py \
+  --confirmation-campaign /absolute/path/to/confirmation-campaign.json \
+  --seed-boundary-action release
+
+systemctl start edgeconnect-startrain-confirmation-campaign.service
+```
+
+Never time a signal between seeds or edit campaign state. Older pinned releases
+without this field require a supervised fail-closed queue-lock barrier; preserve
+that failure evidence and continuity handoff rather than rewriting it.
+
+Scratch architecture suites must not use `fork_elo_ablation.py` or the
+homogeneous Elo queue. Prepare every arm as an empty, hash-pinned root, then use
+the dedicated queue:
+
+```bash
+python scripts/prepare_scratch_architecture.py \
+  --plan /path/to/ablation-plan.json \
+  --treatment ring10-attention-control
+python scripts/prepare_scratch_architecture.py \
+  --plan /path/to/ablation-plan.json \
+  --treatment ring10-attention-full-kv
+python scripts/run_architecture_ablation_queue.py \
+  --plan /path/to/ablation-plan.json \
+  --state /path/to/architecture-queue-state.json \
+  --evidence-directory /path/to/architecture-evidence \
+  --execution-lock-path /path/to/shared/host-execution.lock \
+  --device cuda
+```
+
+The architecture queue charges downtime against each fixed wall budget,
+refuses imported checkpoints or replay before first launch, runs direct
+control/treatment cross-play against one frozen baseline, and publishes
+diagnostic-only evidence. It never authorizes promotion or adoption.
+
 For the next one-factor ring-10 screen, `--suite ring10-optimization` freezes
 UTD at 1.0 and compares:
 

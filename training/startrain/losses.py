@@ -53,6 +53,7 @@ class TrainingTargets:
     soft_policy_mask: Tensor
     sample_weight: Tensor | None = None
     policy_weight: Tensor | None = None
+    clinch_mask: Tensor | None = None
 
     def to(
         self,
@@ -87,6 +88,11 @@ class TrainingTargets:
                 if self.policy_weight is not None
                 else None
             ),
+            clinch_mask=(
+                self.clinch_mask.to(device, non_blocking=non_blocking)
+                if self.clinch_mask is not None
+                else None
+            ),
         )
 
     def pin_memory(self) -> "TrainingTargets":
@@ -113,6 +119,9 @@ class TrainingTargets:
                 if self.policy_weight is not None
                 else None
             ),
+            clinch_mask=(
+                self.clinch_mask.pin_memory() if self.clinch_mask is not None else None
+            ),
         )
 
     def record_stream(self, stream: torch.Stream) -> None:
@@ -136,6 +145,8 @@ class TrainingTargets:
             self.sample_weight.record_stream(stream)
         if self.policy_weight is not None:
             self.policy_weight.record_stream(stream)
+        if self.clinch_mask is not None:
+            self.clinch_mask.record_stream(stream)
 
 
 def _require_tensor(condition: Tensor, message: str) -> None:
@@ -233,6 +244,8 @@ def _validate_shapes(
     ):
         if weights is not None and weights.shape != (batch_size,):
             raise ValueError(f"{name} must have shape ({batch_size},)")
+    if targets.clinch_mask is not None and targets.clinch_mask.shape != (batch_size,):
+        raise ValueError(f"clinch mask must have shape ({batch_size},)")
 
 
 def compute_losses(
@@ -245,6 +258,7 @@ def compute_losses(
     score_margin_max: int = SCORE_MARGIN_MAX,
     weights: LossWeights = LossWeights(),
     validate_targets: bool = True,
+    include_diagnostics: bool = False,
 ) -> dict[str, Tensor]:
     """Compute losses using explicit availability masks.
 
@@ -282,7 +296,6 @@ def compute_losses(
             "policy weights must be finite and non-negative",
         )
     policy_sample_weight = sample_weight * policy_weight
-
     policy_values, policy_has_mass = _soft_cross_entropy(
         output.policy_logits, targets.policy, legal_action_mask
     )
@@ -392,7 +405,7 @@ def compute_losses(
         + weights.alive * alive_loss
         + weights.soft_policy * soft_policy_loss
     )
-    return {
+    losses = {
         "total": total,
         "policy": policy_loss,
         "outcome": outcome_loss,
@@ -401,3 +414,60 @@ def compute_losses(
         "alive": alive_loss,
         "soft_policy": soft_policy_loss,
     }
+    if include_diagnostics:
+        clinch_mask = (
+            targets.clinch_mask.bool()
+            if targets.clinch_mask is not None
+            else torch.zeros(
+                batch_size,
+                device=output.policy_logits.device,
+                dtype=torch.bool,
+            )
+        )
+        with torch.no_grad():
+            losses.update(
+                {
+                    "clinch_policy": _weighted_mean(
+                        policy_values,
+                        policy_valid & clinch_mask,
+                        policy_sample_weight,
+                    ),
+                    "clinch_outcome": _weighted_mean(
+                        outcome_values,
+                        outcome_mask & clinch_mask,
+                        sample_weight,
+                    ),
+                    "clinch_score_margin": _weighted_mean(
+                        margin_values,
+                        margin_mask & clinch_mask,
+                        sample_weight,
+                    ),
+                    "clinch_ownership": _weighted_mean(
+                        ownership_per_sample,
+                        ownership_has_nodes & ownership_sample_mask & clinch_mask,
+                        sample_weight,
+                    ),
+                    "clinch_alive": _weighted_mean(
+                        alive_per_sample,
+                        alive_has_nodes & alive_sample_mask & clinch_mask,
+                        sample_weight,
+                    ),
+                    "clinch_soft_policy": _weighted_mean(
+                        soft_values,
+                        soft_valid & clinch_mask,
+                        policy_sample_weight,
+                    ),
+                    "clinch_samples": clinch_mask.sum(),
+                    "clinch_policy_available": (policy_valid & clinch_mask).sum(),
+                    "clinch_outcome_available": (outcome_mask & clinch_mask).sum(),
+                    "clinch_score_margin_available": (margin_mask & clinch_mask).sum(),
+                    "clinch_ownership_available": (
+                        ownership_has_nodes & ownership_sample_mask & clinch_mask
+                    ).sum(),
+                    "clinch_alive_available": (
+                        alive_has_nodes & alive_sample_mask & clinch_mask
+                    ).sum(),
+                    "clinch_soft_policy_available": (soft_valid & clinch_mask).sum(),
+                }
+            )
+    return losses

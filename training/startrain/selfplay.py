@@ -71,6 +71,7 @@ class SelfPlayConfig:
     c_scale: float = 1.0
     score_utility_weight: float = 0.0
     clinch_finalization: Literal["disabled", "loser-fill"] = "disabled"
+    clinch_auxiliary_targets: Literal["synthetic", "outcome_only"] = "synthetic"
     shard_size: int = 512
     seed: int = 17
 
@@ -114,6 +115,10 @@ class SelfPlayConfig:
             raise ValueError("score utility weight must be in [0, 1]")
         if self.clinch_finalization not in ("disabled", "loser-fill"):
             raise ValueError("clinch_finalization must be disabled or loser-fill")
+        if self.clinch_auxiliary_targets not in ("synthetic", "outcome_only"):
+            raise ValueError(
+                "clinch_auxiliary_targets must be synthetic or outcome_only"
+            )
 
     @classmethod
     def cpu_smoke(cls, *, seed: int = 17) -> "SelfPlayConfig":
@@ -193,6 +198,14 @@ class SelfPlayMetrics:
     replay_append_seconds: float = 0.0
     clinched_games: int = 0
     clinch_empty_nodes: int = 0
+    source_champion_games: int = 0
+    source_candidate_games: int = 0
+    source_history_games: int = 0
+    source_unattributed_games: int = 0
+    source_champion_samples: int = 0
+    source_candidate_samples: int = 0
+    source_history_samples: int = 0
+    source_unattributed_samples: int = 0
 
     def delta(self, previous: "SelfPlayMetrics") -> "SelfPlayMetrics":
         values = {
@@ -254,12 +267,19 @@ class SelfPlayActor:
         replay_sink: ReplaySinkProtocol,
         config: SelfPlayConfig,
         identity: SelfPlayIdentity | None = None,
+        *,
+        source_role: Literal[
+            "champion", "candidate", "history", "unattributed"
+        ] = "unattributed",
     ) -> None:
         self.native = native_module
         self.evaluator = evaluator
         self.sink = replay_sink
         self.config = config
         self.identity = identity or SelfPlayIdentity("manual", "manual", "manual", 0)
+        if source_role not in ("champion", "candidate", "history", "unattributed"):
+            raise ValueError("self-play source_role is invalid")
+        self.source_role = source_role
         self.model_identity = str(
             getattr(evaluator, "model_identity", evaluator.model_version)
         )
@@ -284,6 +304,14 @@ class SelfPlayActor:
         self.replay_append_seconds = 0.0
         self.clinched_games = 0
         self.clinch_empty_nodes = 0
+        self.source_champion_games = 0
+        self.source_candidate_games = 0
+        self.source_history_games = 0
+        self.source_unattributed_games = 0
+        self.source_champion_samples = 0
+        self.source_candidate_samples = 0
+        self.source_history_samples = 0
+        self.source_unattributed_samples = 0
 
     def metrics_snapshot(self) -> SelfPlayMetrics:
         return SelfPlayMetrics(
@@ -304,6 +332,14 @@ class SelfPlayActor:
             replay_append_seconds=self.replay_append_seconds,
             clinched_games=self.clinched_games,
             clinch_empty_nodes=self.clinch_empty_nodes,
+            source_champion_games=self.source_champion_games,
+            source_candidate_games=self.source_candidate_games,
+            source_history_games=self.source_history_games,
+            source_unattributed_games=self.source_unattributed_games,
+            source_champion_samples=self.source_champion_samples,
+            source_candidate_samples=self.source_candidate_samples,
+            source_history_samples=self.source_history_samples,
+            source_unattributed_samples=self.source_unattributed_samples,
         )
 
     def run(
@@ -707,6 +743,11 @@ class SelfPlayActor:
                             if decision.policy is not None
                             else "none"
                         ),
+                        clinch_auxiliary_targets=(
+                            self.config.clinch_auxiliary_targets
+                            if clinch is not None
+                            else "synthetic"
+                        ),
                         run_id=self.identity.run_id,
                         generation_family=self.identity.generation_family,
                         actor_id=self.identity.actor_id,
@@ -729,6 +770,7 @@ class SelfPlayActor:
             if clinch is not None:
                 self.clinched_games += 1
                 self.clinch_empty_nodes += clinch.empty_nodes
+            self._record_source_role(samples=len(decisions))
             summaries.append(
                 GameSummary(
                     row=row,
@@ -759,6 +801,18 @@ class SelfPlayActor:
             if len(self.pending_samples) >= self.config.shard_size:
                 self._flush(model_version=version, model_step=model_step)
         return summaries
+
+    def _record_source_role(self, *, samples: int) -> None:
+        if isinstance(samples, bool) or not isinstance(samples, int) or samples <= 0:
+            raise ValueError("source-role sample count must be a positive integer")
+        games_field = f"source_{self.source_role}_games"
+        samples_field = f"source_{self.source_role}_samples"
+        setattr(self, games_field, int(getattr(self, games_field)) + 1)
+        setattr(
+            self,
+            samples_field,
+            int(getattr(self, samples_field)) + samples,
+        )
 
     def _policy_surprise_sample_weights(
         self,

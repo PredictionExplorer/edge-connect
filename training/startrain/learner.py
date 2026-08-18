@@ -60,7 +60,7 @@ from .device import (
 )
 from .losses import LossWeights
 from .model import MODEL_SCHEMA_VERSION, GraphResTNet
-from .optim import build_optimizer
+from .optim import OptimizerRoutingMetadata, build_optimizer, optimizer_routing_metadata
 from .replay import (
     DecodedReplayShard,
     ReplayBatch,
@@ -74,7 +74,10 @@ from .runtime import RunIdentity, append_jsonl, atomic_json
 from .symmetry import deterministic_transform
 from .training import (
     DeviceBatchPrefetcher,
+    NonFiniteTrainingError,
+    TrainMetricAccumulator,
     build_scheduler,
+    ema_effective_turnover,
     maybe_compile_model,
     train_step,
     unwrap_model,
@@ -1106,6 +1109,12 @@ class LearnerLoop:
         )
         self.model = model.to(learner_config.device)
         self.optimizer = optimizer
+        try:
+            self._optimizer_routing: OptimizerRoutingMetadata | None = (
+                optimizer_routing_metadata(optimizer)
+            )
+        except ValueError:
+            self._optimizer_routing = None
         self.scheduler = scheduler
         self.ema = ema
         self.learner_config = learner_config
@@ -1223,7 +1232,10 @@ class LearnerLoop:
         model = GraphResTNet(config.model).to(learner_device)
         optimizer = build_optimizer(model, config.optimizer)
         scheduler = build_scheduler(optimizer, config.train.scheduler)
-        ema = ExponentialMovingAverage(model, decay=config.train.ema_decay)
+        ema = ExponentialMovingAverage(
+            model,
+            decay=config.train.resolved_ema_decay(world_size),
+        )
         return cls(
             store=store,
             model=model,
@@ -1422,6 +1434,7 @@ class LearnerLoop:
         interval_cpu_device_seconds = 0.0
         interval_device_events: list[tuple[torch.cuda.Event, torch.cuda.Event]] = []
         interval_copy_events: list[tuple[torch.cuda.Event, torch.cuda.Event]] = []
+        interval_train_metrics = TrainMetricAccumulator()
         window: ReplayWindowSession | None = None
         next_refresh_reason = "initial"
         exit_reason = "stop"
@@ -1633,17 +1646,42 @@ class LearnerLoop:
                             torch.cuda.Event(enable_timing=True),
                         )
                         device_events[0].record()
-                    result = train_step(
-                        self.compiled_model,
-                        batch,
-                        self.optimizer,
-                        loss_weights=self.loss_weights,
-                        precision=self.train_config.precision,
-                        gradient_clip_norm=self.train_config.gradient_clip_norm,
-                        scheduler=self.scheduler,
-                        ema=self.ema,
-                        trusted_batch=True,
+                    collect_step_diagnostics = (
+                        self.rank == 0
+                        and (self.step + 1) % self.learner_config.metrics_interval == 0
                     )
+                    try:
+                        result = train_step(
+                            self.compiled_model,
+                            batch,
+                            self.optimizer,
+                            loss_weights=self.loss_weights,
+                            precision=self.train_config.precision,
+                            gradient_clip_norm=self.train_config.gradient_clip_norm,
+                            scheduler=self.scheduler,
+                            ema=self.ema,
+                            trusted_batch=True,
+                            collect_diagnostics=collect_step_diagnostics,
+                        )
+                    except NonFiniteTrainingError as error:
+                        if self.rank == 0:
+                            self.metrics.append(
+                                {
+                                    "schema_version": 1,
+                                    "timestamp_ns": time.time_ns(),
+                                    "worker": "learner",
+                                    "phase": "nonfinite_abort",
+                                    "step": self.step,
+                                    "epoch": self.epoch,
+                                    "nonfinite_loss_count": (
+                                        error.nonfinite_loss_count
+                                    ),
+                                    "nonfinite_gradient_count": (
+                                        error.nonfinite_gradient_count
+                                    ),
+                                }
+                            )
+                        raise
                     if device_events is not None:
                         device_events[1].record()
                         interval_device_events.append(device_events)
@@ -1659,11 +1697,13 @@ class LearnerLoop:
                     )
                     if self.rank == 0:
                         interval_steps += 1
+                        interval_train_metrics.update(result)
                     if (
                         self.rank == 0
                         and self.step % self.learner_config.metrics_interval == 0
                     ):
                         host_metrics = result.to_host()
+                        interval_health = interval_train_metrics.to_host()
                         h2d_seconds = (
                             sum(
                                 started.elapsed_time(completed)
@@ -1685,6 +1725,45 @@ class LearnerLoop:
                         global_batch_size = self.train_config.global_batch_size(
                             self.world_size
                         )
+                        scheduler_metrics = (
+                            host_metrics.scheduler.as_dict()
+                            if host_metrics.scheduler is not None
+                            else None
+                        )
+                        ema_metrics = (
+                            host_metrics.ema.as_dict()
+                            if host_metrics.ema is not None
+                            else None
+                        )
+                        optimizer_routing = (
+                            self._optimizer_routing.as_dict()
+                            if self._optimizer_routing is not None
+                            else None
+                        )
+                        optimizer_weight_norm = (
+                            math.sqrt(
+                                math.fsum(
+                                    group.weight_norm**2
+                                    for group in host_metrics.optimizer_groups
+                                )
+                            )
+                            if host_metrics.optimizer_groups
+                            else None
+                        )
+                        optimizer_update_norm = (
+                            math.sqrt(
+                                math.fsum(
+                                    group.update_norm**2
+                                    for group in host_metrics.optimizer_groups
+                                )
+                            )
+                            if host_metrics.optimizer_groups
+                            else None
+                        )
+                        interval_ema_turnover = ema_effective_turnover(
+                            self.ema.decay,
+                            interval_health.steps,
+                        )
                         self.metrics.append(
                             {
                                 "schema_version": 1,
@@ -1695,7 +1774,86 @@ class LearnerLoop:
                                 "world_size": self.world_size,
                                 "losses": host_metrics.losses,
                                 "gradient_norm": host_metrics.gradient_norm,
+                                "gradient_clipped": host_metrics.gradient_clipped,
+                                "gradient_clipped_steps": (
+                                    interval_health.gradient_clipped_steps
+                                ),
+                                "gradient_clipping_frequency": (
+                                    interval_health.gradient_clipping_frequency
+                                ),
+                                "gradient_clip_fraction": (
+                                    interval_health.gradient_clipping_frequency
+                                ),
+                                "nonfinite_loss_count": (
+                                    interval_health.nonfinite_loss_count
+                                ),
+                                "nonfinite_gradient_count": (
+                                    interval_health.nonfinite_gradient_count
+                                ),
                                 "learning_rates": host_metrics.learning_rates,
+                                "optimizer_routing": optimizer_routing,
+                                "optimizer_routing_hash": (
+                                    self._optimizer_routing.routing_hash
+                                    if self._optimizer_routing is not None
+                                    else None
+                                ),
+                                "optimizer_parameter_tensors": (
+                                    self._optimizer_routing.parameter_tensors
+                                    if self._optimizer_routing is not None
+                                    else None
+                                ),
+                                "optimizer_parameter_elements": (
+                                    self._optimizer_routing.parameter_elements
+                                    if self._optimizer_routing is not None
+                                    else None
+                                ),
+                                "optimizer_groups": [
+                                    group.as_dict()
+                                    for group in host_metrics.optimizer_groups
+                                ],
+                                "optimizer_weight_norm": optimizer_weight_norm,
+                                "optimizer_update_norm": optimizer_update_norm,
+                                "scheduler": scheduler_metrics,
+                                "scheduler_age_steps": (
+                                    host_metrics.scheduler.age_steps
+                                    if host_metrics.scheduler is not None
+                                    else None
+                                ),
+                                "scheduler_segment": (
+                                    host_metrics.scheduler.segment
+                                    if host_metrics.scheduler is not None
+                                    else None
+                                ),
+                                "scheduler_segment_position": (
+                                    host_metrics.scheduler.segment_position
+                                    if host_metrics.scheduler is not None
+                                    else None
+                                ),
+                                "ema": ema_metrics,
+                                "raw_vs_ema_distance": (
+                                    host_metrics.ema.distance_norm
+                                    if host_metrics.ema is not None
+                                    else None
+                                ),
+                                "ema_raw_shadow_distance": (
+                                    host_metrics.ema.distance_norm
+                                    if host_metrics.ema is not None
+                                    else None
+                                ),
+                                "raw_vs_ema_relative_distance": (
+                                    host_metrics.ema.relative_distance
+                                    if host_metrics.ema is not None
+                                    else None
+                                ),
+                                "ema_effective_turnover": (
+                                    host_metrics.ema.effective_turnover
+                                    if host_metrics.ema is not None
+                                    else None
+                                ),
+                                "ema_interval_effective_turnover": (
+                                    interval_ema_turnover
+                                ),
+                                "ema_turnover": interval_ema_turnover,
                                 "step_seconds": wall_seconds / measured_steps,
                                 "examples_per_second": (
                                     global_batch_size * measured_steps / wall_seconds
@@ -1760,6 +1918,9 @@ class LearnerLoop:
                                 "replay_max_shard_id": (
                                     spin_window.selection.max_shard_id
                                 ),
+                                "replay_minimum_shard_id_exclusive": (
+                                    spin_window.selection.minimum_shard_id_exclusive
+                                ),
                                 "effective_unique_samples": (
                                     spin_window.batches_allocated * global_batch_size
                                 ),
@@ -1776,6 +1937,7 @@ class LearnerLoop:
                         interval_cpu_device_seconds = 0.0
                         interval_device_events.clear()
                         interval_copy_events.clear()
+                        interval_train_metrics.reset()
                     if self.rank == 0:
                         self._publish_due_models()
                     if progress is not None and self.rank == 0:
@@ -2726,6 +2888,9 @@ class LearnerLoop:
                 generation_family=self.run_identity.generation_family,
                 current_model_step=self.step,
                 max_model_lag_steps=self.learner_config.max_replay_lag_steps,
+                minimum_shard_id_exclusive=(
+                    self.learner_config.minimum_replay_shard_id_exclusive
+                ),
             )
             if self.rank == 0
             else None
@@ -2742,6 +2907,9 @@ class LearnerLoop:
             generation_family=self.run_identity.generation_family,
             current_model_step=self.step,
             max_model_lag_steps=self.learner_config.max_replay_lag_steps,
+            minimum_shard_id_exclusive=(
+                self.learner_config.minimum_replay_shard_id_exclusive
+            ),
         )
 
     def _active_replay_rings(self, counts: Mapping[int, int]) -> tuple[int, ...]:

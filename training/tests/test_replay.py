@@ -12,11 +12,16 @@ from startrain.contracts import (
     RULES_HASH,
     SOFT_POLICY_TEMPERATURE,
     TARGET_OUTCOME,
+    TARGET_ALIVE,
+    TARGET_OWNERSHIP,
     TARGET_POLICY,
+    TARGET_SCORE_MARGIN,
     TARGET_SOFT_POLICY,
 )
 from startrain.features import DoubleStarPosition
 from startrain.replay import (
+    MISSING_ALIVE,
+    MISSING_OWNERSHIP,
     REPLAY_SCHEMA_VERSION,
     ReplaySample,
     ReplaySchemaError,
@@ -26,6 +31,8 @@ from startrain.replay import (
     read_replay_shard,
     write_replay_shard,
 )
+from startrain.replay_store import ReplaySelection, ReplayStore
+from startrain.runtime import RunIdentity
 from startrain.scoring import PlayerScore, ScoreResult
 from startrain.symmetry import D5Transform
 from startrain.topology import get_topology
@@ -96,6 +103,69 @@ def test_schema_v4_is_node_only_and_binary() -> None:
     assert batch.targets.policy.shape == (1, topology.n)
     assert batch.targets.outcome.shape == (1,)
     assert batch.targets.outcome.tolist() == [OUTCOME_LOSS]
+
+
+def test_clinch_outcome_only_uses_existing_masks_without_schema_change(
+    tmp_path,
+) -> None:
+    position = live_position()
+    policy = normalized_policy(position)
+    synthetic = ReplaySample.from_position(
+        position,
+        policy=policy,
+        final_score=decisive_score(position),
+        search_provenance="gumbel:test:final=clinch-loser-fill",
+        policy_provenance="completed-q",
+    )
+    outcome_only = ReplaySample.from_position(
+        position,
+        policy=policy,
+        final_score=decisive_score(position),
+        search_provenance="gumbel:test:final=clinch-loser-fill",
+        policy_provenance="completed-q",
+        clinch_auxiliary_targets="outcome_only",
+    )
+
+    assert synthetic.schema_version == outcome_only.schema_version == 4
+    assert synthetic.target_mask & (
+        TARGET_SCORE_MARGIN | TARGET_OWNERSHIP | TARGET_ALIVE
+    )
+    assert outcome_only.target_mask & TARGET_POLICY
+    assert outcome_only.target_mask & TARGET_SOFT_POLICY
+    assert outcome_only.target_mask & TARGET_OUTCOME
+    assert not outcome_only.target_mask & (
+        TARGET_SCORE_MARGIN | TARGET_OWNERSHIP | TARGET_ALIVE
+    )
+    assert outcome_only.outcome == synthetic.outcome
+    np.testing.assert_array_equal(
+        outcome_only.final_ownership,
+        np.full_like(outcome_only.final_ownership, MISSING_OWNERSHIP),
+    )
+    np.testing.assert_array_equal(
+        outcome_only.final_alive,
+        np.full_like(outcome_only.final_alive, MISSING_ALIVE),
+    )
+
+    path = write_replay_shard(tmp_path / "clinch-v4.npz", [outcome_only])
+    loaded = read_replay_shard(path)
+    batch = collate_replay_samples(loaded)
+    assert batch.targets.clinch_mask is not None
+    assert batch.targets.clinch_mask.tolist() == [True]
+    assert batch.targets.policy_mask.tolist() == [True]
+    assert batch.targets.outcome_mask.tolist() == [True]
+    assert batch.targets.score_margin_mask.tolist() == [False]
+    assert batch.targets.ownership_mask.tolist() == [False]
+    assert batch.targets.alive_mask.tolist() == [False]
+
+    with pytest.raises(ReplaySchemaError, match="clinch_auxiliary_targets"):
+        ReplaySample.from_position(
+            position,
+            policy=policy,
+            final_score=decisive_score(position),
+            search_provenance="test",
+            policy_provenance="test",
+            clinch_auxiliary_targets="invalid",  # type: ignore[arg-type]
+        )
 
 
 def test_zero_margin_quark_tiebreak_still_has_binary_outcome() -> None:
@@ -280,3 +350,120 @@ def test_replay_augmentation_round_trips_all_d5_transforms() -> None:
         np.testing.assert_array_equal(restored.stones, sample.stones)
         np.testing.assert_allclose(restored.policy, sample.policy)
         np.testing.assert_allclose(restored.soft_policy, sample.soft_policy)
+
+
+def test_replay_branch_cutoff_is_strict_persisted_and_default_neutral(
+    tmp_path,
+) -> None:
+    identity = RunIdentity(
+        tmp_path / "run.json",
+        "run-cutoff",
+        "family-cutoff",
+        1,
+    )
+    model_identity = "sha256-" + "a" * 64
+    with ReplayStore(tmp_path / "replay") as store:
+        generation = store.lease_generation(identity, "actor-cutoff")
+        records = []
+        for index in range(3):
+            replay_sample = replace(
+                sample_for(),
+                run_id=identity.run_id,
+                generation_family=identity.generation_family,
+                actor_id="actor-cutoff",
+                generation=generation,
+                game_id=f"game-cutoff-{index}",
+                model_identity=model_identity,
+            )
+            records.append(
+                store.append(
+                    [replay_sample],
+                    phase_min=0,
+                    phase_max=0,
+                    model_version=model_identity,
+                    model_step=index,
+                    model_identity=model_identity,
+                    run_id=identity.run_id,
+                    generation_family=identity.generation_family,
+                    actor_id="actor-cutoff",
+                    generation=generation,
+                )
+            )
+
+        unbounded = store.select_recent_spans(
+            rings=(4,),
+            per_ring_quota=10,
+            run_id=identity.run_id,
+            generation_family=identity.generation_family,
+            current_model_step=2,
+            max_model_lag_steps=10,
+        )
+        assert [span.record.shard_id for span in unbounded.spans] == [
+            record.shard_id for record in records
+        ]
+        assert unbounded.minimum_shard_id_exclusive is None
+
+        cutoff = records[1].shard_id
+        selected = store.select_recent_spans(
+            rings=(4,),
+            per_ring_quota=10,
+            run_id=identity.run_id,
+            generation_family=identity.generation_family,
+            current_model_step=2,
+            max_model_lag_steps=10,
+            minimum_shard_id_exclusive=cutoff,
+        )
+        assert selected.minimum_shard_id_exclusive == cutoff
+        assert selected.max_shard_id == records[2].shard_id
+        assert [span.record.shard_id for span in selected.spans] == [
+            records[2].shard_id
+        ]
+        assert (
+            store.available_sample_count(
+                run_id=identity.run_id,
+                generation_family=identity.generation_family,
+                current_model_step=2,
+                max_model_lag_steps=10,
+                minimum_shard_id_exclusive=cutoff,
+            )
+            == 1
+        )
+        assert store.eligible_sample_counts(
+            (4,),
+            run_id=identity.run_id,
+            generation_family=identity.generation_family,
+            current_model_step=2,
+            max_model_lag_steps=10,
+            minimum_shard_id_exclusive=cutoff,
+        ) == {4: 1}
+        assert store.sample_counts_by_ring(
+            (4,),
+            run_id=identity.run_id,
+            generation_family=identity.generation_family,
+            minimum_shard_id_exclusive=cutoff,
+        ) == {4: 1}
+        assert [
+            replay_sample.game_id
+            for replay_sample in store.load_recent_samples(
+                sample_window=10,
+                run_id=identity.run_id,
+                generation_family=identity.generation_family,
+                minimum_shard_id_exclusive=cutoff,
+            )
+        ] == ["game-cutoff-2"]
+
+        for invalid in (-1, True, 1.5, "1"):
+            with pytest.raises(ValueError, match="non-negative integer"):
+                store.recent_shards(
+                    sample_window=1,
+                    run_id=identity.run_id,
+                    generation_family=identity.generation_family,
+                    minimum_shard_id_exclusive=invalid,  # type: ignore[arg-type]
+                )
+            with pytest.raises(ValueError, match="non-negative integer"):
+                ReplaySelection(
+                    (),
+                    {},
+                    0,
+                    invalid,  # type: ignore[arg-type]
+                )

@@ -66,6 +66,9 @@ changing shipped self-play sources, target retention, candidate scaling, precisi
 search settings.
 For fixed-budget ring-10 optimization on a stopped production snapshot, follow the
 [Elo-per-hour ablation runbook](docs/elo-per-hour-ablation-runbook.md).
+Implementation status, compute budgets, and gated decisions for training dynamics,
+architecture, and capacity experiments live in the
+[model-improvement roadmap](docs/model-improvement-roadmap.md).
 
 ## Prerequisites
 

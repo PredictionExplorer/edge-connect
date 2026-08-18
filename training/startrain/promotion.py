@@ -26,6 +26,7 @@ from .arena import (
 from .checkpoint import (
     ModelManifest,
     collect_model_garbage,
+    extract_verified_manifest_config,
     load_ema_checkpoint,
     load_model_manifest,
 )
@@ -64,12 +65,20 @@ def load_manifest_evaluator(
     manifest: ModelManifest,
     *,
     device: str,
+    allow_heterogeneous_model: bool = False,
 ) -> GraphInferenceAdapter:
-    model = GraphResTNet(experiment.model).to(device)
+    model_config = experiment.model
+    if allow_heterogeneous_model:
+        verified = extract_verified_manifest_config(
+            manifest,
+            expected_game_config=asdict(experiment.game),
+        )
+        model_config = verified.model
+    model = GraphResTNet(model_config).to(device)
     metadata = load_ema_checkpoint(
         manifest.checkpoint,
         model=model,
-        expected_model_config=asdict(experiment.model),
+        expected_model_config=asdict(model_config),
         expected_game_config=asdict(experiment.game),
         expected_run_id=manifest.run_id,
         expected_generation_family=manifest.generation_family,

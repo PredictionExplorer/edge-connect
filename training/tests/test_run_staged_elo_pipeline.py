@@ -6,13 +6,18 @@ from pathlib import Path
 
 import pytest
 
-from scripts.run_elo_ablation_queue import QueueBusyError, exclusive_execution_lock
+from scripts.run_elo_ablation_queue import (
+    QueueBusyError,
+    exclusive_execution_lock,
+    exclusive_queue_lock,
+)
 from scripts.run_staged_elo_pipeline import (
     CONFIRMATION_CAMPAIGN_REPORT,
     StagedEloPipelineError,
     advance_staged_elo_pipeline,
     build_futility_policy,
     evaluate_futility,
+    manage_confirmation_hold,
     run_confirmation_campaign,
     _verified_completed_queue,
 )
@@ -197,6 +202,7 @@ def _confirmation_campaign(tmp_path: Path) -> tuple[Path, Path]:
             "schema_version": 1,
             "report": CONFIRMATION_CAMPAIGN_REPORT,
             "state_path": str(tmp_path / "confirmation-campaign-state.json"),
+            "seed_boundary_hold_path": str(tmp_path / "seed-boundary-hold.json"),
             "seeds": seeds,
             "cross_seed": {
                 "policy": str(policy),
@@ -531,6 +537,163 @@ def test_confirmation_campaign_runs_pinned_seeds_without_idle_handoff(
     assert first["cross_seed"]["eligible"] is True
     assert first["automatic_adoption_authorized"] is False
     assert json.loads(state_path.read_text(encoding="utf-8")) == first
+
+
+def test_confirmation_campaign_pauses_and_resumes_at_seed_boundary(
+    tmp_path: Path,
+) -> None:
+    campaign, state_path = _confirmation_campaign(tmp_path)
+    calls: list[int] = []
+
+    def queue_runner(
+        manifest_path: Path,
+        *,
+        execution_lock_lease,
+        expected_manifest_sha256: str,
+    ) -> dict[str, object]:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        queue = manifest["queue"]
+        seed = int(queue["seed"])
+        assert execution_lock_lease.path == Path(queue["execution_lock_path"]).resolve()
+        assert hashlib.sha256(manifest_path.read_bytes()).hexdigest() == (
+            expected_manifest_sha256
+        )
+        calls.append(seed)
+        _write_json(Path(queue["comparison_output"]), {"seed": seed})
+        handoff = {
+            "schema_version": 1,
+            "report": "startrain-continuity-handoff-request",
+            "status": "requested",
+            "requested": True,
+            "action": "request_fallback",
+            "requested_action": "reconcile_training_continuity",
+            "reason": "queue_completed",
+            "path": queue["continuity_handoff_output"],
+            "source": {
+                "kind": "elo_ablation_queue",
+                "manifest": str(manifest_path.resolve()),
+                "queue_status": "completed",
+            },
+        }
+        _write_json(Path(queue["continuity_handoff_output"]), handoff)
+        queue_state = {
+            "queue_status": "completed",
+            "arms": [
+                {
+                    "status": "completed",
+                    "completion_status": "complete",
+                    "measurement_cutoff_ns": seed,
+                    "resource_released_ns": seed + 1,
+                    "teardown_status": "clean",
+                    "teardown": {
+                        "process_group_released": True,
+                        "resource_released_ns": seed + 1,
+                    },
+                }
+            ],
+            "finalization": {
+                "status": "completed",
+                "comparison_status": "complete",
+            },
+            "continuity_handoff": handoff,
+        }
+        _write_json(Path(queue["state_path"]), queue_state)
+        return queue_state
+
+    requested = manage_confirmation_hold(
+        campaign,
+        action="request",
+        reason="inspect seed 17 before spending seeds 18 and 19",
+    )
+    assert requested["status"] == "requested"
+    assert requested["effective_after_seed"] is None
+    with pytest.raises(
+        StagedEloPipelineError,
+        match="different reason",
+    ):
+        manage_confirmation_hold(
+            campaign,
+            action="request",
+            reason="a different operator decision",
+        )
+
+    paused = run_confirmation_campaign(
+        campaign,
+        queue_runner=queue_runner,
+        cross_seed_builder=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("cross-seed comparison must not run while paused")
+        ),
+    )
+
+    assert calls == [17]
+    assert paused["status"] == "paused"
+    assert paused["paused_after_seed"] == 17
+    assert paused["next_seed"] == 18
+    assert paused["operator_resume_required"] is True
+    assert paused["continuity_fallback_expected"] is True
+    assert json.loads(state_path.read_text(encoding="utf-8")) == paused
+    hold_status = manage_confirmation_hold(campaign, action="status")
+    assert hold_status["status"] == "requested"
+    assert hold_status["effective_after_seed"] == 17
+
+    released = manage_confirmation_hold(campaign, action="release")
+    assert released["status"] == "released"
+
+    completed = run_confirmation_campaign(
+        campaign,
+        queue_runner=queue_runner,
+        cross_seed_builder=lambda *_args, **_kwargs: {
+            "schema_version": 1,
+            "report": "startrain-elo-ablation-cross-seed-comparison",
+            "status": "eligible",
+            "eligible": True,
+        },
+    )
+
+    assert calls == [17, 18, 19]
+    assert completed["status"] == "completed"
+    assert completed["operator_execution_required"] is True
+    assert "operator_resume_required" not in completed
+
+    late = manage_confirmation_hold(
+        campaign,
+        action="request",
+        reason="retain completed campaign boundary evidence",
+    )
+    assert late["effective_after_seed"] == 19
+    repeated = run_confirmation_campaign(
+        campaign,
+        queue_runner=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("completed seeds must be skipped before hold handling")
+        ),
+        cross_seed_builder=lambda *_args, **_kwargs: {
+            "schema_version": 1,
+            "report": "startrain-elo-ablation-cross-seed-comparison",
+            "status": "eligible",
+            "eligible": True,
+        },
+    )
+    assert repeated["status"] == "completed"
+
+
+def test_confirmation_hold_mutations_are_serialized(tmp_path: Path) -> None:
+    campaign, _state_path = _confirmation_campaign(tmp_path)
+    hold_path = tmp_path / "seed-boundary-hold.json"
+
+    with exclusive_queue_lock(hold_path):
+        with pytest.raises(QueueBusyError, match="another ablation queue"):
+            manage_confirmation_hold(
+                campaign,
+                action="request",
+                reason="serialized request",
+            )
+
+    requested = manage_confirmation_hold(
+        campaign,
+        action="request",
+        reason="serialized request",
+    )
+    assert requested["status"] == "requested"
 
 
 def test_confirmation_campaign_failure_preserves_fallback_expectation(

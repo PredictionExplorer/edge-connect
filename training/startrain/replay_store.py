@@ -33,6 +33,14 @@ def _validated_rings(rings: Sequence[int]) -> tuple[int, ...]:
     return requested
 
 
+def _validated_optional_shard_id(name: str, value: int | None) -> int | None:
+    if value is None:
+        return None
+    if type(value) is not int or value < 0:
+        raise ValueError(f"{name} must be a non-negative integer or null")
+    return value
+
+
 class DuplicateGameError(ValueError):
     pass
 
@@ -71,6 +79,13 @@ class ReplaySelection:
     spans: tuple[ReplaySpan, ...]
     samples_by_ring: dict[int, int]
     max_shard_id: int
+    minimum_shard_id_exclusive: int | None = None
+
+    def __post_init__(self) -> None:
+        _validated_optional_shard_id(
+            "minimum_shard_id_exclusive",
+            self.minimum_shard_id_exclusive,
+        )
 
     @property
     def sample_count(self) -> int:
@@ -895,6 +910,7 @@ class ReplayStore:
         rings: Sequence[int] | None = None,
         current_model_step: int | None = None,
         max_model_lag_steps: int | None = None,
+        minimum_shard_id_exclusive: int | None = None,
         maximum_shard_id: int | None = None,
     ) -> list[ShardRecord]:
         if sample_window <= 0:
@@ -912,6 +928,10 @@ class ReplayStore:
             validate_identifier("run_id", run_id),
             validate_identifier("generation_family", generation_family),
         ]
+        minimum_shard_id_exclusive = _validated_optional_shard_id(
+            "minimum_shard_id_exclusive",
+            minimum_shard_id_exclusive,
+        )
         if rings is not None:
             requested = _validated_rings(rings)
             placeholders = ",".join("?" for _ in requested)
@@ -929,9 +949,15 @@ class ReplayStore:
                 raise ValueError("current_model_step must be non-negative")
             clauses.append("model_step <= ?")
             parameters.append(current_model_step)
+        if minimum_shard_id_exclusive is not None:
+            clauses.append("id > ?")
+            parameters.append(minimum_shard_id_exclusive)
         if maximum_shard_id is not None:
-            if maximum_shard_id < 0:
-                raise ValueError("maximum_shard_id must be non-negative")
+            maximum_shard_id = _validated_optional_shard_id(
+                "maximum_shard_id",
+                maximum_shard_id,
+            )
+            assert maximum_shard_id is not None
             clauses.append("id <= ?")
             parameters.append(maximum_shard_id)
         rows = self.connection.execute(
@@ -959,9 +985,20 @@ class ReplayStore:
         *,
         run_id: str,
         generation_family: str,
+        minimum_shard_id_exclusive: int | None = None,
     ) -> dict[int, int]:
         requested = _validated_rings(rings)
+        minimum_shard_id_exclusive = _validated_optional_shard_id(
+            "minimum_shard_id_exclusive",
+            minimum_shard_id_exclusive,
+        )
         placeholders = ",".join("?" for _ in requested)
+        cutoff_clause = "AND id > ?" if minimum_shard_id_exclusive is not None else ""
+        cutoff_parameters = (
+            (minimum_shard_id_exclusive,)
+            if minimum_shard_id_exclusive is not None
+            else ()
+        )
         rows = self.connection.execute(
             f"""
             SELECT ring, COALESCE(SUM(sample_count), 0) AS samples
@@ -971,6 +1008,7 @@ class ReplayStore:
               AND state = 'ready'
               AND run_id = ?
               AND generation_family = ?
+              {cutoff_clause}
               AND ring IN ({placeholders})
             GROUP BY ring
             """,
@@ -979,6 +1017,7 @@ class ReplayStore:
                 f"{FEATURE_SCHEMA_HASH:016x}",
                 validate_identifier("run_id", run_id),
                 validate_identifier("generation_family", generation_family),
+                *cutoff_parameters,
                 *requested,
             ),
         )
@@ -994,6 +1033,7 @@ class ReplayStore:
         generation_family: str,
         current_model_step: int | None = None,
         max_model_lag_steps: int | None = None,
+        minimum_shard_id_exclusive: int | None = None,
     ) -> int:
         clauses = [
             "state = 'ready'",
@@ -1008,6 +1048,10 @@ class ReplayStore:
             validate_identifier("run_id", run_id),
             validate_identifier("generation_family", generation_family),
         ]
+        minimum_shard_id_exclusive = _validated_optional_shard_id(
+            "minimum_shard_id_exclusive",
+            minimum_shard_id_exclusive,
+        )
         if max_model_lag_steps is not None:
             if current_model_step is None or max_model_lag_steps < 0:
                 raise ValueError(
@@ -1020,6 +1064,9 @@ class ReplayStore:
                 raise ValueError("current_model_step must be non-negative")
             clauses.append("model_step <= ?")
             parameters.append(current_model_step)
+        if minimum_shard_id_exclusive is not None:
+            clauses.append("id > ?")
+            parameters.append(minimum_shard_id_exclusive)
         row = self.connection.execute(
             f"""
             SELECT COALESCE(SUM(sample_count), 0) AS samples
@@ -1154,10 +1201,21 @@ class ReplayStore:
         generation_family: str,
         current_model_step: int,
         max_model_lag_steps: int,
+        minimum_shard_id_exclusive: int | None = None,
     ) -> dict[int, int]:
         requested = _validated_rings(rings)
+        minimum_shard_id_exclusive = _validated_optional_shard_id(
+            "minimum_shard_id_exclusive",
+            minimum_shard_id_exclusive,
+        )
         lower = max(0, current_model_step - max_model_lag_steps)
         placeholders = ",".join("?" for _ in requested)
+        cutoff_clause = "AND id > ?" if minimum_shard_id_exclusive is not None else ""
+        cutoff_parameters = (
+            (minimum_shard_id_exclusive,)
+            if minimum_shard_id_exclusive is not None
+            else ()
+        )
         rows = self.connection.execute(
             f"""
             SELECT ring, COALESCE(SUM(sample_count), 0) AS samples
@@ -1168,6 +1226,7 @@ class ReplayStore:
               AND run_id = ?
               AND generation_family = ?
               AND model_step BETWEEN ? AND ?
+              {cutoff_clause}
               AND ring IN ({placeholders})
             GROUP BY ring
             """,
@@ -1178,6 +1237,7 @@ class ReplayStore:
                 validate_identifier("generation_family", generation_family),
                 lower,
                 current_model_step,
+                *cutoff_parameters,
                 *requested,
             ),
         )
@@ -1195,23 +1255,36 @@ class ReplayStore:
         generation_family: str,
         current_model_step: int,
         max_model_lag_steps: int,
+        minimum_shard_id_exclusive: int | None = None,
     ) -> ReplaySelection:
         if per_ring_quota <= 0:
             raise ValueError("per_ring_quota must be positive")
         requested = _validated_rings(rings)
+        minimum_shard_id_exclusive = _validated_optional_shard_id(
+            "minimum_shard_id_exclusive",
+            minimum_shard_id_exclusive,
+        )
+        cutoff_clause = "AND id > ?" if minimum_shard_id_exclusive is not None else ""
+        cutoff_parameters = (
+            (minimum_shard_id_exclusive,)
+            if minimum_shard_id_exclusive is not None
+            else ()
+        )
         row = self.connection.execute(
-            """
+            f"""
             SELECT COALESCE(MAX(id), 0) AS max_id FROM shards
             WHERE state = 'ready'
               AND run_id = ?
               AND generation_family = ?
               AND model_step BETWEEN ? AND ?
+              {cutoff_clause}
             """,
             (
                 run_id,
                 generation_family,
                 max(0, current_model_step - max_model_lag_steps),
                 current_model_step,
+                *cutoff_parameters,
             ),
         ).fetchone()
         maximum_shard_id = int(row["max_id"])
@@ -1225,6 +1298,7 @@ class ReplayStore:
                 rings=(ring,),
                 current_model_step=current_model_step,
                 max_model_lag_steps=max_model_lag_steps,
+                minimum_shard_id_exclusive=minimum_shard_id_exclusive,
                 maximum_shard_id=maximum_shard_id,
             )
             remaining = per_ring_quota
@@ -1245,7 +1319,12 @@ class ReplayStore:
             spans.extend(selected)
             counts[int(ring)] = sum(span.sample_count for span in selected)
         spans.sort(key=lambda span: span.record.shard_id)
-        return ReplaySelection(tuple(spans), counts, maximum_shard_id)
+        return ReplaySelection(
+            tuple(spans),
+            counts,
+            maximum_shard_id,
+            minimum_shard_id_exclusive,
+        )
 
     def load_recent_samples(
         self,
@@ -1256,6 +1335,7 @@ class ReplayStore:
         rings: Sequence[int] | None = None,
         current_model_step: int | None = None,
         max_model_lag_steps: int | None = None,
+        minimum_shard_id_exclusive: int | None = None,
         verify_checksums: bool = True,
     ) -> list[ReplaySample]:
         output: list[ReplaySample] = []
@@ -1266,6 +1346,7 @@ class ReplayStore:
             rings=rings,
             current_model_step=current_model_step,
             max_model_lag_steps=max_model_lag_steps,
+            minimum_shard_id_exclusive=minimum_shard_id_exclusive,
         )
         for record in records:
             if verify_checksums and _sha256(record.path) != record.checksum_sha256:

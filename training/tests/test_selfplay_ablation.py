@@ -7,7 +7,13 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from startrain.contracts import TARGET_POLICY
+from startrain.contracts import (
+    TARGET_ALIVE,
+    TARGET_OUTCOME,
+    TARGET_OWNERSHIP,
+    TARGET_POLICY,
+    TARGET_SCORE_MARGIN,
+)
 from startrain.inference import InferenceResponse
 from startrain.native import positions_from_native, score_results_from_native
 from startrain.selfplay import SelfPlayActor, SelfPlayConfig
@@ -46,6 +52,43 @@ def test_candidate_limit_scaling_is_explicit_and_capped() -> None:
         SelfPlayConfig(policy_surprise_weight=1.1)
     with pytest.raises(ValueError, match="clinch_finalization"):
         SelfPlayConfig(clinch_finalization="random")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="clinch_auxiliary_targets"):
+        SelfPlayConfig(clinch_auxiliary_targets="random")  # type: ignore[arg-type]
+
+
+def test_source_role_metrics_partition_completed_games_and_samples() -> None:
+    evaluator = SimpleNamespace(
+        model_version="model",
+        model_step=0,
+        model_identity="model",
+    )
+    actor = SelfPlayActor(
+        object(),
+        evaluator,
+        object(),
+        SelfPlayConfig(),
+        source_role="candidate",
+    )
+
+    actor._record_source_role(samples=7)
+    actor._record_source_role(samples=3)
+    metrics = actor.metrics_snapshot()
+
+    assert metrics.source_candidate_games == 2
+    assert metrics.source_candidate_samples == 10
+    assert metrics.source_champion_games == 0
+    assert metrics.source_champion_samples == 0
+    assert metrics.source_unattributed_games == 0
+    with pytest.raises(ValueError, match="sample count"):
+        actor._record_source_role(samples=0)
+    with pytest.raises(ValueError, match="source_role"):
+        SelfPlayActor(
+            object(),
+            evaluator,
+            object(),
+            SelfPlayConfig(),
+            source_role="control",  # type: ignore[arg-type]
+        )
 
 
 def test_pending_clinch_is_not_counted_before_cohort_finalization() -> None:
@@ -179,6 +222,13 @@ def test_loser_fill_clinch_stops_search_and_supplies_conservative_targets() -> N
         full_sink,
         replace(config, clinch_finalization="disabled"),
     ).run()[0]
+    outcome_only_sink = Sink()
+    outcome_only_summary = SelfPlayActor(
+        native,
+        UniformEvaluator(),
+        outcome_only_sink,
+        replace(config, clinch_auxiliary_targets="outcome_only"),
+    ).run()[0]
 
     assert clinch_summary.finish_reason == "clinch"
     assert clinch_summary.empty_nodes_saved > 0
@@ -188,6 +238,8 @@ def test_loser_fill_clinch_stops_search_and_supplies_conservative_targets() -> N
     assert full_summary.finish_reason == "board-full"
     assert full_summary.samples == get_topology(4).n
     assert full_summary.winner == clinch_summary.winner
+    assert outcome_only_summary.finish_reason == "clinch"
+    assert outcome_only_summary.winner == clinch_summary.winner
     assert len(clinch_sink.samples) == clinch_summary.samples
     assert all(
         "final=clinch-loser-fill" in sample.search_provenance
@@ -196,6 +248,14 @@ def test_loser_fill_clinch_stops_search_and_supplies_conservative_targets() -> N
     metrics = clinch_actor.metrics_snapshot()
     assert metrics.clinched_games == 1
     assert metrics.clinch_empty_nodes == clinch_summary.empty_nodes_saved
+    assert outcome_only_sink.samples
+    assert all(
+        sample.target_mask & TARGET_OUTCOME
+        and sample.target_mask & TARGET_POLICY
+        and not sample.target_mask
+        & (TARGET_SCORE_MARGIN | TARGET_OWNERSHIP | TARGET_ALIVE)
+        for sample in outcome_only_sink.samples
+    )
 
     proof_states = native.StateBatch(4, 1)
     actions = []

@@ -9,7 +9,7 @@ import tempfile
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Mapping, Sequence
+from typing import Literal, Mapping, Sequence
 
 import numpy as np
 import torch
@@ -54,6 +54,7 @@ REPLAY_SHARD_FORMAT = "startrain.replay.npz"
 MISSING_OUTCOME = -1
 MISSING_OWNERSHIP = -100
 MISSING_ALIVE = 255
+ClinchAuxiliaryTargets = Literal["synthetic", "outcome_only"]
 
 _REPLAY_SAMPLE_ARRAY_NAMES = (
     "rings",
@@ -388,6 +389,7 @@ class ReplaySample:
         search_provenance: str,
         policy_provenance: str,
         include_spatial_targets: bool = True,
+        clinch_auxiliary_targets: ClinchAuxiliaryTargets = "synthetic",
         weight: float = 1.0,
         policy_weight: float = 1.0,
         run_id: str = "manual",
@@ -398,6 +400,10 @@ class ReplaySample:
         ply: int = 0,
         model_identity: str = "manual",
     ) -> "ReplaySample":
+        if clinch_auxiliary_targets not in ("synthetic", "outcome_only"):
+            raise ReplaySchemaError(
+                "clinch_auxiliary_targets must be synthetic or outcome_only"
+            )
         topology = get_topology(position.rings)
         target_mask = 0
         if policy is None:
@@ -429,8 +435,10 @@ class ReplaySample:
             final_quarks = np.asarray(
                 [player.quarks for player in final_score.players], dtype=np.int8
             )
-            target_mask |= TARGET_OUTCOME | TARGET_SCORE_MARGIN
-            if include_spatial_targets:
+            target_mask |= TARGET_OUTCOME
+            if clinch_auxiliary_targets == "synthetic":
+                target_mask |= TARGET_SCORE_MARGIN
+            if clinch_auxiliary_targets == "synthetic" and include_spatial_targets:
                 final_ownership = final_score.node_owner.numpy()
                 final_alive = final_score.alive_stone.numpy().astype(np.uint8)
                 target_mask |= TARGET_OWNERSHIP | TARGET_ALIVE
@@ -884,6 +892,7 @@ def collate_replay_samples(
     alive = torch.full((batch_size, max_nodes), -1.0, dtype=torch.float32)
     outcome = torch.zeros(batch_size, dtype=torch.long)
     margin = torch.zeros(batch_size, dtype=torch.long)
+    clinch = torch.zeros(batch_size, dtype=torch.bool)
 
     masks = {
         "policy": torch.zeros(batch_size, dtype=torch.bool),
@@ -909,6 +918,7 @@ def collate_replay_samples(
         )
         masks["policy"][index] = bool(sample.target_mask & TARGET_POLICY)
         masks["soft"][index] = bool(sample.target_mask & TARGET_SOFT_POLICY)
+        clinch[index] = "final=clinch-loser-fill" in sample.search_provenance
         if sample.target_mask & (TARGET_OUTCOME | TARGET_SCORE_MARGIN):
             sample_outcome, sample_margin = sample.outcome_targets()
             outcome[index] = sample_outcome
@@ -952,6 +962,7 @@ def collate_replay_samples(
             policy_weight=torch.tensor(
                 [sample.policy_weight for sample in samples], dtype=torch.float32
             ),
+            clinch_mask=clinch,
         ),
         feature_path=feature_path,
     )

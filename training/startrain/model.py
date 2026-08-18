@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import NamedTuple
+from typing import Literal, NamedTuple
 
 import torch
 import torch.nn.functional as functional
@@ -18,6 +18,8 @@ from .features import GLOBAL_FEATURE_DIM, NODE_FEATURE_DIM
 from .topology import EDGE_CLASS_COUNT
 
 MODEL_SCHEMA_VERSION = 2
+LocalOperator = Literal["mean", "source_gated"]
+LOCAL_OPERATORS: tuple[LocalOperator, ...] = ("mean", "source_gated")
 
 
 @dataclass(frozen=True, slots=True)
@@ -35,6 +37,8 @@ class ModelConfig:
     score_margin_min: int = SCORE_MARGIN_MIN
     score_margin_max: int = SCORE_MARGIN_MAX
     soft_policy_temperature: float = SOFT_POLICY_TEMPERATURE
+    local_operator: LocalOperator = "mean"
+    local_blocks_per_group: int = 2
 
     def __post_init__(self) -> None:
         if (
@@ -63,10 +67,31 @@ class ModelConfig:
             raise ValueError("score-margin support is fixed at [-151, 151]")
         if self.soft_policy_temperature != SOFT_POLICY_TEMPERATURE:
             raise ValueError("the single KataGo soft-policy temperature is fixed at 4")
+        if type(self.local_operator) is not str:
+            raise TypeError("local_operator must be a string")
+        if self.local_operator not in LOCAL_OPERATORS:
+            choices = ", ".join(LOCAL_OPERATORS)
+            raise ValueError(f"local_operator must be one of {{{choices}}}")
+        if type(self.local_blocks_per_group) is not int:
+            raise TypeError("local_blocks_per_group must be an integer")
+        if self.local_blocks_per_group <= 0:
+            raise ValueError("local_blocks_per_group must be positive")
 
     @property
     def score_margin_bins(self) -> int:
         return self.score_margin_max - self.score_margin_min + 1
+
+    @property
+    def local_bottleneck_width(self) -> int:
+        return max(8, int(self.width * self.bottleneck_ratio))
+
+    @property
+    def attention_head_width(self) -> int:
+        return self.width // self.attention_heads
+
+    @property
+    def ff_hidden_width(self) -> int:
+        return max(self.width, int(self.width * self.ff_multiplier))
 
 
 class StarModelOutput(NamedTuple):
@@ -76,6 +101,62 @@ class StarModelOutput(NamedTuple):
     ownership_logits: Tensor
     alive_logits: Tensor
     soft_policy_logits: Tensor
+
+
+class ModelParameterCounts(NamedTuple):
+    input_and_output: int
+    local_blocks: int
+    global_blocks: int
+    total: int
+
+
+def model_parameter_counts(config: ModelConfig) -> ModelParameterCounts:
+    """Return an exact allocation count without materializing model tensors."""
+
+    width = config.width
+    bottleneck = config.local_bottleneck_width
+    local_per_block = (
+        width
+        + 2 * width * bottleneck
+        + EDGE_CLASS_COUNT * bottleneck
+        + 2 * bottleneck * bottleneck
+        + bottleneck * width
+        + width
+    )
+    if config.local_operator == "source_gated":
+        local_per_block += width * bottleneck
+    local_blocks = config.rrt_groups * config.local_blocks_per_group * local_per_block
+
+    kv_width = config.kv_heads * config.attention_head_width
+    global_per_block = (
+        4 * width
+        + 2 * width * width
+        + 2 * width * kv_width
+        + 3 * width * config.ff_hidden_width
+    )
+    global_blocks = config.rrt_groups * global_per_block
+
+    projection_parameters = (
+        (config.node_feature_dim + 1) * width
+        + (config.global_feature_dim + 1) * width
+        + width
+    )
+    final_norm_parameters = 2 * width
+    head_outputs = 1 + 2 + config.score_margin_bins + 3 + 1 + 1
+    head_parameters = (width + 1) * head_outputs
+    input_and_output = projection_parameters + final_norm_parameters + head_parameters
+    return ModelParameterCounts(
+        input_and_output=input_and_output,
+        local_blocks=local_blocks,
+        global_blocks=global_blocks,
+        total=input_and_output + local_blocks + global_blocks,
+    )
+
+
+def model_parameter_count(config: ModelConfig) -> int:
+    """Return the exact parameter total for ``config``."""
+
+    return model_parameter_counts(config).total
 
 
 class SwiGLU(nn.Module):
@@ -106,13 +187,18 @@ class LocalEdgeBlock(nn.Module):
         bottleneck_ratio: float,
         dropout: float,
         norm_eps: float,
+        local_operator: LocalOperator = "mean",
     ) -> None:
         super().__init__()
         bottleneck = max(8, int(width * bottleneck_ratio))
+        self.local_operator = local_operator
         self.norm = nn.RMSNorm(width, eps=norm_eps)
         self.self_projection = nn.Linear(width, bottleneck, bias=False)
         self.neighbor_projection = nn.Linear(width, bottleneck, bias=False)
         self.edge_embedding = nn.Embedding(EDGE_CLASS_COUNT, bottleneck)
+        self.source_gate_projection: nn.Linear | None = None
+        if local_operator == "source_gated":
+            self.source_gate_projection = nn.Linear(width, bottleneck, bias=False)
         self.update = SwiGLU(bottleneck, bottleneck, width)
         self.dropout = nn.Dropout(dropout)
         self.layer_scale = nn.Parameter(torch.full((width,), 1e-2))
@@ -128,7 +214,12 @@ class LocalEdgeBlock(nn.Module):
         normalized = self.norm(inputs)
         neighbors = _gather_neighbors(normalized, neighbor_index)
         messages = self.neighbor_projection(neighbors)
-        messages = functional.silu(messages + self.edge_embedding(neighbor_edge_type))
+        messages = messages + self.edge_embedding(neighbor_edge_type)
+        if self.source_gate_projection is not None:
+            source_gate = self.source_gate_projection(normalized).unsqueeze(2)
+            messages = functional.silu(messages) * torch.sigmoid(source_gate + messages)
+        else:
+            messages = functional.silu(messages)
         weights = neighbor_mask.unsqueeze(-1).to(dtype=messages.dtype)
         aggregated = (messages * weights).sum(dim=2)
         aggregated = aggregated / weights.sum(dim=2).clamp_min(1.0)
@@ -208,7 +299,7 @@ class GlobalGQABlock(nn.Module):
 
 
 class RRTGroup(nn.Module):
-    """Exactly two local edge blocks followed by one global GQA block."""
+    """Configured local edge blocks followed by one global GQA block."""
 
     def __init__(self, config: ModelConfig) -> None:
         super().__init__()
@@ -219,8 +310,9 @@ class RRTGroup(nn.Module):
                     config.bottleneck_ratio,
                     config.dropout,
                     config.rms_norm_eps,
+                    config.local_operator,
                 )
-                for _ in range(2)
+                for _ in range(config.local_blocks_per_group)
             ]
         )
         self.global_block = GlobalGQABlock(

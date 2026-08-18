@@ -26,7 +26,7 @@ from startrain.config import (
     load_config,
 )
 from startrain.learner import ImmutableModelPublisher
-from startrain.model import GraphResTNet
+from startrain.model import GraphResTNet, ModelConfig
 from startrain.optim import OptimizerConfig, build_optimizer
 from startrain.orchestration import gpu_pause_ack_path
 from startrain.promotion import (
@@ -82,6 +82,121 @@ def test_arena_manifest_evaluator_uses_compiled_inference_model(
             "isolate_recompiles": False,
         }
     ]
+
+
+def test_manifest_evaluator_requires_explicit_heterogeneous_loading(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    experiment = load_config(Path(__file__).parents[1] / "configs" / "small.yaml")
+    treatment_config = ModelConfig(
+        width=24,
+        rrt_groups=1,
+        attention_heads=4,
+        kv_heads=1,
+    )
+    manifest = SimpleNamespace(
+        checkpoint=tmp_path / "checkpoint.pt",
+        checkpoint_sha256="a" * 64,
+        checkpoint_bytes=1,
+        model_step=4,
+        model_version="sha256-" + "a" * 64,
+        model_identity="sha256-" + "a" * 64,
+        run_id="run-heterogeneous",
+        generation_family="family-heterogeneous",
+    )
+    constructed = []
+    expected_configs = []
+    extraction_calls = []
+
+    def model_factory(config):
+        constructed.append(config)
+        return torch.nn.Linear(1, 1)
+
+    def load_checkpoint(*_args, **options):
+        expected_configs.append(options["expected_model_config"])
+        return {"step": 4}
+
+    monkeypatch.setattr(promotion_module, "GraphResTNet", model_factory)
+    monkeypatch.setattr(promotion_module, "load_ema_checkpoint", load_checkpoint)
+    monkeypatch.setattr(
+        promotion_module,
+        "extract_verified_manifest_config",
+        lambda supplied, **_options: (
+            extraction_calls.append(supplied) or SimpleNamespace(model=treatment_config)
+        ),
+    )
+    monkeypatch.setattr(
+        promotion_module,
+        "maybe_compile_model",
+        lambda model, **_options: model,
+    )
+
+    load_manifest_evaluator(experiment, manifest, device="cpu")
+    load_manifest_evaluator(
+        experiment,
+        manifest,
+        device="cpu",
+        allow_heterogeneous_model=True,
+    )
+
+    assert extraction_calls == [manifest]
+    assert constructed == [experiment.model, treatment_config]
+    assert expected_configs == [
+        asdict(experiment.model),
+        asdict(treatment_config),
+    ]
+
+
+def test_manifest_evaluator_strictly_loads_verified_checkpoint_architecture(
+    tmp_path: Path,
+) -> None:
+    experiment = load_config(Path(__file__).parents[1] / "configs" / "small.yaml")
+    treatment_config = replace(
+        experiment.model,
+        width=16,
+        rrt_groups=1,
+        attention_heads=4,
+        kv_heads=4,
+    )
+    model = GraphResTNet(treatment_config)
+    optimizer = build_optimizer(model, OptimizerConfig(kind="adamw"))
+    scheduler = build_scheduler(
+        optimizer,
+        SchedulerConfig(warmup_steps=0, total_steps=10),
+    )
+    ema = ExponentialMovingAverage(model)
+    identity = RunIdentity(
+        tmp_path / "run.json",
+        "run-heterogeneous-load",
+        "family-heterogeneous-load",
+        1,
+    )
+    serialized_config = experiment.as_dict()
+    serialized_config["model"] = asdict(treatment_config)
+    manifest = ImmutableModelPublisher(tmp_path / "learner", identity).publish(
+        model=model,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        ema=ema,
+        step=3,
+        epoch=0,
+        config=serialized_config,
+    )
+
+    with pytest.raises(ValueError, match="model/feature configuration"):
+        load_manifest_evaluator(experiment, manifest, device="cpu")
+
+    evaluator = load_manifest_evaluator(
+        experiment,
+        manifest,
+        device="cpu",
+        allow_heterogeneous_model=True,
+    )
+    assert isinstance(evaluator.model, GraphResTNet)
+    assert evaluator.model.config == treatment_config
+    assert evaluator.model_step == 3
+    assert evaluator.model_identity == manifest.model_identity
 
 
 def test_promotion_candidates_respect_durable_resume_cutover(tmp_path) -> None:

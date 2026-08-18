@@ -69,6 +69,7 @@ FUTILITY_REPORT = "startrain-elo-futility-policy"
 FUTILITY_EVALUATION_REPORT = "startrain-elo-futility-evaluation"
 CONFIRMATION_CAMPAIGN_REPORT = "startrain-elo-confirmation-campaign"
 CONFIRMATION_CAMPAIGN_STATE_REPORT = "startrain-elo-confirmation-campaign-state"
+CONFIRMATION_HOLD_REPORT = "startrain-elo-seed-boundary-hold"
 
 QueueRunner = Callable[..., dict[str, object]]
 CrossSeedBuilder = Callable[..., dict[str, object]]
@@ -87,6 +88,12 @@ def _parser() -> argparse.ArgumentParser:
     source.add_argument("--pipeline", type=Path)
     source.add_argument("--confirmation-campaign", type=Path)
     parser.add_argument("--stage-index", type=int)
+    parser.add_argument(
+        "--seed-boundary-action",
+        choices=("run", "request", "release", "status"),
+        default="run",
+    )
+    parser.add_argument("--hold-reason")
     return parser
 
 
@@ -163,6 +170,230 @@ def _string(value: object, name: str) -> str:
     if not isinstance(value, str) or not value:
         raise StagedEloPipelineError(f"{name} must be a non-empty string")
     return value
+
+
+def _confirmation_hold_path(
+    campaign: Mapping[str, object],
+) -> Path | None:
+    raw = campaign.get("seed_boundary_hold_path")
+    if raw is None:
+        return None
+    return Path(_string(raw, "seed boundary hold path")).expanduser().resolve()
+
+
+def _read_confirmation_hold(
+    path: Path,
+    *,
+    campaign_sha256: str,
+) -> tuple[dict[str, Any], str] | None:
+    if not path.exists() and not path.is_symlink():
+        return None
+    if path.is_symlink() or not path.is_file():
+        raise StagedEloPipelineError("seed boundary hold path is unsafe")
+    document, digest = _read_json_with_digest(path)
+    if set(document) != {
+        "schema_version",
+        "report",
+        "status",
+        "campaign_sha256",
+        "created_ns",
+        "reason",
+    }:
+        raise StagedEloPipelineError("seed boundary hold fields are incompatible")
+    created_ns = document.get("created_ns")
+    if (
+        document.get("schema_version") != SCHEMA_VERSION
+        or document.get("report") != CONFIRMATION_HOLD_REPORT
+        or document.get("status") != "requested"
+        or document.get("campaign_sha256") != campaign_sha256
+        or isinstance(created_ns, bool)
+        or not isinstance(created_ns, int)
+        or created_ns <= 0
+        or not isinstance(document.get("reason"), str)
+        or not document["reason"]
+    ):
+        raise StagedEloPipelineError("seed boundary hold is invalid")
+    return document, digest
+
+
+def _effective_hold_boundary(
+    state_path: Path,
+    *,
+    campaign_sha256: str,
+) -> int | None:
+    if not state_path.is_file() or state_path.is_symlink():
+        return None
+    state = _read_json(state_path)
+    if (
+        state.get("schema_version") != SCHEMA_VERSION
+        or state.get("report") != CONFIRMATION_CAMPAIGN_STATE_REPORT
+        or state.get("campaign_sha256") != campaign_sha256
+    ):
+        raise StagedEloPipelineError(
+            "confirmation campaign state does not match hold request"
+        )
+    seeds = _list(state.get("seeds"), "confirmation campaign seed state")
+    active: list[int] = []
+    completed: list[int] = []
+    for record in seeds:
+        if not isinstance(record, Mapping):
+            continue
+        seed = record.get("seed")
+        if type(seed) is not int:
+            continue
+        if record.get("status") in {"launch_committed", "running"}:
+            active.append(seed)
+        elif record.get("status") == "completed":
+            completed.append(seed)
+    if active:
+        return max(active)
+    return max(completed) if completed else None
+
+
+def _manage_confirmation_hold_locked(
+    campaign_path: Path,
+    *,
+    action: str,
+    reason: str | None = None,
+    expected_campaign_sha256: str,
+    expected_hold_path: Path,
+) -> dict[str, object]:
+    path = campaign_path.expanduser().resolve()
+    campaign, campaign_sha256 = _read_json_with_digest(path)
+    if campaign_sha256 != expected_campaign_sha256:
+        raise StagedEloPipelineError(
+            "confirmation campaign changed before hold lock acquisition"
+        )
+    if (
+        campaign.get("schema_version") != SCHEMA_VERSION
+        or campaign.get("report") != CONFIRMATION_CAMPAIGN_REPORT
+    ):
+        raise StagedEloPipelineError("unsupported confirmation campaign")
+    hold_path = _confirmation_hold_path(campaign)
+    if hold_path is None:
+        raise StagedEloPipelineError(
+            "confirmation campaign has no seed boundary hold path"
+        )
+    if hold_path != expected_hold_path:
+        raise StagedEloPipelineError(
+            "seed boundary hold path changed before lock acquisition"
+        )
+    state_path = (
+        Path(_string(campaign.get("state_path"), "campaign state path"))
+        .expanduser()
+        .resolve()
+    )
+    if hold_path.parent != state_path.parent or hold_path == state_path:
+        raise StagedEloPipelineError(
+            "seed boundary hold must be a distinct file beside campaign state"
+        )
+    existing = _read_confirmation_hold(
+        hold_path,
+        campaign_sha256=campaign_sha256,
+    )
+    if action == "request":
+        if reason is None or not reason.strip() or reason.strip() != reason:
+            raise StagedEloPipelineError(
+                "requesting a seed boundary hold requires a normalized reason"
+            )
+        if existing is not None and existing[0].get("reason") != reason:
+            raise StagedEloPipelineError(
+                "existing seed boundary hold has a different reason"
+            )
+        if existing is None:
+            hold_path.parent.mkdir(parents=True, exist_ok=True)
+            atomic_json(
+                hold_path,
+                {
+                    "schema_version": SCHEMA_VERSION,
+                    "report": CONFIRMATION_HOLD_REPORT,
+                    "status": "requested",
+                    "campaign_sha256": campaign_sha256,
+                    "created_ns": time.time_ns(),
+                    "reason": reason,
+                },
+            )
+            existing = _read_confirmation_hold(
+                hold_path,
+                campaign_sha256=campaign_sha256,
+            )
+        assert existing is not None
+        document, digest = existing
+        return {
+            "status": "requested",
+            "path": str(hold_path),
+            "sha256": digest,
+            "hold": document,
+            "effective_after_seed": _effective_hold_boundary(
+                state_path,
+                campaign_sha256=campaign_sha256,
+            ),
+        }
+    if reason is not None:
+        raise StagedEloPipelineError("--hold-reason is valid only with request")
+    if action == "release":
+        if existing is None:
+            return {"status": "not_requested", "path": str(hold_path)}
+        document, digest = existing
+        hold_path.unlink()
+        descriptor = os.open(hold_path.parent, os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        return {
+            "status": "released",
+            "path": str(hold_path),
+            "released_sha256": digest,
+            "hold": document,
+        }
+    if action == "status":
+        if existing is None:
+            return {"status": "not_requested", "path": str(hold_path)}
+        document, digest = existing
+        return {
+            "status": "requested",
+            "path": str(hold_path),
+            "sha256": digest,
+            "hold": document,
+            "effective_after_seed": _effective_hold_boundary(
+                state_path,
+                campaign_sha256=campaign_sha256,
+            ),
+        }
+    raise StagedEloPipelineError(f"unsupported seed boundary action: {action}")
+
+
+def manage_confirmation_hold(
+    campaign_path: Path,
+    *,
+    action: str,
+    reason: str | None = None,
+) -> dict[str, object]:
+    path = campaign_path.expanduser().resolve()
+    campaign, campaign_sha256 = _read_json_with_digest(path)
+    if (
+        campaign.get("schema_version") != SCHEMA_VERSION
+        or campaign.get("report") != CONFIRMATION_CAMPAIGN_REPORT
+    ):
+        raise StagedEloPipelineError("unsupported confirmation campaign")
+    hold_path = _confirmation_hold_path(campaign)
+    if hold_path is None:
+        raise StagedEloPipelineError(
+            "confirmation campaign has no seed boundary hold path"
+        )
+    lock = exclusive_queue_lock(hold_path)
+    lock.__enter__()
+    try:
+        return _manage_confirmation_hold_locked(
+            path,
+            action=action,
+            reason=reason,
+            expected_campaign_sha256=campaign_sha256,
+            expected_hold_path=hold_path,
+        )
+    finally:
+        lock.__exit__(None, None, None)
 
 
 def build_futility_policy(
@@ -989,6 +1220,67 @@ def _upsert_campaign_seed(
     cast_records.sort(key=seed_order)
 
 
+def _remove_campaign_seed(state: dict[str, object], seed: int) -> None:
+    records = _list(state.get("seeds"), "confirmation campaign seed state")
+    state["seeds"] = [
+        record
+        for record in records
+        if not isinstance(record, Mapping) or record.get("seed") != seed
+    ]
+
+
+def _pause_campaign_at_boundary(
+    *,
+    state: dict[str, object],
+    state_path: Path,
+    hold_path: Path,
+    campaign_sha256: str,
+    previous_seed: int,
+    next_seed: int,
+) -> bool:
+    hold = _read_confirmation_hold(
+        hold_path,
+        campaign_sha256=campaign_sha256,
+    )
+    if hold is None:
+        return False
+    previous_record = _campaign_seed_record(state, previous_seed)
+    if previous_record is None or previous_record.get("status") != "completed":
+        raise StagedEloPipelineError(
+            "seed boundary hold encountered before previous seed completed"
+        )
+    hold_document, hold_sha256 = hold
+    next_record = _campaign_seed_record(state, next_seed)
+    launch_committed_ns = (
+        next_record.get("launch_committed_ns") if next_record is not None else None
+    )
+    created_ns = hold_document["created_ns"]
+    assert isinstance(created_ns, int)
+    if type(launch_committed_ns) is int and launch_committed_ns < created_ns:
+        return False
+    if next_record is not None and next_record.get("status") == "launch_committed":
+        _remove_campaign_seed(state, next_seed)
+    state.update(
+        {
+            "status": "paused",
+            "paused_after_seed": previous_seed,
+            "next_seed": next_seed,
+            "paused_ns": time.time_ns(),
+            "seed_boundary_hold": {
+                "path": str(hold_path),
+                "sha256": hold_sha256,
+                "reason": hold_document["reason"],
+            },
+            "operator_resume_required": True,
+            "continuity_fallback_expected": True,
+            "automatic_adoption_authorized": False,
+        }
+    )
+    state.pop("operator_execution_required", None)
+    atomic_json(state_path, state)
+    return True
+
+
 def _verified_completed_queue(
     queue_state: Mapping[str, object],
     *,
@@ -1098,6 +1390,13 @@ def run_confirmation_campaign(
         .expanduser()
         .resolve()
     )
+    hold_path = _confirmation_hold_path(campaign)
+    if hold_path is not None and (
+        hold_path.parent != state_path.parent or hold_path == state_path
+    ):
+        raise StagedEloPipelineError(
+            "seed boundary hold must be a distinct file beside campaign state"
+        )
     cross_seed = _mapping(campaign.get("cross_seed"), "campaign cross-seed plan")
     policy_path = (
         Path(_string(cross_seed.get("policy"), "campaign adoption policy"))
@@ -1123,6 +1422,7 @@ def run_confirmation_campaign(
         policy_path,
         output_path,
         execution_lock_path,
+        *([hold_path] if hold_path is not None else []),
     ]
     if len(set(all_paths)) != len(all_paths):
         raise StagedEloPipelineError(
@@ -1159,7 +1459,7 @@ def run_confirmation_campaign(
             ):
                 state.pop(stale, None)
             atomic_json(state_path, state)
-            for spec in specs:
+            for index, spec in enumerate(specs):
                 raw_seed = spec["seed"]
                 assert type(raw_seed) is int
                 seed = raw_seed
@@ -1204,17 +1504,49 @@ def run_confirmation_campaign(
                     raise StagedEloPipelineError(
                         f"seed {seed} deployment manifest changed before execution"
                     )
+                existing_launch_ns = (
+                    existing.get("launch_committed_ns")
+                    if existing is not None
+                    and existing.get("status") == "launch_committed"
+                    else None
+                )
+                launch_committed_ns = (
+                    existing_launch_ns
+                    if type(existing_launch_ns) is int
+                    else time.time_ns()
+                )
+                for stale in (
+                    "operator_resume_required",
+                    "paused_after_seed",
+                    "next_seed",
+                    "paused_ns",
+                    "seed_boundary_hold",
+                ):
+                    state.pop(stale, None)
                 _upsert_campaign_seed(
                     state,
                     {
                         "seed": seed,
-                        "status": "running",
+                        "status": "launch_committed",
+                        "launch_committed_ns": launch_committed_ns,
                         "deployment_manifest": str(manifest_path),
                         "deployment_sha256": manifest_sha256,
                         "comparison": str(comparison_output),
                     },
                 )
                 atomic_json(state_path, state)
+                if index > 0 and hold_path is not None:
+                    previous_raw_seed = specs[index - 1]["seed"]
+                    assert type(previous_raw_seed) is int
+                    if _pause_campaign_at_boundary(
+                        state=state,
+                        state_path=state_path,
+                        hold_path=hold_path,
+                        campaign_sha256=campaign_sha256,
+                        previous_seed=previous_raw_seed,
+                        next_seed=seed,
+                    ):
+                        return state
                 queue_state = queue_runner(
                     manifest_path,
                     execution_lock_lease=execution_lock_lease,
@@ -1369,8 +1701,26 @@ def main(argv: list[str] | None = None) -> int:
                 raise StagedEloPipelineError(
                     "--stage-index cannot be used with --confirmation-campaign"
                 )
-            state = run_confirmation_campaign(arguments.confirmation_campaign)
+            if arguments.seed_boundary_action == "run":
+                if arguments.hold_reason is not None:
+                    raise StagedEloPipelineError(
+                        "--hold-reason requires --seed-boundary-action request"
+                    )
+                state = run_confirmation_campaign(arguments.confirmation_campaign)
+            else:
+                state = manage_confirmation_hold(
+                    arguments.confirmation_campaign,
+                    action=arguments.seed_boundary_action,
+                    reason=arguments.hold_reason,
+                )
         else:
+            if (
+                arguments.seed_boundary_action != "run"
+                or arguments.hold_reason is not None
+            ):
+                raise StagedEloPipelineError(
+                    "seed boundary actions require --confirmation-campaign"
+                )
             if arguments.stage_index is None:
                 raise StagedEloPipelineError(
                     "--stage-index is required with --pipeline"

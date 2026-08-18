@@ -2,6 +2,7 @@
   "schema_version": 1,
   "report": "startrain-elo-confirmation-campaign",
   "state_path": "/var/lib/edgeconnect/elo-confirmation/campaign-state.json",
+  "seed_boundary_hold_path": "/var/lib/edgeconnect/elo-confirmation/seed-boundary-hold.json",
   "seeds": [
     {
       "seed": 17,

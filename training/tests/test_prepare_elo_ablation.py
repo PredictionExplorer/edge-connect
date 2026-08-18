@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -10,9 +11,13 @@ import yaml
 from scripts.prepare_elo_ablation import (
     CLEAN_TREATMENTS,
     DEFAULT_TREATMENTS,
+    RING10_ATTENTION_TREATMENTS,
+    RING10_CAPACITY_TREATMENTS,
     RING10_EFFICIENCY_TREATMENTS,
     RING10_ONLY_TREATMENTS,
     RING10_OPTIMIZATION_TREATMENTS,
+    RING10_RELATIONAL_TREATMENTS,
+    RING10_TRAINING_DYNAMICS_TREATMENTS,
     SYSTEM_TREATMENTS,
     WEIGHTED_TREATMENTS,
     main,
@@ -20,6 +25,7 @@ from scripts.prepare_elo_ablation import (
     resolve_treatments,
 )
 from startrain.config import load_config
+from startrain.model import model_parameter_count
 
 CONFIGS = Path(__file__).parents[1] / "configs"
 
@@ -467,6 +473,291 @@ def test_prepare_generates_ring10_cadence_and_freshness_suite(
     assert freshness.orchestration.model_refresh.candidate_probability == 0.5
     assert freshness.orchestration.model_refresh.history_probability == 0.0
     assert freshness.learner.selfplay_snapshot_interval_examples == 3_000_000
+
+
+def test_prepare_generates_ring10_training_dynamics_suite(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    replay = source / "replay"
+    replay.mkdir()
+    with sqlite3.connect(replay / "manifest.sqlite3") as connection:
+        connection.execute(
+            "CREATE TABLE shards (id INTEGER PRIMARY KEY, state TEXT NOT NULL)"
+        )
+        connection.execute("INSERT INTO shards(id, state) VALUES (42, 'ready')")
+    output = tmp_path / "profiles"
+    manifest = prepare_elo_ablation(
+        base_config=CONFIGS / "h100-8gpu-ring10-only.yaml",
+        output_dir=output,
+        run_root_parent=tmp_path / "runs",
+        run_id="shared-parent-run",
+        source_run_root=source,
+        prefix="ring10-dynamics",
+        seed=17,
+        wall_budget_hours=8,
+        leaf_budget=2_000_000_000,
+        guard_floor_elo=-35,
+        treatments=RING10_TRAINING_DYNAMICS_TREATMENTS,
+        guard_rings=(),
+        suite="ring10-training-dynamics",
+    )
+
+    assert manifest["initialization"] == "fork"
+    assert manifest["source_replay_cutoff"] == 42
+    control = load_config(output / "ring10-dynamics-control.yaml")
+    adamw = load_config(output / "ring10-dynamics-adamw.yaml")
+    ema = load_config(output / "ring10-dynamics-ema-1m.yaml")
+    freshness = load_config(output / "ring10-dynamics-freshness-50.yaml")
+    clinch = load_config(output / "ring10-dynamics-clinch-outcome-only.yaml")
+    assert control.optimizer.kind == "muon_adamw"
+    assert adamw.optimizer.kind == "adamw"
+    assert ema.train.ema_half_life_examples == 1_000_000
+    assert freshness.orchestration.model_refresh.selfplay_source == (
+        "candidate_champion_mix"
+    )
+    assert freshness.orchestration.model_refresh.candidate_probability == 0.5
+    assert clinch.selfplay.clinch_auxiliary_targets == "outcome_only"
+    for name in RING10_TRAINING_DYNAMICS_TREATMENTS:
+        assert (
+            load_config(
+                output / f"{name}.yaml"
+            ).learner.minimum_replay_shard_id_exclusive
+            == 42
+        )
+
+
+def test_direct_treatments_cannot_bypass_initialization_or_replay_policy(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    replay = source / "replay"
+    replay.mkdir(parents=True)
+    with sqlite3.connect(replay / "manifest.sqlite3") as connection:
+        connection.execute(
+            "CREATE TABLE shards (id INTEGER PRIMARY KEY, state TEXT NOT NULL)"
+        )
+        connection.execute("INSERT INTO shards(id, state) VALUES (73, 'ready')")
+
+    architecture = prepare_elo_ablation(
+        base_config=CONFIGS / "h100-8gpu-ring10-only.yaml",
+        output_dir=tmp_path / "architecture",
+        run_root_parent=tmp_path / "architecture-runs",
+        run_id="source-run",
+        source_run_root=source,
+        prefix="architecture",
+        seed=17,
+        wall_budget_hours=8,
+        leaf_budget=2_000_000_000,
+        guard_floor_elo=-35,
+        treatments=("ring10-attention-full-kv",),
+        guard_rings=(),
+    )
+    assert architecture["initialization"] == "scratch"
+    assert _treatment_records(architecture)[0]["run_id"] != "source-run"
+
+    dynamics = prepare_elo_ablation(
+        base_config=CONFIGS / "h100-8gpu-ring10-only.yaml",
+        output_dir=tmp_path / "dynamics",
+        run_root_parent=tmp_path / "dynamics-runs",
+        run_id="source-run",
+        source_run_root=source,
+        prefix="dynamics",
+        seed=17,
+        wall_budget_hours=8,
+        leaf_budget=2_000_000_000,
+        guard_floor_elo=-35,
+        treatments=("ring10-dynamics-adamw",),
+        guard_rings=(),
+    )
+    assert dynamics["source_replay_cutoff"] == 73
+    profile = load_config(Path(str(_treatment_records(dynamics)[0]["profile"])))
+    assert profile.learner.minimum_replay_shard_id_exclusive == 73
+
+    with pytest.raises(ValueError, match="separate ablation plans"):
+        prepare_elo_ablation(
+            base_config=CONFIGS / "h100-8gpu-ring10-only.yaml",
+            output_dir=tmp_path / "mixed",
+            run_root_parent=tmp_path / "mixed-runs",
+            run_id="source-run",
+            source_run_root=source,
+            prefix="mixed",
+            seed=17,
+            wall_budget_hours=8,
+            leaf_budget=2_000_000_000,
+            guard_floor_elo=-35,
+            treatments=(
+                "ring10-attention-control",
+                "ring10-dynamics-control",
+            ),
+            guard_rings=(),
+        )
+
+
+@pytest.mark.parametrize(
+    ("suite", "treatments"),
+    [
+        ("ring10-attention-reallocation", RING10_ATTENTION_TREATMENTS),
+        ("ring10-relational", RING10_RELATIONAL_TREATMENTS),
+        ("ring10-capacity", RING10_CAPACITY_TREATMENTS),
+    ],
+)
+def test_prepare_marks_architecture_suites_scratch(
+    tmp_path: Path,
+    suite: str,
+    treatments: tuple[str, ...],
+) -> None:
+    source = tmp_path / suite / "source"
+    source.mkdir(parents=True)
+    output = tmp_path / suite / "profiles"
+    manifest = prepare_elo_ablation(
+        base_config=CONFIGS / "h100-8gpu-ring10-only.yaml",
+        output_dir=output,
+        run_root_parent=tmp_path / suite / "runs",
+        run_id="shared-parent-run",
+        source_run_root=source,
+        prefix=suite,
+        seed=17,
+        wall_budget_hours=8,
+        leaf_budget=2_000_000_000,
+        guard_floor_elo=-35,
+        treatments=treatments,
+        guard_rings=(),
+        suite=suite,
+    )
+
+    assert manifest["initialization"] == "scratch"
+    records = _treatment_records(manifest)
+    assert [item["treatment"] for item in records] == list(treatments)
+    run_ids = {str(item["run_id"]) for item in records}
+    assert len(run_ids) == len(treatments)
+    assert all(run_id.startswith("scratch-") for run_id in run_ids)
+    for item in records:
+        assert (
+            load_config(Path(str(item["profile"]))).orchestration.run_id
+            == item["run_id"]
+        )
+
+
+def test_prepare_architecture_suite_parameter_contracts(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+
+    def prepare(
+        suite: str,
+        treatments: tuple[str, ...],
+    ) -> Path:
+        output = tmp_path / suite
+        prepare_elo_ablation(
+            base_config=CONFIGS / "h100-8gpu-ring10-only.yaml",
+            output_dir=output,
+            run_root_parent=tmp_path / f"{suite}-runs",
+            run_id="shared-parent-run",
+            source_run_root=source,
+            prefix=suite,
+            seed=17,
+            wall_budget_hours=8,
+            leaf_budget=2_000_000_000,
+            guard_floor_elo=-35,
+            treatments=treatments,
+            guard_rings=(),
+            suite=suite,
+        )
+        return output
+
+    attention = prepare(
+        "ring10-attention-reallocation",
+        RING10_ATTENTION_TREATMENTS,
+    )
+    attention_control = load_config(attention / "ring10-attention-control.yaml")
+    attention_full = load_config(attention / "ring10-attention-full-kv.yaml")
+    assert model_parameter_count(attention_control.model) == 10_476_983
+    assert model_parameter_count(attention_full.model) == 10_476_983
+
+    relational = prepare("ring10-relational", RING10_RELATIONAL_TREATMENTS)
+    relational_control = load_config(relational / "ring10-relational-control.yaml")
+    local_heavy = load_config(relational / "ring10-relational-local-heavy.yaml")
+    source_gated = load_config(relational / "ring10-relational-source-gated.yaml")
+    assert model_parameter_count(relational_control.model) == 10_476_983
+    assert model_parameter_count(local_heavy.model) == 10_476_953
+    assert model_parameter_count(source_gated.model) == 10_476_983
+
+    capacity = prepare("ring10-capacity", RING10_CAPACITY_TREATMENTS)
+    capacity_control = load_config(capacity / "ring10-capacity-control.yaml")
+    capacity_depth = load_config(capacity / "ring10-capacity-depth-7.yaml")
+    capacity_width = load_config(capacity / "ring10-capacity-width-512.yaml")
+    assert model_parameter_count(capacity_control.model) == 10_476_983
+    assert model_parameter_count(capacity_depth.model) == 14_614_199
+    assert model_parameter_count(capacity_width.model) == 18_556_727
+
+
+def test_prepare_canonicalizes_architecture_before_parameter_validation(
+    tmp_path: Path,
+) -> None:
+    raw = yaml.safe_load(
+        (CONFIGS / "h100-8gpu-ring10-only.yaml").read_text(encoding="utf-8")
+    )
+    raw["model"]["rrt_groups"] = 6
+    base = tmp_path / "drifted.yaml"
+    base.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+    source = tmp_path / "source"
+    source.mkdir()
+
+    output = tmp_path / "profiles"
+    prepare_elo_ablation(
+        base_config=base,
+        output_dir=output,
+        run_root_parent=tmp_path / "runs",
+        run_id="source-run",
+        source_run_root=source,
+        prefix="attention",
+        seed=17,
+        wall_budget_hours=8,
+        leaf_budget=2_000_000_000,
+        guard_floor_elo=-35,
+        treatments=("ring10-attention-control",),
+        guard_rings=(),
+    )
+    control = load_config(output / "ring10-attention-control.yaml")
+    assert control.model.rrt_groups == 5
+    assert model_parameter_count(control.model) == 10_476_983
+
+
+def test_capacity_control_resets_equal_count_attention_drift(
+    tmp_path: Path,
+) -> None:
+    raw = yaml.safe_load(
+        (CONFIGS / "h100-8gpu-ring10-only.yaml").read_text(encoding="utf-8")
+    )
+    raw["model"]["kv_heads"] = 12
+    raw["model"]["ff_multiplier"] = 2.0
+    base = tmp_path / "equal-count-drift.yaml"
+    base.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+    source = tmp_path / "source"
+    source.mkdir()
+    output = tmp_path / "capacity"
+
+    prepare_elo_ablation(
+        base_config=base,
+        output_dir=output,
+        run_root_parent=tmp_path / "runs",
+        run_id="source-run",
+        source_run_root=source,
+        prefix="capacity",
+        seed=17,
+        wall_budget_hours=8,
+        leaf_budget=2_000_000_000,
+        guard_floor_elo=-35,
+        treatments=RING10_CAPACITY_TREATMENTS,
+        guard_rings=(),
+        suite="ring10-capacity",
+    )
+
+    control = load_config(output / "ring10-capacity-control.yaml")
+    depth = load_config(output / "ring10-capacity-depth-7.yaml")
+    width = load_config(output / "ring10-capacity-width-512.yaml")
+    assert (control.model.kv_heads, control.model.ff_multiplier) == (3, 2.5)
+    assert (depth.model.kv_heads, depth.model.ff_multiplier) == (3, 2.5)
+    assert (width.model.kv_heads, width.model.ff_multiplier) == (4, 2.5)
 
 
 def test_resolve_treatments_keeps_suites_fail_closed() -> None:
