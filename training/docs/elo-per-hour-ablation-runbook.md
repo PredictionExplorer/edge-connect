@@ -174,6 +174,66 @@ The queue comparator reads the empty guard-ring contract from the plan. If a
 comparison must be regenerated directly, pass `--no-guard-rings`; never add
 the generalist ring 4/6/8 floors to these runs.
 
+### Frozen-live ring-10 cadence suite
+
+The approved arena-backlog trial starts from an immutable copy of the actual
+live ring-10-only profile. Do not substitute a canonical repository profile or
+the older `ring10-optimization` suite: that suite rewrites its control cadence
+and self-play source instead of preserving the live control.
+
+```bash
+python scripts/prepare_elo_ablation.py \
+  --base-config /absolute/path/to/frozen-live-ring10.yaml \
+  --source-run-root /absolute/path/to/stopped-live-ring10 \
+  --output-dir /absolute/path/to/ring10-live-cadence-profiles-seed17 \
+  --run-root-parent /absolute/path/to/ring10-live-cadence-runs \
+  --run-id <run-id-from-source-run.json> \
+  --prefix ring10-live-cadence \
+  --seed 17 \
+  --wall-budget-hours 8 \
+  --leaf-budget 2000000000 \
+  --suite ring10-live-cadence
+```
+
+The suite is exactly two arms:
+
+1. `ring10-live-cadence-control` preserves the frozen profile, including every
+   learner cadence field.
+2. `ring10-live-cadence-5m` changes only
+   `learner.candidate_interval_examples` to `5000000`.
+
+Both arms retain UTD `1.0`, worker and promotion topology, actor self-play,
+model-refresh policy, and the complete arena contract. The normal per-arm run
+root, shared run ID, and experiment seed are the only preparation metadata.
+Preparation fails before creating output unless the base is a valid continuous
+`ring10_only` profile with explicit UTD `1.0` and an explicit positive
+candidate-example cadence below five million. A missing cadence, a cadence
+already at or above five million, an incompatible UTD, or an incomplete arm
+selection cannot define the backlog-reducing one-factor transition and is
+rejected.
+
+Do not add `ring10-freshness-50`, any `ring10-dynamics-*` arm, or another
+topology change to this plan. The completed dynamics/freshness screen had no
+promoted frontier gain; those null arms are excluded rather than retuned inside
+the cadence trial.
+
+The treatment must clear both gates:
+
+- **Operational backlog gate:** over the same fixed-budget measurement window,
+  candidate arrival/service ratio is at most `1.20`, or its ratio is at least
+  25% lower than control. Relative reduction is
+  `(control_ratio - treatment_ratio) / control_ratio` and must be at least
+  `0.25`.
+- **Pair-valid Elo/hour gate:** the seed-17 screen must remain eligible and show
+  positive pair-valid chronological champion-frontier ring-10 Elo/hour evidence
+  before confirmation. Adoption still requires seeds 17, 18, and 19, a strictly
+  positive candidate-LCB minus control-UCB in every seed, and at least 20%
+  median point Elo/hour improvement.
+
+Operational relief alone never authorizes confirmation or adoption. Compare
+both arms from the same frozen champion anchor and replay cutoff, count all
+eight provisioned GPUs through resource release, and retain null results.
+
 ### Benchmark arena occupancy before changing promotion
 
 Test continuation occupancy against fixed manifests before changing a profile:
@@ -584,17 +644,12 @@ refuses imported checkpoints or replay before first launch, runs direct
 control/treatment cross-play against one frozen baseline, and publishes
 diagnostic-only evidence. It never authorizes promotion or adoption.
 
-For the next one-factor ring-10 screen, `--suite ring10-optimization` freezes
-UTD at 1.0 and compares:
-
-- `ring10-optimization-control`: 2M-example candidate cadence, champion self-play
-- `ring10-cadence-5m`: 5M-example candidate cadence
-- `ring10-freshness-50`: 2M cadence and a 50/50 candidate/champion self-play mix
-
-Do not combine cadence and freshness until each independently improves
-pair-valid frontier Elo/hour. For systems-only screening,
-`actor-batch-128`, `actor-batch-160`, and `actor-batch-192` provide the bounded
-batch sweep.
+The older `ring10-optimization` matrix remains available only to reproduce its
+original canonical-control experiment. New live-backlog work uses the
+two-arm `ring10-live-cadence` suite above and does not repeat its already-null
+freshness or training-dynamics arms. For systems-only screening,
+`actor-batch-128`, `actor-batch-160`, and `actor-batch-192` still provide the
+bounded batch sweep.
 
 Persist operational telemetry during every confirmation:
 

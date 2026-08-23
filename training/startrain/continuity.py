@@ -40,7 +40,17 @@ MANIFEST_SCHEMA_VERSION = 1
 STATE_SCHEMA_VERSION = 1
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _UNIT = re.compile(r"^[A-Za-z0-9@_.:-]+\.service$")
+_TIMER = re.compile(r"^[A-Za-z0-9@_.:-]+\.timer$")
+_REPLAY_BACKUP_TIMER = re.compile(
+    r"^edgeconnect-startrain-(?P<owner>[A-Za-z0-9@_.:-]+)-backup\.timer$"
+)
+_DISASTER_BACKUP_TIMER = re.compile(
+    r"^edgeconnect-startrain-(?P<owner>[A-Za-z0-9@_.:-]+)-disaster-backup\.timer$"
+)
 _ACTIVE_STATES = frozenset({"active", "activating", "reloading"})
+_ENABLED_UNIT_FILE_STATES = frozenset(
+    {"enabled", "enabled-runtime", "linked", "linked-runtime"}
+)
 
 
 class ContinuityError(RuntimeError):
@@ -64,6 +74,36 @@ class ContinuitySplitBrainError(ContinuityError):
 
 
 @dataclass(frozen=True, slots=True)
+class WorkloadProtection:
+    replay_backup_timer: str
+    disaster_backup_timer: str
+    disaster_backup_root: Path
+    disaster_backup_mount: Path
+    mac_acknowledgement_namespace: Path
+    telemetry_service: str
+    telemetry_output: Path
+
+    @property
+    def replay_backup_service(self) -> str:
+        return self.replay_backup_timer.removesuffix(".timer") + ".service"
+
+    @property
+    def disaster_backup_service(self) -> str:
+        return self.disaster_backup_timer.removesuffix(".timer") + ".service"
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "replay_backup_timer": self.replay_backup_timer,
+            "disaster_backup_timer": self.disaster_backup_timer,
+            "disaster_backup_root": str(self.disaster_backup_root),
+            "disaster_backup_mount": str(self.disaster_backup_mount),
+            "mac_acknowledgement_namespace": str(self.mac_acknowledgement_namespace),
+            "telemetry_service": self.telemetry_service,
+            "telemetry_output": str(self.telemetry_output),
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class Workload:
     workload_id: str
     role: str
@@ -81,13 +121,14 @@ class Workload:
     runtime_unit_sha256: str | None
     lkg_verified_ns: int | None
     lkg_priority: int
+    protection: WorkloadProtection | None = None
 
     @property
     def is_lkg(self) -> bool:
         return self.lkg_verified_ns is not None
 
     def state_identity(self) -> dict[str, object]:
-        return {
+        identity: dict[str, object] = {
             "id": self.workload_id,
             "role": self.role,
             "unit": self.unit,
@@ -120,6 +161,9 @@ class Workload:
             "runtime_unit_sha256": self.runtime_unit_sha256,
             "lkg_verified_ns": self.lkg_verified_ns,
         }
+        if self.protection is not None:
+            identity["protection"] = self.protection.as_dict()
+        return identity
 
 
 @dataclass(frozen=True, slots=True)
@@ -192,6 +236,27 @@ class WorkloadVerification:
 
 
 @dataclass(frozen=True, slots=True)
+class WorkloadProtectionVerification:
+    workload_id: str
+    configured: bool
+    valid: bool
+    require_active: bool
+    reasons: tuple[str, ...]
+    units: dict[str, dict[str, object]]
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "workload_id": self.workload_id,
+            "configured": self.configured,
+            "valid": self.valid,
+            "require_active": self.require_active,
+            "automatic_transition_allowed": not self.configured or self.valid,
+            "reasons": list(self.reasons),
+            "units": copy.deepcopy(self.units),
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class HardwareAssessment:
     status: str
     safe: bool
@@ -246,6 +311,9 @@ class UnitStatus:
     result: str | None = None
     exec_main_status: int | None = None
     query_error: str | None = None
+    load_state: str | None = None
+    unit_file_state: str | None = None
+    fragment_path: str | None = None
 
     @property
     def active(self) -> bool:
@@ -260,6 +328,9 @@ class UnitStatus:
             "result": self.result,
             "exec_main_status": self.exec_main_status,
             "query_error": self.query_error,
+            "load_state": self.load_state,
+            "unit_file_state": self.unit_file_state,
+            "fragment_path": self.fragment_path,
         }
 
 
@@ -269,6 +340,14 @@ class UnitManager(Protocol):
     def start(self, unit: str) -> None: ...
 
     def stop(self, unit: str) -> None: ...
+
+
+class ProtectionInspector(Protocol):
+    def status(self, unit: str) -> UnitStatus: ...
+
+    def definition(self, unit: str) -> str: ...
+
+    def is_mount(self, path: Path) -> bool: ...
 
 
 class SystemdUnitManager:
@@ -295,6 +374,9 @@ class SystemdUnitManager:
                     "--property=MainPID",
                     "--property=Result",
                     "--property=ExecMainStatus",
+                    "--property=LoadState",
+                    "--property=UnitFileState",
+                    "--property=FragmentPath",
                 ],
                 check=False,
                 capture_output=True,
@@ -327,7 +409,29 @@ class SystemdUnitManager:
             main_pid=main_pid,
             result=values.get("Result"),
             exec_main_status=exec_status,
+            load_state=values.get("LoadState"),
+            unit_file_state=values.get("UnitFileState"),
+            fragment_path=values.get("FragmentPath"),
         )
+
+    def definition(self, unit: str) -> str:
+        try:
+            completed = self.runner(
+                ["systemctl", "cat", "--no-pager", unit],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=self.timeout,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise ContinuityError(f"cannot read {unit}: {exc}") from exc
+        if completed.returncode != 0:
+            detail = completed.stderr.strip() or f"exit status {completed.returncode}"
+            raise ContinuityError(f"cannot read {unit}: {detail}")
+        return completed.stdout
+
+    def is_mount(self, path: Path) -> bool:
+        return path.is_dir() and not path.is_symlink() and path.is_mount()
 
     def start(self, unit: str) -> None:
         try:
@@ -553,13 +657,183 @@ def workload_fingerprints(
     }
 
 
+def _protection_unit(
+    value: object,
+    *,
+    name: str,
+    pattern: re.Pattern[str],
+) -> str:
+    if (
+        not isinstance(value, str)
+        or _TIMER.fullmatch(value) is None
+        or pattern.fullmatch(value) is None
+    ):
+        raise ContinuityManifestError(f"{name} has an invalid or unsupported name")
+    return value
+
+
+def _systemd_literal_path(path: Path, *, name: str) -> None:
+    if any(
+        character.isspace() or ord(character) < 32 or character in {"%", "\\", '"', "'"}
+        for character in str(path)
+    ):
+        raise ContinuityManifestError(
+            f"{name} cannot be represented safely in the systemd templates"
+        )
+
+
+def _parse_workload_protection(
+    value: object,
+    *,
+    workload_id: str,
+    run_root: Path,
+    profile_path: Path,
+    runtime_training_dir: Path,
+) -> WorkloadProtection | None:
+    if value is None:
+        return None
+    raw = _mapping(value, name=f"workload {workload_id} protection")
+    _strict_keys(
+        raw,
+        name=f"workload {workload_id} protection",
+        required={
+            "replay_backup_timer",
+            "disaster_backup_timer",
+            "disaster_backup_root",
+            "disaster_backup_mount",
+            "mac_acknowledgement_namespace",
+            "telemetry_service",
+            "telemetry_output",
+        },
+    )
+    replay_timer = _protection_unit(
+        raw.get("replay_backup_timer"),
+        name=f"workload {workload_id} replay backup timer",
+        pattern=_REPLAY_BACKUP_TIMER,
+    )
+    disaster_timer = _protection_unit(
+        raw.get("disaster_backup_timer"),
+        name=f"workload {workload_id} disaster backup timer",
+        pattern=_DISASTER_BACKUP_TIMER,
+    )
+    replay_owner = _REPLAY_BACKUP_TIMER.fullmatch(replay_timer)
+    disaster_owner = _DISASTER_BACKUP_TIMER.fullmatch(disaster_timer)
+    assert replay_owner is not None
+    assert disaster_owner is not None
+    if replay_owner.group("owner") != disaster_owner.group("owner"):
+        raise ContinuityManifestError(
+            f"workload {workload_id} backup timers must share one owner namespace"
+        )
+    telemetry_service = raw.get("telemetry_service")
+    if (
+        not isinstance(telemetry_service, str)
+        or _UNIT.fullmatch(telemetry_service) is None
+    ):
+        raise ContinuityManifestError(
+            f"workload {workload_id} has an invalid telemetry service"
+        )
+    disaster_root = _absolute_path(
+        raw.get("disaster_backup_root"),
+        name=f"workload {workload_id} disaster backup root",
+    )
+    disaster_mount = _absolute_path(
+        raw.get("disaster_backup_mount"),
+        name=f"workload {workload_id} disaster backup mount",
+    )
+    acknowledgement_namespace = _absolute_path(
+        raw.get("mac_acknowledgement_namespace"),
+        name=f"workload {workload_id} Mac acknowledgement namespace",
+    )
+    telemetry_output = _absolute_path(
+        raw.get("telemetry_output"),
+        name=f"workload {workload_id} telemetry output",
+    )
+    try:
+        disaster_relative = disaster_root.relative_to(disaster_mount)
+    except ValueError as exc:
+        raise ContinuityManifestError(
+            f"workload {workload_id} disaster backup root must be inside its mount"
+        ) from exc
+    if not disaster_relative.parts:
+        raise ContinuityManifestError(
+            f"workload {workload_id} disaster backup root must be below its mount"
+        )
+    try:
+        acknowledgement_relative = acknowledgement_namespace.relative_to(disaster_root)
+    except ValueError as exc:
+        raise ContinuityManifestError(
+            f"workload {workload_id} Mac acknowledgement namespace must be "
+            "inside its disaster backup root"
+        ) from exc
+    if (
+        not acknowledgement_relative.parts
+        or acknowledgement_relative.parts[0] != "acknowledgements"
+    ):
+        raise ContinuityManifestError(
+            f"workload {workload_id} Mac acknowledgement namespace must be "
+            "below the disaster backup acknowledgements directory"
+        )
+    try:
+        telemetry_relative = telemetry_output.relative_to(run_root)
+    except ValueError as exc:
+        raise ContinuityManifestError(
+            f"workload {workload_id} telemetry output must be inside its run root"
+        ) from exc
+    if (
+        len(telemetry_relative.parts) < 2
+        or telemetry_relative.parts[0] != "status"
+        or telemetry_output.suffix != ".jsonl"
+    ):
+        raise ContinuityManifestError(
+            f"workload {workload_id} telemetry output must be a JSONL file "
+            "below the run status directory"
+        )
+    for left, right, message in (
+        (
+            run_root,
+            disaster_mount,
+            "run root must be outside the disaster backup mount",
+        ),
+        (
+            disaster_mount,
+            run_root,
+            "disaster backup mount must be outside the run root",
+        ),
+    ):
+        try:
+            left.relative_to(right)
+        except ValueError:
+            pass
+        else:
+            raise ContinuityManifestError(f"workload {workload_id} {message}")
+    for path, name in (
+        (run_root, "run root"),
+        (profile_path, "profile path"),
+        (runtime_training_dir, "runtime training directory"),
+        (disaster_root, "disaster backup root"),
+        (disaster_mount, "disaster backup mount"),
+        (acknowledgement_namespace, "Mac acknowledgement namespace"),
+        (telemetry_output, "telemetry output"),
+    ):
+        _systemd_literal_path(path, name=f"workload {workload_id} {name}")
+    return WorkloadProtection(
+        replay_backup_timer=replay_timer,
+        disaster_backup_timer=disaster_timer,
+        disaster_backup_root=disaster_root,
+        disaster_backup_mount=disaster_mount,
+        mac_acknowledgement_namespace=acknowledgement_namespace,
+        telemetry_service=telemetry_service,
+        telemetry_output=telemetry_output,
+    )
+
+
 def _parse_workload(value: object, *, index: int) -> Workload:
     raw = _mapping(value, name=f"workload {index}")
     _strict_keys(
         raw,
         name=f"workload {index}",
         required={"id", "role", "unit", "profile", "run_root", "runtime"},
-        optional={"last_known_good"},
+        optional={"last_known_good", "protection"},
     )
     workload_id = _identifier(raw.get("id"), name=f"workload {index} id")
     role = raw.get("role")
@@ -581,6 +855,18 @@ def _parse_workload(value: object, *, index: int) -> Workload:
         root,
         name=f"workload {workload_id} run root",
         required={"path", "sha256"},
+    )
+    profile_path = _absolute_path(
+        profile.get("path"), name=f"workload {workload_id} profile path"
+    )
+    profile_sha256 = _sha256_value(
+        profile.get("sha256"), name=f"workload {workload_id} profile SHA-256"
+    )
+    run_root = _absolute_path(
+        root.get("path"), name=f"workload {workload_id} run root path"
+    )
+    run_root_sha256 = _sha256_value(
+        root.get("sha256"), name=f"workload {workload_id} run root SHA-256"
     )
     runtime = _mapping(
         raw.get("runtime"),
@@ -664,22 +950,25 @@ def _parse_workload(value: object, *, index: int) -> Workload:
         raise ContinuityManifestError(
             f"primary workload {workload_id} may not also be an LKG fallback"
         )
+    protection = _parse_workload_protection(
+        raw.get("protection"),
+        workload_id=workload_id,
+        run_root=run_root,
+        profile_path=profile_path,
+        runtime_training_dir=runtime_training_dir,
+    )
+    if protection is not None and protection.telemetry_service == unit:
+        raise ContinuityManifestError(
+            f"workload {workload_id} telemetry and training units must differ"
+        )
     return Workload(
         workload_id=workload_id,
         role=str(role),
         unit=unit,
-        profile_path=_absolute_path(
-            profile.get("path"), name=f"workload {workload_id} profile path"
-        ),
-        profile_sha256=_sha256_value(
-            profile.get("sha256"), name=f"workload {workload_id} profile SHA-256"
-        ),
-        run_root=_absolute_path(
-            root.get("path"), name=f"workload {workload_id} run root path"
-        ),
-        run_root_sha256=_sha256_value(
-            root.get("sha256"), name=f"workload {workload_id} run root SHA-256"
-        ),
+        profile_path=profile_path,
+        profile_sha256=profile_sha256,
+        run_root=run_root,
+        run_root_sha256=run_root_sha256,
         runtime_manifest_path=runtime_path,
         runtime_manifest_sha256=runtime_sha256,
         runtime_training_dir=runtime_training_dir,
@@ -689,6 +978,7 @@ def _parse_workload(value: object, *, index: int) -> Workload:
         runtime_unit_sha256=runtime_unit_sha256,
         lkg_verified_ns=verified_ns,
         lkg_priority=priority,
+        protection=protection,
     )
 
 
@@ -759,6 +1049,52 @@ def load_continuity_manifest(path: str | Path) -> ContinuityManifest:
         raise ContinuityManifestError("workload units must be unique")
     if len(roots) != len(set(roots)):
         raise ContinuityManifestError("workload run roots must be unique")
+    protected = [
+        (workload, workload.protection)
+        for workload in workloads
+        if workload.protection is not None
+    ]
+    protection_units: list[str] = []
+    for workload, protection_value in protected:
+        assert protection_value is not None
+        protection_units.extend(
+            (
+                protection_value.replay_backup_timer,
+                protection_value.replay_backup_service,
+                protection_value.disaster_backup_timer,
+                protection_value.disaster_backup_service,
+                protection_value.telemetry_service,
+            )
+        )
+    if len(protection_units) != len(set(protection_units)):
+        raise ContinuityManifestError("workload protection units must be unique")
+    if set(protection_units) & set(units):
+        raise ContinuityManifestError(
+            "workload protection units must differ from training units"
+        )
+    for attribute, label in (
+        ("disaster_backup_root", "disaster backup roots"),
+        ("mac_acknowledgement_namespace", "Mac acknowledgement namespaces"),
+        ("telemetry_output", "telemetry outputs"),
+    ):
+        values = [
+            getattr(protection_value, attribute)
+            for _workload, protection_value in protected
+            if protection_value is not None
+        ]
+        if len(values) != len(set(values)):
+            raise ContinuityManifestError(f"workload {label} must be unique")
+    disaster_roots = [
+        protection_value.disaster_backup_root
+        for _workload, protection_value in protected
+        if protection_value is not None
+    ]
+    for index, left in enumerate(disaster_roots):
+        for right in disaster_roots[index + 1 :]:
+            if left in right.parents or right in left.parents:
+                raise ContinuityManifestError(
+                    "workload disaster backup roots may not overlap"
+                )
     primary = _identifier(raw.get("primary"), name="primary workload id")
     primary_rows = [workload for workload in workloads if workload.role == "primary"]
     if (
@@ -1061,6 +1397,265 @@ def verify_continuity_manifest(
         "manifest_sha256": manifest.sha256,
         "workloads": verified,
     }
+
+
+def _effective_unit_values(
+    definition: str,
+    *,
+    section: str,
+    setting: str,
+) -> list[str]:
+    active_section: str | None = None
+    values: list[str] = []
+    for raw_line in definition.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith(("#", ";")):
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            active_section = line[1:-1]
+            continue
+        key, separator, value = line.partition("=")
+        if separator and active_section == section and key.strip() == setting:
+            normalized = value.strip()
+            if not normalized:
+                values.clear()
+            else:
+                values.append(normalized)
+    return values
+
+
+def workload_protection_commands(
+    manifest: ContinuityManifest,
+    workload: Workload,
+) -> dict[str, str]:
+    protection = workload.protection
+    assert protection is not None
+    assert workload.runtime_training_dir is not None
+    training = workload.runtime_training_dir
+    python = training / ".venv" / "bin" / "python"
+    return {
+        protection.replay_backup_service: (
+            f"{python} {training}/scripts/replay_manifest_backup.py backup "
+            f"--run-root {workload.run_root} --retain 3"
+        ),
+        protection.disaster_backup_service: (
+            f"{python} {training}/scripts/training_disaster_recovery.py snapshot "
+            f"--run-root {workload.run_root} --profile {workload.profile_path} "
+            f"--backup-root {protection.disaster_backup_root} "
+            f"--expected-backup-mount {protection.disaster_backup_mount}"
+        ),
+        protection.telemetry_service: (
+            f"{python} -u {training}/scripts/monitor_run.py "
+            f"--continuity-manifest {manifest.pinned_manifest_path} "
+            f"--run-root {workload.run_root} --profile {workload.profile_path} "
+            f"--unit {workload.unit} "
+            f"--continuity-state {manifest.state_path} "
+            f"--disaster-backup-root {protection.disaster_backup_root} "
+            "--interval 5 --format jsonl "
+            f"--telemetry-output {protection.telemetry_output}"
+        ),
+    }
+
+
+def verify_workload_protection(
+    manifest: ContinuityManifest,
+    workload_id: str,
+    *,
+    inspector: ProtectionInspector | None = None,
+    require_active: bool = False,
+) -> WorkloadProtectionVerification:
+    """Verify that installed protection belongs exclusively to one workload."""
+
+    workload = manifest.workload(workload_id)
+    protection = workload.protection
+    if protection is None:
+        return WorkloadProtectionVerification(
+            workload_id=workload_id,
+            configured=False,
+            valid=True,
+            require_active=require_active,
+            reasons=(),
+            units={},
+        )
+    active_inspector = SystemdUnitManager() if inspector is None else inspector
+    reasons: list[str] = []
+    units: dict[str, dict[str, object]] = {}
+    top_level_units = (
+        protection.replay_backup_timer,
+        protection.disaster_backup_timer,
+        protection.telemetry_service,
+    )
+    service_units = (
+        protection.replay_backup_service,
+        protection.disaster_backup_service,
+    )
+
+    for unit in (*top_level_units, *service_units):
+        status = active_inspector.status(unit)
+        units[unit] = status.as_dict()
+        if status.query_error is not None:
+            reasons.append(f"{unit}: status query failed: {status.query_error}")
+            continue
+        if status.load_state != "loaded":
+            reasons.append(f"{unit}: unit is not loaded")
+        if (
+            unit in top_level_units
+            and status.unit_file_state not in _ENABLED_UNIT_FILE_STATES
+        ):
+            reasons.append(f"{unit}: unit is not enabled")
+        activity_required = require_active or unit in {
+            protection.replay_backup_timer,
+            protection.disaster_backup_timer,
+        }
+        if activity_required and unit in top_level_units and not status.active:
+            reasons.append(f"{unit}: unit is not active")
+
+    for other in manifest.workloads:
+        other_protection = other.protection
+        if other.workload_id == workload_id or other_protection is None:
+            continue
+        for unit in (
+            other_protection.replay_backup_timer,
+            other_protection.disaster_backup_timer,
+            other_protection.telemetry_service,
+        ):
+            status = active_inspector.status(unit)
+            units[unit] = status.as_dict()
+            if status.query_error is not None:
+                reasons.append(
+                    f"{unit}: competing ownership query failed: {status.query_error}"
+                )
+            elif status.active:
+                reasons.append(
+                    f"{unit}: protection for inactive workload "
+                    f"{other.workload_id} is active"
+                )
+
+    expected_timers = {
+        protection.replay_backup_timer: protection.replay_backup_service,
+        protection.disaster_backup_timer: protection.disaster_backup_service,
+    }
+    for timer, expected_service in expected_timers.items():
+        try:
+            definition = active_inspector.definition(timer)
+        except Exception as exc:
+            reasons.append(
+                f"{timer}: cannot verify definition: {type(exc).__name__}: {exc}"
+            )
+            continue
+        targets = _effective_unit_values(
+            definition,
+            section="Timer",
+            setting="Unit",
+        )
+        if targets != [expected_service]:
+            reasons.append(f"{timer}: timer target differs from {expected_service}")
+
+    for service, expected_command in workload_protection_commands(
+        manifest,
+        workload,
+    ).items():
+        try:
+            definition = active_inspector.definition(service)
+        except Exception as exc:
+            reasons.append(
+                f"{service}: cannot verify definition: {type(exc).__name__}: {exc}"
+            )
+            continue
+        commands = _effective_unit_values(
+            definition,
+            section="Service",
+            setting="ExecStart",
+        )
+        if commands != [expected_command]:
+            reasons.append(f"{service}: ExecStart ownership differs from manifest")
+
+    try:
+        mounted = active_inspector.is_mount(protection.disaster_backup_mount)
+    except Exception as exc:
+        reasons.append(
+            f"disaster backup mount cannot be verified: {type(exc).__name__}: {exc}"
+        )
+    else:
+        if not mounted:
+            reasons.append(
+                f"disaster backup mount is not mounted: "
+                f"{protection.disaster_backup_mount}"
+            )
+        elif (
+            not protection.disaster_backup_root.is_dir()
+            or protection.disaster_backup_root.is_symlink()
+        ):
+            reasons.append(
+                f"disaster backup root is missing or unsafe: "
+                f"{protection.disaster_backup_root}"
+            )
+        else:
+            try:
+                mount_device = protection.disaster_backup_mount.stat().st_dev
+                root_device = protection.disaster_backup_root.stat().st_dev
+            except OSError as exc:
+                reasons.append(f"disaster backup device cannot be verified: {exc}")
+            else:
+                if mount_device != root_device:
+                    reasons.append(
+                        "disaster backup root is not on its configured mount"
+                    )
+
+    try:
+        run_identity, _ = _json_object_bytes(
+            workload.run_root / "run.json",
+            name=f"workload {workload_id} run identity",
+        )
+        run_id = _identifier(
+            run_identity.get("run_id"),
+            name=f"workload {workload_id} run_id",
+        )
+        generation_family = _identifier(
+            run_identity.get("generation_family"),
+            name=f"workload {workload_id} generation_family",
+        )
+        namespace, _ = _json_object_bytes(
+            protection.disaster_backup_root / "namespace.json",
+            name=f"workload {workload_id} disaster backup namespace",
+        )
+        expected_namespace = {
+            "report": "startrain-disaster-recovery-namespace",
+            "schema_version": 1,
+            "run_id": run_id,
+            "generation_family": generation_family,
+            "source_run_root": str(workload.run_root),
+        }
+        if namespace != expected_namespace:
+            reasons.append("disaster backup namespace is not bound to the workload")
+    except ContinuityManifestError as exc:
+        reasons.append(f"disaster backup namespace cannot be verified: {exc}")
+
+    for path, label, expected_kind in (
+        (
+            protection.mac_acknowledgement_namespace,
+            "Mac acknowledgement namespace",
+            "directory",
+        ),
+        (protection.telemetry_output, "telemetry output", "file"),
+    ):
+        if not path.exists():
+            continue
+        if (
+            path.is_symlink()
+            or (expected_kind == "directory" and not path.is_dir())
+            or (expected_kind == "file" and not path.is_file())
+        ):
+            reasons.append(f"{label} is unsafe: {path}")
+
+    return WorkloadProtectionVerification(
+        workload_id=workload_id,
+        configured=True,
+        valid=not reasons,
+        require_active=require_active,
+        reasons=tuple(reasons),
+        units=units,
+    )
 
 
 def _secure_directory(path: Path) -> None:
@@ -1669,7 +2264,7 @@ def _synthetic_failure(
 
 
 def _initial_state(manifest: ContinuityManifest, *, now_ns: int) -> dict[str, Any]:
-    return {
+    state = {
         "format": STATE_FORMAT,
         "schema_version": STATE_SCHEMA_VERSION,
         "manifest_path": str(manifest.path),
@@ -1701,6 +2296,9 @@ def _initial_state(manifest: ContinuityManifest, *, now_ns: int) -> dict[str, An
         "blocked_reason": None,
         "last_alert": None,
     }
+    if any(workload.protection is not None for workload in manifest.workloads):
+        state["protection"] = None
+    return state
 
 
 def _load_state(
@@ -1779,6 +2377,15 @@ def _load_state(
         value = state.get(name)
         if value is not None and value not in known_ids:
             raise ContinuityStateError(f"continuity state {name} is unknown")
+    protection_configured = any(
+        workload.protection is not None for workload in manifest.workloads
+    )
+    if protection_configured and "protection" not in state:
+        state["protection"] = None
+    elif state.get("protection") is not None and not isinstance(
+        state["protection"], dict
+    ):
+        raise ContinuityStateError("continuity state protection is invalid")
     return state, False
 
 
@@ -2149,12 +2756,76 @@ def _set_execution_state(
     }
 
 
+def _clear_protection_state(
+    manifest: ContinuityManifest,
+    state: dict[str, Any],
+) -> None:
+    if any(workload.protection is not None for workload in manifest.workloads):
+        state["protection"] = None
+    else:
+        state.pop("protection", None)
+
+
+def _record_protection_assessment(
+    manifest: ContinuityManifest,
+    state: dict[str, Any],
+    workload: Workload,
+    *,
+    inspector: ProtectionInspector,
+    require_active: bool,
+    now_ns: int,
+    alerts_to_deliver: list[Path],
+) -> dict[str, object] | None:
+    if workload.protection is None:
+        _clear_protection_state(manifest, state)
+        return None
+    assessment = verify_workload_protection(
+        manifest,
+        workload.workload_id,
+        inspector=inspector,
+        require_active=require_active,
+    )
+    state["protection"] = assessment.as_dict()
+    if assessment.valid:
+        return None
+    blocked_reason: dict[str, object] = {
+        "code": "protection_ownership_drift",
+        "workload_id": workload.workload_id,
+        "require_active": require_active,
+        "reasons": list(assessment.reasons),
+    }
+    alert, created = _write_alert(
+        manifest,
+        state,
+        kind="protection_ownership_drift",
+        dedupe_key=_digest_bytes(
+            _canonical_bytes(
+                {
+                    "workload_id": workload.workload_id,
+                    "reasons": list(assessment.reasons),
+                }
+            )
+        ),
+        severity="critical",
+        message=(
+            f"protection ownership for workload {workload.workload_id} "
+            "does not match the pinned manifest"
+        ),
+        now_ns=now_ns,
+        details=blocked_reason,
+    )
+    if created:
+        alerts_to_deliver.append(alert)
+    return blocked_reason
+
+
 def reconcile_training_continuity(
     manifest_path: str | Path,
     *,
     now_ns: int | None = None,
     hardware_report_path: str | Path | None = None,
     unit_manager: UnitManager | None = None,
+    protection_inspector: ProtectionInspector | None = None,
     alert_runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
 ) -> dict[str, object]:
     """Idempotently reconcile host execution with the pinned continuity policy."""
@@ -2162,6 +2833,13 @@ def reconcile_training_continuity(
     manifest = load_continuity_manifest(manifest_path)
     now = time.time_ns() if now_ns is None else now_ns
     manager = SystemdUnitManager() if unit_manager is None else unit_manager
+    inspector = (
+        protection_inspector
+        if protection_inspector is not None
+        else manager
+        if isinstance(manager, SystemdUnitManager)
+        else SystemdUnitManager()
+    )
     report_override = (
         Path(hardware_report_path).expanduser().resolve()
         if hardware_report_path is not None
@@ -2225,6 +2903,7 @@ def reconcile_training_continuity(
 
             if len(active_ids) > 1:
                 state["phase"] = "blocked_split_brain"
+                _clear_protection_state(manifest, state)
                 state["blocked_reason"] = {
                     "code": "multiple_live_workloads",
                     "workload_ids": sorted(active_ids),
@@ -2259,6 +2938,7 @@ def reconcile_training_continuity(
                     isinstance(expected_id, str) and active_id != expected_id
                 )
                 if unexpected:
+                    _clear_protection_state(manifest, state)
                     state["phase"] = "blocked_unexpected_active"
                     state["blocked_reason"] = {
                         "code": "unexpected_or_quarantined_workload_active",
@@ -2283,6 +2963,15 @@ def reconcile_training_continuity(
                     if created:
                         alerts_to_deliver.append(alert)
                 else:
+                    protection_block = _record_protection_assessment(
+                        manifest,
+                        state,
+                        workload,
+                        inspector=inspector,
+                        require_active=True,
+                        now_ns=now,
+                        alerts_to_deliver=alerts_to_deliver,
+                    )
                     productivity = assess_workload_productivity(
                         workload,
                         now_ns=now,
@@ -2321,7 +3010,7 @@ def reconcile_training_continuity(
                             "hardware_status": hardware.status,
                         }
                         if not hardware.safe
-                        else None
+                        else protection_block
                     )
                     if not hardware.safe:
                         alert, created = _write_alert(
@@ -2384,6 +3073,7 @@ def reconcile_training_continuity(
                 # lease.  Unknown owners are never interrupted or raced.
                 state["phase"] = "busy_external"
                 state["active_workload_id"] = None
+                _clear_protection_state(manifest, state)
                 state["blocked_reason"] = {
                     "code": "execution_lock_held",
                     "lock_path": str(manifest.execution_lock_path),
@@ -2396,6 +3086,7 @@ def reconcile_training_continuity(
             ):
                 state["phase"] = "operator_hold"
                 state["active_workload_id"] = None
+                _clear_protection_state(manifest, state)
                 state["blocked_reason"] = {
                     "code": "operator_hold",
                     "path": str(manifest.operator_hold_path),
@@ -2410,6 +3101,7 @@ def reconcile_training_continuity(
                     statuses=statuses,
                     hardware=hardware,
                     manager=manager,
+                    protection_inspector=inspector,
                     now_ns=now,
                     alerts_to_deliver=alerts_to_deliver,
                 )
@@ -2436,6 +3128,7 @@ def _reconcile_stopped_host(
     statuses: Mapping[str, UnitStatus],
     hardware: HardwareAssessment,
     manager: UnitManager,
+    protection_inspector: ProtectionInspector,
     now_ns: int,
     alerts_to_deliver: list[Path],
 ) -> dict[str, object]:
@@ -2623,6 +3316,21 @@ def _reconcile_stopped_host(
         _persist_state(manifest, state, previous, now_ns=now_ns)
         return copy.deepcopy(state)
 
+    protection_block = _record_protection_assessment(
+        manifest,
+        state,
+        target,
+        inspector=protection_inspector,
+        require_active=False,
+        now_ns=now_ns,
+        alerts_to_deliver=alerts_to_deliver,
+    )
+    if protection_block is not None and manifest.automatic_start:
+        state["phase"] = "blocked_protection_drift"
+        state["blocked_reason"] = protection_block
+        _persist_state(manifest, state, previous, now_ns=now_ns)
+        return copy.deepcopy(state)
+
     if not hardware.safe:
         state["phase"] = (
             "blocked_hardware_unsafe"
@@ -2651,7 +3359,7 @@ def _reconcile_stopped_host(
 
     if not manifest.automatic_start:
         state["phase"] = "ready_manual_start"
-        state["blocked_reason"] = None
+        state["blocked_reason"] = protection_block
         _persist_state(manifest, state, previous, now_ns=now_ns)
         return copy.deepcopy(state)
 
@@ -2787,6 +3495,7 @@ def run_locked_workload(
     orchestrator: str | Path,
     exec_fn: Callable[[str, list[str], dict[str, str]], Any] = _exec_workload,
     now_ns: int | None = None,
+    protection_inspector: ProtectionInspector | None = None,
 ) -> Any:
     """Verify and exec one coordinator while holding the host GPU lock."""
 
@@ -2844,6 +3553,17 @@ def run_locked_workload(
         # Re-verify after obtaining the execution lease to close the normal
         # preflight-to-exec drift window.
         verification = verify_workload(manifest, workload_id)
+        protection = verify_workload_protection(
+            manifest,
+            workload_id,
+            inspector=protection_inspector,
+            require_active=False,
+        )
+        if not protection.valid:
+            raise ContinuityError(
+                f"protection ownership is not verified for workload {workload_id}: "
+                + "; ".join(protection.reasons)
+            )
         hardware = assess_hardware(
             manifest,
             now_ns=time.time_ns() if now_ns is None else now_ns,

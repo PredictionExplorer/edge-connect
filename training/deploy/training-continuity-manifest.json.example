@@ -33,6 +33,15 @@
         "orchestrator_sha256": "@ORCHESTRATOR_SHA256@",
         "unit_path": "/etc/systemd/system/@PRIMARY_UNIT@",
         "unit_sha256": "@PRIMARY_UNIT_SHA256@"
+      },
+      "protection": {
+        "replay_backup_timer": "edgeconnect-startrain-@PRIMARY_PROTECTION_ID@-backup.timer",
+        "disaster_backup_timer": "edgeconnect-startrain-@PRIMARY_PROTECTION_ID@-disaster-backup.timer",
+        "disaster_backup_root": "@PRIMARY_DISASTER_BACKUP_ROOT@",
+        "disaster_backup_mount": "@PRIMARY_DISASTER_BACKUP_MOUNT@",
+        "mac_acknowledgement_namespace": "@PRIMARY_DISASTER_BACKUP_ROOT@/acknowledgements",
+        "telemetry_service": "edgeconnect-startrain-@PRIMARY_PROTECTION_ID@-monitor.service",
+        "telemetry_output": "@PRIMARY_RUN_ROOT@/status/monitor-5s.jsonl"
       }
     },
     {
@@ -55,6 +64,15 @@
         "orchestrator_sha256": "@ORCHESTRATOR_SHA256@",
         "unit_path": "/etc/systemd/system/@FALLBACK_UNIT@",
         "unit_sha256": "@FALLBACK_UNIT_SHA256@"
+      },
+      "protection": {
+        "replay_backup_timer": "edgeconnect-startrain-@FALLBACK_PROTECTION_ID@-backup.timer",
+        "disaster_backup_timer": "edgeconnect-startrain-@FALLBACK_PROTECTION_ID@-disaster-backup.timer",
+        "disaster_backup_root": "@FALLBACK_DISASTER_BACKUP_ROOT@",
+        "disaster_backup_mount": "@FALLBACK_DISASTER_BACKUP_MOUNT@",
+        "mac_acknowledgement_namespace": "@FALLBACK_DISASTER_BACKUP_ROOT@/acknowledgements",
+        "telemetry_service": "edgeconnect-startrain-@FALLBACK_PROTECTION_ID@-monitor.service",
+        "telemetry_output": "@FALLBACK_RUN_ROOT@/status/monitor-5s.jsonl"
       },
       "last_known_good": {
         "verified_ns": @FALLBACK_VERIFIED_NS@,

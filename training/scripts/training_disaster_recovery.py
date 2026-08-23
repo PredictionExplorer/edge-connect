@@ -936,7 +936,8 @@ def _pointer_checkpoint(
     run_id: str,
     generation_family: str,
     name: str,
-) -> None:
+    allow_concurrent_removal: bool = False,
+) -> bool:
     if (
         payload.get("run_id") != run_id
         or payload.get("generation_family") != generation_family
@@ -953,11 +954,17 @@ def _pointer_checkpoint(
     )
     _positive_int(f"{name} checkpoint_bytes", payload.get("checkpoint_bytes"))
     source = builder.run_root / PurePosixPath(pointer_logical).parent / checkpoint_value
-    builder.add_run_file(
-        source,
-        "checkpoint",
-        expected_sha256=checkpoint_sha256,
-    )
+    try:
+        builder.add_run_file(
+            source,
+            "checkpoint",
+            expected_sha256=checkpoint_sha256,
+        )
+    except DisasterRecoveryError:
+        if allow_concurrent_removal and not source.exists():
+            return False
+        raise
+    return True
 
 
 def _add_recovery_journal(
@@ -1009,20 +1016,26 @@ def _add_recovery_journal(
     retained.reverse()
     if not retained:
         return
-    builder.add_bytes(
-        b"".join(_canonical_json(payload) for payload in retained),
-        logical,
-        "learner-metadata",
-    )
+    captured: list[dict[str, Any]] = []
     for line_number, payload in enumerate(retained, start=1):
-        _pointer_checkpoint(
+        if not _pointer_checkpoint(
             builder,
             payload,
             pointer_logical=logical,
             run_id=run_id,
             generation_family=generation_family,
             name=f"recovery journal line {line_number}",
-        )
+            allow_concurrent_removal=True,
+        ):
+            continue
+        captured.append(payload)
+    if not captured:
+        return
+    builder.add_bytes(
+        b"".join(_canonical_json(payload) for payload in captured),
+        logical,
+        "learner-metadata",
+    )
 
 
 def _resolve_source_reference(
@@ -1046,10 +1059,10 @@ def _add_warm_start(
     *,
     run_id: str,
     generation_family: str,
-) -> None:
+    allow_missing_checkpoint: bool = False,
+) -> bool:
     source, logical = _path_within(builder.run_root, path, name="warm-start marker")
-    entry = builder.add(source, logical, "learner-metadata")
-    payload = _read_catalog_json(builder, entry, name="champion warm-start marker")
+    payload = _read_json_file(source, name="champion warm-start marker")
     if (
         payload.get("format") != "startrain.champion-warm-start"
         or payload.get("schema_version") != 1
@@ -1058,14 +1071,16 @@ def _add_warm_start(
         or payload.get("generation_family") != generation_family
     ):
         raise DisasterRecoveryError("champion warm-start marker is incompatible")
-    _pointer_checkpoint(
+    if not _pointer_checkpoint(
         builder,
         payload,
         pointer_logical=logical,
         run_id=run_id,
         generation_family=generation_family,
         name="champion warm-start marker",
-    )
+        allow_concurrent_removal=allow_missing_checkpoint,
+    ):
+        return False
     source_manifest = payload.get("source_manifest")
     if source_manifest is not None:
         manifest_path = _resolve_source_reference(
@@ -1091,6 +1106,19 @@ def _add_warm_start(
             raise DisasterRecoveryError(
                 "warm-start source manifest evidence disagrees with artifact"
             )
+    entry = builder.add(source, logical, "learner-metadata")
+    if (
+        _read_catalog_json(
+            builder,
+            entry,
+            name="champion warm-start marker",
+        )
+        != payload
+    ):
+        raise DisasterRecoveryError(
+            "champion warm-start marker changed during snapshot"
+        )
+    return True
 
 
 def _manifest_references(value: Any) -> Iterator[str]:
@@ -1417,6 +1445,7 @@ def _collect_payloads(
                 path,
                 run_id=identity.run_id,
                 generation_family=identity.generation_family,
+                allow_missing_checkpoint=cutover.is_file(),
             )
         else:
             builder.add_run_file(path, "learner-metadata")

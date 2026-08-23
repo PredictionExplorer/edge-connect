@@ -698,6 +698,28 @@ manifest and its SHA-256, training directory, orchestrator path/hash, and
 installed systemd unit path/hash. The release manifest must enumerate hashes for
 every launch-critical source file. Profile/run verification alone does not
 identify the code that will execute.
+
+For continuity-aware protection, add an optional, all-or-nothing `protection`
+object to each workload that may start automatically:
+
+```json
+"protection": {
+  "replay_backup_timer": "edgeconnect-startrain-<owner>-backup.timer",
+  "disaster_backup_timer": "edgeconnect-startrain-<owner>-disaster-backup.timer",
+  "disaster_backup_root": "/lambda/nfs/<filesystem>/edgeconnect-dr/<owner>",
+  "disaster_backup_mount": "/lambda/nfs/<filesystem>",
+  "mac_acknowledgement_namespace": "/lambda/nfs/<filesystem>/edgeconnect-dr/<owner>/acknowledgements",
+  "telemetry_service": "edgeconnect-startrain-<owner>-monitor.service",
+  "telemetry_output": "/absolute/run/root/status/monitor-5s.jsonl"
+}
+```
+
+The fields are strict: unit and output names must be unique, backup roots may
+not overlap, the DR root must be below its mount, the Mac namespace must be
+below `acknowledgements`, and telemetry must be a JSONL file below that
+workload's `status` directory. A workload may omit `protection`; manifests
+without protection objects retain the legacy behavior and API.
+
 Keep mutable continuity state under `/var/lib/edgeconnect`, outside every run
 root. Pre-create the shared GPU execution lock for the training user and its
 private operations group:
@@ -718,6 +740,45 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now edgeconnect-startrain-continuity.timer
 sudo systemctl start edgeconnect-startrain-continuity.service
 ```
+
+The protection renderer accepts only the atomically pinned manifest under the
+state root. During first installation, create the configured operator hold and
+run the reconciler once to pin the manifest without starting a workload. Then
+render into a staging directory:
+
+```bash
+python scripts/render_workload_protection_units.py \
+  --manifest "$STATE_ROOT/continuity-manifest.json" \
+  --workload "$WORKLOAD_ID" \
+  --output-directory "$RENDER_ROOT/$WORKLOAD_ID" \
+  --user "$USER" \
+  --provisioned-gpus 8
+```
+
+The command verifies the workload hashes and deterministically renders the
+existing replay-backup, disaster-backup, and strength-report service/timer
+templates plus a restartable five-second monitor service. It never invokes
+systemd and refuses to write directly into the systemd installation tree.
+Existing staged files are not overwritten; use `--replace-existing` only for a
+deliberate atomic replacement after reviewing the diff.
+
+Before removing the operator hold, install the reviewed units, create and
+verify the first DR snapshot so `namespace.json` is bound to this exact run
+root, and enable the workload's replay timer, DR timer, telemetry service, and
+report timer. The telemetry service may restart until continuity records the
+workload active. The controller requires the pinned protection definitions,
+enabled ownership, and both backup timers active before an automatic start;
+once the workload is active, its telemetry service must also be active and
+protection for inactive workloads must not be running.
+
+For a fallback or experiment cutover, first take the old workload's final local
+and DR backups, gracefully stop it, then stop/disable its protection units.
+While the GPU host is stopped, install/enable the target protection units and
+verify the target DR namespace before reconciling the target. Do not share a DR
+root or Mac acknowledgement namespace across workloads. Ownership drift writes
+an immutable `protection_ownership_drift` alert and blocks a new automatic
+start. It does not stop an otherwise healthy active workload; the operator can
+repair protection without sacrificing training progress.
 
 Install `deploy/edgeconnect-startrain-continuity-trigger.conf.example` as a
 drop-in on finite queue units for immediate handoff. The one-minute timer remains
@@ -882,6 +943,24 @@ For durable phase-aware telemetry, run a second monitor at five-second cadence:
 This retains GPU utilization/power, learner UTD inputs, replay model-step lag,
 candidate arrival/service ratio, supersession, and arena/GPU7 occupancy. Do not
 infer useful Elo efficiency from GPU utilization alone.
+
+On a continuity-managed host, `--continuity-manifest` resolves the run root,
+profile, training unit, DR root, Mac acknowledgement namespace, and continuity
+state from the state's `active_workload_id`:
+
+```bash
+"$MONITOR_PYTHON" -u "$MONITOR_TRAINING/scripts/monitor_run.py" \
+  --continuity-manifest "$STATE_ROOT/continuity-manifest.json" \
+  --interval 5 --format jsonl \
+  --telemetry-output "$RUN_ROOT/status/monitor-5s.jsonl"
+```
+
+An explicit `--run-root`, `--profile`, `--unit`, `--continuity-state`, or
+`--disaster-backup-root` is accepted only when it matches the resolved active
+workload. A missing active workload, stale manifest hash, or conflicting
+argument fails before monitoring begins. The rendered monitor service supplies
+matching explicit values so its output remains bound to one workload during a
+cutover.
 
 For structured stdout ingestion, use `--format jsonl`. A one-shot status check is:
 
@@ -1116,6 +1195,10 @@ python scripts/pull_training_snapshot.py \
   --run-id "$RUN_ID" \
   --ack-remote-path "$DR_ROOT/acknowledgements/<mac-name>.json"
 ```
+
+For a protected continuity workload, place the acknowledgement file below that
+workload's manifest-pinned `mac_acknowledgement_namespace`. The namespace must
+remain below its own DR root's `acknowledgements` directory.
 
 Install the rendered
 `deploy/com.edgeconnect.training-backup.plist.example` with `launchctl`.

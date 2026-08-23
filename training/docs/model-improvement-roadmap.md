@@ -70,10 +70,16 @@ do not infer progress from loss, throughput, or promotion counts alone.
 
 ### One-factor treatments
 
-- [-] Reference-validated optimizer alternative versus Muon+AdamW.
-- [-] Example-normalized EMA / longer candidate cadence.
-- [-] Champion-only versus 50/50 candidate/champion self-play.
-- [-] Synthetic clinch auxiliaries versus exact-outcome-only clinch targets.
+- [x] Reference-validated optimizer alternative versus Muon+AdamW: seed-17
+  screen completed with no promoted frontier gain.
+- [x] Example-normalized EMA: seed-17 screen completed with no promoted
+  frontier gain.
+- [x] Champion-only versus 50/50 candidate/champion self-play: seed-17 screen
+  completed with no promoted frontier gain.
+- [x] Synthetic clinch auxiliaries versus exact-outcome-only clinch targets:
+  seed-17 screen completed with no promoted frontier gain.
+- [ ] Frozen-live candidate publication cadence: exact live control versus a
+  five-million-learner-example cadence, with no other profile change.
 
 ### Gates
 
@@ -83,6 +89,27 @@ do not infer progress from loss, throughput, or promotion counts alone.
 - [ ] Held-out policy/value calibration improvement.
 - [ ] H100 throughput remains within the preregistered limit.
 - [ ] Seed-17 pair-valid Elo/hour is positive before confirmation.
+
+### Preregistered live cadence trial
+
+- [ ] Suite: `ring10-live-cadence`.
+- [ ] Control: `ring10-live-cadence-control`, preserving every learner cadence
+  field from the frozen live ring-10-only profile.
+- [ ] Treatment: `ring10-live-cadence-5m`, changing only
+  `learner.candidate_interval_examples` to `5000000`.
+- [ ] Invariants: UTD `1.0`; identical model, optimizer, replay policy,
+  topology, actor self-play, model-refresh policy, arena, champion anchor, and
+  replay cutoff.
+- [ ] Exclusions: do not queue the null optimizer, EMA, freshness, or clinch
+  arms and do not use the canonicalizing `ring10-optimization` control.
+- [ ] Screen: seed 17, fixed eight-hour and two-billion-leaf budget per arm,
+  charging all eight H100s through resource release.
+- [ ] Operational gate: candidate arrival/service ratio `<= 1.20`, or at least
+  a 25% relative reduction from control.
+- [ ] Statistical gate: eligible positive pair-valid chronological
+  champion-frontier ring-10 Elo/hour evidence at screening; confirmation still
+  requires positive candidate-LCB minus control-UCB in every seed and at least
+  20% median point Elo/hour improvement across seeds 17, 18, and 19.
 
 ## Phase 2: parameter-matched attention reallocation
 
@@ -148,6 +175,27 @@ Result:
 Decision:
 ```
 
+```text
+ID: R10-LIVE-CADENCE-01
+Phase: 1 — training dynamics / arena backlog
+Status: preregistered; not started
+Hypothesis: reducing candidate publication frequency clears arena backlog
+  without reducing pair-valid champion-frontier Elo gained per wall hour
+Commit: to be frozen before execution
+Release: to be frozen before execution
+Control: ring10-live-cadence-control
+Treatment: ring10-live-cadence-5m
+Anchor/replay cutoff: one common stopped live ring-10-only boundary; pending
+Seeds: 17 screen; 17, 18, 19 only after both screening gates pass
+Budget: 8 hours / 2B leaves per screen arm; 12 hours per confirmation arm
+System gates: arrival/service <=1.20 or >=25% relative reduction versus control
+Statistical gate: standard pair-valid Elo/hour screening and three-seed gate
+NFS snapshot: pending
+Mac acknowledgement: pending
+Result: pending
+Decision: pending
+```
+
 ## Compute ledger
 
 Record provisioned rather than utilized GPU-hours.
@@ -174,3 +222,11 @@ instead, then inspect the finalized seed-17 frontier before spending another
 Decision: diagnose training dynamics and target/replay freshness before scaling.
 Repeated rejected candidates are evidence of harmful or inconclusive updates,
 not evidence of a demonstrated model-capacity ceiling.
+
+### 2026-08-22 — Isolate the live cadence transition
+
+Decision: preregister only an exact frozen-live control and a five-million
+example candidate-publication treatment. The completed optimizer, EMA,
+freshness, and clinch screen had no promoted frontier gain, so those arms are
+excluded. Backlog relief is necessary but insufficient: the treatment must also
+pass the standard pair-valid Elo/hour gates.

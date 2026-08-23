@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+from copy import deepcopy
 from pathlib import Path
 
 import pytest
@@ -14,6 +15,7 @@ from scripts.prepare_elo_ablation import (
     RING10_ATTENTION_TREATMENTS,
     RING10_CAPACITY_TREATMENTS,
     RING10_EFFICIENCY_TREATMENTS,
+    RING10_LIVE_CADENCE_TREATMENTS,
     RING10_ONLY_TREATMENTS,
     RING10_OPTIMIZATION_TREATMENTS,
     RING10_RELATIONAL_TREATMENTS,
@@ -97,6 +99,27 @@ def _prepare(tmp_path: Path) -> tuple[dict[str, object], Path]:
         treatments=DEFAULT_TREATMENTS,
     )
     return manifest, output
+
+
+def _write_live_ring10_profile(tmp_path: Path) -> tuple[Path, dict[str, object]]:
+    raw = yaml.safe_load(
+        (CONFIGS / "h100-8gpu-ring10-only.yaml").read_text(encoding="utf-8")
+    )
+    assert isinstance(raw, dict)
+    learner = raw["learner"]
+    assert isinstance(learner, dict)
+    learner.update(
+        {
+            "candidate_interval_examples": 2_000_000,
+            "selfplay_snapshot_interval_examples": None,
+            "selfplay_snapshot_warmup_examples": 0,
+            "selfplay_snapshot_warmup_interval_examples": None,
+            "target_updates_per_new_sample": 1.0,
+        }
+    )
+    profile = tmp_path / "frozen-live-ring10.yaml"
+    profile.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+    return profile, raw
 
 
 def test_prepare_generates_strict_one_factor_profiles(tmp_path: Path) -> None:
@@ -475,6 +498,174 @@ def test_prepare_generates_ring10_cadence_and_freshness_suite(
     assert freshness.learner.selfplay_snapshot_interval_examples == 3_000_000
 
 
+def test_prepare_generates_frozen_live_ring10_cadence_suite(
+    tmp_path: Path,
+) -> None:
+    base, frozen = _write_live_ring10_profile(tmp_path)
+    source = tmp_path / "source-run"
+    source.mkdir()
+    output = tmp_path / "ring10-live-cadence-profiles"
+    run_root_parent = tmp_path / "ring10-live-cadence-runs"
+
+    manifest = prepare_elo_ablation(
+        base_config=base,
+        output_dir=output,
+        run_root_parent=run_root_parent,
+        run_id="shared-parent-run",
+        source_run_root=source,
+        prefix="ring10-live-cadence",
+        seed=17,
+        wall_budget_hours=8,
+        leaf_budget=2_000_000_000,
+        guard_floor_elo=-35,
+        treatments=RING10_LIVE_CADENCE_TREATMENTS,
+        guard_rings=(),
+        suite="ring10-live-cadence",
+    )
+
+    assert manifest["suite"] == "ring10-live-cadence"
+    assert manifest["initialization"] == "fork"
+    assert manifest["training_objective"] == "ring10_only"
+    assert manifest["promotion_objective"] == "ring_10_only"
+    assert manifest["guard_rings"] == []
+    assert [item["treatment"] for item in _treatment_records(manifest)] == list(
+        RING10_LIVE_CADENCE_TREATMENTS
+    )
+
+    control_raw = yaml.safe_load(
+        (output / "ring10-live-cadence-control.yaml").read_text(encoding="utf-8")
+    )
+    treatment_raw = yaml.safe_load(
+        (output / "ring10-live-cadence-5m.yaml").read_text(encoding="utf-8")
+    )
+    expected_control = deepcopy(frozen)
+    control_orchestration = expected_control["orchestration"]
+    assert isinstance(control_orchestration, dict)
+    control_orchestration["run_id"] = "shared-parent-run"
+    control_directories = control_orchestration["directories"]
+    assert isinstance(control_directories, dict)
+    control_directories["root"] = str(
+        run_root_parent / "ring10-live-cadence-ring10-live-cadence-control-seed17"
+    )
+    assert control_raw == expected_control
+
+    expected_treatment = deepcopy(expected_control)
+    treatment_orchestration = expected_treatment["orchestration"]
+    assert isinstance(treatment_orchestration, dict)
+    treatment_directories = treatment_orchestration["directories"]
+    assert isinstance(treatment_directories, dict)
+    treatment_directories["root"] = str(
+        run_root_parent / "ring10-live-cadence-ring10-live-cadence-5m-seed17"
+    )
+    treatment_learner = expected_treatment["learner"]
+    assert isinstance(treatment_learner, dict)
+    treatment_learner["candidate_interval_examples"] = 5_000_000
+    assert treatment_raw == expected_treatment
+
+    control = load_config(output / "ring10-live-cadence-control.yaml")
+    treatment = load_config(output / "ring10-live-cadence-5m.yaml")
+    assert control.learner.candidate_interval_examples == 2_000_000
+    assert treatment.learner.candidate_interval_examples == 5_000_000
+    for profile in (control, treatment):
+        assert profile.learner.target_updates_per_new_sample == 1.0
+        assert profile.learner.selfplay_snapshot_interval_examples is None
+        assert profile.learner.selfplay_snapshot_warmup_examples == 0
+        assert profile.learner.selfplay_snapshot_warmup_interval_examples is None
+        assert profile.orchestration.model_refresh.selfplay_source == "champion"
+        assert profile.arena.rings == (10,)
+        assert profile.arena.per_ring_regression_floor_elo == {}
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected_error"),
+    [
+        ("missing-candidate-cadence", "explicit learner.candidate_interval_examples"),
+        ("already-at-target", "below 5000000"),
+        ("slower-than-target", "below 5000000"),
+        ("missing-utd", "frozen UTD=1.0"),
+        ("different-utd", "frozen UTD=1.0"),
+        ("generalist-objective", "requires a ring10_only base profile"),
+        ("multi-ring-arena", "requires a single-ring unguarded legacy arena"),
+    ],
+)
+def test_live_ring10_cadence_suite_rejects_ambiguous_base(
+    tmp_path: Path,
+    mutation: str,
+    expected_error: str,
+) -> None:
+    base, raw = _write_live_ring10_profile(tmp_path)
+    learner = raw["learner"]
+    assert isinstance(learner, dict)
+    if mutation == "missing-candidate-cadence":
+        learner.pop("candidate_interval_examples")
+    elif mutation == "already-at-target":
+        learner["candidate_interval_examples"] = 5_000_000
+    elif mutation == "slower-than-target":
+        learner["candidate_interval_examples"] = 6_000_000
+    elif mutation == "missing-utd":
+        learner.pop("target_updates_per_new_sample")
+    elif mutation == "different-utd":
+        learner["target_updates_per_new_sample"] = 0.75
+    elif mutation == "generalist-objective":
+        orchestration = raw["orchestration"]
+        assert isinstance(orchestration, dict)
+        orchestration["training_objective"] = "generalist"
+    elif mutation == "multi-ring-arena":
+        arena = raw["arena"]
+        assert isinstance(arena, dict)
+        arena["rings"] = [4, 6, 8, 10]
+    else:
+        raise AssertionError(f"unsupported mutation: {mutation}")
+    base.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+    source = tmp_path / "source"
+    source.mkdir()
+    output = tmp_path / "profiles"
+
+    with pytest.raises(ValueError, match=expected_error):
+        prepare_elo_ablation(
+            base_config=base,
+            output_dir=output,
+            run_root_parent=tmp_path / "runs",
+            run_id="shared-parent-run",
+            source_run_root=source,
+            prefix="ring10-live-cadence",
+            seed=17,
+            wall_budget_hours=8,
+            leaf_budget=2_000_000_000,
+            guard_floor_elo=-35,
+            treatments=RING10_LIVE_CADENCE_TREATMENTS,
+            guard_rings=(),
+            suite="ring10-live-cadence",
+        )
+    assert not output.exists()
+
+
+def test_live_ring10_cadence_treatments_require_complete_suite(
+    tmp_path: Path,
+) -> None:
+    base, _ = _write_live_ring10_profile(tmp_path)
+    source = tmp_path / "source"
+    source.mkdir()
+    output = tmp_path / "profiles"
+
+    with pytest.raises(ValueError, match="complete --suite ring10-live-cadence"):
+        prepare_elo_ablation(
+            base_config=base,
+            output_dir=output,
+            run_root_parent=tmp_path / "runs",
+            run_id="shared-parent-run",
+            source_run_root=source,
+            prefix="ring10-live-cadence",
+            seed=17,
+            wall_budget_hours=8,
+            leaf_budget=2_000_000_000,
+            guard_floor_elo=-35,
+            treatments=RING10_LIVE_CADENCE_TREATMENTS,
+            guard_rings=(),
+        )
+    assert not output.exists()
+
+
 def test_prepare_generates_ring10_training_dynamics_suite(tmp_path: Path) -> None:
     source = tmp_path / "source"
     source.mkdir()
@@ -774,6 +965,13 @@ def test_resolve_treatments_keeps_suites_fail_closed() -> None:
             treatments=None,
         )
         == RING10_OPTIMIZATION_TREATMENTS
+    )
+    assert (
+        resolve_treatments(
+            suite="ring10-live-cadence",
+            treatments=None,
+        )
+        == RING10_LIVE_CADENCE_TREATMENTS
     )
     with pytest.raises(ValueError, match="cannot be combined"):
         resolve_treatments(

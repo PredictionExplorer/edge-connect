@@ -10,6 +10,7 @@ import pytest
 import yaml
 
 from scripts import monitor_run as monitor
+from startrain import continuity
 
 CONFIGS = Path(__file__).parents[1] / "configs"
 
@@ -17,6 +18,141 @@ CONFIGS = Path(__file__).parents[1] / "configs"
 def _write_json(path: Path, payload: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload), encoding="utf-8")
+
+
+def _continuity_fixture(tmp_path: Path) -> dict[str, Path]:
+    state_root = (tmp_path / "continuity-state").resolve()
+    primary_root = (tmp_path / "primary-run").resolve()
+    fallback_root = (tmp_path / "fallback-run").resolve()
+    disaster_mount = (tmp_path / "disaster").resolve()
+    disaster_root = (disaster_mount / "primary").resolve()
+    fallback_disaster_root = (disaster_mount / "fallback").resolve()
+    training_dir = (tmp_path / "release" / "training").resolve()
+    for path in (
+        state_root,
+        primary_root,
+        fallback_root,
+        disaster_root,
+        fallback_disaster_root,
+        training_dir,
+    ):
+        path.mkdir(parents=True)
+    primary_profile = (primary_root / "profile.yaml").resolve()
+    fallback_profile = (fallback_root / "profile.yaml").resolve()
+    primary_profile.write_text("{}\n", encoding="utf-8")
+    fallback_profile.write_text("{}\n", encoding="utf-8")
+    digest = "a" * 64
+    runtime_manifest = (tmp_path / "release" / "release.json").resolve()
+    orchestrator = (training_dir / ".venv" / "bin" / "orchestrator").resolve()
+    unit_root = (tmp_path / "units").resolve()
+    unit_root.mkdir()
+
+    def workload(
+        workload_id: str,
+        role: str,
+        root: Path,
+        profile: Path,
+        unit: str,
+    ) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "id": workload_id,
+            "role": role,
+            "unit": unit,
+            "profile": {"path": str(profile), "sha256": digest},
+            "run_root": {"path": str(root), "sha256": digest},
+            "runtime": {
+                "manifest": str(runtime_manifest),
+                "sha256": digest,
+                "training_dir": str(training_dir),
+                "orchestrator": str(orchestrator),
+                "orchestrator_sha256": digest,
+                "unit_path": str(unit_root / unit),
+                "unit_sha256": digest,
+            },
+        }
+        if role == "fallback":
+            payload["last_known_good"] = {"verified_ns": 1}
+        return payload
+
+    primary = workload(
+        "primary",
+        "primary",
+        primary_root,
+        primary_profile,
+        "edgeconnect-primary.service",
+    )
+
+    def protection(owner: str, root: Path, backup_root: Path) -> dict[str, object]:
+        return {
+            "replay_backup_timer": (f"edgeconnect-startrain-{owner}-backup.timer"),
+            "disaster_backup_timer": (
+                f"edgeconnect-startrain-{owner}-disaster-backup.timer"
+            ),
+            "disaster_backup_root": str(backup_root),
+            "disaster_backup_mount": str(disaster_mount),
+            "mac_acknowledgement_namespace": str(
+                backup_root / "acknowledgements" / owner
+            ),
+            "telemetry_service": (f"edgeconnect-startrain-{owner}-monitor.service"),
+            "telemetry_output": str(root / "status" / "monitor-5s.jsonl"),
+        }
+
+    primary["protection"] = protection("primary", primary_root, disaster_root)
+    fallback = workload(
+        "fallback-lkg",
+        "fallback",
+        fallback_root,
+        fallback_profile,
+        "edgeconnect-fallback.service",
+    )
+    fallback["protection"] = protection(
+        "fallback-lkg",
+        fallback_root,
+        fallback_disaster_root,
+    )
+    manifest_path = (tmp_path / "continuity.json").resolve()
+    _write_json(
+        manifest_path,
+        {
+            "format": continuity.MANIFEST_FORMAT,
+            "schema_version": 1,
+            "state_root": str(state_root),
+            "locks": {
+                "transition": str(state_root / "transition.lock"),
+                "execution": str(tmp_path / "execution.lock"),
+            },
+            "hardware": {
+                "report_path": str(state_root / "hardware.json"),
+                "max_age_seconds": 180,
+                "probe_workload": "fallback-lkg",
+            },
+            "primary": "primary",
+            "workloads": [primary, fallback],
+        },
+    )
+    manifest = continuity.load_continuity_manifest(manifest_path)
+    _write_json(
+        manifest.state_path,
+        {
+            "format": continuity.STATE_FORMAT,
+            "schema_version": 1,
+            "manifest_sha256": manifest.sha256,
+            "active_workload_id": "primary",
+            "active_profile_sha256": digest,
+            "active_run_root_sha256": digest,
+        },
+    )
+    return {
+        "manifest": manifest_path,
+        "run_root": primary_root,
+        "profile": primary_profile,
+        "state": manifest.state_path,
+        "disaster_root": disaster_root,
+        "acknowledgements": disaster_root / "acknowledgements" / "primary",
+        "fallback_run_root": fallback_root,
+        "fallback_profile": fallback_profile,
+        "fallback_disaster_root": fallback_disaster_root,
+    }
 
 
 def _fixture(tmp_path: Path, *, now_ns: int) -> Path:
@@ -878,6 +1014,105 @@ def test_replay_reports_sample_weighted_model_step_lag(tmp_path) -> None:
         "weighted_p90": 20,
         "maximum": 20,
     }
+
+
+def test_continuity_manifest_resolves_active_monitor_target(tmp_path: Path) -> None:
+    paths = _continuity_fixture(tmp_path)
+
+    target = monitor.resolve_monitor_target(
+        paths["manifest"],
+        run_root=paths["run_root"],
+        profile_path=paths["profile"],
+        unit="edgeconnect-primary.service",
+        continuity_state_path=paths["state"],
+        disaster_backup_root=paths["disaster_root"],
+    )
+
+    assert target.run_root == paths["run_root"]
+    assert target.profile_path == paths["profile"]
+    assert target.unit == "edgeconnect-primary.service"
+    assert target.continuity_state_path == paths["state"]
+    assert target.disaster_backup_root == paths["disaster_root"]
+    assert target.mac_acknowledgement_namespace == paths["acknowledgements"]
+
+
+def test_continuity_manifest_follows_fallback_active_workload(
+    tmp_path: Path,
+) -> None:
+    paths = _continuity_fixture(tmp_path)
+    manifest = continuity.load_continuity_manifest(paths["manifest"])
+    _write_json(
+        paths["state"],
+        {
+            "format": continuity.STATE_FORMAT,
+            "schema_version": 1,
+            "manifest_sha256": manifest.sha256,
+            "active_workload_id": "fallback-lkg",
+            "active_profile_sha256": "a" * 64,
+            "active_run_root_sha256": "a" * 64,
+        },
+    )
+
+    target = monitor.resolve_monitor_target(paths["manifest"])
+
+    assert target.run_root == paths["fallback_run_root"]
+    assert target.profile_path == paths["fallback_profile"]
+    assert target.unit == "edgeconnect-fallback.service"
+    assert target.disaster_backup_root == paths["fallback_disaster_root"]
+
+
+def test_continuity_manifest_rejects_conflicting_explicit_monitor_inputs(
+    tmp_path: Path,
+) -> None:
+    paths = _continuity_fixture(tmp_path)
+    conflicts = (
+        ({"run_root": tmp_path / "other-run"}, "--run-root"),
+        ({"profile_path": tmp_path / "other.yaml"}, "--profile"),
+        ({"unit": "edgeconnect-other.service"}, "--unit"),
+        (
+            {"continuity_state_path": tmp_path / "other-state.json"},
+            "--continuity-state",
+        ),
+        (
+            {"disaster_backup_root": tmp_path / "other-disaster"},
+            "--disaster-backup-root",
+        ),
+    )
+
+    for arguments, option in conflicts:
+        with pytest.raises(ValueError, match=option):
+            monitor.resolve_monitor_target(paths["manifest"], **arguments)
+
+
+def test_main_uses_manifest_resolved_active_workload(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    paths = _continuity_fixture(tmp_path)
+    captured: dict[str, object] = {}
+
+    def fake_run_monitor(run_root: Path, **arguments: object) -> None:
+        captured["run_root"] = run_root
+        captured.update(arguments)
+
+    monkeypatch.setattr(monitor, "run_monitor", fake_run_monitor)
+    monkeypatch.setattr(monitor.signal, "signal", lambda *_args: None)
+
+    result = monitor.main(
+        [
+            "--continuity-manifest",
+            str(paths["manifest"]),
+            "--once",
+        ]
+    )
+
+    assert result == 0
+    assert captured["run_root"] == paths["run_root"]
+    assert captured["profile_path"] == paths["profile"]
+    assert captured["unit"] == "edgeconnect-primary.service"
+    assert captured["continuity_state_path"] == paths["state"]
+    assert captured["disaster_backup_root"] == paths["disaster_root"]
+    assert captured["mac_acknowledgement_namespace"] == paths["acknowledgements"]
 
 
 def test_run_monitor_once_emits_one_json_record(tmp_path, monkeypatch, capsys) -> None:

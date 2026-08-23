@@ -451,6 +451,92 @@ def test_snapshot_verify_restore_and_deduplicate(tmp_path: Path) -> None:
     assert second_profile["orchestration"]["directories"]["root"] == str(second_restore)
 
 
+def test_snapshot_skips_recovery_journal_checkpoint_removed_during_capture(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _fixture(tmp_path)
+    current = json.loads(
+        (fixture.root / "learner" / "recovery.json").read_text(encoding="utf-8")
+    )
+    stale_checkpoint, stale_digest = _content_addressed_file(
+        fixture.root / "learner" / "recovery",
+        prefix="sha256-",
+        suffix=".pt",
+        data=b"stale recovery checkpoint removed concurrently",
+    )
+    stale = {
+        **current,
+        "checkpoint": f"recovery/{stale_checkpoint.name}",
+        "checkpoint_sha256": stale_digest,
+        "checkpoint_bytes": stale_checkpoint.stat().st_size,
+        "step": 9,
+        "updated_ns": int(current["updated_ns"]) - 1,
+    }
+    journal = fixture.root / "learner" / "recovery.journal.jsonl"
+    journal.write_bytes(_encoded(stale) + _encoded(current))
+
+    original = recovery._pointer_checkpoint
+
+    def remove_stale_checkpoint(*args, **kwargs):
+        if kwargs.get("name") == "recovery journal line 1":
+            stale_checkpoint.unlink()
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(recovery, "_pointer_checkpoint", remove_stale_checkpoint)
+
+    snapshot = _snapshot(fixture, tmp_path / "backup")
+    assert recovery.verify_snapshot(snapshot)["status"] == "ok"
+    restored = recovery.restore_snapshot(
+        snapshot,
+        tmp_path / "restored-after-journal-race",
+        relocate_profile=True,
+    )
+    rows = [
+        json.loads(line)
+        for line in (restored / "learner" / "recovery.journal.jsonl")
+        .read_text()
+        .splitlines()
+    ]
+    assert [row["checkpoint_sha256"] for row in rows] == [current["checkpoint_sha256"]]
+
+
+def test_snapshot_omits_obsolete_warm_start_with_missing_checkpoint(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture(tmp_path)
+    marker_path = fixture.root / "learner" / "champion-warm-start.json"
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    obsolete, obsolete_digest = _content_addressed_file(
+        fixture.root / "learner" / "recovery",
+        prefix="sha256-",
+        suffix=".pt",
+        data=b"obsolete warm-start checkpoint superseded by resume cutover",
+    )
+    marker.update(
+        {
+            "checkpoint": f"recovery/{obsolete.name}",
+            "checkpoint_sha256": obsolete_digest,
+            "checkpoint_bytes": obsolete.stat().st_size,
+        }
+    )
+    _write_json(marker_path, marker)
+    obsolete.unlink()
+
+    snapshot = _snapshot(fixture, tmp_path / "backup")
+    payload = _snapshot_payload(snapshot)
+    assert "learner/champion-warm-start.json" not in payload["catalog"]
+    assert recovery.verify_snapshot(snapshot)["status"] == "ok"
+    restored = recovery.restore_snapshot(
+        snapshot,
+        tmp_path / "restored-without-obsolete-warm-start",
+        relocate_profile=True,
+    )
+    assert not (restored / "learner" / "champion-warm-start.json").exists()
+    assert (restored / "learner" / "recovery.json").is_file()
+    assert (restored / "learner" / "resume-cutover.json").is_file()
+
+
 def test_snapshot_rejects_missing_shard_without_publishing_latest(
     tmp_path: Path,
 ) -> None:

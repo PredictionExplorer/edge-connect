@@ -11,6 +11,7 @@ import sqlite3
 import stat
 from collections.abc import Callable, Mapping, Sequence
 from copy import deepcopy
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -63,6 +64,11 @@ RING10_OPTIMIZATION_TREATMENTS = (
     "ring10-cadence-5m",
     "ring10-freshness-50",
 )
+RING10_LIVE_CADENCE_TARGET_EXAMPLES = 5_000_000
+RING10_LIVE_CADENCE_TREATMENTS = (
+    "ring10-live-cadence-control",
+    "ring10-live-cadence-5m",
+)
 RING10_TRAINING_DYNAMICS_TREATMENTS = (
     "ring10-dynamics-control",
     "ring10-dynamics-adamw",
@@ -89,6 +95,7 @@ RING10_OBJECTIVE_TREATMENTS = frozenset(
     (
         *RING10_EFFICIENCY_TREATMENTS,
         *RING10_OPTIMIZATION_TREATMENTS,
+        *RING10_LIVE_CADENCE_TREATMENTS,
         *RING10_TRAINING_DYNAMICS_TREATMENTS,
         *RING10_ATTENTION_TREATMENTS,
         *RING10_RELATIONAL_TREATMENTS,
@@ -99,6 +106,7 @@ RING10_EFFICIENCY_VARIANTS = frozenset(RING10_EFFICIENCY_TREATMENTS[1:])
 TREATMENT_SUITES = {
     "ring10-efficiency": RING10_EFFICIENCY_TREATMENTS,
     "ring10-optimization": RING10_OPTIMIZATION_TREATMENTS,
+    "ring10-live-cadence": RING10_LIVE_CADENCE_TREATMENTS,
     "ring10-training-dynamics": RING10_TRAINING_DYNAMICS_TREATMENTS,
     "ring10-attention-reallocation": RING10_ATTENTION_TREATMENTS,
     "ring10-relational": RING10_RELATIONAL_TREATMENTS,
@@ -168,6 +176,7 @@ def _parser() -> argparse.ArgumentParser:
             *WEIGHTED_TREATMENTS,
             *RING10_EFFICIENCY_TREATMENTS,
             *RING10_OPTIMIZATION_TREATMENTS,
+            *RING10_LIVE_CADENCE_TREATMENTS,
             *RING10_TRAINING_DYNAMICS_TREATMENTS,
             *RING10_ATTENTION_TREATMENTS,
             *RING10_RELATIONAL_TREATMENTS,
@@ -302,6 +311,16 @@ def _ring_ten_optimization_control(config: RawConfig) -> None:
 def _ring_ten_cadence_five_million(config: RawConfig) -> None:
     _ring_ten_optimization_control(config)
     _mapping(config, "learner")["candidate_interval_examples"] = 5_000_000
+
+
+def _ring_ten_live_cadence_control(_config: RawConfig) -> None:
+    return
+
+
+def _ring_ten_live_cadence_five_million(config: RawConfig) -> None:
+    _mapping(config, "learner")["candidate_interval_examples"] = (
+        RING10_LIVE_CADENCE_TARGET_EXAMPLES
+    )
 
 
 def _ring_ten_freshness_fifty(config: RawConfig) -> None:
@@ -595,6 +614,8 @@ TREATMENTS: dict[str, Treatment] = {
     "ring10-optimization-control": _ring_ten_optimization_control,
     "ring10-cadence-5m": _ring_ten_cadence_five_million,
     "ring10-freshness-50": _ring_ten_freshness_fifty,
+    "ring10-live-cadence-control": _ring_ten_live_cadence_control,
+    "ring10-live-cadence-5m": _ring_ten_live_cadence_five_million,
     "ring10-dynamics-control": _ring_ten_dynamics_control,
     "ring10-dynamics-adamw": _ring_ten_dynamics_adamw,
     "ring10-dynamics-ema-1m": _ring_ten_dynamics_ema_one_million,
@@ -909,6 +930,62 @@ def _validate_ring10_efficiency_base(experiment: ExperimentConfig) -> None:
         raise ValueError("ring10 control promotion topology drifted")
 
 
+def _validate_ring10_live_cadence_base(
+    raw: RawConfig,
+    experiment: ExperimentConfig,
+) -> None:
+    if experiment.orchestration.training_objective != "ring10_only":
+        raise ValueError(
+            "ring10 live cadence suite requires a ring10_only base profile"
+        )
+    validate_continuous_config(experiment)
+    learner = _mapping(raw, "learner")
+    if experiment.learner.target_updates_per_new_sample != 1.0:
+        raise ValueError("ring10 live cadence suite requires frozen UTD=1.0")
+    if "candidate_interval_examples" not in learner:
+        raise ValueError(
+            "ring10 live cadence suite requires an explicit "
+            "learner.candidate_interval_examples"
+        )
+    candidate_interval = learner["candidate_interval_examples"]
+    if (
+        isinstance(candidate_interval, bool)
+        or not isinstance(candidate_interval, int)
+        or candidate_interval <= 0
+        or candidate_interval >= RING10_LIVE_CADENCE_TARGET_EXAMPLES
+    ):
+        raise ValueError(
+            "ring10 live cadence suite requires a positive frozen candidate cadence "
+            f"below {RING10_LIVE_CADENCE_TARGET_EXAMPLES}"
+        )
+    treatment = replace(
+        experiment,
+        learner=replace(
+            experiment.learner,
+            candidate_interval_examples=RING10_LIVE_CADENCE_TARGET_EXAMPLES,
+        ),
+    )
+    validate_continuous_config(treatment)
+
+
+def _validate_ring10_live_cadence_transition(
+    before: RawConfig,
+    after: RawConfig,
+    treatment: str,
+) -> None:
+    expected = deepcopy(before)
+    if treatment == "ring10-live-cadence-5m":
+        _mapping(expected, "learner")["candidate_interval_examples"] = (
+            RING10_LIVE_CADENCE_TARGET_EXAMPLES
+        )
+    elif treatment != "ring10-live-cadence-control":
+        raise ValueError(f"unsupported ring10 live cadence treatment: {treatment}")
+    if after != expected:
+        raise ValueError(
+            f"{treatment} violated the frozen live one-factor cadence contract"
+        )
+
+
 def _validate_inputs(
     *,
     prefix: str,
@@ -942,6 +1019,7 @@ def _configure_common(
     run_id: str,
     seed: int,
     guard_floor_elo: float,
+    guard_rings: Sequence[int],
 ) -> None:
     _mapping(raw, "train")["seed"] = seed
     _mapping(raw, "selfplay")["seed"] = seed
@@ -949,15 +1027,16 @@ def _configure_common(
     orchestration = _mapping(raw, "orchestration")
     orchestration["run_id"] = run_id
     _mapping(orchestration, "directories")["root"] = str(run_root)
-    arena = _mapping(raw, "arena")
-    floors = arena.get("per_ring_regression_floor_elo")
-    if floors is None:
-        floors = {}
-        arena["per_ring_regression_floor_elo"] = floors
-    if not isinstance(floors, dict):
-        raise ValueError("arena.per_ring_regression_floor_elo must be a mapping")
-    for ring in GUARD_RINGS:
-        floors[ring] = guard_floor_elo
+    if guard_rings:
+        arena = _mapping(raw, "arena")
+        floors = arena.get("per_ring_regression_floor_elo")
+        if floors is None:
+            floors = {}
+            arena["per_ring_regression_floor_elo"] = floors
+        if not isinstance(floors, dict):
+            raise ValueError("arena.per_ring_regression_floor_elo must be a mapping")
+        for ring in guard_rings:
+            floors[ring] = guard_floor_elo
 
 
 def _validate_profile(
@@ -1037,6 +1116,14 @@ def prepare_elo_ablation(
             raise ValueError(f"unknown treatment suite: {suite}")
         if tuple(treatments) != expected:
             raise ValueError("treatments do not match the selected suite")
+    if any(name in RING10_LIVE_CADENCE_TREATMENTS for name in treatments) and (
+        suite != "ring10-live-cadence"
+        or tuple(treatments) != RING10_LIVE_CADENCE_TREATMENTS
+    ):
+        raise ValueError(
+            "ring10 live cadence treatments require the complete "
+            "--suite ring10-live-cadence"
+        )
     _validate_inputs(
         prefix=prefix,
         seed=seed,
@@ -1090,7 +1177,9 @@ def prepare_elo_ablation(
     )
     base_sha256 = _sha256(base)
     raw_base = _load_raw(base)
-    if (suite is not None and suite.startswith("ring10-")) or any(
+    if suite == "ring10-live-cadence":
+        _validate_ring10_live_cadence_base(raw_base, load_config(base))
+    elif (suite is not None and suite.startswith("ring10-")) or any(
         treatment in RING10_EFFICIENCY_VARIANTS
         or treatment in RING10_TRAINING_DYNAMICS_TREATMENTS
         or treatment in SCRATCH_INITIALIZATION_TREATMENTS
@@ -1124,8 +1213,16 @@ def prepare_elo_ablation(
             run_id=treatment_run_id,
             seed=seed,
             guard_floor_elo=guard_floor_elo,
+            guard_rings=configured_guard_rings,
         )
+        before_treatment = deepcopy(profile)
         TREATMENTS[treatment_name](profile)
+        if treatment_name in RING10_LIVE_CADENCE_TREATMENTS:
+            _validate_ring10_live_cadence_transition(
+                before_treatment,
+                profile,
+                treatment_name,
+            )
         if replay_cutoff is not None:
             _mapping(profile, "learner")["minimum_replay_shard_id_exclusive"] = (
                 replay_cutoff

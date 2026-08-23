@@ -16,12 +16,14 @@ import subprocess
 import sys
 import time
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 
 import yaml
 
 from startrain.config import load_config
+from startrain.continuity import ContinuityError, load_continuity_manifest
 
 if __package__:
     from .validate_continuous_profile import validate_continuous_config
@@ -36,11 +38,26 @@ _DIGEST_CACHE: dict[Path, tuple[int, int, int, str]] = {}
 _ARENA_RESULT_CACHE: dict[Path, tuple[int, int, dict[str, object]]] = {}
 
 
+@dataclass(frozen=True, slots=True)
+class MonitorTarget:
+    run_root: Path
+    profile_path: Path | None
+    unit: str | None
+    continuity_state_path: Path | None
+    disaster_backup_root: Path | None
+    mac_acknowledgement_namespace: Path | None
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--run-root", type=Path, required=True)
+    parser.add_argument("--run-root", type=Path)
     parser.add_argument("--profile", type=Path)
     parser.add_argument("--unit")
+    parser.add_argument(
+        "--continuity-manifest",
+        type=Path,
+        help="resolve the active workload from a pinned continuity manifest",
+    )
     parser.add_argument(
         "--continuity-state",
         type=Path,
@@ -78,6 +95,100 @@ def _read_json(path: Path, *, attempts: int = 3) -> dict[str, object] | None:
             if attempt + 1 < attempts:
                 time.sleep(0.02)
     return None
+
+
+def resolve_monitor_target(
+    continuity_manifest_path: Path,
+    *,
+    run_root: Path | None = None,
+    profile_path: Path | None = None,
+    unit: str | None = None,
+    continuity_state_path: Path | None = None,
+    disaster_backup_root: Path | None = None,
+) -> MonitorTarget:
+    """Resolve and bind monitor inputs to the manifest's active workload."""
+
+    manifest = load_continuity_manifest(continuity_manifest_path)
+    state = _read_json(manifest.state_path)
+    if (
+        state is None
+        or state.get("format") != "startrain.training-continuity-state"
+        or state.get("schema_version") != 1
+        or state.get("manifest_sha256") != manifest.sha256
+    ):
+        raise ValueError(
+            f"continuity state is missing, invalid, or stale: {manifest.state_path}"
+        )
+    active_workload_id = state.get("active_workload_id")
+    if not isinstance(active_workload_id, str) or not active_workload_id:
+        raise ValueError("continuity state does not identify an active workload")
+    workload = manifest.workload(active_workload_id)
+    if (
+        state.get("active_profile_sha256") != workload.profile_sha256
+        or state.get("active_run_root_sha256") != workload.run_root_sha256
+    ):
+        raise ValueError(
+            "continuity state active workload hashes differ from the manifest"
+        )
+
+    def path_value(
+        explicit: Path | None,
+        expected: Path,
+        *,
+        option: str,
+    ) -> Path:
+        if explicit is not None and explicit.expanduser().resolve() != expected:
+            raise ValueError(f"{option} conflicts with the active continuity workload")
+        return expected
+
+    resolved_run_root = path_value(
+        run_root,
+        workload.run_root,
+        option="--run-root",
+    )
+    resolved_profile = path_value(
+        profile_path,
+        workload.profile_path,
+        option="--profile",
+    )
+    if unit is not None and unit != workload.unit:
+        raise ValueError("--unit conflicts with the active continuity workload")
+    resolved_state = path_value(
+        continuity_state_path,
+        manifest.state_path,
+        option="--continuity-state",
+    )
+    protection = workload.protection
+    expected_disaster_root = (
+        protection.disaster_backup_root if protection is not None else None
+    )
+    if (
+        disaster_backup_root is not None
+        and expected_disaster_root is not None
+        and disaster_backup_root.expanduser().resolve() != expected_disaster_root
+    ):
+        raise ValueError(
+            "--disaster-backup-root conflicts with the active continuity workload"
+        )
+    resolved_disaster_root = (
+        expected_disaster_root
+        if expected_disaster_root is not None
+        else (
+            disaster_backup_root.expanduser().resolve()
+            if disaster_backup_root is not None
+            else None
+        )
+    )
+    return MonitorTarget(
+        run_root=resolved_run_root,
+        profile_path=resolved_profile,
+        unit=workload.unit,
+        continuity_state_path=resolved_state,
+        disaster_backup_root=resolved_disaster_root,
+        mac_acknowledgement_namespace=(
+            protection.mac_acknowledgement_namespace if protection is not None else None
+        ),
+    )
 
 
 def _continuity_status(
@@ -132,6 +243,7 @@ def _continuity_status(
         "productive_idle_seconds": idle_seconds,
         "hardware": payload.get("hardware"),
         "execution": payload.get("execution"),
+        "protection": payload.get("protection"),
         "blocked_reason": payload.get("blocked_reason"),
         "last_failure": payload.get("last_failure"),
         "last_handoff": payload.get("last_handoff"),
@@ -146,6 +258,7 @@ def _disaster_recovery_status(
     *,
     run_id: object,
     run_root: Path | None = None,
+    acknowledgement_namespace: Path | None = None,
     now_ns: int,
 ) -> dict[str, object]:
     if path is None:
@@ -275,7 +388,31 @@ def _disaster_recovery_status(
         }
     latest_ack: dict[str, object] | None = None
     latest_ack_completed_ns: int | None = None
-    acknowledgements = root / "acknowledgements"
+    acknowledgement_input = (
+        root / "acknowledgements"
+        if acknowledgement_namespace is None
+        else acknowledgement_namespace.expanduser()
+    )
+    acknowledgements = acknowledgement_input.resolve()
+    try:
+        acknowledgement_relative = acknowledgements.relative_to(root)
+    except ValueError:
+        acknowledgement_relative = Path()
+    if (
+        not acknowledgement_relative.parts
+        or acknowledgement_relative.parts[0] != "acknowledgements"
+        or acknowledgement_input.is_symlink()
+        or (
+            acknowledgements.exists()
+            and (not acknowledgements.is_dir() or acknowledgements.is_symlink())
+        )
+    ):
+        return {
+            "configured": True,
+            "valid": False,
+            "backup_root": str(root),
+            "reason": "acknowledgement_namespace_invalid",
+        }
     if acknowledgements.is_dir() and not acknowledgements.is_symlink():
         for candidate in sorted(acknowledgements.glob("*.json")):
             payload = _read_json(candidate)
@@ -1330,6 +1467,7 @@ def collect_snapshot(
     profile_path: Path | None = None,
     continuity_state_path: Path | None = None,
     disaster_backup_root: Path | None = None,
+    mac_acknowledgement_namespace: Path | None = None,
     now_ns: int | None = None,
 ) -> dict[str, object]:
     root = run_root.expanduser().resolve()
@@ -2402,6 +2540,7 @@ def collect_snapshot(
         disaster_backup_root,
         run_id=orchestration.get("run_id"),
         run_root=root,
+        acknowledgement_namespace=mac_acknowledgement_namespace,
         now_ns=now,
     )
     if (
@@ -2682,12 +2821,22 @@ def run_monitor(
     stop_requested: Callable[[], bool],
     continuity_state_path: Path | None = None,
     disaster_backup_root: Path | None = None,
+    mac_acknowledgement_namespace: Path | None = None,
     telemetry_output: Path | None = None,
 ) -> None:
     next_tick = time.monotonic()
     while not stop_requested():
         try:
-            if continuity_state_path is not None and disaster_backup_root is not None:
+            if mac_acknowledgement_namespace is not None:
+                snapshot = collect_snapshot(
+                    run_root,
+                    unit=unit,
+                    profile_path=profile_path,
+                    continuity_state_path=continuity_state_path,
+                    disaster_backup_root=disaster_backup_root,
+                    mac_acknowledgement_namespace=(mac_acknowledgement_namespace),
+                )
+            elif continuity_state_path is not None and disaster_backup_root is not None:
                 snapshot = collect_snapshot(
                     run_root,
                     unit=unit,
@@ -2758,9 +2907,35 @@ def run_monitor(
 
 
 def main(argv: list[str] | None = None) -> int:
-    arguments = _parser().parse_args(argv)
+    parser = _parser()
+    arguments = parser.parse_args(argv)
     if arguments.interval <= 0:
         raise SystemExit("--interval must be positive")
+    if arguments.continuity_manifest is not None:
+        try:
+            target = resolve_monitor_target(
+                arguments.continuity_manifest,
+                run_root=arguments.run_root,
+                profile_path=arguments.profile,
+                unit=arguments.unit,
+                continuity_state_path=arguments.continuity_state,
+                disaster_backup_root=arguments.disaster_backup_root,
+            )
+        except (ContinuityError, ValueError) as error:
+            parser.error(str(error))
+    else:
+        if arguments.run_root is None:
+            parser.error(
+                "--run-root is required unless --continuity-manifest is provided"
+            )
+        target = MonitorTarget(
+            run_root=arguments.run_root,
+            profile_path=arguments.profile,
+            unit=arguments.unit,
+            continuity_state_path=arguments.continuity_state,
+            disaster_backup_root=arguments.disaster_backup_root,
+            mac_acknowledgement_namespace=None,
+        )
     stopped = False
 
     def request_stop(_signal_number, _frame) -> None:
@@ -2770,15 +2945,16 @@ def main(argv: list[str] | None = None) -> int:
     signal.signal(signal.SIGINT, request_stop)
     signal.signal(signal.SIGTERM, request_stop)
     run_monitor(
-        arguments.run_root,
-        profile_path=arguments.profile,
-        unit=arguments.unit,
+        target.run_root,
+        profile_path=target.profile_path,
+        unit=target.unit,
         interval=arguments.interval,
         once=arguments.once,
         output_format=arguments.format,
         stop_requested=lambda: stopped,
-        continuity_state_path=arguments.continuity_state,
-        disaster_backup_root=arguments.disaster_backup_root,
+        continuity_state_path=target.continuity_state_path,
+        disaster_backup_root=target.disaster_backup_root,
+        mac_acknowledgement_namespace=(target.mac_acknowledgement_namespace),
         telemetry_output=arguments.telemetry_output,
     )
     return 0

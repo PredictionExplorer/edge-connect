@@ -61,6 +61,8 @@ class Fixture:
     runtime_manifest: Path
     runtime_orchestrator: Path
     queue_state: Path | None
+    primary_disaster_root: Path | None
+    fallback_disaster_root: Path | None
     now_ns: int
 
 
@@ -69,6 +71,7 @@ def _fixture(
     *,
     queue_artifact: bool = False,
     alert_command: list[str] | None = None,
+    protection: bool = False,
 ) -> Fixture:
     now_ns = 2_000_000_000_000
     primary_root, primary_profile = _run(tmp_path, "primary", created_ns=now_ns - 10)
@@ -196,6 +199,53 @@ def _fixture(
         },
         "alerts": {"timeout_seconds": 1},
     }
+    primary_disaster_root: Path | None = None
+    fallback_disaster_root: Path | None = None
+    if protection:
+        disaster_mount = (tmp_path / "disaster").resolve()
+        disaster_mount.mkdir()
+        primary_disaster_root = (disaster_mount / "primary").resolve()
+        fallback_disaster_root = (disaster_mount / "fallback").resolve()
+        for workload, disaster_root, owner, run_root in (
+            (
+                raw["workloads"][0],
+                primary_disaster_root,
+                "primary",
+                primary_root,
+            ),
+            (
+                raw["workloads"][1],
+                fallback_disaster_root,
+                "fallback-lkg",
+                fallback_root,
+            ),
+        ):
+            assert isinstance(workload, dict)
+            disaster_root.mkdir()
+            run_identity = json.loads((run_root / "run.json").read_text())
+            _write_json(
+                disaster_root / "namespace.json",
+                {
+                    "report": "startrain-disaster-recovery-namespace",
+                    "schema_version": 1,
+                    "run_id": run_identity["run_id"],
+                    "generation_family": run_identity["generation_family"],
+                    "source_run_root": str(run_root),
+                },
+            )
+            workload["protection"] = {
+                "replay_backup_timer": (f"edgeconnect-startrain-{owner}-backup.timer"),
+                "disaster_backup_timer": (
+                    f"edgeconnect-startrain-{owner}-disaster-backup.timer"
+                ),
+                "disaster_backup_root": str(disaster_root),
+                "disaster_backup_mount": str(disaster_mount),
+                "mac_acknowledgement_namespace": str(
+                    disaster_root / "acknowledgements"
+                ),
+                "telemetry_service": (f"edgeconnect-startrain-{owner}-monitor.service"),
+                "telemetry_output": str(run_root / "status" / "monitor-5s.jsonl"),
+            }
     if alert_command is not None:
         raw["alerts"]["command"] = alert_command
     manifest = (tmp_path / "continuity.json").resolve()
@@ -222,6 +272,8 @@ def _fixture(
         runtime_manifest=runtime_manifest,
         runtime_orchestrator=runtime_orchestrator,
         queue_state=queue_state,
+        primary_disaster_root=primary_disaster_root,
+        fallback_disaster_root=fallback_disaster_root,
         now_ns=now_ns,
     )
 
@@ -254,6 +306,87 @@ class FakeUnitManager:
             sub_state="stop-sigterm",
             main_pid=123,
         )
+
+
+class FakeProtectionInspector:
+    def __init__(self) -> None:
+        self.statuses: dict[str, continuity.UnitStatus] = {}
+        self.definitions: dict[str, str] = {}
+
+    def status(self, unit: str) -> continuity.UnitStatus:
+        return self.statuses.get(
+            unit,
+            continuity.UnitStatus(
+                unit,
+                "inactive",
+                load_state="not-found",
+                unit_file_state="disabled",
+            ),
+        )
+
+    def definition(self, unit: str) -> str:
+        try:
+            return self.definitions[unit]
+        except KeyError as exc:
+            raise RuntimeError(f"definition unavailable: {unit}") from exc
+
+    def is_mount(self, _path: Path) -> bool:
+        return True
+
+
+def _protection_inspector(
+    fixture: Fixture,
+    *,
+    active_workload_id: str | None = None,
+) -> FakeProtectionInspector:
+    manifest = continuity.load_continuity_manifest(fixture.manifest)
+    inspector = FakeProtectionInspector()
+    for workload in manifest.workloads:
+        protection = workload.protection
+        assert protection is not None
+        active = workload.workload_id == active_workload_id
+        for unit in (
+            protection.replay_backup_timer,
+            protection.disaster_backup_timer,
+            protection.telemetry_service,
+        ):
+            timer = unit in {
+                protection.replay_backup_timer,
+                protection.disaster_backup_timer,
+            }
+            staged = (
+                active_workload_id is None
+                and workload.workload_id == manifest.primary_id
+                and timer
+            )
+            inspector.statuses[unit] = continuity.UnitStatus(
+                unit,
+                "active" if active or staged else "inactive",
+                load_state="loaded",
+                unit_file_state="enabled",
+            )
+        for service in (
+            protection.replay_backup_service,
+            protection.disaster_backup_service,
+        ):
+            inspector.statuses[service] = continuity.UnitStatus(
+                service,
+                "inactive",
+                load_state="loaded",
+                unit_file_state="static",
+            )
+        inspector.definitions[protection.replay_backup_timer] = (
+            f"[Timer]\nUnit={protection.replay_backup_service}\n"
+        )
+        inspector.definitions[protection.disaster_backup_timer] = (
+            f"[Timer]\nUnit={protection.disaster_backup_service}\n"
+        )
+        for service, command in continuity.workload_protection_commands(
+            manifest,
+            workload,
+        ).items():
+            inspector.definitions[service] = f"[Service]\nExecStart={command}\n"
+    return inspector
 
 
 def _fatal(fixture: Fixture, **overrides: object) -> None:
@@ -678,6 +811,112 @@ def test_host_transition_lock_is_nonblocking(tmp_path: Path) -> None:
     assert state["phase"] == "transition_busy"
     assert units.starts == []
     assert not (fixture.state_root / "continuity-state.json").exists()
+
+
+def test_optional_protection_metadata_is_strict_and_backward_compatible(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture(tmp_path)
+    manifest = continuity.load_continuity_manifest(fixture.manifest)
+    assert all(workload.protection is None for workload in manifest.workloads)
+
+    raw = json.loads(fixture.manifest.read_text(encoding="utf-8"))
+    raw["workloads"][0]["protection"] = {
+        "replay_backup_timer": "edgeconnect-startrain-primary-backup.timer"
+    }
+    _write_json(fixture.manifest, raw)
+
+    with pytest.raises(
+        continuity.ContinuityManifestError,
+        match="protection is missing fields",
+    ):
+        continuity.load_continuity_manifest(fixture.manifest)
+
+
+def test_protection_drift_blocks_automatic_workload_start_with_durable_alert(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture(tmp_path, protection=True)
+    units = FakeUnitManager()
+    inspector = _protection_inspector(fixture)
+    manifest = continuity.load_continuity_manifest(fixture.manifest)
+    primary = manifest.workload("primary")
+    assert primary.protection is not None
+    inspector.definitions[primary.protection.replay_backup_service] = (
+        "[Service]\nExecStart=/usr/bin/false\n"
+    )
+
+    state = continuity.reconcile_training_continuity(
+        fixture.manifest,
+        now_ns=fixture.now_ns,
+        unit_manager=units,
+        protection_inspector=inspector,
+    )
+
+    assert state["phase"] == "blocked_protection_drift"
+    assert state["blocked_reason"]["code"] == "protection_ownership_drift"
+    assert state["protection"]["valid"] is False
+    assert units.starts == []
+    alerts = [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in (fixture.state_root / "alerts").glob("*.json")
+        if not path.name.endswith(".delivery.json")
+    ]
+    assert [alert["kind"] for alert in alerts] == ["protection_ownership_drift"]
+
+
+def test_protection_drift_does_not_stop_healthy_active_workload(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture(tmp_path, protection=True)
+    units = FakeUnitManager()
+    initial_inspector = _protection_inspector(fixture)
+    started = continuity.reconcile_training_continuity(
+        fixture.manifest,
+        now_ns=fixture.now_ns,
+        unit_manager=units,
+        protection_inspector=initial_inspector,
+    )
+    assert started["phase"] == "active_primary"
+
+    drifted_inspector = _protection_inspector(
+        fixture,
+        active_workload_id="primary",
+    )
+    manifest = continuity.load_continuity_manifest(fixture.manifest)
+    primary = manifest.workload("primary")
+    assert primary.protection is not None
+    drifted_inspector.definitions[primary.protection.telemetry_service] = (
+        "[Service]\nExecStart=/usr/bin/false\n"
+    )
+
+    drifted = continuity.reconcile_training_continuity(
+        fixture.manifest,
+        now_ns=fixture.now_ns + 1,
+        unit_manager=units,
+        protection_inspector=drifted_inspector,
+    )
+    alert_paths = [
+        path
+        for path in (fixture.state_root / "alerts").glob("*.json")
+        if not path.name.endswith(".delivery.json")
+    ]
+    continuity.reconcile_training_continuity(
+        fixture.manifest,
+        now_ns=fixture.now_ns + 2,
+        unit_manager=units,
+        protection_inspector=drifted_inspector,
+    )
+
+    assert drifted["phase"] == "active_primary"
+    assert drifted["active_workload_id"] == "primary"
+    assert drifted["blocked_reason"]["code"] == "protection_ownership_drift"
+    assert units.stops == []
+    assert [
+        path
+        for path in (fixture.state_root / "alerts").glob("*.json")
+        if not path.name.endswith(".delivery.json")
+    ] == alert_paths
 
 
 def test_corrupt_manifest_fails_before_service_control(tmp_path: Path) -> None:
