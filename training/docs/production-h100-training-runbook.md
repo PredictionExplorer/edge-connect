@@ -1388,8 +1388,9 @@ are rechecked before every durable step. The armed digest is intentionally stale
 waits for a strictly newer, quiescent terminal arena result.
 
 The terminal-boundary service is restartable. A waiting exit retries without
-touching the run; install and enable the paired five-second timer rather than the
-oneshot service itself. `ExecStopPost` recovers an interrupted process by
+touching the run; install the promotion-status path unit for immediate
+event-driven activation and keep the five-second timer as an independent
+backstop. Do not enable the oneshot service itself. `ExecStopPost` recovers an interrupted process by
 releasing only its owned hold and requesting continuity fallback. After
 accepting a boundary it:
 
