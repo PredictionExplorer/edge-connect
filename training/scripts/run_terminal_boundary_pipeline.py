@@ -27,8 +27,16 @@ STATE_REPORT = "startrain-terminal-boundary-state"
 ACTIVATION_REPORT = "startrain-terminal-boundary-queue-activation"
 FALLBACK_REPORT = "startrain-continuity-handoff-request"
 TERMINAL_DECISIONS = frozenset(
-    {"promote", "reject", "reject_ring_regression", "reject_max_pairs"}
+    {
+        "promote",
+        "reject",
+        "reject_ring_regression",
+        "reject_max_pairs",
+        "plateau_reset",
+        "plateau_recover",
+    }
 )
+CONTROL_BOUNDARY_DECISIONS = frozenset({"plateau_reset", "plateau_recover"})
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _MAX_JSON_BYTES = 64 * 1024 * 1024
@@ -1200,84 +1208,119 @@ def _capture_terminal_bundle(
         )
     arena_root = Path(str(source["arena_root"])).resolve()
     decision = status["decision"]
-    if decision == "promote":
-        promotion_result = _string(
-            _mapping(champion["document"], name="champion pointer").get(
-                "promotion_result"
-            ),
-            name="champion promotion result",
+    if status.get("schema_version") != 1:
+        raise TerminalBoundaryManifestError(
+            "terminal promotion status schema is incompatible"
         )
-        result_path = (Path(str(champion["path"])).parent / promotion_result).resolve()
+    if decision in CONTROL_BOUNDARY_DECISIONS:
+        if candidate_identity != champion_identity or candidate_step != champion_step:
+            raise TerminalBoundaryManifestError(
+                "plateau boundary does not point to the current champion"
+            )
+        champion_manifest = _mapping(
+            champion["manifest"],
+            name="champion manifest",
+        )
+        candidate_manifest = Path(str(champion_manifest["path"]))
+        candidate_manifest_evidence = dict(champion_manifest)
+        baseline_identity = champion_identity
+        baseline_manifest_path = candidate_manifest
+        baseline_manifest = dict(champion_manifest)
+        result_path = Path(str(source["promotion_status"]))
+        result = {
+            "schema_version": 1,
+            "terminal": True,
+            "result_kind": "plateau_control",
+            "candidate": candidate_identity,
+            "baseline": champion_identity,
+            "promotion": {"decision": decision},
+        }
+        result_sha256 = status_sha256
+        result_bytes = status_bytes
     else:
-        result_path = (
-            arena_root / f"{candidate_identity}-vs-{champion_identity}.json"
-        ).resolve()
-    if result_path.parent != arena_root:
-        raise TerminalBoundaryManifestError(
-            "terminal arena result escaped the source arena root"
+        if decision == "promote":
+            promotion_result = _string(
+                _mapping(champion["document"], name="champion pointer").get(
+                    "promotion_result"
+                ),
+                name="champion promotion result",
+            )
+            result_path = (
+                Path(str(champion["path"])).parent / promotion_result
+            ).resolve()
+        else:
+            result_path = (
+                arena_root / f"{candidate_identity}-vs-{champion_identity}.json"
+            ).resolve()
+        if result_path.parent != arena_root:
+            raise TerminalBoundaryManifestError(
+                "terminal arena result escaped the source arena root"
+            )
+        result, result_sha256, result_bytes = _read_json_with_digest(
+            result_path,
+            name="terminal arena result",
         )
-    result, result_sha256, result_bytes = _read_json_with_digest(
-        result_path,
-        name="terminal arena result",
-    )
-    promotion = _mapping(result.get("promotion"), name="terminal result promotion")
-    baseline_identity = _string(result.get("baseline"), name="terminal result baseline")
-    if (
-        status.get("schema_version") != 1
-        or result.get("schema_version") != 3
-        or result.get("terminal") is not True
-        or result.get("candidate") != candidate_identity
-        or promotion.get("decision") != decision
-        or (
-            isinstance(result.get("result_kind"), str)
-            and result.get("result_kind") != "promotion"
+        promotion = _mapping(result.get("promotion"), name="terminal result promotion")
+        baseline_identity = _string(
+            result.get("baseline"),
+            name="terminal result baseline",
         )
-    ):
-        raise TerminalBoundaryManifestError(
-            "promotion status, candidate, champion, and terminal result are incoherent"
-        )
-    if decision == "promote":
         if (
-            champion_identity != candidate_identity
-            or baseline_identity == candidate_identity
+            result.get("schema_version") != 3
+            or result.get("terminal") is not True
+            or result.get("candidate") != candidate_identity
+            or promotion.get("decision") != decision
+            or (
+                isinstance(result.get("result_kind"), str)
+                and result.get("result_kind") != "promotion"
+            )
         ):
             raise TerminalBoundaryManifestError(
-                "promoted terminal result has an incoherent champion transition"
+                "promotion status, candidate, champion, and terminal result are "
+                "incoherent"
             )
-    elif baseline_identity != champion_identity:
-        raise TerminalBoundaryManifestError(
-            "rejected terminal result baseline is not the current champion"
-        )
-
-    candidate_manifest = _absolute_path(
-        result.get("candidate_manifest"),
-        name="terminal result candidate manifest",
-    )
-    candidate_manifest_evidence = _direct_manifest_evidence(
-        candidate_manifest,
-        identity=candidate_identity,
-        step=candidate_step,
-        run_identity=run,
-        name="terminal result candidate manifest",
-    )
-    baseline_manifest_path = _absolute_path(
-        result.get("champion_manifest"),
-        name="terminal result champion manifest",
-    )
-    baseline_manifest = _direct_manifest_evidence(
-        baseline_manifest_path,
-        identity=baseline_identity,
-        run_identity=run,
-        name="terminal result baseline manifest",
-    )
-    if decision != "promote":
-        current_manifest = Path(
-            _mapping(champion["manifest"], name="champion manifest")["path"]
-        )
-        if baseline_manifest_path != current_manifest:
+        if decision == "promote":
+            if (
+                champion_identity != candidate_identity
+                or baseline_identity == candidate_identity
+            ):
+                raise TerminalBoundaryManifestError(
+                    "promoted terminal result has an incoherent champion transition"
+                )
+        elif baseline_identity != champion_identity:
             raise TerminalBoundaryManifestError(
-                "terminal result baseline differs from the champion pointer"
+                "rejected terminal result baseline is not the current champion"
             )
+
+        candidate_manifest = _absolute_path(
+            result.get("candidate_manifest"),
+            name="terminal result candidate manifest",
+        )
+        candidate_manifest_evidence = _direct_manifest_evidence(
+            candidate_manifest,
+            identity=candidate_identity,
+            step=candidate_step,
+            run_identity=run,
+            name="terminal result candidate manifest",
+        )
+        baseline_manifest_path = _absolute_path(
+            result.get("champion_manifest"),
+            name="terminal result champion manifest",
+        )
+        baseline_manifest = _direct_manifest_evidence(
+            baseline_manifest_path,
+            identity=baseline_identity,
+            run_identity=run,
+            name="terminal result baseline manifest",
+        )
+        if decision != "promote":
+            current_manifest = Path(
+                _mapping(champion["manifest"], name="champion manifest")["path"]
+            )
+            if baseline_manifest_path != current_manifest:
+                raise TerminalBoundaryManifestError(
+                    "terminal result baseline differs from the champion pointer"
+                )
 
     status_again = _read_regular_bytes(
         Path(source["promotion_status"]),

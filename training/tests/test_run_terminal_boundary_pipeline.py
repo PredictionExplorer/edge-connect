@@ -927,6 +927,37 @@ def test_current_terminal_is_accepted_and_launched(tmp_path: Path) -> None:
     )
 
 
+def test_plateau_reset_is_accepted_as_a_quiescent_control_boundary(
+    tmp_path: Path,
+) -> None:
+    fixture = BoundaryFixture(tmp_path)
+    _write_json(
+        fixture.status_path,
+        {
+            "schema_version": 1,
+            "candidate_identity": fixture.champion_identity,
+            "candidate_step": 10,
+            "champion_identity": fixture.champion_identity,
+            "champion_step": 10,
+            "decision": "plateau_reset",
+            "terminal": True,
+            "updated_ns": 200,
+        },
+    )
+
+    state = run_terminal_boundary_pipeline(
+        fixture.policy_path,
+        adapters=FakeAdapters(fixture),
+    )
+
+    assert state["status"] == "completed"
+    assert state["accepted_terminal"]["decision"] == "plateau_reset"
+    assert (
+        state["accepted_terminal"]["winner_snapshot"]["champion"]["model_identity"]
+        == fixture.champion_identity
+    )
+
+
 def test_terminal_result_remains_valid_when_candidate_pointer_has_advanced(
     tmp_path: Path,
 ) -> None:
