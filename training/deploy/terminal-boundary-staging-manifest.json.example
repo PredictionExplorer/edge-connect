@@ -137,6 +137,8 @@
     "output_dir": "/var/lib/edgeconnect/terminal-boundary/calibration-plan",
     "run_root_parent": "/srv/edgeconnect/runs/terminal-calibration",
     "run_id": "@RUN_ID@",
+    "runtime_user": "ubuntu",
+    "runtime_group": "ubuntu",
     "prefix": "terminal-calibration",
     "seed": 47,
     "wall_budget_hours": 2,
@@ -167,7 +169,7 @@
   },
   "queue": {
     "training_dir": "/srv/edgeconnect/release/training",
-    "deployment_manifest": "/var/lib/edgeconnect/terminal-boundary/queue-deployment.json",
+    "deployment_manifest": "/var/lib/edgeconnect/terminal-boundary/queue/deployment.json",
     "activation_manifest": "/var/lib/edgeconnect/terminal-boundary/queue-activation.json",
     "queue_unit": {
       "name": "edgeconnect-startrain-terminal-calibration-queue.service",
@@ -182,9 +184,9 @@
       "path": "/etc/edgeconnect/startrain-terminal-calibration.env",
       "sha256": "@ENVIRONMENT_SHA256@"
     },
-    "state_path": "/var/lib/edgeconnect/terminal-boundary/queue-state.json",
-    "comparison_output": "/var/lib/edgeconnect/terminal-boundary/comparison.json",
-    "continuity_handoff_output": "/var/lib/edgeconnect/terminal-boundary/queue-continuity-handoff.json",
+    "state_path": "/var/lib/edgeconnect/terminal-boundary/queue/state.json",
+    "comparison_output": "/var/lib/edgeconnect/terminal-boundary/queue/comparison.json",
+    "continuity_handoff_output": "/var/lib/edgeconnect/terminal-boundary/queue/continuity-handoff.json",
     "execution_lock_path": "/var/lock/edgeconnect-startrain-execution.lock",
     "source_commit": "@SOURCE_COMMIT@",
     "orchestrator": "startrain-orchestrate",

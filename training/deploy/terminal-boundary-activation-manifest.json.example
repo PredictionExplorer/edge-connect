@@ -77,6 +77,14 @@
     }
   },
   "calibration": {
+    "runtime_ownership": {
+      "status": "verified",
+      "user": "ubuntu",
+      "group": "ubuntu",
+      "uid": 1000,
+      "gid": 1000,
+      "paths_updated": 1234
+    },
     "frozen_replay": {
       "status": "completed",
       "comparison": {
@@ -136,12 +144,12 @@
   },
   "queue": {
     "deployment_manifest": {
-      "path": "/var/lib/edgeconnect/terminal-boundary/queue-deployment.json",
+      "path": "/var/lib/edgeconnect/terminal-boundary/queue/deployment.json",
       "sha256": "@QUEUE_DEPLOYMENT_SHA256@",
       "bytes": 12345
     },
     "unit": "edgeconnect-startrain-terminal-calibration-queue.service",
-    "state_path": "/var/lib/edgeconnect/terminal-boundary/queue-state.json",
+    "state_path": "/var/lib/edgeconnect/terminal-boundary/queue/state.json",
     "execution_lock_path": "/var/lock/edgeconnect-startrain-execution.lock"
   }
 }

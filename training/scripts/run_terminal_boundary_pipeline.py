@@ -128,6 +128,12 @@ class TerminalBoundaryAdapters(Protocol):
         prepare_only: bool,
     ) -> Mapping[str, object]: ...
 
+    def prepare_runtime_ownership(
+        self,
+        policy: Mapping[str, object],
+        plan: Mapping[str, object],
+    ) -> Mapping[str, object]: ...
+
     def generate_queue_manifest(
         self,
         policy: Mapping[str, object],
@@ -497,6 +503,8 @@ def _validate_policy(document: dict[str, Any], policy_path: Path) -> LoadedPolic
     calibration_run_id = _identifier(
         calibration.get("run_id"), name="calibration run ID"
     )
+    _identifier(calibration.get("runtime_user"), name="calibration runtime user")
+    _identifier(calibration.get("runtime_group"), name="calibration runtime group")
     if calibration_run_id != identity["run_id"]:
         raise TerminalBoundaryManifestError(
             "calibration run ID differs from the source run identity"
@@ -621,6 +629,24 @@ def _validate_policy(document: dict[str, Any], policy_path: Path) -> LoadedPolic
         ("execution_lock_path", "queue execution lock"),
     ):
         _absolute_path(queue.get(field), name=label)
+    queue_owned_paths = [
+        _absolute_path(queue.get(field), name=f"queue {field}")
+        for field in (
+            "deployment_manifest",
+            "state_path",
+            "comparison_output",
+            "continuity_handoff_output",
+        )
+    ]
+    queue_parent = queue_owned_paths[0].parent
+    if (
+        any(path.parent != queue_parent for path in queue_owned_paths)
+        or queue_parent == state_path.parent
+    ):
+        raise TerminalBoundaryManifestError(
+            "queue-owned outputs must share a dedicated directory separate from "
+            "terminal-boundary state"
+        )
     _string(queue.get("source_commit"), name="queue source commit")
     _string(queue.get("orchestrator"), name="queue orchestrator")
     _positive_number(queue.get("poll_seconds"), name="queue polling interval")
@@ -1716,6 +1742,7 @@ def _activation_document(
         "champion_snapshot": evidence("export_champion"),
         "calibration": {
             "frozen_replay": evidence("run_frozen_calibration"),
+            "runtime_ownership": evidence("prepare_runtime_ownership"),
             "plan": {key: plan[key] for key in ("path", "sha256", "bytes")},
             "roots": roots,
         },
@@ -2000,6 +2027,24 @@ def verify_queue_activation_manifest(
             "queue deployment changed after activation was pinned"
         )
     calibration = _mapping(document.get("calibration"), name="activation calibration")
+    runtime_ownership = _mapping(
+        calibration.get("runtime_ownership"),
+        name="activation runtime ownership",
+    )
+    policy_calibration = _mapping(
+        policy.raw.get("calibration"),
+        name="calibration",
+    )
+    if (
+        runtime_ownership.get("status") != "verified"
+        or runtime_ownership.get("user") != policy_calibration.get("runtime_user")
+        or runtime_ownership.get("group") != policy_calibration.get("runtime_group")
+        or not isinstance(runtime_ownership.get("paths_updated"), int)
+        or int(runtime_ownership["paths_updated"]) <= 0
+    ):
+        raise TerminalBoundaryManifestError(
+            "activation runtime ownership evidence is incomplete"
+        )
     frozen_replay = _mapping(
         calibration.get("frozen_replay"),
         name="activation frozen-replay calibration",
@@ -2732,6 +2777,15 @@ def run_terminal_boundary_pipeline(
                 ),
             )
             deployment = _deployment_manifest_evidence(policy, raw_deployment)
+            _run_step(
+                policy,
+                state,
+                "prepare_runtime_ownership",
+                lambda: operations.prepare_runtime_ownership(
+                    policy.raw,
+                    plan_evidence,
+                ),
+            )
             _run_step(
                 policy,
                 state,
@@ -3760,6 +3814,101 @@ class DefaultTerminalBoundaryAdapters:
             apply=True,
             replace_existing=True,
         )
+
+    def prepare_runtime_ownership(
+        self,
+        policy: Mapping[str, object],
+        plan: Mapping[str, object],
+    ) -> Mapping[str, object]:
+        import grp
+        import pwd
+
+        calibration = _mapping(policy.get("calibration"), name="calibration")
+        user = _string(calibration.get("runtime_user"), name="calibration runtime user")
+        group = _string(
+            calibration.get("runtime_group"),
+            name="calibration runtime group",
+        )
+        uid = pwd.getpwnam(user).pw_uid
+        gid = grp.getgrnam(group).gr_gid
+        document = _mapping(plan.get("plan"), name="calibration plan")
+        roots = _sequence(document.get("treatments"), name="calibration treatments")
+        changed = 0
+
+        def chown_tree(root: Path) -> None:
+            nonlocal changed
+            for path in (root, *sorted(root.rglob("*"))):
+                if path.is_symlink():
+                    raise TerminalBoundaryExecutionError(
+                        f"calibration root contains a symlink: {path}"
+                    )
+                os.chown(path, uid, gid, follow_symlinks=False)
+                changed += 1
+
+        profile_directories: set[Path] = set()
+        for raw in roots:
+            treatment = _mapping(raw, name="calibration treatment")
+            root = _absolute_path(
+                treatment.get("run_root"),
+                name="calibration run root",
+            )
+            chown_tree(root)
+            profile = _absolute_path(
+                treatment.get("profile"),
+                name="calibration treatment profile",
+            )
+            profile_directories.add(profile.parent)
+
+        plan_path = _absolute_path(plan.get("path"), name="calibration plan path")
+        plan_directory = plan_path.parent
+        chown_tree(plan_directory)
+        for path in sorted(plan_directory.rglob("*")):
+            if path.is_file():
+                path.chmod(0o440)
+            elif path.is_dir():
+                path.chmod(0o550)
+        plan_directory.chmod(0o550)
+        for profile_directory in sorted(profile_directories):
+            if profile_directory == plan_directory:
+                continue
+            chown_tree(profile_directory)
+            for path in sorted(profile_directory.rglob("*")):
+                if path.is_file():
+                    path.chmod(0o440)
+                elif path.is_dir():
+                    path.chmod(0o550)
+            profile_directory.chmod(0o550)
+
+        queue = self._queue(policy)
+        queue_paths = [
+            Path(str(queue[field])).expanduser().resolve()
+            for field in (
+                "deployment_manifest",
+                "state_path",
+                "comparison_output",
+                "continuity_handoff_output",
+            )
+        ]
+        queue_directory = queue_paths[0].parent
+        queue_directory.mkdir(parents=True, exist_ok=True)
+        os.chown(queue_directory, uid, gid)
+        queue_directory.chmod(0o750)
+        deployment = queue_paths[0]
+        if not deployment.is_file() or deployment.is_symlink():
+            raise TerminalBoundaryExecutionError(
+                "queue deployment manifest is missing before ownership handoff"
+            )
+        os.chown(deployment, uid, gid)
+        deployment.chmod(0o440)
+        changed += 2
+        return {
+            "status": "verified",
+            "user": user,
+            "group": group,
+            "uid": uid,
+            "gid": gid,
+            "paths_updated": changed,
+        }
 
     def generate_queue_manifest(
         self,

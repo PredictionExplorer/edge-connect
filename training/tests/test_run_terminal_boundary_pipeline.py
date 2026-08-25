@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import hashlib
+import grp
 import json
 import os
+import pwd
+import stat
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -322,6 +325,8 @@ class BoundaryFixture:
                 "output_dir": str(tmp_path / "calibration-plan"),
                 "run_root_parent": str(tmp_path / "calibration-runs"),
                 "run_id": "source-run",
+                "runtime_user": "ubuntu",
+                "runtime_group": "ubuntu",
                 "prefix": "terminal",
                 "seed": 47,
                 "wall_budget_hours": 1,
@@ -347,7 +352,7 @@ class BoundaryFixture:
             },
             "queue": {
                 "training_dir": str(self.training_dir),
-                "deployment_manifest": str(state_root / "queue-deployment.json"),
+                "deployment_manifest": str(state_root / "queue" / "deployment.json"),
                 "activation_manifest": str(state_root / "queue-activation.json"),
                 "queue_unit": {
                     **_artifact(self.queue_unit),
@@ -355,10 +360,10 @@ class BoundaryFixture:
                 },
                 "finalize_unit": _artifact(self.finalize_unit),
                 "environment": _artifact(self.environment),
-                "state_path": str(state_root / "queue-state.json"),
-                "comparison_output": str(state_root / "comparison.json"),
+                "state_path": str(state_root / "queue" / "state.json"),
+                "comparison_output": str(state_root / "queue" / "comparison.json"),
                 "continuity_handoff_output": str(
-                    state_root / "queue-continuity-handoff.json"
+                    state_root / "queue" / "continuity-handoff.json"
                 ),
                 "execution_lock_path": str(state_root / "execution.lock"),
                 "source_commit": "a" * 40,
@@ -735,6 +740,18 @@ class FakeAdapters:
             "status": "ok",
             "mode": "prepare_only" if prepare_only else "apply",
             "marker": str(marker),
+        }
+
+    def prepare_runtime_ownership(self, policy, _plan) -> dict[str, object]:
+        self._event("prepare_runtime_ownership")
+        calibration = policy["calibration"]
+        return {
+            "status": "verified",
+            "user": calibration["runtime_user"],
+            "group": calibration["runtime_group"],
+            "uid": 1000,
+            "gid": 1000,
+            "paths_updated": 1,
         }
 
     def generate_queue_manifest(self, policy, plan) -> dict[str, object]:
@@ -1180,6 +1197,7 @@ def test_success_side_effect_order_is_fail_closed(tmp_path: Path) -> None:
         "warm_prepare:control",
         "warm_activate:control",
         "generate_queue_manifest",
+        "prepare_runtime_ownership",
         "verify_queue_manifest",
         "launch_queue",
     ]
@@ -1282,3 +1300,36 @@ def test_activation_rejects_tampered_warm_start_checkpoint(
             fixture.policy["queue"]["activation_manifest"],
             policy_path=fixture.policy_path,
         )
+
+
+def test_default_runtime_ownership_handoff_covers_profiles_and_queue_manifest(
+    tmp_path: Path,
+) -> None:
+    fixture = BoundaryFixture(tmp_path)
+    fixture.make_terminal()
+    run_terminal_boundary_pipeline(
+        fixture.policy_path,
+        adapters=FakeAdapters(fixture),
+    )
+    current_user = pwd.getpwuid(os.getuid()).pw_name
+    current_group = grp.getgrgid(os.getgid()).gr_name
+    fixture.policy["calibration"]["runtime_user"] = current_user
+    fixture.policy["calibration"]["runtime_group"] = current_group
+    activation = json.loads(
+        Path(fixture.policy["queue"]["activation_manifest"]).read_text(encoding="utf-8")
+    )
+    plan_path = Path(activation["calibration"]["plan"]["path"])
+    plan_document = json.loads(plan_path.read_text(encoding="utf-8"))
+
+    evidence = DefaultTerminalBoundaryAdapters().prepare_runtime_ownership(
+        fixture.policy,
+        {"path": str(plan_path), "plan": plan_document},
+    )
+
+    deployment = Path(fixture.policy["queue"]["deployment_manifest"])
+    profile = Path(plan_document["treatments"][0]["profile"])
+    assert evidence["status"] == "verified"
+    assert deployment.stat().st_uid == os.getuid()
+    assert profile.stat().st_uid == os.getuid()
+    assert stat.S_IMODE(deployment.stat().st_mode) == 0o440
+    assert stat.S_IMODE(profile.stat().st_mode) == 0o440
