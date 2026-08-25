@@ -2416,6 +2416,20 @@ def run_terminal_boundary_pipeline(
                     operations.inspect_arena_pause(policy.raw),
                     name="arena pause inspection",
                 )
+                if hardware_evidence.get("status") == "unavailable" or (
+                    hardware_evidence.get("healthy") is True
+                    and hardware_evidence.get("current") is False
+                ):
+                    state.update(
+                        {
+                            "status": "waiting",
+                            "phase": "awaiting_current_hardware_report",
+                            "waiting_reason": "hardware_health_report_refreshing",
+                            "automatic_launch_authorized": False,
+                        }
+                    )
+                    _persist_state(policy, state)
+                    return state
                 if pause_evidence.get("active") is not False:
                     state.update(
                         {
@@ -2471,6 +2485,20 @@ def run_terminal_boundary_pipeline(
                     operations.inspect_arena_pause(policy.raw),
                     name="arena pause inspection",
                 )
+                if hardware_evidence.get("status") == "unavailable" or (
+                    hardware_evidence.get("healthy") is True
+                    and hardware_evidence.get("current") is False
+                ):
+                    state.update(
+                        {
+                            "status": "waiting",
+                            "phase": "awaiting_current_hardware_report",
+                            "waiting_reason": "hardware_health_report_refreshing",
+                            "automatic_launch_authorized": False,
+                        }
+                    )
+                    _persist_state(policy, state)
+                    return state
                 _validate_source_preflight(
                     source_evidence,
                     hardware_evidence,
@@ -2508,10 +2536,19 @@ def run_terminal_boundary_pipeline(
                     operations.inspect_source(policy.raw),
                     name="source inspection",
                 )
-                observed_hardware = _json_safe_evidence(
-                    operations.inspect_hardware(policy.raw),
-                    name="hardware inspection",
-                )
+                hardware_deadline = time.monotonic() + 30.0
+                while True:
+                    observed_hardware = _json_safe_evidence(
+                        operations.inspect_hardware(policy.raw),
+                        name="hardware inspection",
+                    )
+                    transient = observed_hardware.get("status") == "unavailable" or (
+                        observed_hardware.get("healthy") is True
+                        and observed_hardware.get("current") is False
+                    )
+                    if not transient or time.monotonic() >= hardware_deadline:
+                        break
+                    time.sleep(0.5)
                 observed_pause = _json_safe_evidence(
                     operations.inspect_arena_pause(policy.raw),
                     name="arena pause inspection",
@@ -3041,10 +3078,29 @@ class DefaultTerminalBoundaryAdapters:
     def inspect_hardware(self, policy: Mapping[str, object]) -> Mapping[str, object]:
         source = self._source(policy)
         path = Path(source["hardware_report"])
-        report, digest_value, _ = _read_json_with_digest(
-            path,
-            name="hardware health report",
-        )
+        if not path.exists():
+            return {
+                "path": str(path),
+                "healthy": False,
+                "current": False,
+                "status": "unavailable",
+                "reason": "hardware health report is being refreshed",
+            }
+        try:
+            report, digest_value, _ = _read_json_with_digest(
+                path,
+                name="hardware health report",
+            )
+        except TerminalBoundaryManifestError:
+            if not path.exists():
+                return {
+                    "path": str(path),
+                    "healthy": False,
+                    "current": False,
+                    "status": "unavailable",
+                    "reason": "hardware health report changed during refresh",
+                }
+            raise
         captured_ns = report.get("captured_ns")
         now = self.clock_ns()
         maximum_age_ns = int(float(source["hardware_max_age_seconds"]) * 1e9)
@@ -3077,6 +3133,7 @@ class DefaultTerminalBoundaryAdapters:
             "sha256": digest_value,
             "healthy": healthy,
             "current": current,
+            "status": "healthy" if healthy and current else "unsafe",
             "captured_ns": captured_ns,
             "expected_gpu_ids": sorted(expected_gpus),
         }

@@ -444,6 +444,7 @@ class FakeAdapters:
         crash_snapshot_once: bool = False,
         arena_active: bool = False,
         frozen_fallback: bool = False,
+        hardware_unavailable: bool = False,
     ) -> None:
         self.fixture = fixture
         self.fail_at = fail_at
@@ -451,6 +452,7 @@ class FakeAdapters:
         self.crash_snapshot_once = crash_snapshot_once
         self.arena_active = arena_active
         self.frozen_fallback = frozen_fallback
+        self.hardware_unavailable = hardware_unavailable
         self.snapshot_crashed = False
         self.snapshot_side_effects = 0
         self.events: list[str] = []
@@ -474,6 +476,12 @@ class FakeAdapters:
 
     def inspect_hardware(self, _policy) -> dict[str, object]:
         self.events.append("inspect_hardware")
+        if self.hardware_unavailable:
+            return {
+                "healthy": False,
+                "current": False,
+                "status": "unavailable",
+            }
         return {"healthy": True, "current": True}
 
     def inspect_arena_pause(self, _policy) -> dict[str, object]:
@@ -969,6 +977,25 @@ def test_newer_terminal_followed_by_active_arena_waits_for_next_boundary(
         "newer_terminal_already_followed_by_active_arena"
     )
     assert state["accepted_terminal"] is None
+    assert _side_effects(adapters) == []
+
+
+def test_transient_missing_hardware_report_waits_without_fallback(
+    tmp_path: Path,
+) -> None:
+    fixture = BoundaryFixture(tmp_path)
+    fixture.make_terminal()
+    adapters = FakeAdapters(fixture, hardware_unavailable=True)
+
+    state = run_terminal_boundary_pipeline(
+        fixture.policy_path,
+        adapters=adapters,
+    )
+
+    assert state["status"] == "waiting"
+    assert state["phase"] == "awaiting_current_hardware_report"
+    assert state["waiting_reason"] == "hardware_health_report_refreshing"
+    assert state["fallback"] is None
     assert _side_effects(adapters) == []
 
 
