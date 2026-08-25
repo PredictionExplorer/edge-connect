@@ -4186,9 +4186,11 @@ def main(argv: list[str] | None = None) -> int:
             if report.get("status") == "completed":
                 status = 0
             elif report.get("status") == "waiting":
-                status = 75
+                status = 0
+            elif report.get("status") in {"blocked", "failed"}:
+                status = 3
             else:
-                status = 2
+                status = 75
     except TerminalBoundaryBusyError as error:
         report = {
             "schema_version": SCHEMA_VERSION,

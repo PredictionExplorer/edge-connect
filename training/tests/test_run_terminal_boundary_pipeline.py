@@ -881,6 +881,19 @@ def test_cli_does_not_restart_after_execution_failure(
     assert main(["run", "--manifest", str(fixture.policy_path)]) == 3
 
 
+def test_cli_treats_normal_waiting_state_as_success(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = BoundaryFixture(tmp_path)
+    monkeypatch.setattr(
+        "scripts.run_terminal_boundary_pipeline.run_terminal_boundary_pipeline",
+        lambda _path: {"status": "waiting"},
+    )
+
+    assert main(["run", "--manifest", str(fixture.policy_path)]) == 0
+
+
 def test_current_terminal_is_accepted_and_launched(tmp_path: Path) -> None:
     fixture = BoundaryFixture(tmp_path)
     fixture.make_terminal(decision="reject")
