@@ -16,6 +16,10 @@ from dataclasses import dataclass
 from pathlib import Path
 
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+CHAMPION_WARM_START_FORMAT = "startrain.champion-warm-start"
+CHAMPION_WARM_START_SCHEMA_VERSION = 1
+CUTOVER_STAGING_FORMAT = "startrain.cutover-staging"
+CUTOVER_STAGING_SCHEMA_VERSION = 1
 SELECTION_CUTOVER_FORMAT = "startrain.selection-cutover"
 SELECTION_CUTOVER_SCHEMA_VERSION = 1
 
@@ -90,6 +94,93 @@ def require_active_selection_cutover(learner_root: str | Path) -> None:
         or not isinstance(payload.get("warm_start_checkpoint_sha256"), str)
     ):
         raise RuntimeError("active archived selection cutover evidence is incomplete")
+
+
+def _read_launch_evidence(path: Path, name: str) -> dict[str, object]:
+    if path.is_symlink():
+        raise RuntimeError(f"{name} may not be a symbolic link")
+    try:
+        with path.open("r", encoding="utf-8") as stream:
+            payload = json.load(stream)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"cannot read {name}: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"{name} must contain a JSON object")
+    return payload
+
+
+def require_launch_ready(learner_root: str | Path) -> None:
+    """Refuse launch while any two-phase training-state cutover is incomplete."""
+
+    root = Path(learner_root)
+    require_active_selection_cutover(root)
+
+    active_warm_start_digest: str | None = None
+    warm_start_path = root / "champion-warm-start.json"
+    if warm_start_path.exists():
+        warm_start = _read_launch_evidence(
+            warm_start_path,
+            "champion warm-start marker",
+        )
+        if (
+            warm_start.get("format") != CHAMPION_WARM_START_FORMAT
+            or warm_start.get("schema_version") != CHAMPION_WARM_START_SCHEMA_VERSION
+        ):
+            raise RuntimeError("champion warm-start marker is incompatible")
+        warm_start_status = warm_start.get("status")
+        if warm_start_status == "prepared":
+            raise RuntimeError(
+                "champion warm start is prepared but has not been activated"
+            )
+        if warm_start_status != "active":
+            raise RuntimeError("champion warm-start marker status is invalid")
+        checkpoint_digest = warm_start.get("checkpoint_sha256")
+        checkpoint_bytes = warm_start.get("checkpoint_bytes")
+        model_step = warm_start.get("absolute_model_step")
+        if (
+            not isinstance(checkpoint_digest, str)
+            or len(checkpoint_digest) != 64
+            or isinstance(checkpoint_bytes, bool)
+            or not isinstance(checkpoint_bytes, int)
+            or checkpoint_bytes <= 0
+            or isinstance(model_step, bool)
+            or not isinstance(model_step, int)
+            or model_step < 0
+        ):
+            raise RuntimeError("active champion warm-start evidence is incomplete")
+        active_warm_start_digest = checkpoint_digest
+
+    staging_path = root / "cutover-staging.json"
+    if not staging_path.exists():
+        return
+    staging = _read_launch_evidence(staging_path, "cutover staging evidence")
+    if (
+        staging.get("format") != CUTOVER_STAGING_FORMAT
+        or staging.get("schema_version") != CUTOVER_STAGING_SCHEMA_VERSION
+    ):
+        raise RuntimeError("cutover staging evidence is incompatible")
+    staging_status = staging.get("status")
+    if staging_status == "pending":
+        raise RuntimeError("cutover staging is pending activation")
+    if staging_status != "active":
+        raise RuntimeError("cutover staging status is invalid")
+    activated_ns = staging.get("activated_ns")
+    checkpoint_digest = staging.get("checkpoint_sha256")
+    if (
+        isinstance(activated_ns, bool)
+        or not isinstance(activated_ns, int)
+        or activated_ns <= 0
+        or not isinstance(checkpoint_digest, str)
+        or len(checkpoint_digest) != 64
+    ):
+        raise RuntimeError("active cutover staging evidence is incomplete")
+    if (
+        active_warm_start_digest is None
+        or checkpoint_digest != active_warm_start_digest
+    ):
+        raise RuntimeError(
+            "active cutover staging disagrees with the champion warm start"
+        )
 
 
 def load_run_identity(path: str | Path) -> RunIdentity:

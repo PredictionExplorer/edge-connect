@@ -234,6 +234,66 @@ Operational relief alone never authorizes confirmation or adoption. Compare
 both arms from the same frozen champion anchor and replay cutoff, count all
 eight provisioned GPUs through resource release, and retain null results.
 
+### Frozen-replay optimizer and clipping calibration
+
+Run optimizer calibration only from the exact stopped runtime profile selected
+at a terminal boundary. Do not substitute a canonical config: plateau recovery
+may have reduced the effective Muon and AdamW learning rates that produced the
+current champion. The frozen suite is:
+
+1. `ring10-optimizer-runtime-effective-control`;
+2. `ring10-optimizer-clip-norm-2`;
+3. `ring10-optimizer-clip-norm-5`; and
+4. `ring10-optimizer-0.5x-effective-lr`.
+
+The first three form the primary clipping screen; the LR arm remains a separate
+one-factor follow-on. AdamW-only is excluded because its completed seed-17
+dynamics screen produced no frontier gain. Generate the complete immutable
+profile suite with `prepare_elo_ablation.py --suite
+ring10-optimizer-calibration`.
+
+Use `run_frozen_replay_optimizer_calibration_queue.py` to execute deterministic
+learner-only arms against one hash-pinned replay cutoff. Each arm opens SQLite
+in read-only/query-only mode, starts from the same champion EMA with fresh
+optimizer/scheduler state, uses disjoint deterministic train/holdout samples,
+and is capped at two H100-hours. The queue falls back to deterministic
+sequential waves until shared-replay concurrency has separately cleared its
+throughput gate.
+
+The frozen comparator requires:
+
+- zero non-finite loss or gradient events;
+- exact source, partition, optimizer-routing, and reference-evaluation parity;
+- at least 90% of control learner throughput; and
+- a strictly positive one-sided paired-bootstrap lower bound for held-out
+  policy/value composite loss reduction, with Bonferroni familywise allocation
+  across every non-control arm.
+
+Clip frequency is diagnostic only. A tie, invalid arm, or no passing treatment
+retains control and resumes the protected workload. A unique winner creates a
+derived screen plan containing only runtime control and that treatment; those
+two roots then use the normal pair-valid Elo queue. Production advancement
+still requires seed 17, seeds 17/18/19, and the 24-hour canary gates.
+
+### Automatic terminal-boundary staging
+
+`run_terminal_boundary_pipeline.py` may be armed from a separate immutable
+release. Its policy pins the current promotion-status digest and timestamp, so
+it ignores that result and accepts only a strictly newer terminal decision.
+It also refuses a terminal result already followed by another active arena
+lease. Candidate pointers may advance while an older candidate finishes; the
+pipeline therefore verifies the evaluated candidate from the immutable arena
+result and model manifest rather than requiring the latest candidate pointer.
+
+At a quiescent boundary it places the continuity operator hold, stops the source
+before lengthy backup work can race a new arena, proves process/GPU release,
+creates replay and DR snapshots, waits for the matching off-host
+acknowledgement, exports the champion, runs frozen calibration, prepares and
+activates isolated warm-start roots, verifies the queue activation manifest,
+launches the queue, then releases its owned hold. Any failure releases only its
+own hold and requests the verified continuity fallback. Every step records
+intent and evidence before continuing, so restart is idempotent.
+
 ### Benchmark arena occupancy before changing promotion
 
 Test continuation occupancy against fixed manifests before changing a profile:

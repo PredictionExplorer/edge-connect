@@ -19,7 +19,12 @@ from startrain.orchestration import (
     FATAL_WORKER_EXIT_CODE,
     TRANSIENT_WORKER_EXIT_CODE,
 )
-from startrain.runtime import SignalLatch, atomic_json, load_run_identity
+from startrain.runtime import (
+    SignalLatch,
+    atomic_json,
+    load_run_identity,
+    require_launch_ready,
+)
 
 if __package__:
     from .preflight_run_state import run_state_preflight
@@ -637,6 +642,7 @@ def run_elo_ablation(
     )
     leaf_budget = int(_positive_number("leaf_budget", metadata.get("leaf_budget")))
     _validate_measurement_resumable(metadata)
+    require_launch_ready(root / "learner")
     restored_from = restore_if_corrupt(root)
     _append_replay_restore_evidence(
         metadata,

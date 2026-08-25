@@ -54,6 +54,8 @@ from startrain.orchestration import (
     validate_autonomous_run_root,
 )
 from startrain.runtime import (
+    CHAMPION_WARM_START_FORMAT,
+    CHAMPION_WARM_START_SCHEMA_VERSION,
     RunIdentity,
     atomic_json,
     load_or_create_run_identity,
@@ -95,6 +97,27 @@ def test_finite_and_continuous_systemd_restart_policies_are_distinct() -> None:
     assert "@PROVISIONED_GPUS@" in report_service
     assert "OnUnitActiveSec=15min" in report_timer
     assert "edgeconnect-startrain-@RUN_ID@-report.service" in report_timer
+
+
+def test_orchestrator_refuses_prepared_warm_start(tmp_path: Path) -> None:
+    root = tmp_path / "run"
+    learner = root / "learner"
+    learner.mkdir(parents=True)
+    raw = yaml.safe_load((CONFIGS / "h100-4gpu.yaml").read_text(encoding="utf-8"))
+    raw["orchestration"]["directories"]["root"] = str(root)
+    profile = tmp_path / "profile.yaml"
+    profile.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+    atomic_json(
+        learner / "champion-warm-start.json",
+        {
+            "format": CHAMPION_WARM_START_FORMAT,
+            "schema_version": CHAMPION_WARM_START_SCHEMA_VERSION,
+            "status": "prepared",
+        },
+    )
+
+    with pytest.raises(RuntimeError, match="prepared but has not been activated"):
+        orchestration_module.orchestrate_main(["--config", str(profile)])
 
 
 def test_coordinator_fails_closed_before_starting_workers_on_bad_hardware(

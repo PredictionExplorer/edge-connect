@@ -43,6 +43,13 @@ class NonFiniteTrainingError(FloatingPointError):
 
 @dataclass(frozen=True, slots=True)
 class HostTrainStepMetrics:
+    """Host metrics with finite-safe clipping diagnostics.
+
+    ``gradient_norm`` remains the pre-clip global norm. Clip severity is the
+    fraction removed (``1 - coefficient``), while clip ratio is the pre-clip
+    norm divided by the configured threshold.
+    """
+
     losses: dict[str, float]
     gradient_norm: float
     gradient_clipped: bool
@@ -52,6 +59,17 @@ class HostTrainStepMetrics:
     optimizer_groups: tuple[OptimizerGroupDiagnostics, ...]
     scheduler: "SchedulerDiagnostics | None"
     ema: "EMADiagnostics | None"
+    gradient_post_clip_norm: float | None = None
+    gradient_clip_threshold: float | None = None
+    gradient_clip_coefficient: float | None = None
+    gradient_clip_severity: float | None = None
+    gradient_clip_ratio: float | None = None
+
+    @property
+    def gradient_pre_clip_norm(self) -> float:
+        """Backward-compatible pre-clip global norm."""
+
+        return self.gradient_norm
 
 
 @dataclass(frozen=True, slots=True)
@@ -197,25 +215,73 @@ class TrainStepResult:
     optimizer_diagnostics: OptimizerStepDiagnostics | None = None
     scheduler_diagnostics: SchedulerDiagnostics | None = None
     ema_diagnostics: _EMADiagnosticTensors | None = None
+    gradient_clip_threshold: float | None = None
 
     def to_host(self) -> HostTrainStepMetrics:
         names = tuple(self.loss_tensors)
-        values = torch.stack(
-            (
-                *(self.loss_tensors[name].detach().float() for name in names),
-                self.gradient_norm_tensor.detach().float(),
-                self.gradient_clipped_tensor.detach().float(),
-                self.nonfinite_loss_count_tensor.detach().float(),
-                self.nonfinite_gradient_count_tensor.detach().float(),
+        tensors = [
+            *(self.loss_tensors[name].detach().float() for name in names),
+            self.gradient_norm_tensor.detach().float(),
+            self.gradient_clipped_tensor.detach().float(),
+            self.nonfinite_loss_count_tensor.detach().float(),
+            self.nonfinite_gradient_count_tensor.detach().float(),
+        ]
+        post_clip_index: int | None = None
+        coefficient_index: int | None = None
+        if self.gradient_clip_threshold is not None:
+            # Match torch.nn.utils.clip_grad_norm_ exactly. Deriving the norm avoids
+            # a second reduction over gradients and cannot perturb the optimizer.
+            coefficient = torch.clamp(
+                self.gradient_clip_threshold
+                / (self.gradient_norm_tensor.detach() + 1e-6),
+                max=1.0,
             )
+            post_clip_index = len(tensors)
+            tensors.append((self.gradient_norm_tensor.detach() * coefficient).float())
+            coefficient_index = len(tensors)
+            tensors.append(coefficient.float())
+        host_values = torch.stack(tensors).cpu().tolist()
+        loss_count = len(names)
+        gradient_norm = float(host_values[loss_count])
+        threshold = (
+            float(self.gradient_clip_threshold)
+            if self.gradient_clip_threshold is not None
+            else None
         )
-        host_values = values.cpu().tolist()
+        if threshold is not None and (not math.isfinite(threshold) or threshold <= 0):
+            threshold = None
+        post_clip_norm = (
+            float(host_values[post_clip_index]) if post_clip_index is not None else None
+        )
+        if post_clip_norm is not None and (
+            not math.isfinite(post_clip_norm) or post_clip_norm < 0
+        ):
+            post_clip_norm = None
+        clip_coefficient = (
+            float(host_values[coefficient_index])
+            if coefficient_index is not None
+            else None
+        )
+        if clip_coefficient is not None and (
+            not math.isfinite(clip_coefficient) or not 0 <= clip_coefficient <= 1
+        ):
+            clip_coefficient = None
+        clip_severity = 1.0 - clip_coefficient if clip_coefficient is not None else None
+        clip_ratio = (
+            gradient_norm / threshold
+            if threshold is not None
+            and math.isfinite(gradient_norm)
+            and gradient_norm >= 0
+            else None
+        )
+        if clip_ratio is not None and not math.isfinite(clip_ratio):
+            clip_ratio = None
         return HostTrainStepMetrics(
-            losses=dict(zip(names, host_values[:-4], strict=True)),
-            gradient_norm=float(host_values[-4]),
-            gradient_clipped=bool(host_values[-3]),
-            nonfinite_loss_count=int(host_values[-2]),
-            nonfinite_gradient_count=int(host_values[-1]),
+            losses=dict(zip(names, host_values[:loss_count], strict=True)),
+            gradient_norm=gradient_norm,
+            gradient_clipped=bool(host_values[loss_count + 1]),
+            nonfinite_loss_count=int(host_values[loss_count + 2]),
+            nonfinite_gradient_count=int(host_values[loss_count + 3]),
             learning_rates=self.learning_rates,
             optimizer_groups=(
                 self.optimizer_diagnostics.to_host()
@@ -228,6 +294,11 @@ class TrainStepResult:
                 if self.ema_diagnostics is not None
                 else None
             ),
+            gradient_post_clip_norm=post_clip_norm,
+            gradient_clip_threshold=threshold,
+            gradient_clip_coefficient=clip_coefficient,
+            gradient_clip_severity=clip_severity,
+            gradient_clip_ratio=clip_ratio,
         )
 
     @property
@@ -237,6 +308,10 @@ class TrainStepResult:
     @property
     def gradient_norm(self) -> float:
         return self.to_host().gradient_norm
+
+    @property
+    def gradient_pre_clip_norm(self) -> float:
+        return self.gradient_norm
 
 
 class DeviceBatchPrefetcher(Iterator[ReplayBatch]):
@@ -723,4 +798,5 @@ def train_step(
             scheduler_diagnostics(scheduler) if scheduler is not None else None
         ),
         ema_diagnostics=ema_diagnostics,
+        gradient_clip_threshold=float(gradient_clip_norm),
     )

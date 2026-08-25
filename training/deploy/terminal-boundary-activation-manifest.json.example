@@ -1,0 +1,147 @@
+{
+  "schema_version": 1,
+  "report": "startrain-terminal-boundary-queue-activation",
+  "status": "verified_for_launch",
+  "created_ns": 1000000000000000001,
+  "policy": {
+    "path": "/etc/edgeconnect/terminal-boundary-policy-v1.json",
+    "sha256": "@POLICY_SHA256@",
+    "policy_id": "terminal-calibration-seed47",
+    "policy_version": 1
+  },
+  "terminal": {
+    "promotion_status_sha256": "@TERMINAL_PROMOTION_STATUS_SHA256@",
+    "promotion_status_updated_ns": 1000000000000000001,
+    "decision": "promote",
+    "candidate_identity": "@CANDIDATE_ID@",
+    "champion_identity": "@CANDIDATE_ID@",
+    "result_sha256": "@TERMINAL_RESULT_SHA256@"
+  },
+  "safety": {
+    "operator_hold": {
+      "status": "active",
+      "path": "/var/lib/edgeconnect/terminal-boundary/operator-hold.json",
+      "sha256": "@OPERATOR_HOLD_SHA256@",
+      "bytes": 123
+    },
+    "replay_backup": {
+      "status": "ok",
+      "path": "/srv/edgeconnect/runs/continuous/recovery/replay-manifest/manifest-1000000000000000001.sqlite3",
+      "sha256": "@REPLAY_BACKUP_SHA256@",
+      "bytes": 12345
+    },
+    "disaster_snapshot": {
+      "status": "ok",
+      "snapshot": "/mnt/edgeconnect-backup/continuous/snapshots/@RUN_ID@/snapshot-1000000000000000001.json",
+      "snapshot_sha256": "@DISASTER_SNAPSHOT_SHA256@",
+      "snapshot_bytes": 12345
+    },
+    "off_host_acknowledgement": {
+      "status": "verified",
+      "path": "/mnt/edgeconnect-backup/continuous/acknowledgements/terminal-boundary-mac.json",
+      "sha256": "@OFF_HOST_ACK_SHA256@",
+      "bytes": 1234,
+      "snapshot_sha256": "@DISASTER_SNAPSHOT_SHA256@"
+    },
+    "source_stop": {
+      "status": "stopped",
+      "unit": "edgeconnect-startrain-continuous.service"
+    },
+    "source_release": {
+      "status": "verified",
+      "service_inactive": true,
+      "main_pid_released": true,
+      "coordinator_lock_released": true,
+      "process_groups_released": true,
+      "gpus_released": true
+    },
+    "launch_preflight": {
+      "hardware": {
+        "healthy": true,
+        "current": true
+      },
+      "arena_pause": {
+        "active": false
+      },
+      "verified_ns": 1000000000000000002
+    }
+  },
+  "champion_snapshot": {
+    "status": "verified",
+    "destination": "/srv/edgeconnect/exports/terminal-champion-v1",
+    "model_identity": "@CANDIDATE_ID@",
+    "pin": {
+      "path": "/var/lib/edgeconnect/terminal-boundary/champion-snapshot-pin.json",
+      "sha256": "@CHAMPION_SNAPSHOT_PIN_SHA256@",
+      "bytes": 1234
+    }
+  },
+  "calibration": {
+    "frozen_replay": {
+      "status": "completed",
+      "comparison": {
+        "path": "/var/lib/edgeconnect/terminal-boundary/frozen-calibration/comparison.json",
+        "sha256": "@FROZEN_CALIBRATION_COMPARISON_SHA256@",
+        "selection": {
+          "selected_arm": "@SELECTED_TREATMENT@",
+          "fallback_to_control": false
+        }
+      },
+      "screen_plan": {
+        "path": "/var/lib/edgeconnect/terminal-boundary/screen-plan/ablation-plan.json",
+        "sha256": "@SCREEN_PLAN_SHA256@"
+      }
+    },
+    "plan": {
+      "path": "/var/lib/edgeconnect/terminal-boundary/screen-plan/ablation-plan.json",
+      "sha256": "@SCREEN_PLAN_SHA256@",
+      "bytes": 12345
+    },
+    "roots": [
+      {
+        "treatment": "control",
+        "run_root": "/srv/edgeconnect/runs/terminal-calibration/terminal-calibration-control-seed47",
+        "profile": "/var/lib/edgeconnect/terminal-boundary/calibration-plan/control.yaml",
+        "profile_sha256": "@CALIBRATION_PROFILE_SHA256@",
+        "fork": {
+          "status": "forked",
+          "metadata_sha256": "@FORK_METADATA_SHA256@"
+        },
+        "warm_start_prepared": {
+          "status": "ok",
+          "mode": "prepare-only"
+        },
+        "warm_start_active": {
+          "status": "ok",
+          "mode": "apply",
+          "marker": {
+            "path": "/srv/edgeconnect/runs/terminal-calibration/terminal-calibration-control-seed47/learner/champion-warm-start.json",
+            "sha256": "@ACTIVE_WARM_START_MARKER_SHA256@",
+            "bytes": 1234,
+            "status": "active"
+          },
+          "recovery": {
+            "path": "/srv/edgeconnect/runs/terminal-calibration/terminal-calibration-control-seed47/learner/recovery.json",
+            "sha256": "@ACTIVE_RECOVERY_SHA256@",
+            "bytes": 1234
+          },
+          "resume_cutover": {
+            "path": "/srv/edgeconnect/runs/terminal-calibration/terminal-calibration-control-seed47/learner/resume-cutover.json",
+            "sha256": "@ACTIVE_RESUME_CUTOVER_SHA256@",
+            "bytes": 1234
+          }
+        }
+      }
+    ]
+  },
+  "queue": {
+    "deployment_manifest": {
+      "path": "/var/lib/edgeconnect/terminal-boundary/queue-deployment.json",
+      "sha256": "@QUEUE_DEPLOYMENT_SHA256@",
+      "bytes": 12345
+    },
+    "unit": "edgeconnect-startrain-terminal-calibration-queue.service",
+    "state_path": "/var/lib/edgeconnect/terminal-boundary/queue-state.json",
+    "execution_lock_path": "/var/lock/edgeconnect-startrain-execution.lock"
+  }
+}

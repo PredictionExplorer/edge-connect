@@ -21,6 +21,10 @@ from scripts.run_elo_ablation import (
     main,
     run_elo_ablation,
 )
+from startrain.runtime import (
+    CHAMPION_WARM_START_FORMAT,
+    CHAMPION_WARM_START_SCHEMA_VERSION,
+)
 
 CONFIGS = Path(__file__).parents[1] / "configs"
 
@@ -140,6 +144,38 @@ def test_runner_fails_closed_when_replay_cannot_be_restored(
             poll_seconds=0.01,
         )
     assert preflight_called is False
+
+
+def test_runner_rejects_prepared_warm_start_before_restore(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, profile = _forked_run(tmp_path)
+    (root / "learner" / "champion-warm-start.json").write_text(
+        json.dumps(
+            {
+                "format": CHAMPION_WARM_START_FORMAT,
+                "schema_version": CHAMPION_WARM_START_SCHEMA_VERSION,
+                "status": "prepared",
+            }
+        ),
+        encoding="utf-8",
+    )
+    restore_called = False
+
+    def restore(_run_root: Path) -> None:
+        nonlocal restore_called
+        restore_called = True
+
+    monkeypatch.setattr(run_module, "restore_if_corrupt", restore)
+
+    with pytest.raises(RuntimeError, match="prepared but has not been activated"):
+        run_elo_ablation(
+            config_path=profile,
+            orchestrator=sys.executable,
+            poll_seconds=0.01,
+        )
+    assert restore_called is False
 
 
 def test_runner_persists_restore_evidence_before_preflight_failure(

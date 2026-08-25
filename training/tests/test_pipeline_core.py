@@ -1024,6 +1024,14 @@ def test_learner_runs_batch_publishes_metrics_and_resumes_example_cadence(
         assert metric["data_wait_seconds"] >= 0
         assert metric["window_setup_seconds"] >= 0
         assert metric["h2d_seconds"] == 0
+        assert metric["gradient_pre_clip_norm"] == metric["gradient_norm"]
+        assert metric["gradient_post_clip_norm"] <= metric["gradient_norm"]
+        assert metric["gradient_clip_threshold"] == 1.0
+        assert 0 <= metric["gradient_clip_coefficient"] <= 1
+        assert metric["gradient_clip_severity"] == pytest.approx(
+            1.0 - metric["gradient_clip_coefficient"]
+        )
+        assert metric["gradient_clip_ratio"] == pytest.approx(metric["gradient_norm"])
         assert metric["examples_consumed"] == 2
         assert metric["total_replay_samples"] == 2
         assert metric["updates_per_new_sample"] == 1

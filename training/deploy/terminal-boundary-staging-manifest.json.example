@@ -1,0 +1,205 @@
+{
+  "schema_version": 1,
+  "report": "startrain-terminal-boundary-policy",
+  "policy_id": "terminal-calibration-seed47",
+  "policy_version": 1,
+  "state_path": "/var/lib/edgeconnect/terminal-boundary/state.json",
+  "runtime": {
+    "training_dir": "/srv/edgeconnect/release/training",
+    "release_manifest": {
+      "path": "/srv/edgeconnect/release/release-manifest.json",
+      "sha256": "@RELEASE_MANIFEST_SHA256@"
+    },
+    "terminal_runner": {
+      "path": "/srv/edgeconnect/release/training/scripts/run_terminal_boundary_pipeline.py",
+      "sha256": "@TERMINAL_RUNNER_SHA256@"
+    },
+    "calibration_runner": {
+      "path": "/srv/edgeconnect/release/training/scripts/run_frozen_replay_optimizer_calibration.py",
+      "sha256": "@CALIBRATION_RUNNER_SHA256@"
+    },
+    "calibration_queue": {
+      "path": "/srv/edgeconnect/release/training/scripts/run_frozen_replay_optimizer_calibration_queue.py",
+      "sha256": "@CALIBRATION_QUEUE_SHA256@"
+    },
+    "calibration_comparator": {
+      "path": "/srv/edgeconnect/release/training/scripts/compare_frozen_replay_optimizer_calibration.py",
+      "sha256": "@CALIBRATION_COMPARATOR_SHA256@"
+    },
+    "ablation_preparer": {
+      "path": "/srv/edgeconnect/release/training/scripts/prepare_elo_ablation.py",
+      "sha256": "@ABLATION_PREPARER_SHA256@"
+    },
+    "ablation_forker": {
+      "path": "/srv/edgeconnect/release/training/scripts/fork_elo_ablation.py",
+      "sha256": "@ABLATION_FORKER_SHA256@"
+    },
+    "warm_starter": {
+      "path": "/srv/edgeconnect/release/training/scripts/prepare_champion_warm_start.py",
+      "sha256": "@WARM_STARTER_SHA256@"
+    },
+    "runtime_module": {
+      "path": "/srv/edgeconnect/release/training/startrain/runtime.py",
+      "sha256": "@RUNTIME_MODULE_SHA256@"
+    },
+    "training_module": {
+      "path": "/srv/edgeconnect/release/training/startrain/training.py",
+      "sha256": "@TRAINING_MODULE_SHA256@"
+    },
+    "learner_module": {
+      "path": "/srv/edgeconnect/release/training/startrain/learner.py",
+      "sha256": "@LEARNER_MODULE_SHA256@"
+    },
+    "checkpoint_module": {
+      "path": "/srv/edgeconnect/release/training/startrain/checkpoint.py",
+      "sha256": "@CHECKPOINT_MODULE_SHA256@"
+    },
+    "continuity_module": {
+      "path": "/srv/edgeconnect/release/training/startrain/continuity.py",
+      "sha256": "@CONTINUITY_MODULE_SHA256@"
+    },
+    "snapshot_module": {
+      "path": "/srv/edgeconnect/release/training/starserve/snapshot.py",
+      "sha256": "@SNAPSHOT_MODULE_SHA256@"
+    },
+    "replay_backup": {
+      "path": "/srv/edgeconnect/release/training/scripts/replay_manifest_backup.py",
+      "sha256": "@REPLAY_BACKUP_SHA256@"
+    },
+    "disaster_recovery": {
+      "path": "/srv/edgeconnect/release/training/scripts/training_disaster_recovery.py",
+      "sha256": "@DISASTER_RECOVERY_SHA256@"
+    },
+    "queue_generator": {
+      "path": "/srv/edgeconnect/release/training/scripts/run_elo_ablation_queue.py",
+      "sha256": "@QUEUE_GENERATOR_SHA256@"
+    },
+    "queue_runner": {
+      "path": "/srv/edgeconnect/release/training/scripts/run_elo_ablation.py",
+      "sha256": "@QUEUE_RUNNER_SHA256@"
+    },
+    "elo_comparator": {
+      "path": "/srv/edgeconnect/release/training/scripts/compare_elo_ablation.py",
+      "sha256": "@ELO_COMPARATOR_SHA256@"
+    }
+  },
+  "arm": {
+    "promotion_status_sha256": "@ARMED_PROMOTION_STATUS_SHA256@",
+    "promotion_status_updated_ns": 1000000000000000000
+  },
+  "source": {
+    "run_root": "/srv/edgeconnect/runs/continuous",
+    "run_identity": {
+      "run_id": "@RUN_ID@",
+      "generation_family": "@GENERATION_FAMILY@",
+      "created_ns": 1000000000000000000
+    },
+    "profile": {
+      "path": "/srv/edgeconnect/release/training/configs/continuous.yaml",
+      "sha256": "@SOURCE_PROFILE_SHA256@"
+    },
+    "unit": {
+      "name": "edgeconnect-startrain-continuous.service",
+      "path": "/etc/systemd/system/edgeconnect-startrain-continuous.service",
+      "sha256": "@SOURCE_UNIT_SHA256@"
+    },
+    "promotion_status": "/srv/edgeconnect/runs/continuous/arena/promotion-status.json",
+    "candidate_pointer": "/srv/edgeconnect/runs/continuous/learner/candidate.json",
+    "champion_pointer": "/srv/edgeconnect/runs/continuous/learner/champion.json",
+    "arena_root": "/srv/edgeconnect/runs/continuous/arena",
+    "coordinator_status": "/srv/edgeconnect/runs/continuous/status/coordinator.json",
+    "coordinator_lock": "/srv/edgeconnect/runs/continuous/coordinator.lock",
+    "arena_pause_request": "/srv/edgeconnect/runs/continuous/status/arena-gpu-pause.json",
+    "hardware_report": "/srv/edgeconnect/runs/continuous/status/hardware-health.json",
+    "hardware_max_age_seconds": 180,
+    "gpu_ids": [0, 1, 2, 3, 4, 5, 6, 7],
+    "stop_timeout_seconds": 1000
+  },
+  "operator_hold_path": "@CONTINUITY_OPERATOR_HOLD_PATH@",
+  "backup": {
+    "replay_retain": 3,
+    "replay_max_total_bytes": 21474836480,
+    "disaster_backup_root": "/mnt/edgeconnect-backup/continuous",
+    "disaster_backup_mount": "/mnt/edgeconnect-backup",
+    "off_host_acknowledgement_path": "/mnt/edgeconnect-backup/continuous/acknowledgements/terminal-boundary-mac.json",
+    "off_host_ack_timeout_seconds": 1800,
+    "off_host_ack_poll_seconds": 5
+  },
+  "snapshot": {
+    "destination": "/srv/edgeconnect/exports/terminal-champion-v1",
+    "pin_path": "/var/lib/edgeconnect/terminal-boundary/champion-snapshot-pin.json"
+  },
+  "calibration": {
+    "base_config": {
+      "path": "@SOURCE_PROFILE_PATH@",
+      "sha256": "@SOURCE_PROFILE_SHA256@"
+    },
+    "output_dir": "/var/lib/edgeconnect/terminal-boundary/calibration-plan",
+    "run_root_parent": "/srv/edgeconnect/runs/terminal-calibration",
+    "run_id": "@RUN_ID@",
+    "prefix": "terminal-calibration",
+    "seed": 47,
+    "wall_budget_hours": 2,
+    "leaf_budget": 1000000000,
+    "guard_floor_elo": -35,
+    "treatments": [
+      "ring10-optimizer-runtime-effective-control",
+      "ring10-optimizer-clip-norm-2",
+      "ring10-optimizer-clip-norm-5",
+      "ring10-optimizer-0.5x-effective-lr"
+    ],
+    "suite": "ring10-optimizer-calibration",
+    "guard_rings": [],
+    "frozen_replay": {
+      "output_root": "/var/lib/edgeconnect/terminal-boundary/frozen-calibration",
+      "screen_plan_path": "/var/lib/edgeconnect/terminal-boundary/screen-plan/ablation-plan.json",
+      "steps": 1000,
+      "device": "cuda:0",
+      "budget_h100_hours": 2,
+      "batch_size": 512,
+      "evaluation_batch_size": 64,
+      "max_samples": 65536,
+      "holdout_fraction": 0.2,
+      "checkpoint_interval": 100,
+      "screen_wall_budget_hours": 8,
+      "screen_leaf_budget": 2000000000
+    }
+  },
+  "queue": {
+    "training_dir": "/srv/edgeconnect/release/training",
+    "deployment_manifest": "/var/lib/edgeconnect/terminal-boundary/queue-deployment.json",
+    "activation_manifest": "/var/lib/edgeconnect/terminal-boundary/queue-activation.json",
+    "queue_unit": {
+      "name": "edgeconnect-startrain-terminal-calibration-queue.service",
+      "path": "/etc/systemd/system/edgeconnect-startrain-terminal-calibration-queue.service",
+      "sha256": "@QUEUE_UNIT_SHA256@"
+    },
+    "finalize_unit": {
+      "path": "/etc/systemd/system/edgeconnect-startrain-terminal-calibration-finalize.service",
+      "sha256": "@FINALIZE_UNIT_SHA256@"
+    },
+    "environment": {
+      "path": "/etc/edgeconnect/startrain-terminal-calibration.env",
+      "sha256": "@ENVIRONMENT_SHA256@"
+    },
+    "state_path": "/var/lib/edgeconnect/terminal-boundary/queue-state.json",
+    "comparison_output": "/var/lib/edgeconnect/terminal-boundary/comparison.json",
+    "continuity_handoff_output": "/var/lib/edgeconnect/terminal-boundary/queue-continuity-handoff.json",
+    "execution_lock_path": "/var/lock/edgeconnect-startrain-execution.lock",
+    "source_commit": "@SOURCE_COMMIT@",
+    "orchestrator": "startrain-orchestrate",
+    "poll_seconds": 5,
+    "launch_timeout_seconds": 30,
+    "max_transient_retries": 2,
+    "retry_delay_seconds": 30,
+    "continue_after_fatal": false,
+    "provisioned_gpus": 8
+  },
+  "fallback": {
+    "handoff_path": "/var/lib/edgeconnect/terminal-boundary/fallback-request.json",
+    "continuity_manifest": {
+      "path": "/etc/edgeconnect/training-continuity.json",
+      "sha256": "@CONTINUITY_MANIFEST_SHA256@"
+    }
+  }
+}

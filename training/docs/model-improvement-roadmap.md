@@ -60,11 +60,11 @@ do not infer progress from loss, throughput, or promotion counts alone.
 
 ### Instrumentation
 
-- [-] Optimizer routing hash and parameter counts.
-- [-] Per-group update/weight norms and effective learning rates.
-- [-] Gradient clipping frequency and non-finite counts.
-- [-] Scheduler age and segment-relative position.
-- [-] Raw-versus-EMA distance and effective EMA turnover.
+- [x] Optimizer routing hash and parameter counts.
+- [x] Per-group update/weight norms and effective learning rates.
+- [x] Gradient clipping frequency, pre/post-clip norms, severity, and non-finite counts.
+- [x] Scheduler age and segment-relative position.
+- [x] Raw-versus-EMA distance and effective EMA turnover.
 - [-] Replay source-role share, branch cutoff, and lag quantiles.
 - [-] Clinch-conditioned policy/outcome/score/ownership/alive losses.
 
@@ -78,35 +78,43 @@ do not infer progress from loss, throughput, or promotion counts alone.
   completed with no promoted frontier gain.
 - [x] Synthetic clinch auxiliaries versus exact-outcome-only clinch targets:
   seed-17 screen completed with no promoted frontier gain.
-- [ ] Frozen-live candidate publication cadence: exact live control versus a
+- [x] Frozen-live candidate publication cadence: exact live control versus a
   five-million-learner-example cadence, with no other profile change.
 
 ### Gates
 
-- [ ] Frozen-replay calibration, no more than 2 H100-hours per variant.
-- [ ] Finite training and optimizer reference parity.
-- [ ] Complete replay cutoff/source-share evidence.
-- [ ] Held-out policy/value calibration improvement.
-- [ ] H100 throughput remains within the preregistered limit.
+- [-] Frozen-replay calibration, no more than 2 H100-hours per variant:
+  runner, comparator, and terminal-boundary staging are implemented; H100
+  execution is pending.
+- [-] Finite training and optimizer reference parity: enforced by the staged
+  comparator; execution is pending.
+- [-] Complete replay cutoff/source-share evidence: hash-pinned by the staged
+  runner; execution is pending.
+- [-] Held-out policy/value calibration improvement: one-sided paired bootstrap
+  gate implemented; execution is pending.
+- [-] H100 throughput remains within the preregistered 90% control floor;
+  execution is pending.
 - [ ] Seed-17 pair-valid Elo/hour is positive before confirmation.
 
 ### Preregistered live cadence trial
 
-- [ ] Suite: `ring10-live-cadence`.
-- [ ] Control: `ring10-live-cadence-control`, preserving every learner cadence
+- [x] Suite: `ring10-live-cadence`.
+- [x] Control: `ring10-live-cadence-control`, preserving every learner cadence
   field from the frozen live ring-10-only profile.
-- [ ] Treatment: `ring10-live-cadence-5m`, changing only
+- [x] Treatment: `ring10-live-cadence-5m`, changing only
   `learner.candidate_interval_examples` to `5000000`.
-- [ ] Invariants: UTD `1.0`; identical model, optimizer, replay policy,
+- [x] Invariants: UTD `1.0`; identical model, optimizer, replay policy,
   topology, actor self-play, model-refresh policy, arena, champion anchor, and
   replay cutoff.
-- [ ] Exclusions: do not queue the null optimizer, EMA, freshness, or clinch
+- [x] Exclusions: do not queue the null optimizer, EMA, freshness, or clinch
   arms and do not use the canonicalizing `ring10-optimization` control.
-- [ ] Screen: seed 17, fixed eight-hour and two-billion-leaf budget per arm,
+- [x] Screen: seed 17, fixed eight-hour and two-billion-leaf budget per arm,
   charging all eight H100s through resource release.
-- [ ] Operational gate: candidate arrival/service ratio `<= 1.20`, or at least
-  a 25% relative reduction from control.
-- [ ] Statistical gate: eligible positive pair-valid chronological
+- [x] Operational gate: treatment ratio `1.00` versus control `1.25`, clearing
+  the absolute `<= 1.20` gate.
+- [!] Statistical gate: both arms retained the common champion and gained zero
+  pair-valid frontier Elo/hour, so confirmation was not authorized. The
+  standard gate still requires positive pair-valid chronological
   champion-frontier ring-10 Elo/hour evidence at screening; confirmation still
   requires positive candidate-LCB minus control-UCB in every seed and at least
   20% median point Elo/hour improvement across seeds 17, 18, and 19.
@@ -178,22 +186,54 @@ Decision:
 ```text
 ID: R10-LIVE-CADENCE-01
 Phase: 1 — training dynamics / arena backlog
-Status: preregistered; not started
+Status: seed-17 screen complete; confirmation rejected
 Hypothesis: reducing candidate publication frequency clears arena backlog
   without reducing pair-valid champion-frontier Elo gained per wall hour
-Commit: to be frozen before execution
-Release: to be frozen before execution
+Commit: 874f5b9366e5e097b8f4cfc9af8e21053dc2abca
+Release: main-874f5b9-elo-opt
 Control: ring10-live-cadence-control
 Treatment: ring10-live-cadence-5m
-Anchor/replay cutoff: one common stopped live ring-10-only boundary; pending
-Seeds: 17 screen; 17, 18, 19 only after both screening gates pass
+Anchor/replay cutoff: common champion step 586699,
+  sha256-6ea82195c4c33b298903635db19b1d61112e9ab2ca6011aefadacb66455d07de
+Seeds: 17 only; seeds 18/19 remain held because the statistical gate failed
 Budget: 8 hours / 2B leaves per screen arm; 12 hours per confirmation arm
 System gates: arrival/service <=1.20 or >=25% relative reduction versus control
 Statistical gate: standard pair-valid Elo/hour screening and three-seed gate
-NFS snapshot: pending
-Mac acknowledgement: pending
+NFS snapshot: verified distinct treatment snapshots under
+  edgeconnect-dr/elo-optimization/cadence-seed17-v2
+Mac acknowledgement: verified treatment baselines and queue control-plane mirror
+Result: treatment arrival/service 1.00 versus control 1.25, approximately 4.6%
+  higher actor and learner throughput, but zero promotions and zero pair-valid
+  champion-frontier Elo/hour in both arms
+Decision: retain the runtime workload; do not confirm or adopt the 5M cadence
+```
+
+```text
+ID: R10-OPTIMIZER-CAL-01
+Phase: 1 — frozen-replay optimizer/clipping calibration
+Status: implementation complete; automatic terminal-boundary execution pending
+Hypothesis: a less restrictive clip norm or a further 0.5x effective-LR
+  reduction improves held-out policy/value calibration without sacrificing
+  learner throughput, then converts to positive pair-valid Elo/hour
+Commit: pending reviewed implementation commit
+Release: pending immutable release
+Control: exact runtime-effective frozen source profile
+Treatments: clip norm 2; clip norm 5; follow-on 0.5x effective LR
+Anchor/replay cutoff: atomically selected from the next quiescent terminal
+  boundary; current live roots are never edited
+Seeds: frozen-replay diagnostic, then seed-17 control versus unique winner;
+  seeds 17/18/19 only after positive screening
+Budget: no more than 2 H100-hours per frozen arm; 8 hours / 2B leaves per
+  seed-17 Elo arm
+System gates: finite/reference parity, read-only replay, >=90% control
+  throughput, complete backups and source release
+Statistical gate: strictly positive one-sided held-out composite lower bound;
+  pair-valid Elo/hour remains the advancement and adoption authority
+NFS snapshot: required at terminal boundary
+Mac acknowledgement: required before source cutover completes
 Result: pending
-Decision: pending
+Decision: automatic fallback to runtime control on no winner, tie, invalid
+  evidence, or any cutover failure
 ```
 
 ## Compute ledger

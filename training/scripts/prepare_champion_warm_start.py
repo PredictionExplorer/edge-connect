@@ -36,6 +36,10 @@ from startrain.manifest_selection import (
 from startrain.model import GraphResTNet
 from startrain.optim import build_optimizer
 from startrain.runtime import (
+    CHAMPION_WARM_START_FORMAT,
+    CHAMPION_WARM_START_SCHEMA_VERSION,
+    CUTOVER_STAGING_FORMAT,
+    CUTOVER_STAGING_SCHEMA_VERSION,
     SELECTION_CUTOVER_FORMAT,
     SELECTION_CUTOVER_SCHEMA_VERSION,
     atomic_json,
@@ -43,8 +47,8 @@ from startrain.runtime import (
 )
 from startrain.training import build_scheduler
 
-WARM_START_FORMAT = "startrain.champion-warm-start"
-WARM_START_SCHEMA_VERSION = 1
+WARM_START_FORMAT = CHAMPION_WARM_START_FORMAT
+WARM_START_SCHEMA_VERSION = CHAMPION_WARM_START_SCHEMA_VERSION
 
 
 class WarmStartError(RuntimeError):
@@ -59,6 +63,277 @@ def _read_json(path: Path) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise WarmStartError(f"{path} must contain a JSON object")
     return payload
+
+
+def _file_evidence(path: Path, *, relative_to: Path) -> dict[str, object]:
+    resolved = path.resolve()
+    try:
+        relative = resolved.relative_to(relative_to.resolve())
+    except ValueError as exc:
+        raise WarmStartError(
+            f"staged artifact escaped the learner root: {path}"
+        ) from exc
+    try:
+        data = resolved.read_bytes()
+    except OSError as exc:
+        raise WarmStartError(f"cannot read staged artifact {resolved}: {exc}") from exc
+    if not data:
+        raise WarmStartError(f"staged artifact is empty: {resolved}")
+    return {
+        "path": str(relative),
+        "sha256": hashlib.sha256(data).hexdigest(),
+        "bytes": len(data),
+    }
+
+
+def _evidence_path(
+    learner_root: Path,
+    evidence: object,
+    *,
+    name: str,
+    expected_root: Path,
+) -> Path:
+    if not isinstance(evidence, dict):
+        raise WarmStartError(f"{name} evidence is invalid")
+    path_value = evidence.get("path")
+    digest = evidence.get("sha256")
+    size = evidence.get("bytes")
+    if (
+        not isinstance(path_value, str)
+        or not path_value
+        or Path(path_value).is_absolute()
+        or not isinstance(digest, str)
+        or len(digest) != 64
+        or isinstance(size, bool)
+        or not isinstance(size, int)
+        or size <= 0
+    ):
+        raise WarmStartError(f"{name} evidence is invalid")
+    path = (learner_root / path_value).resolve()
+    if not path.is_relative_to(expected_root.resolve()):
+        raise WarmStartError(f"{name} escaped its staging directory")
+    verify_file(path, expected_sha256=digest, expected_bytes=size)
+    return path
+
+
+def _write_staged_json(path: Path, payload: dict[str, object]) -> None:
+    if path.exists():
+        if _read_json(path) != payload:
+            raise WarmStartError(f"existing staged artifact is incompatible: {path}")
+        return
+    atomic_json(path, payload)
+
+
+def _load_cutover_staging(
+    learner_root: Path,
+    marker_path: Path,
+    marker: dict[str, Any],
+) -> dict[str, Any] | None:
+    staging_path = learner_root / "cutover-staging.json"
+    if not staging_path.is_file():
+        return None
+    staging = _read_json(staging_path)
+    expected = {
+        "format": CUTOVER_STAGING_FORMAT,
+        "schema_version": CUTOVER_STAGING_SCHEMA_VERSION,
+        "run_id": marker.get("run_id"),
+        "generation_family": marker.get("generation_family"),
+        "source_model_identity": marker.get("source_model_identity"),
+        "source_model_step": marker.get("source_model_step"),
+        "profile_sha256": marker.get("profile_sha256"),
+        "checkpoint": marker.get("checkpoint"),
+        "checkpoint_sha256": marker.get("checkpoint_sha256"),
+        "checkpoint_bytes": marker.get("checkpoint_bytes"),
+        "absolute_model_step": marker.get("absolute_model_step"),
+        "prepared_ns": marker.get("prepared_ns"),
+    }
+    if any(staging.get(key) != value for key, value in expected.items()):
+        raise WarmStartError("cutover staging evidence disagrees with the warm start")
+    status = staging.get("status")
+    marker_status = marker.get("status")
+    if status not in ("pending", "active"):
+        raise WarmStartError("cutover staging status is invalid")
+    if status == "active" and marker_status not in ("prepared", "active"):
+        raise WarmStartError("active cutover staging has an invalid warm-start state")
+    if status == "pending" and marker_status not in ("prepared", "active"):
+        raise WarmStartError("pending cutover staging has an invalid warm-start state")
+
+    checkpoint_digest = marker.get("checkpoint_sha256")
+    if not isinstance(checkpoint_digest, str):
+        raise WarmStartError("prepared checkpoint digest is invalid")
+    staging_root = learner_root / "cutover-staging" / checkpoint_digest
+    cadence_path = _evidence_path(
+        learner_root,
+        staging.get("cadence"),
+        name="staged cadence",
+        expected_root=staging_root,
+    )
+    if _read_json(cadence_path) != marker.get("cadence"):
+        raise WarmStartError("staged cadence disagrees with the warm-start marker")
+    staged_utd = staging.get("utd_segment")
+    marker_utd = marker.get("utd_segment")
+    if marker_utd is None:
+        if staged_utd is not None:
+            raise WarmStartError("unexpected staged UTD evidence")
+    else:
+        utd_path = _evidence_path(
+            learner_root,
+            staged_utd,
+            name="staged UTD segment",
+            expected_root=staging_root,
+        )
+        if _read_json(utd_path) != marker_utd:
+            raise WarmStartError("staged UTD segment disagrees with the marker")
+
+    prepared_marker = staging.get("prepared_marker")
+    if not isinstance(prepared_marker, dict):
+        raise WarmStartError("prepared warm-start marker evidence is invalid")
+    prepared_path = _evidence_path(
+        learner_root,
+        prepared_marker,
+        name="prepared warm-start marker",
+        expected_root=staging_root,
+    )
+    prepared_payload = _read_json(prepared_path)
+    prepared_fields = (
+        "run_id",
+        "generation_family",
+        "source_model_identity",
+        "source_model_step",
+        "profile_sha256",
+        "checkpoint",
+        "checkpoint_sha256",
+        "checkpoint_bytes",
+        "absolute_model_step",
+        "prepared_ns",
+    )
+    if (
+        prepared_payload.get("format") != WARM_START_FORMAT
+        or prepared_payload.get("schema_version") != WARM_START_SCHEMA_VERSION
+        or prepared_payload.get("status") != "prepared"
+        or any(prepared_payload.get(key) != staging.get(key) for key in prepared_fields)
+    ):
+        raise WarmStartError("immutable prepared warm-start evidence is incompatible")
+    if marker_status == "prepared" and prepared_payload != marker:
+        raise WarmStartError(
+            "prepared warm-start marker differs from immutable staging evidence"
+        )
+
+    active_marker = staging.get("active_marker")
+    if status == "active":
+        activated_ns = staging.get("activated_ns")
+        if (
+            isinstance(activated_ns, bool)
+            or not isinstance(activated_ns, int)
+            or activated_ns <= 0
+        ):
+            raise WarmStartError("active cutover staging evidence is incomplete")
+        if marker_status == "active":
+            active_path = _evidence_path(
+                learner_root,
+                active_marker,
+                name="active warm-start marker",
+                expected_root=learner_root,
+            )
+            if active_path != marker_path.resolve():
+                raise WarmStartError("active warm-start marker path is incompatible")
+        elif not isinstance(active_marker, dict):
+            raise WarmStartError("active warm-start marker evidence is invalid")
+    elif active_marker is not None:
+        raise WarmStartError("pending cutover staging has active marker evidence")
+    return staging
+
+
+def _write_cutover_staging(
+    learner_root: Path,
+    marker_path: Path,
+    marker: dict[str, Any],
+) -> dict[str, Any]:
+    checkpoint_digest = marker.get("checkpoint_sha256")
+    cadence = marker.get("cadence")
+    utd_segment = marker.get("utd_segment")
+    if (
+        marker.get("status") != "prepared"
+        or not isinstance(checkpoint_digest, str)
+        or not isinstance(cadence, dict)
+        or (utd_segment is not None and not isinstance(utd_segment, dict))
+    ):
+        raise WarmStartError("warm-start marker cannot be staged")
+    existing = _load_cutover_staging(learner_root, marker_path, marker)
+    if existing is not None:
+        if existing.get("status") != "pending":
+            raise WarmStartError("active cutover staging cannot be prepared again")
+        return existing
+
+    staging_root = learner_root / "cutover-staging" / checkpoint_digest
+    cadence_path = staging_root / "cadence.json"
+    _write_staged_json(cadence_path, cadence)
+    prepared_marker_path = staging_root / "champion-warm-start.prepared.json"
+    _write_staged_json(prepared_marker_path, marker)
+    utd_evidence: dict[str, object] | None = None
+    if utd_segment is not None:
+        utd_path = staging_root / "utd-segment.json"
+        _write_staged_json(utd_path, utd_segment)
+        utd_evidence = _file_evidence(utd_path, relative_to=learner_root)
+    staging: dict[str, Any] = {
+        "format": CUTOVER_STAGING_FORMAT,
+        "schema_version": CUTOVER_STAGING_SCHEMA_VERSION,
+        "status": "pending",
+        "run_id": marker.get("run_id"),
+        "generation_family": marker.get("generation_family"),
+        "source_model_identity": marker.get("source_model_identity"),
+        "source_model_step": marker.get("source_model_step"),
+        "profile_sha256": marker.get("profile_sha256"),
+        "checkpoint": marker.get("checkpoint"),
+        "checkpoint_sha256": checkpoint_digest,
+        "checkpoint_bytes": marker.get("checkpoint_bytes"),
+        "absolute_model_step": marker.get("absolute_model_step"),
+        "prepared_ns": marker.get("prepared_ns"),
+        "prepared_marker": _file_evidence(
+            prepared_marker_path,
+            relative_to=learner_root,
+        ),
+        "active_marker": None,
+        "cadence": _file_evidence(cadence_path, relative_to=learner_root),
+        "utd_segment": utd_evidence,
+        "created_ns": marker.get("prepared_ns"),
+    }
+    atomic_json(learner_root / "cutover-staging.json", staging)
+    return staging
+
+
+def _activate_cutover_staging(
+    learner_root: Path,
+    marker_path: Path,
+    marker: dict[str, Any],
+    staging: dict[str, Any] | None,
+    *,
+    cutover_created_ns: int,
+) -> dict[str, Any] | None:
+    if staging is None:
+        return staging
+    if (
+        staging.get("status") not in ("pending", "active")
+        or marker.get("status") != "active"
+    ):
+        raise WarmStartError("cutover staging cannot be activated")
+    marker_evidence = _file_evidence(marker_path, relative_to=learner_root)
+    if (
+        staging.get("status") == "active"
+        and staging.get("active_marker") == marker_evidence
+    ):
+        return staging
+    active = dict(staging)
+    active.update(
+        {
+            "status": "active",
+            "active_marker": marker_evidence,
+            "cutover_created_ns": cutover_created_ns,
+            "activated_ns": time.time_ns(),
+        }
+    )
+    atomic_json(learner_root / "cutover-staging.json", active)
+    return active
 
 
 def _existing_warm_start(
@@ -344,13 +619,14 @@ def _activate_prepared_warm_start(
     selfplay_enabled: bool,
     run_id: str,
     generation_family: str,
-) -> tuple[dict[str, Any], ResumeCheckpoint]:
+) -> tuple[dict[str, Any], ResumeCheckpoint, dict[str, Any] | None]:
     prepared = _prepared_checkpoint(
         learner_root,
         marker,
         run_id=run_id,
         generation_family=generation_family,
     )
+    staging = _load_cutover_staging(learner_root, marker_path, marker)
     examples = marker.get("examples_consumed")
     if isinstance(examples, bool) or not isinstance(examples, int) or examples < 0:
         raise WarmStartError("prepared examples_consumed is invalid")
@@ -442,7 +718,14 @@ def _activate_prepared_warm_start(
         champion=champion,
         recovery=prepared,
     )
-    return active, cutover
+    staging = _activate_cutover_staging(
+        learner_root,
+        marker_path,
+        active,
+        staging,
+        cutover_created_ns=cutover_created_ns,
+    )
+    return active, cutover, staging
 
 
 def prepare_champion_warm_start(
@@ -450,13 +733,17 @@ def prepare_champion_warm_start(
     profile: str | Path,
     *,
     apply: bool = False,
+    prepare_only: bool = False,
     initial_replay_credit: int | None = None,
     replace_existing: bool = False,
     selection_snapshot: str | Path | None = None,
     source_manifest: str | Path | None = None,
 ) -> dict[str, object]:
-    """Validate and optionally activate a fresh optimizer segment."""
+    """Validate, stage, or activate a fresh optimizer segment."""
 
+    if apply and prepare_only:
+        raise WarmStartError("apply and prepare_only are mutually exclusive")
+    mutating = apply or prepare_only
     root = Path(run_root).expanduser().resolve()
     profile_path = Path(profile).expanduser().resolve()
     experiment = load_config(profile_path)
@@ -469,11 +756,11 @@ def prepare_champion_warm_start(
         selection_snapshot=selection_snapshot,
         source_manifest=source_manifest,
     )
-    if apply and strict_source_pin and not (root / "ablation.json").is_file():
+    if mutating and strict_source_pin and not (root / "ablation.json").is_file():
         raise WarmStartError(
             "verified archived-manifest warm starts may only be applied to a fork"
         )
-    if apply and strict_source_pin:
+    if mutating and strict_source_pin:
         source_artifact = (warm_source.artifact_manifest or warm_source.path).resolve()
         if source_artifact.parent != (root / "learner" / "manifests").resolve():
             raise WarmStartError(
@@ -481,14 +768,14 @@ def prepare_champion_warm_start(
             )
     snapshot_details = source_details.get("selection_snapshot")
     if (
-        apply
+        mutating
         and isinstance(snapshot_details, dict)
         and Path(str(snapshot_details.get("source_run_root"))).resolve() == root
     ):
         raise WarmStartError(
             "selection snapshot source cannot be mutated as its own warm-start fork"
         )
-    preflight = run_state_preflight(root, profile_path, apply=apply)
+    preflight = run_state_preflight(root, profile_path, apply=False)
     source_metadata = inspect_checkpoint(
         warm_source.checkpoint,
         expected_model_config=experiment.as_dict()["model"],
@@ -522,6 +809,7 @@ def prepare_champion_warm_start(
     profile_sha256 = str(profile_report["sha256"])
     marker_path = learner_root / "champion-warm-start.json"
     replaced_marker: dict[str, Any] | None = None
+    replaced_staging: dict[str, Any] | None = None
     try:
         existing = _existing_warm_start(
             marker_path,
@@ -557,14 +845,66 @@ def prepare_champion_warm_start(
         # archive the historical marker and build a new segment from the
         # current champion.
         replaced_marker = candidate
+        staging_path = learner_root / "cutover-staging.json"
+        if staging_path.is_file():
+            replaced_staging = _read_json(staging_path)
+            if (
+                replaced_staging.get("format") != CUTOVER_STAGING_FORMAT
+                or replaced_staging.get("schema_version")
+                != CUTOVER_STAGING_SCHEMA_VERSION
+                or replaced_staging.get("status") != "active"
+                or replaced_staging.get("run_id") != identity.run_id
+                or replaced_staging.get("generation_family")
+                != identity.generation_family
+            ):
+                raise WarmStartError(
+                    "pending cutover staging must be activated before replacement"
+                ) from None
         existing = None
     if existing is not None:
+        staging = _load_cutover_staging(learner_root, marker_path, existing)
+        if existing.get("status") == "prepared":
+            _prepared_checkpoint(
+                learner_root,
+                existing,
+                run_id=identity.run_id,
+                generation_family=identity.generation_family,
+            )
+        if existing.get("status") == "prepared" and prepare_only:
+            mode = "already-prepared"
+            if staging is None:
+                with state_apply_guard(root):
+                    staging = _write_cutover_staging(
+                        learner_root,
+                        marker_path,
+                        existing,
+                    )
+                mode = "resumed-prepare"
+            return {
+                "status": "ok",
+                "mode": mode,
+                "run_root": str(root),
+                "warm_start": existing,
+                "cutover_staging": staging,
+                "preflight": preflight,
+            }
         if existing.get("status") == "prepared" and apply:
             selfplay_enabled = (
                 experiment.learner.selfplay_snapshot_interval_examples is not None
             )
+            activation_preflight = run_state_preflight(
+                root,
+                profile_path,
+                apply=True,
+            )
             with state_apply_guard(root):
-                active, cutover = _activate_prepared_warm_start(
+                if staging is None:
+                    staging = _write_cutover_staging(
+                        learner_root,
+                        marker_path,
+                        existing,
+                    )
+                active, cutover, staging = _activate_prepared_warm_start(
                     learner_root,
                     marker_path,
                     existing,
@@ -583,7 +923,9 @@ def prepare_champion_warm_start(
                     "checkpoint_sha256": cutover.checkpoint_sha256,
                     "step": cutover.step,
                 },
+                "cutover_staging": staging,
                 "preflight": preflight,
+                "activation_preflight": activation_preflight,
             }
         if existing.get("status") == "active" and apply:
             prepared = _prepared_checkpoint(
@@ -598,21 +940,63 @@ def prepare_champion_warm_start(
                     champion=warm_source,
                     recovery=prepared,
                 )
+                cutover_created_ns = existing.get("cutover_created_ns")
+                if staging is not None and (
+                    isinstance(cutover_created_ns, bool)
+                    or not isinstance(cutover_created_ns, int)
+                    or cutover_created_ns <= 0
+                ):
+                    raise WarmStartError(
+                        "active warm-start cutover timestamp is invalid"
+                    )
+                staging = _activate_cutover_staging(
+                    learner_root,
+                    marker_path,
+                    existing,
+                    staging,
+                    cutover_created_ns=(
+                        cutover_created_ns if isinstance(cutover_created_ns, int) else 0
+                    ),
+                )
         return {
             "status": "ok",
             "mode": (
                 "already-active"
                 if apply
                 else (
-                    "prepared-needs-apply"
-                    if existing.get("status") == "prepared"
-                    else "dry-run"
+                    (
+                        "activation-needs-apply"
+                        if staging is not None and staging.get("status") == "pending"
+                        else "already-active"
+                    )
+                    if prepare_only
+                    else (
+                        "prepared-needs-apply"
+                        if existing.get("status") == "prepared"
+                        else "dry-run"
+                    )
                 )
             ),
             "run_root": str(root),
             "warm_start": existing,
+            "cutover_staging": staging,
             "preflight": preflight,
         }
+
+    staging_path = learner_root / "cutover-staging.json"
+    if replaced_staging is None and staging_path.is_file():
+        orphaned_staging = _read_json(staging_path)
+        if (
+            orphaned_staging.get("format") != CUTOVER_STAGING_FORMAT
+            or orphaned_staging.get("schema_version") != CUTOVER_STAGING_SCHEMA_VERSION
+            or orphaned_staging.get("status") != "active"
+            or orphaned_staging.get("run_id") != identity.run_id
+            or orphaned_staging.get("generation_family") != identity.generation_family
+        ):
+            raise WarmStartError(
+                "cutover staging exists without a compatible warm-start marker"
+            )
+        replaced_staging = orphaned_staging
 
     recovery = preflight["recovery"]
     replay = preflight["replay"]
@@ -744,7 +1128,7 @@ def prepare_champion_warm_start(
 
     plan: dict[str, object] = {
         "status": "ok",
-        "mode": "apply" if apply else "dry-run",
+        "mode": ("apply" if apply else ("prepare-only" if prepare_only else "dry-run")),
         "run_root": str(root),
         "profile": str(profile_path),
         "profile_sha256": profile_sha256,
@@ -772,27 +1156,41 @@ def prepare_champion_warm_start(
             else None
         ),
     }
-    if not apply:
+    if not mutating:
         return plan
 
+    cutover: ResumeCheckpoint | None = None
+    staging: dict[str, Any] | None = None
     with state_apply_guard(root):
-        if replaced_marker is not None:
-            encoded = json.dumps(
-                replaced_marker,
-                sort_keys=True,
-                separators=(",", ":"),
-            ).encode("utf-8")
+        if replaced_marker is not None or replaced_staging is not None:
             history = learner_root / "champion-warm-start-history"
             history.mkdir(parents=True, exist_ok=True)
-            archive = history / (
-                f"marker-{replaced_marker.get('source_model_step', 'unknown')}-"
-                f"{hashlib.sha256(encoded).hexdigest()[:16]}.json"
-            )
-            if archive.exists() and _read_json(archive) != replaced_marker:
-                raise WarmStartError(
-                    "existing champion warm-start history artifact is incompatible"
+            for kind, historical in (
+                ("marker", replaced_marker),
+                ("cutover-staging", replaced_staging),
+            ):
+                if historical is None:
+                    continue
+                encoded = json.dumps(
+                    historical,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+                archive_root = history
+                if kind == "cutover-staging":
+                    archive_root = history / "cutover-staging"
+                    archive_root.mkdir(parents=True, exist_ok=True)
+                archive = archive_root / (
+                    f"{kind}-{historical.get('source_model_step', 'unknown')}-"
+                    f"{hashlib.sha256(encoded).hexdigest()[:16]}.json"
                 )
-            atomic_json(archive, replaced_marker)
+                if archive.exists() and _read_json(archive) != historical:
+                    raise WarmStartError(
+                        "existing champion warm-start history artifact is incompatible"
+                    )
+                atomic_json(archive, historical)
+            if replaced_staging is not None:
+                staging_path.unlink(missing_ok=True)
         prepared = create_recovery_checkpoint_artifact(
             learner_root,
             model=model,
@@ -809,7 +1207,7 @@ def prepare_champion_warm_start(
             utd_segment=utd_segment,
             extra={"training_segment": training_segment},
         )
-        marker: dict[str, object] = {
+        marker: dict[str, Any] = {
             "format": WARM_START_FORMAT,
             "schema_version": WARM_START_SCHEMA_VERSION,
             "status": "prepared",
@@ -838,32 +1236,38 @@ def prepare_champion_warm_start(
             "cadence": cadence,
             "prepared_ns": time.time_ns(),
         }
-        if utd_segment is not None:
-            atomic_json(learner_root / "utd-segment.json", utd_segment)
-        atomic_json(learner_root / "cadence.json", cadence)
-        write_model_pointer(
-            learner_root / "candidate.json",
-            warm_source,
-            role="candidate",
-        )
-        if selfplay_enabled:
-            write_model_pointer(
-                learner_root / "selfplay" / "candidate.json",
-                warm_source,
-                role="candidate",
-            )
         atomic_json(marker_path, marker)
+        staging = _write_cutover_staging(learner_root, marker_path, marker)
 
-        marker, cutover = _activate_prepared_warm_start(
-            learner_root,
-            marker_path,
-            marker,
-            champion=warm_source,
-            selfplay_enabled=selfplay_enabled,
-            run_id=identity.run_id,
-            generation_family=identity.generation_family,
+    if apply:
+        activation_preflight = run_state_preflight(
+            root,
+            profile_path,
+            apply=True,
         )
+        with state_apply_guard(root):
+            marker = _read_json(marker_path)
+            staging = _load_cutover_staging(learner_root, marker_path, marker)
+            if marker.get("status") != "prepared" or staging is None:
+                raise WarmStartError(
+                    "prepared warm start changed before atomic activation"
+                )
+            marker, cutover, staging = _activate_prepared_warm_start(
+                learner_root,
+                marker_path,
+                marker,
+                champion=warm_source,
+                selfplay_enabled=selfplay_enabled,
+                run_id=identity.run_id,
+                generation_family=identity.generation_family,
+            )
+        plan["activation_preflight"] = activation_preflight
     plan["warm_start"] = marker
+    plan["cutover_staging"] = staging
+    if prepare_only:
+        return plan
+    if cutover is None:
+        raise WarmStartError("warm-start activation did not publish a resume cutover")
     plan["resume_cutover"] = {
         "checkpoint": str(cutover.checkpoint),
         "checkpoint_sha256": cutover.checkpoint_sha256,
@@ -894,6 +1298,11 @@ def _parser() -> argparse.ArgumentParser:
     )
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--dry-run", action="store_true")
+    mode.add_argument(
+        "--prepare-only",
+        action="store_true",
+        help="create validated staging artifacts without activating training state",
+    )
     mode.add_argument("--apply", action="store_true")
     return parser
 
@@ -902,11 +1311,16 @@ def main(argv: list[str] | None = None) -> int:
     mode = "dry-run"
     try:
         arguments = _parser().parse_args(argv)
-        mode = "apply" if arguments.apply else "dry-run"
+        mode = (
+            "apply"
+            if arguments.apply
+            else ("prepare-only" if arguments.prepare_only else "dry-run")
+        )
         report = prepare_champion_warm_start(
             arguments.run_root,
             arguments.profile,
             apply=arguments.apply,
+            prepare_only=arguments.prepare_only,
             initial_replay_credit=arguments.initial_replay_credit,
             replace_existing=arguments.replace_existing,
             selection_snapshot=arguments.selection_snapshot,

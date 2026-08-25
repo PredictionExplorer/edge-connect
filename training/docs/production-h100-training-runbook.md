@@ -1374,6 +1374,60 @@ Re-render the training, replay-backup, report, and continuity units with the
 forked root and profile hashes. A rollback repoints those units to the untouched
 parent root; it does not delete the failed fork.
 
+### Automatic terminal-boundary calibration cutover
+
+Use `scripts/run_terminal_boundary_pipeline.py` only from a detached, immutable
+release. Render
+`deploy/edgeconnect-startrain-terminal-boundary.service.example` and a
+root-owned policy based on
+`deploy/terminal-boundary-staging-manifest.json.example`. Pin the exact source
+run identity, profile, systemd unit, current promotion-status digest/timestamp,
+continuity operator-hold path, backup namespace, calibration policy, queue
+units, release manifest, and every cutover/calibration script. Runtime hashes
+are rechecked before every durable step. The armed digest is intentionally stale: the service
+waits for a strictly newer, quiescent terminal arena result.
+
+The terminal-boundary service is restartable. A waiting exit retries without
+touching the run; install and enable the paired five-second timer rather than the
+oneshot service itself. `ExecStopPost` recovers an interrupted process by
+releasing only its owned hold and requesting continuity fallback. After
+accepting a boundary it:
+
+1. verifies the terminal result, evaluated model manifest, current champion,
+   systemd/coordinator identity, arena lease, and fresh GPU health;
+2. places the continuity operator hold and gracefully stops the source before
+   backup work, preventing a new evaluation from racing the cutover;
+3. proves the source service, process group, coordinator lock, and all assigned
+   GPUs are released;
+4. creates the final replay backup and DR snapshot and waits for the exact
+   off-host acknowledgement;
+5. runs the bounded read-only frozen-replay calibration suite;
+6. prepares isolated warm starts without activating pointers, then atomically
+   activates only control and a unique gate-passing treatment;
+7. pins and verifies the queue activation manifest, starts the queue, and
+   releases its operator hold.
+
+Before profile generation, the controller reads the stopped run's pinned
+recovery checkpoint and derives Muon/AdamW control rates from matching optimizer
+`initial_lr` and scheduler `base_lrs` entries. It refuses missing, zero,
+ambiguous, or mismatched rates. This prevents a fresh warm start from
+accidentally restoring higher YAML learning rates after runtime plateau
+reductions.
+
+`prepare_champion_warm_start.py --prepare-only` writes an immutable prepared
+checkpoint, cadence/UTD evidence, and `cutover-staging.json`, but no active
+`resume-cutover.json` or pointer changes. The learner CLI, orchestrator, and
+ablation runner all reject prepared or pending roots. A later `--apply` verifies
+the immutable prepared evidence and performs the active cutover. This
+prepare/activate split is required; never bypass the launch gate.
+
+If frozen calibration has no unique winner, the service does not create an Elo
+queue. It releases its owned hold and resumes the verified runtime control. Any
+backup, acknowledgement, source-release, artifact, warm-start, hardware, or
+queue failure follows the same continuity fallback path. Never delete failed
+state: the durable saga and immutable evidence make retries and incident review
+possible.
+
 ### Non-autonomous throughput runs
 
 Do not edit an initialized throughput profile or pull/rebuild its active checkout

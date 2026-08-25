@@ -52,6 +52,7 @@ from startrain.runtime import (
     RunIdentity,
     atomic_json,
     require_active_selection_cutover,
+    require_launch_ready,
 )
 from startrain.training import build_scheduler
 
@@ -792,6 +793,44 @@ def test_warm_start_uses_archived_non_champion_ema_with_fresh_state(
     selected_path = child / Path(plan.candidates[1].manifest.path).relative_to(
         fixture.root
     )
+    active_paths = tuple(
+        path
+        for path in (
+            child / "learner" / "champion.json",
+            child / "learner" / "candidate.json",
+            child / "learner" / "recovery.json",
+            child / "learner" / "resume-cutover.json",
+            child / "learner" / "cadence.json",
+            child / "learner" / "utd-segment.json",
+        )
+        if path.is_file()
+    )
+    active_before = {path: path.read_bytes() for path in active_paths}
+
+    prepared_report = prepare_champion_warm_start(
+        child,
+        child / "profile-elo-ablation.yaml",
+        prepare_only=True,
+        selection_snapshot=child / "selection-snapshot.json",
+        source_manifest=selected_path,
+    )
+    prepared_marker = prepared_report["warm_start"]
+    assert isinstance(prepared_marker, dict)
+    assert prepared_marker["status"] == "prepared"
+    assert prepared_marker["source_model_identity"] == plan.candidates[1].model_identity
+    assert {path: path.read_bytes() for path in active_paths} == active_before
+    assert (
+        json.loads(
+            (child / "learner" / "selection-cutover.json").read_text(encoding="utf-8")
+        )["status"]
+        == "pending"
+    )
+    assert (
+        json.loads(
+            (child / "learner" / "cutover-staging.json").read_text(encoding="utf-8")
+        )["status"]
+        == "pending"
+    )
 
     report = prepare_champion_warm_start(
         child,
@@ -800,7 +839,6 @@ def test_warm_start_uses_archived_non_champion_ema_with_fresh_state(
         selection_snapshot=child / "selection-snapshot.json",
         source_manifest=selected_path,
     )
-
     marker = report["warm_start"]
     assert isinstance(marker, dict)
     assert marker["source_model_identity"] == plan.candidates[1].model_identity
@@ -830,6 +868,7 @@ def test_warm_start_uses_archived_non_champion_ema_with_fresh_state(
     )
     assert cutover["status"] == "active"
     require_active_selection_cutover(child / "learner")
+    require_launch_ready(child / "learner")
 
 
 def test_warm_start_rejects_incompatible_run_and_generation(tmp_path: Path) -> None:

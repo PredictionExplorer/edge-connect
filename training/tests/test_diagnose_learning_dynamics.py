@@ -38,7 +38,11 @@ def test_learning_dynamics_report_summarizes_metrics_and_arena(tmp_path: Path) -
             {
                 "model": {"width": 384},
                 "optimizer": {"kind": "muon_adamw"},
-                "train": {"per_rank_batch_size": 512, "ema_decay": 0.9999},
+                "train": {
+                    "per_rank_batch_size": 512,
+                    "ema_decay": 0.9999,
+                    "gradient_clip_norm": 1.0,
+                },
                 "learner": {
                     "candidate_interval": 10_000,
                     "candidate_interval_examples": 2_000_000,
@@ -58,7 +62,22 @@ def test_learning_dynamics_report_summarizes_metrics_and_arena(tmp_path: Path) -
                 "step": 1,
                 "examples_per_second": 1000,
                 "gradient_norm": 2.0,
+                "gradient_pre_clip_norm": 2.0,
+                "gradient_post_clip_norm": 1.0,
+                "gradient_clip_threshold": 1.0,
+                "gradient_clip_coefficient": 0.5,
+                "gradient_clip_severity": 0.5,
+                "gradient_clip_ratio": 2.0,
                 "gradient_clipped": True,
+                "learning_rates": [0.01, 0.001],
+                "optimizer_groups": [
+                    {
+                        "group_index": 0,
+                        "name": "muon",
+                        "effective_learning_rate": 0.02,
+                        "update_to_weight_ratio": 0.001,
+                    }
+                ],
                 "losses": {
                     "total": 3.0,
                     "policy": 2.0,
@@ -67,10 +86,37 @@ def test_learning_dynamics_report_summarizes_metrics_and_arena(tmp_path: Path) -
                 },
             },
             {
+                "event": "plateau_recovery",
+                "timestamp_ns": 10,
+                "reason": "terminal_rejection_streak",
+                "from_step": 1,
+                "to_step": 1,
+                "candidate_identity": "candidate",
+                "champion_identity": "champion",
+                "learning_rate_scale": 0.5,
+                "learning_rates": [0.005, 0.0005],
+                "optimizer_state_cleared": True,
+            },
+            {
                 "step": 2,
                 "examples_per_second": 1200,
-                "gradient_norm": 1.0,
+                "gradient_norm": 0.5,
+                "gradient_pre_clip_norm": 0.5,
+                "gradient_post_clip_norm": 0.5,
+                "gradient_clip_threshold": 1.0,
+                "gradient_clip_coefficient": 1.0,
+                "gradient_clip_severity": 0.0,
+                "gradient_clip_ratio": 0.5,
                 "gradient_clipped": False,
+                "learning_rates": [0.004, 0.0004],
+                "optimizer_groups": [
+                    {
+                        "group_index": 0,
+                        "name": "muon",
+                        "effective_learning_rate": 0.01,
+                        "update_to_weight_ratio": 0.0005,
+                    }
+                ],
                 "losses": {
                     "total": 2.0,
                     "policy": 1.0,
@@ -120,8 +166,30 @@ def test_learning_dynamics_report_summarizes_metrics_and_arena(tmp_path: Path) -
 
     assert run["learner_metrics"]["examples_per_second"]["mean"] == 1100
     assert run["learner_metrics"]["gradient_clipped"]["mean"] == 0.5
+    assert run["learner_metrics"]["gradient_post_clip_norm"]["mean"] == 0.75
+    assert run["learner_metrics"]["gradient_clip_coefficient"]["mean"] == 0.75
+    assert run["learner_metrics"]["gradient_clip_severity"]["mean"] == 0.25
+    assert run["learner_metrics"]["gradient_clip_ratio"]["mean"] == 1.25
     assert run["learner_metrics"]["losses.clinch_score_margin"]["count"] == 1
     assert run["learner_metrics"]["losses.clinch_score_margin"]["mean"] == 2.0
+    assert run["train"]["gradient_clip_norm"] == 1.0
+    assert run["runtime_learning_rates"] == [0.004, 0.0004]
+    assert run["latest_recorded_learning_rate_scale"] == 0.5
+    assert run["learning_rate_reduction_events"] == [
+        {
+            "event": "plateau_recovery",
+            "timestamp_ns": 10,
+            "reason": "terminal_rejection_streak",
+            "from_step": 1,
+            "to_step": 1,
+            "candidate_identity": "candidate",
+            "champion_identity": "champion",
+            "learning_rate_scale": 0.5,
+            "learning_rates": [0.005, 0.0005],
+            "optimizer_state_cleared": True,
+        }
+    ]
+    assert run["latest_optimizer_groups"][0]["effective_learning_rate"] == 0.01
     assert run["selfplay_source_role_rows"] == {"candidate": 1, "champion": 1}
     assert run["selfplay_source_samples"] == {"candidate": 40.0, "champion": 100.0}
     assert run["publication_step_deltas"] == [100]

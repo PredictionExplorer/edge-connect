@@ -767,9 +767,30 @@ def test_sampled_diagnostics_do_not_change_train_step_numerics() -> None:
     }
     assert any(name.startswith("clinch_") for name in instrumented_result.loss_tensors)
     assert baseline_result.learning_rates == instrumented_result.learning_rates
+    state_before_host_metrics = {
+        name: value.detach().clone()
+        for name, value in instrumented.state_dict().items()
+    }
     host = instrumented_result.to_host()
+    for name, value in instrumented.state_dict().items():
+        torch.testing.assert_close(
+            value,
+            state_before_host_metrics[name],
+            atol=0,
+            rtol=0,
+        )
     assert host.nonfinite_loss_count == 0
     assert host.nonfinite_gradient_count == 0
+    assert host.gradient_pre_clip_norm == host.gradient_norm
+    assert host.gradient_clip_coefficient is not None
+    assert host.gradient_post_clip_norm == pytest.approx(
+        host.gradient_norm * host.gradient_clip_coefficient
+    )
+    assert host.gradient_clip_threshold == 1.0
+    assert host.gradient_clip_severity == pytest.approx(
+        1.0 - host.gradient_clip_coefficient
+    )
+    assert host.gradient_clip_ratio == pytest.approx(host.gradient_norm)
     assert len(host.optimizer_groups) == len(instrumented_optimizer.param_groups)
     assert all(group.update_norm > 0 for group in host.optimizer_groups)
     assert host.scheduler is not None
@@ -778,6 +799,44 @@ def test_sampled_diagnostics_do_not_change_train_step_numerics() -> None:
     assert host.ema.num_updates == 1
     assert host.ema.distance_norm > 0
     assert host.ema.effective_turnover == pytest.approx(0.1)
+
+
+def test_gradient_clipping_metrics_cover_threshold_edges_and_nonfinite_values() -> None:
+    def metrics(norm: float, *, threshold: float = 1.0):
+        return TrainStepResult(
+            loss_tensors={"total": torch.tensor(1.0)},
+            gradient_norm_tensor=torch.tensor(norm),
+            gradient_clipped_tensor=torch.tensor(norm > threshold),
+            nonfinite_loss_count_tensor=torch.tensor(0),
+            nonfinite_gradient_count_tensor=torch.tensor(0),
+            learning_rates=(0.1,),
+            gradient_clip_threshold=threshold,
+        ).to_host()
+
+    below = metrics(0.5)
+    assert below.gradient_post_clip_norm == pytest.approx(0.5)
+    assert below.gradient_clip_coefficient == 1.0
+    assert below.gradient_clip_severity == 0.0
+    assert below.gradient_clip_ratio == pytest.approx(0.5)
+
+    above = metrics(2.0)
+    expected_coefficient = 1.0 / (2.0 + 1e-6)
+    assert above.gradient_post_clip_norm == pytest.approx(2.0 * expected_coefficient)
+    assert above.gradient_clip_coefficient == pytest.approx(expected_coefficient)
+    assert above.gradient_clip_severity == pytest.approx(1.0 - expected_coefficient)
+    assert above.gradient_clip_ratio == pytest.approx(2.0)
+
+    zero = metrics(0.0)
+    assert zero.gradient_post_clip_norm == 0.0
+    assert zero.gradient_clip_coefficient == 1.0
+    assert zero.gradient_clip_severity == 0.0
+    assert zero.gradient_clip_ratio == 0.0
+
+    nonfinite = metrics(float("inf"))
+    assert nonfinite.gradient_post_clip_norm is None
+    assert nonfinite.gradient_clip_coefficient == 0.0
+    assert nonfinite.gradient_clip_severity == 1.0
+    assert nonfinite.gradient_clip_ratio is None
 
 
 def test_train_metric_accumulator_reports_clipping_frequency_without_step_sync() -> (

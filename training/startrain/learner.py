@@ -1774,6 +1774,24 @@ class LearnerLoop:
                                 "world_size": self.world_size,
                                 "losses": host_metrics.losses,
                                 "gradient_norm": host_metrics.gradient_norm,
+                                "gradient_pre_clip_norm": (
+                                    host_metrics.gradient_pre_clip_norm
+                                ),
+                                "gradient_post_clip_norm": (
+                                    host_metrics.gradient_post_clip_norm
+                                ),
+                                "gradient_clip_threshold": (
+                                    host_metrics.gradient_clip_threshold
+                                ),
+                                "gradient_clip_coefficient": (
+                                    host_metrics.gradient_clip_coefficient
+                                ),
+                                "gradient_clip_severity": (
+                                    host_metrics.gradient_clip_severity
+                                ),
+                                "gradient_clip_ratio": (
+                                    host_metrics.gradient_clip_ratio
+                                ),
                                 "gradient_clipped": host_metrics.gradient_clipped,
                                 "gradient_clipped_steps": (
                                     interval_health.gradient_clipped_steps

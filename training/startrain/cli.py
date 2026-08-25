@@ -48,7 +48,7 @@ from .runtime import (
     SignalLatch,
     atomic_json,
     load_run_identity,
-    require_active_selection_cutover,
+    require_launch_ready,
 )
 from .selfplay import SelfPlayActor, SelfPlayConfig, SelfPlayIdentity
 
@@ -165,7 +165,7 @@ def train_main(argv: list[str] | None = None) -> None:
     arguments = parser.parse_args(argv)
 
     experiment = load_config(arguments.config)
-    require_active_selection_cutover(arguments.output)
+    require_launch_ready(arguments.output)
     raw_data_workers = os.environ.get(LEARNER_DATA_WORKERS_ENV)
     if raw_data_workers is not None:
         try:

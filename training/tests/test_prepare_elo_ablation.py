@@ -18,10 +18,13 @@ from scripts.prepare_elo_ablation import (
     RING10_LIVE_CADENCE_TREATMENTS,
     RING10_ONLY_TREATMENTS,
     RING10_OPTIMIZATION_TREATMENTS,
+    RING10_OPTIMIZER_CALIBRATION_LABELS,
+    RING10_OPTIMIZER_CALIBRATION_TREATMENTS,
     RING10_RELATIONAL_TREATMENTS,
     RING10_TRAINING_DYNAMICS_TREATMENTS,
     SYSTEM_TREATMENTS,
     WEIGHTED_TREATMENTS,
+    _validate_ring10_optimizer_calibration_transition,
     main,
     prepare_elo_ablation,
     resolve_treatments,
@@ -37,6 +40,16 @@ def _treatment_records(manifest: dict[str, object]) -> list[dict[str, object]]:
     assert isinstance(raw, list)
     assert all(isinstance(item, dict) for item in raw)
     return raw
+
+
+def _runtime_optimizer_evidence(profile: Path) -> dict[str, object]:
+    source = profile.resolve()
+    return {
+        "adamw_lr": 7.5e-05,
+        "muon_lr": 0.005,
+        "source_profile_path": str(source),
+        "source_profile_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+    }
 
 
 def _winner_snapshot(source: Path) -> dict[str, object]:
@@ -496,6 +509,197 @@ def test_prepare_generates_ring10_cadence_and_freshness_suite(
     assert freshness.orchestration.model_refresh.candidate_probability == 0.5
     assert freshness.orchestration.model_refresh.history_probability == 0.0
     assert freshness.learner.selfplay_snapshot_interval_examples == 3_000_000
+
+
+def test_prepare_generates_strict_ring10_optimizer_calibration_suite(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    replay = source / "replay"
+    replay.mkdir()
+    with sqlite3.connect(replay / "manifest.sqlite3") as connection:
+        connection.execute(
+            "CREATE TABLE shards (id INTEGER PRIMARY KEY, state TEXT NOT NULL)"
+        )
+        connection.execute("INSERT INTO shards(id, state) VALUES (42, 'ready')")
+    runtime_profile = source / "profile-relocated.yaml"
+    runtime_profile.write_bytes((CONFIGS / "h100-8gpu-ring10-only.yaml").read_bytes())
+    runtime_optimizer = {
+        **_runtime_optimizer_evidence(runtime_profile),
+        "recovery_checkpoint_sha256": "a" * 64,
+    }
+    output = tmp_path / "optimizer-calibration"
+
+    manifest = prepare_elo_ablation(
+        base_config=runtime_profile,
+        output_dir=output,
+        run_root_parent=tmp_path / "runs",
+        run_id="shared-parent-run",
+        source_run_root=source,
+        prefix="optimizer-calibration",
+        seed=17,
+        wall_budget_hours=2,
+        leaf_budget=1,
+        guard_floor_elo=-35,
+        treatments=RING10_OPTIMIZER_CALIBRATION_TREATMENTS,
+        guard_rings=(),
+        suite="ring10-optimizer-calibration",
+        runtime_effective_optimizer=runtime_optimizer,
+    )
+
+    assert manifest["suite"] == "ring10-optimizer-calibration"
+    assert manifest["source_replay_cutoff"] == 42
+    assert manifest["runtime_effective_optimizer"] == runtime_optimizer
+    records = _treatment_records(manifest)
+    assert [record["treatment"] for record in records] == list(
+        RING10_OPTIMIZER_CALIBRATION_TREATMENTS
+    )
+    assert [record["calibration_label"] for record in records] == [
+        RING10_OPTIMIZER_CALIBRATION_LABELS[treatment]
+        for treatment in RING10_OPTIMIZER_CALIBRATION_TREATMENTS
+    ]
+    assert [record["calibration_phase"] for record in records] == [
+        "primary",
+        "primary",
+        "primary",
+        "follow_on",
+    ]
+
+    control = load_config(output / "ring10-optimizer-runtime-effective-control.yaml")
+    clip_two = load_config(output / "ring10-optimizer-clip-norm-2.yaml")
+    clip_five = load_config(output / "ring10-optimizer-clip-norm-5.yaml")
+    half_lr = load_config(output / "ring10-optimizer-0.5x-effective-lr.yaml")
+    assert {
+        profile.optimizer.kind for profile in (control, clip_two, clip_five, half_lr)
+    } == {"muon_adamw"}
+    assert control.train.gradient_clip_norm == 1.0
+    assert control.optimizer.adamw_lr == pytest.approx(7.5e-05)
+    assert control.optimizer.muon_lr == pytest.approx(0.005)
+    assert clip_two.train.gradient_clip_norm == 2.0
+    assert clip_five.train.gradient_clip_norm == 5.0
+    assert half_lr.train.gradient_clip_norm == 1.0
+    assert half_lr.optimizer.adamw_lr == pytest.approx(control.optimizer.adamw_lr * 0.5)
+    assert half_lr.optimizer.muon_lr == pytest.approx(control.optimizer.muon_lr * 0.5)
+    for profile in (control, clip_two, clip_five, half_lr):
+        assert profile.learner.minimum_replay_shard_id_exclusive == 42
+
+
+def test_ring10_optimizer_calibration_rejects_adamw_and_extra_factors(
+    tmp_path: Path,
+) -> None:
+    raw = yaml.safe_load(
+        (CONFIGS / "h100-8gpu-ring10-only.yaml").read_text(encoding="utf-8")
+    )
+    raw["optimizer"]["kind"] = "adamw"
+    base = tmp_path / "adamw.yaml"
+    base.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+    source = tmp_path / "source"
+    source.mkdir()
+
+    with pytest.raises(ValueError, match="excludes AdamW"):
+        prepare_elo_ablation(
+            base_config=base,
+            output_dir=tmp_path / "profiles",
+            run_root_parent=tmp_path / "runs",
+            run_id="source-run",
+            source_run_root=source,
+            prefix="optimizer-calibration",
+            seed=17,
+            wall_budget_hours=2,
+            leaf_budget=1,
+            guard_floor_elo=-35,
+            treatments=RING10_OPTIMIZER_CALIBRATION_TREATMENTS,
+            guard_rings=(),
+            suite="ring10-optimizer-calibration",
+            runtime_effective_optimizer=_runtime_optimizer_evidence(base),
+        )
+
+    with pytest.raises(ValueError, match="exact frozen profile"):
+        prepare_elo_ablation(
+            base_config=CONFIGS / "h100-8gpu-ring10-only.yaml",
+            output_dir=tmp_path / "static-profiles",
+            run_root_parent=tmp_path / "static-runs",
+            run_id="source-run",
+            source_run_root=source,
+            prefix="optimizer-calibration",
+            seed=17,
+            wall_budget_hours=2,
+            leaf_budget=1,
+            guard_floor_elo=-35,
+            treatments=RING10_OPTIMIZER_CALIBRATION_TREATMENTS,
+            guard_rings=(),
+            suite="ring10-optimizer-calibration",
+            runtime_effective_optimizer=_runtime_optimizer_evidence(
+                CONFIGS / "h100-8gpu-ring10-only.yaml"
+            ),
+        )
+
+    zero_source = tmp_path / "zero-source"
+    zero_replay = zero_source / "replay"
+    zero_replay.mkdir(parents=True)
+    with sqlite3.connect(zero_replay / "manifest.sqlite3") as connection:
+        connection.execute(
+            "CREATE TABLE shards (id INTEGER PRIMARY KEY, state TEXT NOT NULL)"
+        )
+        connection.execute("INSERT INTO shards(id, state) VALUES (0, 'ready')")
+    zero_profile = zero_source / "profile-relocated.yaml"
+    zero_profile.write_bytes((CONFIGS / "h100-8gpu-ring10-only.yaml").read_bytes())
+    with pytest.raises(ValueError, match="positive frozen replay cutoff"):
+        prepare_elo_ablation(
+            base_config=zero_profile,
+            output_dir=tmp_path / "zero-profiles",
+            run_root_parent=tmp_path / "zero-runs",
+            run_id="source-run",
+            source_run_root=zero_source,
+            prefix="optimizer-calibration",
+            seed=17,
+            wall_budget_hours=2,
+            leaf_budget=1,
+            guard_floor_elo=-35,
+            treatments=RING10_OPTIMIZER_CALIBRATION_TREATMENTS,
+            guard_rings=(),
+            suite="ring10-optimizer-calibration",
+            runtime_effective_optimizer=_runtime_optimizer_evidence(zero_profile),
+        )
+
+    before = yaml.safe_load(
+        (CONFIGS / "h100-8gpu-ring10-only.yaml").read_text(encoding="utf-8")
+    )
+    after = deepcopy(before)
+    after["train"]["gradient_clip_norm"] = 2.0
+    after["optimizer"]["weight_decay"] = 0.02
+    with pytest.raises(ValueError, match="one-factor contract"):
+        _validate_ring10_optimizer_calibration_transition(
+            before,
+            after,
+            "ring10-optimizer-clip-norm-2",
+        )
+
+
+def test_ring10_optimizer_treatments_require_complete_named_suite(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    with pytest.raises(
+        ValueError,
+        match="complete --suite ring10-optimizer-calibration",
+    ):
+        prepare_elo_ablation(
+            base_config=CONFIGS / "h100-8gpu-ring10-only.yaml",
+            output_dir=tmp_path / "profiles",
+            run_root_parent=tmp_path / "runs",
+            run_id="source-run",
+            source_run_root=source,
+            prefix="optimizer-calibration",
+            seed=17,
+            wall_budget_hours=2,
+            leaf_budget=1,
+            guard_floor_elo=-35,
+            treatments=("ring10-optimizer-clip-norm-2",),
+            guard_rings=(),
+        )
 
 
 def test_prepare_generates_frozen_live_ring10_cadence_suite(
@@ -965,6 +1169,13 @@ def test_resolve_treatments_keeps_suites_fail_closed() -> None:
             treatments=None,
         )
         == RING10_OPTIMIZATION_TREATMENTS
+    )
+    assert (
+        resolve_treatments(
+            suite="ring10-optimizer-calibration",
+            treatments=None,
+        )
+        == RING10_OPTIMIZER_CALIBRATION_TREATMENTS
     )
     assert (
         resolve_treatments(

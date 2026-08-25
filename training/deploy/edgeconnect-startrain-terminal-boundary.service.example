@@ -1,0 +1,44 @@
+[Unit]
+Description=EdgeConnect terminal-boundary calibration cutover
+Wants=network-online.target
+After=network-online.target remote-fs.target @SOURCE_UNIT@
+ConditionPathIsFile=@POLICY_MANIFEST@
+RequiresMountsFor=@DISASTER_BACKUP_MOUNT@
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+User=@ORCHESTRATION_USER@
+WorkingDirectory=@TRAINING_DIR@
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONPATH=@TRAINING_DIR@
+Environment=PATH=@TRAINING_DIR@/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStartPre=@TRAINING_DIR@/.venv/bin/python @TRAINING_DIR@/scripts/run_terminal_boundary_pipeline.py verify --manifest @POLICY_MANIFEST@
+ExecStart=@TRAINING_DIR@/.venv/bin/python @TRAINING_DIR@/scripts/run_terminal_boundary_pipeline.py run --manifest @POLICY_MANIFEST@
+ExecStopPost=-@TRAINING_DIR@/.venv/bin/python @TRAINING_DIR@/scripts/run_terminal_boundary_pipeline.py recover --manifest @POLICY_MANIFEST@
+Restart=no
+KillSignal=SIGTERM
+KillMode=control-group
+TimeoutStartSec=infinity
+TimeoutStopSec=60
+OOMPolicy=stop
+LimitNOFILE=1048576
+NoNewPrivileges=true
+UMask=0027
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=@STATE_ROOT@ @CONTINUITY_STATE_ROOT@ @RUN_ROOT@/recovery/replay-manifest @DISASTER_BACKUP_ROOT@ @CHAMPION_SNAPSHOT_PARENT@ @CALIBRATION_OUTPUT_PARENT@ @FROZEN_CALIBRATION_OUTPUT_ROOT@ @SCREEN_PLAN_PARENT@ @CALIBRATION_RUN_PARENT@
+ProtectClock=true
+ProtectControlGroups=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+SystemCallArchitectures=native

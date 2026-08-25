@@ -1,0 +1,12 @@
+[Unit]
+Description=Poll for the next safe EdgeConnect terminal training boundary
+
+[Timer]
+OnBootSec=30s
+OnUnitInactiveSec=5s
+AccuracySec=1s
+Persistent=true
+Unit=@TERMINAL_BOUNDARY_SERVICE@
+
+[Install]
+WantedBy=timers.target

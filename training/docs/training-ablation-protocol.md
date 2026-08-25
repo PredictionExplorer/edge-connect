@@ -72,6 +72,60 @@ Candidate/champion/history mixing keeps pointer roles and run identities strict.
 Models are refreshed only between complete game batches, so no game contains
 weights from two checkpoints.
 
+## Frozen ring-10 optimizer calibration
+
+Optimizer/clipping calibration is deliberately separate from live Elo training.
+Generate only the complete `ring10-optimizer-calibration` suite. Its explicit
+arms are:
+
+- `ring10-optimizer-runtime-effective-control` (clip norm 1);
+- `ring10-optimizer-clip-norm-2`;
+- `ring10-optimizer-clip-norm-5`; and
+- the follow-on `ring10-optimizer-0.5x-effective-lr`.
+
+All four retain runtime Muon+AdamW routing; AdamW-only profiles are rejected.
+The follow-on halves both configured runtime learning-rate groups. The older
+`lr-quarter` treatment remains accepted for historical plans and still has its
+historical behavior (the same 0.5 multiplier), but new calibration evidence
+uses the unambiguous `0.5x effective-LR` label.
+
+The base profile must be the stopped runtime's exact frozen profile. The
+terminal-boundary controller additionally reads the hash-pinned recovery
+checkpoint and requires each optimizer group's `initial_lr` to equal the
+scheduler `base_lrs`. Those recovered Muon and AdamW rates replace the YAML
+defaults before profiles are generated, so runtime plateau reductions cannot be
+silently lost.
+
+Run each arm with `scripts/run_frozen_replay_optimizer_calibration.py` against
+one content-addressed champion publication and an explicit ready-shard cutoff.
+The runner opens the replay manifest in SQLite read-only/query-only mode,
+hashes the logical cutoff, verifies selected shard hashes, and makes stable,
+disjoint train/holdout partitions. It initializes the raw model and a fresh EMA
+from champion EMA weights, creates empty optimizer/scheduler state, and writes
+only under the requested output directory. An arm declares at most two
+H100-hours; `--dry-run` validates and prints the frozen contract without
+creating output. A paused invocation can resume only when its source,
+partition, config, and run-contract hashes still match.
+
+Compare the complete suite with
+`scripts/compare_frozen_replay_optimizer_calibration.py`. A treatment must have
+finite training/evaluation, strict optimizer and reference parity, at least
+90% of control learner throughput, and a strictly positive one-sided paired
+bootstrap lower bound on held-out policy/value-composite loss reduction.
+Bonferroni allocation preserves the configured familywise confidence across
+all non-control arms.
+Gradient-clipping reduction is reported only as a diagnostic and never passes
+an arm by itself. No passing arm, invalid evidence, or a top-score tie retains
+the runtime-effective control. These artifacts are diagnostic calibration
+evidence and do not authorize production promotion.
+
+`scripts/run_frozen_replay_optimizer_calibration_queue.py` owns resumable arm
+state and runs deterministic sequential waves until shared-replay concurrency
+has separately passed a throughput test. A unique gate-passing treatment
+produces a derived Elo screen plan containing only runtime control and that
+treatment. No winner or a tie produces no screen plan and returns to the
+protected runtime control.
+
 The autonomous profile adds a stronger provenance contract: every treatment
 starts with random weights, empty replay, a new run identity, and no external
 positions. Its fixed Elo ladder may evaluate historical checkpoints, but those

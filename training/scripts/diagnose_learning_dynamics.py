@@ -26,6 +26,7 @@ CLINCH_AVAILABILITY = {
     "losses.clinch_alive": "losses.clinch_alive_available",
     "losses.clinch_soft_policy": "losses.clinch_soft_policy_available",
 }
+LEARNING_RATE_REDUCTION_EVENTS = frozenset({"plateau_recovery", "plateau_reset"})
 
 
 class DiagnosisError(RuntimeError):
@@ -104,6 +105,56 @@ def _diagnostic_metric_values(
         yield _nested(row, path)
 
 
+def _finite_number_list(value: object) -> list[float] | None:
+    if not isinstance(value, list | tuple):
+        return None
+    numbers: list[float] = []
+    for item in value:
+        if isinstance(item, bool):
+            return None
+        number = _number(item)
+        if number is None or number < 0:
+            return None
+        numbers.append(number)
+    return numbers
+
+
+def _learning_rate_evidence(
+    rows: Iterable[Mapping[str, object]],
+) -> tuple[list[float] | None, float | None, list[dict[str, object]]]:
+    latest_rates = None
+    latest_reduction_scale = None
+    reduction_events: list[dict[str, object]] = []
+    for row in rows:
+        rates = _finite_number_list(row.get("learning_rates"))
+        if rates is not None:
+            latest_rates = rates
+        event = row.get("event")
+        if event not in LEARNING_RATE_REDUCTION_EVENTS:
+            continue
+        raw_scale = row.get("learning_rate_scale")
+        scale = None if isinstance(raw_scale, bool) else _number(raw_scale)
+        if scale is None or not 0 < scale <= 1:
+            scale = None
+        else:
+            latest_reduction_scale = scale
+        reduction_events.append(
+            {
+                "event": event,
+                "timestamp_ns": row.get("timestamp_ns"),
+                "reason": row.get("reason"),
+                "from_step": row.get("from_step"),
+                "to_step": row.get("to_step"),
+                "candidate_identity": row.get("candidate_identity"),
+                "champion_identity": row.get("champion_identity"),
+                "learning_rate_scale": scale,
+                "learning_rates": rates,
+                "optimizer_state_cleared": row.get("optimizer_state_cleared"),
+            }
+        )
+    return latest_rates, latest_reduction_scale, reduction_events
+
+
 def _profile(root: Path) -> tuple[Path, dict[str, Any]]:
     candidates = (
         root / "profile-elo-ablation.yaml",
@@ -173,6 +224,12 @@ def _diagnose_run(label: str, root: Path) -> dict[str, object]:
         "examples_per_second",
         "step_seconds",
         "gradient_norm",
+        "gradient_pre_clip_norm",
+        "gradient_post_clip_norm",
+        "gradient_clip_threshold",
+        "gradient_clip_coefficient",
+        "gradient_clip_severity",
+        "gradient_clip_ratio",
         "gradient_clipped",
         "gradient_clipping_frequency",
         "gradient_clip_fraction",
@@ -215,6 +272,19 @@ def _diagnose_run(label: str, root: Path) -> dict[str, object]:
         if (summary := _summary(_diagnostic_metric_values(learner_rows, path)))
         is not None
     }
+    (
+        runtime_learning_rates,
+        latest_recorded_learning_rate_scale,
+        learning_rate_reduction_events,
+    ) = _learning_rate_evidence(learner_rows)
+    latest_optimizer_groups = next(
+        (
+            groups
+            for row in reversed(learner_rows)
+            if isinstance(groups := row.get("optimizer_groups"), list)
+        ),
+        None,
+    )
 
     actor_rows = []
     for path in sorted((resolved / "metrics").glob("actor*.jsonl")):
@@ -277,6 +347,7 @@ def _diagnose_run(label: str, root: Path) -> dict[str, object]:
             "batch_size": train_config.get("per_rank_batch_size"),
             "ema_decay": train_config.get("ema_decay"),
             "ema_half_life_examples": train_config.get("ema_half_life_examples"),
+            "gradient_clip_norm": train_config.get("gradient_clip_norm"),
         },
         "learner_config": {
             key: learner_config.get(key)
@@ -291,6 +362,10 @@ def _diagnose_run(label: str, root: Path) -> dict[str, object]:
         "learner_metric_rows": len(learner_rows),
         "learner_metrics": learner_summary,
         "latest_learner_metric": learner_rows[-1] if learner_rows else None,
+        "runtime_learning_rates": runtime_learning_rates,
+        "latest_recorded_learning_rate_scale": latest_recorded_learning_rate_scale,
+        "learning_rate_reduction_events": learning_rate_reduction_events,
+        "latest_optimizer_groups": latest_optimizer_groups,
         "actor_metric_rows": len(actor_rows),
         "selfplay_source_role_rows": dict(sorted(source_roles.items())),
         "selfplay_source_samples": dict(sorted(source_samples.items())),

@@ -64,6 +64,18 @@ RING10_OPTIMIZATION_TREATMENTS = (
     "ring10-cadence-5m",
     "ring10-freshness-50",
 )
+RING10_OPTIMIZER_CALIBRATION_TREATMENTS = (
+    "ring10-optimizer-runtime-effective-control",
+    "ring10-optimizer-clip-norm-2",
+    "ring10-optimizer-clip-norm-5",
+    "ring10-optimizer-0.5x-effective-lr",
+)
+RING10_OPTIMIZER_CALIBRATION_LABELS = {
+    "ring10-optimizer-runtime-effective-control": "runtime-effective control",
+    "ring10-optimizer-clip-norm-2": "clip norm 2",
+    "ring10-optimizer-clip-norm-5": "clip norm 5",
+    "ring10-optimizer-0.5x-effective-lr": "0.5x effective-LR treatment",
+}
 RING10_LIVE_CADENCE_TARGET_EXAMPLES = 5_000_000
 RING10_LIVE_CADENCE_TREATMENTS = (
     "ring10-live-cadence-control",
@@ -95,6 +107,7 @@ RING10_OBJECTIVE_TREATMENTS = frozenset(
     (
         *RING10_EFFICIENCY_TREATMENTS,
         *RING10_OPTIMIZATION_TREATMENTS,
+        *RING10_OPTIMIZER_CALIBRATION_TREATMENTS,
         *RING10_LIVE_CADENCE_TREATMENTS,
         *RING10_TRAINING_DYNAMICS_TREATMENTS,
         *RING10_ATTENTION_TREATMENTS,
@@ -106,6 +119,7 @@ RING10_EFFICIENCY_VARIANTS = frozenset(RING10_EFFICIENCY_TREATMENTS[1:])
 TREATMENT_SUITES = {
     "ring10-efficiency": RING10_EFFICIENCY_TREATMENTS,
     "ring10-optimization": RING10_OPTIMIZATION_TREATMENTS,
+    "ring10-optimizer-calibration": RING10_OPTIMIZER_CALIBRATION_TREATMENTS,
     "ring10-live-cadence": RING10_LIVE_CADENCE_TREATMENTS,
     "ring10-training-dynamics": RING10_TRAINING_DYNAMICS_TREATMENTS,
     "ring10-attention-reallocation": RING10_ATTENTION_TREATMENTS,
@@ -343,6 +357,20 @@ def _ring_ten_freshness_fifty(config: RawConfig) -> None:
     )
 
 
+def _ring_ten_optimizer_runtime_effective_control(_config: RawConfig) -> None:
+    """Retain the exact deployed Muon+AdamW optimizer and clip settings."""
+
+
+def _ring_ten_optimizer_clip_norm(config: RawConfig, norm: float) -> None:
+    _mapping(config, "train")["gradient_clip_norm"] = norm
+
+
+def _half_effective_learning_rates(config: RawConfig) -> None:
+    optimizer = _mapping(config, "optimizer")
+    optimizer["adamw_lr"] = float(optimizer["adamw_lr"]) * 0.5
+    optimizer["muon_lr"] = float(optimizer["muon_lr"]) * 0.5
+
+
 def _ring_ten_dynamics_control(config: RawConfig) -> None:
     _ring_ten_optimization_control(config)
     _mapping(config, "optimizer")["kind"] = "muon_adamw"
@@ -549,9 +577,9 @@ def _learner_batch(config: RawConfig, size: int) -> None:
 
 
 def _lr_quarter(config: RawConfig) -> None:
-    optimizer = _mapping(config, "optimizer")
-    optimizer["adamw_lr"] = float(optimizer["adamw_lr"]) * 0.5
-    optimizer["muon_lr"] = float(optimizer["muon_lr"]) * 0.5
+    # Historical compatibility: despite its old label, lr-quarter has always
+    # applied a 0.5 multiplier to both runtime learning-rate groups.
+    _half_effective_learning_rates(config)
 
 
 def _fresh_source(config: RawConfig) -> None:
@@ -614,6 +642,16 @@ TREATMENTS: dict[str, Treatment] = {
     "ring10-optimization-control": _ring_ten_optimization_control,
     "ring10-cadence-5m": _ring_ten_cadence_five_million,
     "ring10-freshness-50": _ring_ten_freshness_fifty,
+    "ring10-optimizer-runtime-effective-control": (
+        _ring_ten_optimizer_runtime_effective_control
+    ),
+    "ring10-optimizer-clip-norm-2": lambda config: _ring_ten_optimizer_clip_norm(
+        config, 2.0
+    ),
+    "ring10-optimizer-clip-norm-5": lambda config: _ring_ten_optimizer_clip_norm(
+        config, 5.0
+    ),
+    "ring10-optimizer-0.5x-effective-lr": _half_effective_learning_rates,
     "ring10-live-cadence-control": _ring_ten_live_cadence_control,
     "ring10-live-cadence-5m": _ring_ten_live_cadence_five_million,
     "ring10-dynamics-control": _ring_ten_dynamics_control,
@@ -968,6 +1006,82 @@ def _validate_ring10_live_cadence_base(
     validate_continuous_config(treatment)
 
 
+def _validate_ring10_optimizer_calibration_base(
+    raw: RawConfig,
+    experiment: ExperimentConfig,
+) -> None:
+    """Freeze the runtime control before applying one optimizer factor."""
+
+    _validate_ring10_efficiency_base(experiment)
+    if experiment.model.dropout != 0.0:
+        raise ValueError(
+            "ring10 optimizer calibration requires deterministic zero dropout"
+        )
+    optimizer = _mapping(raw, "optimizer")
+    train = _mapping(raw, "train")
+    if optimizer.get("kind") != "muon_adamw":
+        raise ValueError(
+            "ring10 optimizer calibration excludes AdamW-only optimizer profiles"
+        )
+    if train.get("gradient_clip_norm") != 1.0:
+        raise ValueError(
+            "ring10 optimizer calibration requires runtime clip norm 1 control"
+        )
+    for name in ("adamw_lr", "muon_lr"):
+        value = optimizer.get(name)
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, int | float)
+            or float(value) <= 0
+        ):
+            raise ValueError(
+                f"ring10 optimizer calibration requires explicit positive {name}"
+            )
+
+
+def _validate_ring10_optimizer_calibration_source(
+    base_config: Path,
+    source_run_root: Path,
+) -> None:
+    allowed = {
+        (source_run_root / name).resolve()
+        for name in (
+            "profile-elo-ablation.yaml",
+            "profile.yaml",
+            "profile-relocated.yaml",
+        )
+    }
+    if base_config.resolve() not in allowed:
+        raise ValueError(
+            "ring10 optimizer calibration must use the stopped runtime's exact "
+            "frozen profile"
+        )
+
+
+def _validate_ring10_optimizer_calibration_transition(
+    before: RawConfig,
+    after: RawConfig,
+    treatment: str,
+) -> None:
+    expected = deepcopy(before)
+    if treatment == "ring10-optimizer-runtime-effective-control":
+        pass
+    elif treatment == "ring10-optimizer-clip-norm-2":
+        _mapping(expected, "train")["gradient_clip_norm"] = 2.0
+    elif treatment == "ring10-optimizer-clip-norm-5":
+        _mapping(expected, "train")["gradient_clip_norm"] = 5.0
+    elif treatment == "ring10-optimizer-0.5x-effective-lr":
+        _half_effective_learning_rates(expected)
+    else:
+        raise ValueError(f"unsupported ring10 optimizer treatment: {treatment}")
+    if after != expected:
+        raise ValueError(
+            f"{treatment} violated the frozen optimizer one-factor contract"
+        )
+    if _mapping(after, "optimizer").get("kind") != "muon_adamw":
+        raise ValueError("ring10 optimizer calibration cannot select AdamW")
+
+
 def _validate_ring10_live_cadence_transition(
     before: RawConfig,
     after: RawConfig,
@@ -1109,6 +1223,7 @@ def prepare_elo_ablation(
     futility_policy: Mapping[str, object] | None = None,
     guard_rings: Sequence[int] | None = None,
     suite: str | None = None,
+    runtime_effective_optimizer: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     if suite is not None:
         expected = TREATMENT_SUITES.get(suite)
@@ -1123,6 +1238,14 @@ def prepare_elo_ablation(
         raise ValueError(
             "ring10 live cadence treatments require the complete "
             "--suite ring10-live-cadence"
+        )
+    if any(name in RING10_OPTIMIZER_CALIBRATION_TREATMENTS for name in treatments) and (
+        suite != "ring10-optimizer-calibration"
+        or tuple(treatments) != RING10_OPTIMIZER_CALIBRATION_TREATMENTS
+    ):
+        raise ValueError(
+            "ring10 optimizer calibration treatments require the complete "
+            "--suite ring10-optimizer-calibration"
         )
     _validate_inputs(
         prefix=prefix,
@@ -1177,8 +1300,44 @@ def prepare_elo_ablation(
     )
     base_sha256 = _sha256(base)
     raw_base = _load_raw(base)
+    normalized_runtime_optimizer: dict[str, object] | None = None
+    if suite == "ring10-optimizer-calibration":
+        if not isinstance(runtime_effective_optimizer, Mapping):
+            raise ValueError(
+                "ring10 optimizer calibration requires pinned runtime-effective "
+                "optimizer evidence"
+            )
+        adamw_lr = runtime_effective_optimizer.get("adamw_lr")
+        muon_lr = runtime_effective_optimizer.get("muon_lr")
+        source_profile_path = runtime_effective_optimizer.get("source_profile_path")
+        source_profile_sha256 = runtime_effective_optimizer.get("source_profile_sha256")
+        if (
+            isinstance(adamw_lr, bool)
+            or not isinstance(adamw_lr, int | float)
+            or float(adamw_lr) <= 0
+            or isinstance(muon_lr, bool)
+            or not isinstance(muon_lr, int | float)
+            or float(muon_lr) <= 0
+            or not isinstance(source_profile_path, str)
+            or Path(source_profile_path).expanduser().resolve() != base
+            or not isinstance(source_profile_sha256, str)
+            or source_profile_sha256 != base_sha256
+        ):
+            raise ValueError(
+                "runtime-effective optimizer evidence does not match the exact "
+                "active source profile"
+            )
+        optimizer = _mapping(raw_base, "optimizer")
+        optimizer["adamw_lr"] = float(adamw_lr)
+        optimizer["muon_lr"] = float(muon_lr)
+        normalized_runtime_optimizer = dict(runtime_effective_optimizer)
+        normalized_runtime_optimizer["adamw_lr"] = float(adamw_lr)
+        normalized_runtime_optimizer["muon_lr"] = float(muon_lr)
     if suite == "ring10-live-cadence":
         _validate_ring10_live_cadence_base(raw_base, load_config(base))
+    elif suite == "ring10-optimizer-calibration":
+        _validate_ring10_optimizer_calibration_base(raw_base, load_config(base))
+        _validate_ring10_optimizer_calibration_source(base, source)
     elif (suite is not None and suite.startswith("ring10-")) or any(
         treatment in RING10_EFFICIENCY_VARIANTS
         or treatment in RING10_TRAINING_DYNAMICS_TREATMENTS
@@ -1189,10 +1348,18 @@ def prepare_elo_ablation(
     replay_cutoff = (
         _source_replay_cutoff(source)
         if any(
-            treatment in RING10_TRAINING_DYNAMICS_TREATMENTS for treatment in treatments
+            treatment in RING10_TRAINING_DYNAMICS_TREATMENTS
+            or treatment in RING10_OPTIMIZER_CALIBRATION_TREATMENTS
+            for treatment in treatments
         )
         else None
     )
+    if suite == "ring10-optimizer-calibration" and (
+        replay_cutoff is None or replay_cutoff <= 0
+    ):
+        raise ValueError(
+            "ring10 optimizer calibration requires a positive frozen replay cutoff"
+        )
     destination.mkdir(parents=True)
     generated = []
     for treatment_name in treatments:
@@ -1219,6 +1386,12 @@ def prepare_elo_ablation(
         TREATMENTS[treatment_name](profile)
         if treatment_name in RING10_LIVE_CADENCE_TREATMENTS:
             _validate_ring10_live_cadence_transition(
+                before_treatment,
+                profile,
+                treatment_name,
+            )
+        if treatment_name in RING10_OPTIMIZER_CALIBRATION_TREATMENTS:
+            _validate_ring10_optimizer_calibration_transition(
                 before_treatment,
                 profile,
                 treatment_name,
@@ -1250,17 +1423,24 @@ def prepare_elo_ablation(
                 f"{treatment_name} parameter contract differs from "
                 f"{expected_parameters}"
             )
-        generated.append(
-            {
-                "treatment": treatment_name,
-                "training_objective": training_objective,
-                "promotion_objective": promotion_objective,
-                "run_id": treatment_run_id,
-                "profile": str(profile_path),
-                "profile_sha256": _sha256(profile_path),
-                "run_root": str(run_root),
-            }
-        )
+        treatment_record: dict[str, object] = {
+            "treatment": treatment_name,
+            "training_objective": training_objective,
+            "promotion_objective": promotion_objective,
+            "run_id": treatment_run_id,
+            "profile": str(profile_path),
+            "profile_sha256": _sha256(profile_path),
+            "run_root": str(run_root),
+        }
+        calibration_label = RING10_OPTIMIZER_CALIBRATION_LABELS.get(treatment_name)
+        if calibration_label is not None:
+            treatment_record["calibration_label"] = calibration_label
+            treatment_record["calibration_phase"] = (
+                "follow_on"
+                if treatment_name == "ring10-optimizer-0.5x-effective-lr"
+                else "primary"
+            )
+        generated.append(treatment_record)
     manifest = {
         "schema_version": SCHEMA_VERSION,
         "report": REPORT_NAME,
@@ -1270,6 +1450,7 @@ def prepare_elo_ablation(
         "base_config_sha256": base_sha256,
         "source_run_root": str(source),
         "source_replay_cutoff": replay_cutoff,
+        "runtime_effective_optimizer": normalized_runtime_optimizer,
         "source_winner_snapshot": verified_winner,
         "futility_policy": registered_futility,
         "run_id": run_id,

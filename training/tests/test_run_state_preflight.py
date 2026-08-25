@@ -10,6 +10,7 @@ import pytest
 import torch
 import yaml
 
+import scripts.prepare_champion_warm_start as warm_start_module
 from scripts.prepare_champion_warm_start import prepare_champion_warm_start
 from scripts.preflight_run_state import (
     StatePreflightError,
@@ -30,7 +31,7 @@ from startrain.learner import ImmutableModelPublisher
 from startrain.model import GraphResTNet
 from startrain.optim import build_optimizer
 from startrain.replay_store import ReplayStore
-from startrain.runtime import RunIdentity, atomic_json
+from startrain.runtime import RunIdentity, atomic_json, require_launch_ready
 from startrain.training import build_scheduler
 
 CONFIGS = Path(__file__).parents[1] / "configs"
@@ -453,6 +454,139 @@ def test_champion_warm_start_uses_ema_with_fresh_train_state_and_cutover(
     )
     assert repeated["mode"] == "already-active"
     assert marker_path.read_bytes() == marker_bytes
+
+
+def test_champion_warm_start_prepare_only_stages_without_repointing(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture(tmp_path)
+    learner = fixture.root / "learner"
+    champion = load_model_manifest(learner / "champion.json")
+    old_cutover = write_resume_cutover(
+        learner,
+        manifest=champion,
+        run_id=fixture.identity.run_id,
+        generation_family=fixture.identity.generation_family,
+    )
+    active_paths = (
+        learner / "champion.json",
+        learner / "candidate.json",
+        learner / "recovery.json",
+        learner / "resume-cutover.json",
+        learner / "cadence.json",
+    )
+    active_before = {path: path.read_bytes() for path in active_paths}
+
+    prepared = prepare_champion_warm_start(
+        fixture.root,
+        fixture.profile,
+        prepare_only=True,
+    )
+
+    assert prepared["mode"] == "prepare-only"
+    marker_path = learner / "champion-warm-start.json"
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    staging_path = learner / "cutover-staging.json"
+    staging = json.loads(staging_path.read_text(encoding="utf-8"))
+    assert marker["status"] == "prepared"
+    assert staging["status"] == "pending"
+    assert staging["checkpoint_sha256"] == marker["checkpoint_sha256"]
+    assert (
+        json.loads((learner / staging["cadence"]["path"]).read_text(encoding="utf-8"))
+        == marker["cadence"]
+    )
+    assert (
+        json.loads(
+            (learner / staging["utd_segment"]["path"]).read_text(encoding="utf-8")
+        )
+        == marker["utd_segment"]
+    )
+    prepared_marker_artifact = learner / staging["prepared_marker"]["path"]
+    prepared_marker_bytes = prepared_marker_artifact.read_bytes()
+    assert json.loads(prepared_marker_bytes)["status"] == "prepared"
+    inspect_checkpoint(
+        learner / marker["checkpoint"],
+        expected_run_id=fixture.identity.run_id,
+        expected_generation_family=fixture.identity.generation_family,
+        expected_sha256=marker["checkpoint_sha256"],
+        expected_bytes=marker["checkpoint_bytes"],
+    )
+    assert {path: path.read_bytes() for path in active_paths} == active_before
+    assert not (learner / "utd-segment.json").exists()
+    assert not (learner / "selfplay" / "candidate.json").exists()
+    assert (
+        load_resume_cutover(
+            learner / "resume-cutover.json",
+            expected_run_id=fixture.identity.run_id,
+            expected_generation_family=fixture.identity.generation_family,
+        ).checkpoint_sha256
+        == old_cutover.checkpoint_sha256
+    )
+
+    marker_before = marker_path.read_bytes()
+    staging_before = staging_path.read_bytes()
+    repeated = prepare_champion_warm_start(
+        fixture.root,
+        fixture.profile,
+        prepare_only=True,
+    )
+    assert repeated["mode"] == "already-prepared"
+    assert marker_path.read_bytes() == marker_before
+    assert staging_path.read_bytes() == staging_before
+    assert {path: path.read_bytes() for path in active_paths} == active_before
+
+    activated = prepare_champion_warm_start(
+        fixture.root,
+        fixture.profile,
+        apply=True,
+    )
+    assert activated["mode"] == "resumed-apply"
+    assert json.loads(marker_path.read_text(encoding="utf-8"))["status"] == "active"
+    active_staging = json.loads(staging_path.read_text(encoding="utf-8"))
+    assert active_staging["status"] == "active"
+    assert prepared_marker_artifact.read_bytes() == prepared_marker_bytes
+    assert active_staging["prepared_marker"] == staging["prepared_marker"]
+    assert (learner / "utd-segment.json").is_file()
+    assert (learner / "selfplay" / "candidate.json").is_file()
+
+
+def test_direct_apply_crash_leaves_launch_blocked_before_pointer_changes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _fixture(tmp_path)
+    learner = fixture.root / "learner"
+    active_paths = (
+        learner / "champion.json",
+        learner / "candidate.json",
+        learner / "recovery.json",
+    )
+    active_before = {path: path.read_bytes() for path in active_paths}
+
+    def interrupt(*_args, **_kwargs):
+        raise RuntimeError("synthetic activation interruption")
+
+    monkeypatch.setattr(
+        warm_start_module,
+        "_activate_prepared_warm_start",
+        interrupt,
+    )
+    with pytest.raises(RuntimeError, match="synthetic activation interruption"):
+        prepare_champion_warm_start(
+            fixture.root,
+            fixture.profile,
+            apply=True,
+        )
+
+    marker = json.loads(
+        (learner / "champion-warm-start.json").read_text(encoding="utf-8")
+    )
+    staging = json.loads((learner / "cutover-staging.json").read_text(encoding="utf-8"))
+    assert marker["status"] == "prepared"
+    assert staging["status"] == "pending"
+    assert {path: path.read_bytes() for path in active_paths} == active_before
+    with pytest.raises(RuntimeError, match="prepared but has not been activated"):
+        require_launch_ready(learner)
 
 
 def test_champion_warm_start_uses_champion_examples_not_later_recovery(
