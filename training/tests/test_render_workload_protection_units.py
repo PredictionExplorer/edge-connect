@@ -153,7 +153,6 @@ def _manifest(tmp_path: Path) -> Path:
         ),
         "disaster_backup_root": str(disaster_root),
         "disaster_backup_mount": str(disaster_mount),
-        "mac_acknowledgement_namespace": str(disaster_root / "acknowledgements"),
         "telemetry_service": "edgeconnect-startrain-primary-monitor.service",
         "telemetry_output": str(primary_root / "status" / "monitor-5s.jsonl"),
     }

@@ -560,8 +560,9 @@ coordinators from owning one root; an abandoned lock is removed only when its PI
 longer live. Review retention dry-run metrics before enabling deletion. Continuous
 runs should also install the replay-ledger backup timer described in the production
 runbook. That timer handles local corruption only; install the 15-minute
-`training_disaster_recovery.py` timer to an attached filesystem and the hourly
-`pull_training_snapshot.py` Mac job to survive complete host-volume loss.
+`training_disaster_recovery.py` timer on an attached Lambda filesystem to survive
+complete host-volume loss. Lambda-attached, fully verified disaster snapshots are
+the supported disaster-backup gate.
 
 ## Benchmark and recalibration gates
 

@@ -119,11 +119,9 @@
   "backup": {
     "replay_retain": 3,
     "replay_max_total_bytes": 21474836480,
-    "disaster_backup_root": "/mnt/edgeconnect-backup/continuous",
-    "disaster_backup_mount": "/mnt/edgeconnect-backup",
-    "off_host_acknowledgement_path": "/mnt/edgeconnect-backup/continuous/acknowledgements/terminal-boundary-mac.json",
-    "off_host_ack_timeout_seconds": 1800,
-    "off_host_ack_poll_seconds": 5
+    "disaster_backup_root": "/lambda/nfs/<filesystem>/edgeconnect-dr/continuous",
+    "disaster_backup_mount": "/lambda/nfs/<filesystem>",
+    "disaster_snapshot_verification": "lambda_attached"
   },
   "snapshot": {
     "destination": "/srv/edgeconnect/exports/terminal-champion-v1",

@@ -83,13 +83,9 @@ class TerminalBoundaryAdapters(Protocol):
     ) -> Mapping[str, object]: ...
 
     def disaster_snapshot(
-        self, policy: Mapping[str, object]
-    ) -> Mapping[str, object]: ...
-
-    def off_host_acknowledgement(
         self,
         policy: Mapping[str, object],
-        snapshot: Mapping[str, object],
+        required_after_ns: int,
     ) -> Mapping[str, object]: ...
 
     def stop_source(self, policy: Mapping[str, object]) -> Mapping[str, object]: ...
@@ -465,28 +461,20 @@ def _validate_policy(document: dict[str, Any], policy_path: Path) -> LoadedPolic
         backup.get("disaster_backup_mount"),
         name="disaster backup mount",
     )
-    acknowledgement_path = _absolute_path(
-        backup.get("off_host_acknowledgement_path"),
-        name="off-host acknowledgement path",
-    )
-    _positive_number(
-        backup.get("off_host_ack_timeout_seconds"),
-        name="off-host acknowledgement timeout",
-    )
-    _positive_number(
-        backup.get("off_host_ack_poll_seconds"),
-        name="off-host acknowledgement polling interval",
-    )
+    disaster_verification = backup.get("disaster_snapshot_verification")
+    if disaster_verification != "lambda_attached":
+        raise TerminalBoundaryManifestError(
+            "disaster snapshot verification must be lambda_attached"
+        )
     try:
         disaster_root.relative_to(disaster_mount)
-        acknowledgement_path.relative_to(disaster_root)
     except ValueError as error:
         raise TerminalBoundaryManifestError(
-            "backup root and acknowledgement must remain under the backup mount"
+            "disaster backup root must remain under the backup mount"
         ) from error
-    if disaster_root == disaster_mount or acknowledgement_path == disaster_root:
+    if disaster_root == disaster_mount:
         raise TerminalBoundaryManifestError(
-            "backup root and acknowledgement must be child paths"
+            "disaster backup root must be a child of the backup mount"
         )
 
     snapshot = _mapping(document.get("snapshot"), name="champion snapshot")
@@ -1725,6 +1713,24 @@ def _activation_document(
             )
         return result
 
+    source_release_record = _mapping(
+        steps.get("prove_source_release"),
+        name="prove_source_release step",
+    )
+    source_release_verified_ns = _positive_int(
+        source_release_record.get("completed_ns"),
+        name="source release verification timestamp",
+    )
+    backup = _mapping(policy.raw.get("backup"), name="backup policy")
+    disaster_snapshot = {
+        **evidence("disaster_snapshot"),
+        "verification": backup["disaster_snapshot_verification"],
+        "required_after_ns": source_release_verified_ns,
+    }
+    source_release = {
+        **evidence("prove_source_release"),
+        "verified_ns": source_release_verified_ns,
+    }
     plan_document = _mapping(plan.get("plan"), name="calibration plan")
     treatments = _sequence(plan_document.get("treatments"), name="plan treatments")
     roots = []
@@ -1773,10 +1779,9 @@ def _activation_document(
         "safety": {
             "operator_hold": evidence("operator_hold"),
             "replay_backup": evidence("final_replay_backup"),
-            "disaster_snapshot": evidence("disaster_snapshot"),
-            "off_host_acknowledgement": evidence("off_host_acknowledgement"),
+            "disaster_snapshot": disaster_snapshot,
             "source_stop": evidence("stop_source"),
-            "source_release": evidence("prove_source_release"),
+            "source_release": source_release,
             "launch_preflight": _mapping(
                 state.get("launch_preflight"),
                 name="launch preflight",
@@ -1823,6 +1828,95 @@ def _verify_evidence_file(
             f"{name} changed after activation was pinned"
         )
     return path
+
+
+def _verify_lambda_disaster_snapshot(
+    policy: Mapping[str, object],
+    evidence: Mapping[str, object],
+    *,
+    required_after_ns: int,
+) -> dict[str, object]:
+    backup = _mapping(policy.get("backup"), name="backup policy")
+    verification = backup.get("disaster_snapshot_verification")
+    if verification != "lambda_attached":
+        raise TerminalBoundaryManifestError(
+            "disaster snapshot verification must be lambda_attached"
+        )
+    if (
+        evidence.get("status") != "ok"
+        or evidence.get("verification") != verification
+        or evidence.get("required_after_ns") != required_after_ns
+    ):
+        raise TerminalBoundaryManifestError(
+            "Lambda disaster snapshot evidence is incomplete"
+        )
+    snapshot_path = _verify_evidence_file(
+        evidence,
+        name="activation Lambda disaster snapshot",
+        path_key="snapshot",
+        sha256_key="snapshot_sha256",
+        bytes_key="snapshot_bytes",
+    )
+    backup_root = _absolute_path(
+        backup.get("disaster_backup_root"),
+        name="disaster backup root",
+    )
+    try:
+        from scripts.training_disaster_recovery import verify_snapshot
+
+        verified = verify_snapshot(snapshot_path, backup_root=backup_root)
+    except Exception as error:
+        raise TerminalBoundaryManifestError(
+            f"Lambda disaster snapshot failed end-to-end verification: {error}"
+        ) from error
+    source_identity = _mapping(
+        _mapping(policy.get("source"), name="source").get("run_identity"),
+        name="source run identity",
+    )
+    created_ns = _positive_int(
+        verified.get("created_ns"),
+        name="verified Lambda disaster snapshot created_ns",
+    )
+    evidence_created_ns = _positive_int(
+        evidence.get("created_ns"),
+        name="Lambda disaster snapshot created_ns",
+    )
+    for field, label in (
+        ("catalog_files", "catalog files"),
+        ("catalog_bytes", "catalog bytes"),
+        ("objects", "objects"),
+    ):
+        _positive_int(
+            verified.get(field),
+            name=f"verified Lambda disaster snapshot {label}",
+        )
+        _positive_int(
+            evidence.get(field),
+            name=f"Lambda disaster snapshot {label}",
+        )
+    if (
+        verified.get("status") != "ok"
+        or Path(str(verified.get("snapshot"))).resolve() != snapshot_path
+        or verified.get("snapshot_sha256") != evidence.get("snapshot_sha256")
+        or verified.get("snapshot_bytes") != evidence.get("snapshot_bytes")
+        or verified.get("run_id") != source_identity.get("run_id")
+        or verified.get("generation_family") != source_identity.get("generation_family")
+        or evidence.get("run_id") != verified.get("run_id")
+        or evidence.get("generation_family") != verified.get("generation_family")
+        or evidence_created_ns != created_ns
+        or any(
+            evidence.get(field) != verified.get(field)
+            for field in ("catalog_files", "catalog_bytes", "objects")
+        )
+    ):
+        raise TerminalBoundaryManifestError(
+            "Lambda disaster snapshot evidence disagrees with full verification"
+        )
+    if created_ns < required_after_ns:
+        raise TerminalBoundaryManifestError(
+            "Lambda disaster snapshot predates verified source release"
+        )
+    return verified
 
 
 def verify_queue_activation_manifest(
@@ -1909,10 +2003,6 @@ def verify_queue_activation_manifest(
         safety.get("disaster_snapshot"),
         name="activation disaster snapshot",
     )
-    acknowledgement = _mapping(
-        safety.get("off_host_acknowledgement"),
-        name="activation off-host acknowledgement",
-    )
     source_stop = _mapping(
         safety.get("source_stop"),
         name="activation source stop",
@@ -1933,11 +2023,13 @@ def verify_queue_activation_manifest(
         launch_preflight.get("arena_pause"),
         name="activation launch arena pause",
     )
+    source_release_verified_ns = _positive_int(
+        source_release.get("verified_ns"),
+        name="activation source release verified_ns",
+    )
     if (
         operator_hold.get("status") != "active"
         or replay_backup.get("status") != "ok"
-        or disaster_snapshot.get("status") != "ok"
-        or acknowledgement.get("status") != "verified"
         or source_stop.get("status") != "stopped"
         or any(
             source_release.get(field) is not True
@@ -1971,15 +2063,10 @@ def verify_queue_activation_manifest(
     if operator_hold_path.exists():
         _verify_evidence_file(operator_hold, name="activation operator hold")
     _verify_evidence_file(replay_backup, name="activation replay backup")
-    _verify_evidence_file(
+    _verify_lambda_disaster_snapshot(
+        policy.raw,
         disaster_snapshot,
-        name="activation disaster snapshot",
-        sha256_key="snapshot_sha256",
-        bytes_key="snapshot_bytes",
-    )
-    _verify_evidence_file(
-        acknowledgement,
-        name="activation off-host acknowledgement",
+        required_after_ns=source_release_verified_ns,
     )
     champion_snapshot = _mapping(
         document.get("champion_snapshot"),
@@ -2657,19 +2744,17 @@ def run_terminal_boundary_pipeline(
                 "final_replay_backup",
                 lambda: operations.final_replay_backup(policy.raw),
             )
-            snapshot_evidence = _run_step(
-                policy,
-                state,
-                "disaster_snapshot",
-                lambda: operations.disaster_snapshot(policy.raw),
+            source_release_verified_ns = _positive_int(
+                _step_record(state, "prove_source_release").get("completed_ns"),
+                name="source release verification timestamp",
             )
             _run_step(
                 policy,
                 state,
-                "off_host_acknowledgement",
-                lambda: operations.off_host_acknowledgement(
+                "disaster_snapshot",
+                lambda: operations.disaster_snapshot(
                     policy.raw,
-                    snapshot_evidence,
+                    source_release_verified_ns,
                 ),
             )
             winner_snapshot = _mapping(
@@ -3270,7 +3355,11 @@ class DefaultTerminalBoundaryAdapters:
         )
         return {"status": "ok", **evidence}
 
-    def disaster_snapshot(self, policy: Mapping[str, object]) -> Mapping[str, object]:
+    def disaster_snapshot(
+        self,
+        policy: Mapping[str, object],
+        required_after_ns: int,
+    ) -> Mapping[str, object]:
         from scripts.training_disaster_recovery import (
             create_snapshot,
             verify_snapshot,
@@ -3297,7 +3386,7 @@ class DefaultTerminalBoundaryAdapters:
                 == identity.get("generation_family")
                 and isinstance(latest_created_ns, int)
                 and not isinstance(latest_created_ns, bool)
-                and latest_created_ns >= self._frozen_boundary_ns(policy)
+                and latest_created_ns >= required_after_ns
             ):
                 return {
                     **latest_report,
@@ -3319,76 +3408,6 @@ class DefaultTerminalBoundaryAdapters:
             backup_root=backup_root,
         )
         return {**report, "path": str(snapshot)}
-
-    def off_host_acknowledgement(
-        self,
-        policy: Mapping[str, object],
-        snapshot: Mapping[str, object],
-    ) -> Mapping[str, object]:
-        backup = _mapping(policy.get("backup"), name="backup policy")
-        path = Path(str(backup["off_host_acknowledgement_path"]))
-        deadline = self.monotonic() + _positive_number(
-            backup.get("off_host_ack_timeout_seconds"),
-            name="off-host acknowledgement timeout",
-        )
-        expected_sha256 = _digest(
-            snapshot.get("snapshot_sha256"),
-            name="disaster snapshot SHA-256",
-        )
-        expected_snapshot = Path(
-            str(snapshot.get("snapshot", snapshot.get("path")))
-        ).resolve()
-        snapshot_created_ns = _positive_int(
-            snapshot.get("created_ns"),
-            name="disaster snapshot created_ns",
-        )
-        disaster_root = Path(backup["disaster_backup_root"])
-        expected_relative = str(expected_snapshot.relative_to(disaster_root))
-        while True:
-            if path.is_file() and not path.is_symlink():
-                document, digest_value, data = _read_json_with_digest(
-                    path,
-                    name="off-host acknowledgement",
-                )
-                completed_ns = document.get("completed_ns")
-                if (
-                    document.get("schema_version") != 1
-                    or document.get("report")
-                    != "startrain-disaster-recovery-acknowledgement"
-                    or document.get("local_verification_status") != "verified"
-                ):
-                    raise TerminalBoundaryExecutionError(
-                        "off-host acknowledgement has an invalid envelope"
-                    )
-                if (
-                    document.get("snapshot_sha256") == expected_sha256
-                    and document.get("snapshot_path") == expected_relative
-                    and isinstance(completed_ns, int)
-                    and not isinstance(completed_ns, bool)
-                    and completed_ns >= snapshot_created_ns
-                ):
-                    return {
-                        "status": "verified",
-                        "path": str(path),
-                        "sha256": digest_value,
-                        "bytes": len(data),
-                        "snapshot_sha256": expected_sha256,
-                        "completed_ns": completed_ns,
-                    }
-            remaining = deadline - self.monotonic()
-            if remaining <= 0:
-                raise TimeoutError(
-                    "timed out awaiting required off-host snapshot acknowledgement"
-                )
-            self.sleep(
-                min(
-                    _positive_number(
-                        backup.get("off_host_ack_poll_seconds"),
-                        name="off-host acknowledgement polling interval",
-                    ),
-                    remaining,
-                )
-            )
 
     def stop_source(self, policy: Mapping[str, object]) -> Mapping[str, object]:
         from startrain.continuity import SystemdUnitManager

@@ -31,8 +31,8 @@ do not infer progress from loss, throughput, or promotion counts alone.
   champion unchanged.
 - Seed-18 boundary barrier: armed. Seed 17 will finalize before seed 18 may
   acquire its queue lock.
-- Durability: active-arm NFS snapshots, campaign control-plane snapshots,
-  independent Mac mirrors, and verified continuity fallback are active.
+- Durability: Lambda-attached active-arm disaster snapshots, campaign
+  control-plane snapshots, and verified continuity fallback are active.
 
 ## Status legend
 
@@ -45,7 +45,7 @@ do not infer progress from loss, throughput, or promotion counts alone.
 
 - [-] Finish seed-17 three-lane arm without interruption.
 - [x] Arm reversible seed-18 queue-lock barrier.
-- [x] Back up and Mac-ack barrier/control-plane evidence.
+- [x] Back up barrier/control-plane evidence to the attached Lambda filesystem.
 - [ ] Finalize and inspect seed-17 pair-valid comparison.
 - [ ] If no promotion/frontier gain, keep seeds 18/19 paused.
 - [ ] If seed 17 is positive, release the barrier and resume the pinned campaign.
@@ -177,8 +177,7 @@ Seeds:
 Budget:
 System gates:
 Statistical gate:
-NFS snapshot:
-Mac acknowledgement:
+Lambda snapshot verification:
 Result:
 Decision:
 ```
@@ -199,9 +198,8 @@ Seeds: 17 only; seeds 18/19 remain held because the statistical gate failed
 Budget: 8 hours / 2B leaves per screen arm; 12 hours per confirmation arm
 System gates: arrival/service <=1.20 or >=25% relative reduction versus control
 Statistical gate: standard pair-valid Elo/hour screening and three-seed gate
-NFS snapshot: verified distinct treatment snapshots under
+Lambda snapshot verification: verified distinct treatment snapshots under
   edgeconnect-dr/elo-optimization/cadence-seed17-v2
-Mac acknowledgement: verified treatment baselines and queue control-plane mirror
 Result: treatment arrival/service 1.00 versus control 1.25, approximately 4.6%
   higher actor and learner throughput, but zero promotions and zero pair-valid
   champion-frontier Elo/hour in both arms
@@ -229,8 +227,8 @@ System gates: finite/reference parity, read-only replay, >=90% control
   throughput, complete backups and source release
 Statistical gate: strictly positive one-sided held-out composite lower bound;
   pair-valid Elo/hour remains the advancement and adoption authority
-NFS snapshot: required at terminal boundary
-Mac acknowledgement: required before source cutover completes
+Lambda snapshot verification: `lambda_attached`; a complete snapshot newer than
+  verified source release is required before source cutover completes
 Result: pending
 Decision: automatic fallback to runtime control on no winner, tie, invalid
   evidence, or any cutover failure

@@ -18,7 +18,7 @@ import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 
 import yaml
 
@@ -33,7 +33,6 @@ else:
 SEVERITY = {"OK": 0, "WARN": 1, "ERROR": 2}
 CONTINUITY_STALE_SECONDS = 180.0
 DISASTER_BACKUP_STALE_SECONDS = 30.0 * 60.0
-OFFSITE_ACK_STALE_SECONDS = 2.0 * 60.0 * 60.0
 _DIGEST_CACHE: dict[Path, tuple[int, int, int, str]] = {}
 _ARENA_RESULT_CACHE: dict[Path, tuple[int, int, dict[str, object]]] = {}
 
@@ -45,7 +44,6 @@ class MonitorTarget:
     unit: str | None
     continuity_state_path: Path | None
     disaster_backup_root: Path | None
-    mac_acknowledgement_namespace: Path | None
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -185,9 +183,6 @@ def resolve_monitor_target(
         unit=workload.unit,
         continuity_state_path=resolved_state,
         disaster_backup_root=resolved_disaster_root,
-        mac_acknowledgement_namespace=(
-            protection.mac_acknowledgement_namespace if protection is not None else None
-        ),
     )
 
 
@@ -258,7 +253,6 @@ def _disaster_recovery_status(
     *,
     run_id: object,
     run_root: Path | None = None,
-    acknowledgement_namespace: Path | None = None,
     now_ns: int,
 ) -> dict[str, object]:
     if path is None:
@@ -386,97 +380,6 @@ def _disaster_recovery_status(
             "snapshot_path": str(snapshot_path),
             "reason": "snapshot_cutoff_invalid",
         }
-    latest_ack: dict[str, object] | None = None
-    latest_ack_completed_ns: int | None = None
-    acknowledgement_input = (
-        root / "acknowledgements"
-        if acknowledgement_namespace is None
-        else acknowledgement_namespace.expanduser()
-    )
-    acknowledgements = acknowledgement_input.resolve()
-    try:
-        acknowledgement_relative = acknowledgements.relative_to(root)
-    except ValueError:
-        acknowledgement_relative = Path()
-    if (
-        not acknowledgement_relative.parts
-        or acknowledgement_relative.parts[0] != "acknowledgements"
-        or acknowledgement_input.is_symlink()
-        or (
-            acknowledgements.exists()
-            and (not acknowledgements.is_dir() or acknowledgements.is_symlink())
-        )
-    ):
-        return {
-            "configured": True,
-            "valid": False,
-            "backup_root": str(root),
-            "reason": "acknowledgement_namespace_invalid",
-        }
-    if acknowledgements.is_dir() and not acknowledgements.is_symlink():
-        for candidate in sorted(acknowledgements.glob("*.json")):
-            payload = _read_json(candidate)
-            if (
-                payload is None
-                or payload.get("report")
-                != "startrain-disaster-recovery-acknowledgement"
-                or payload.get("schema_version") != 1
-                or payload.get("local_verification_status") != "verified"
-            ):
-                continue
-            acknowledged_path = payload.get("snapshot_path")
-            acknowledged_sha256 = payload.get("snapshot_sha256")
-            if (
-                not isinstance(acknowledged_path, str)
-                or not isinstance(acknowledged_sha256, str)
-                or len(acknowledged_sha256) != 64
-                or any(
-                    character not in "0123456789abcdef"
-                    for character in acknowledged_sha256
-                )
-            ):
-                continue
-            relative = PurePosixPath(acknowledged_path)
-            if (
-                relative.is_absolute()
-                or len(relative.parts) != 3
-                or relative.parts[:2] != ("snapshots", run_id)
-                or any(part in {"", ".", ".."} for part in relative.parts)
-            ):
-                continue
-            acknowledged_snapshot_path = root.joinpath(*relative.parts)
-            acknowledged_snapshot = _read_json(acknowledged_snapshot_path)
-            try:
-                acknowledged_bytes = acknowledged_snapshot_path.stat().st_size
-            except OSError:
-                continue
-            acknowledged_valid, _ = _verified_artifact(
-                acknowledged_snapshot_path,
-                expected_bytes=acknowledged_bytes,
-                expected_sha256=acknowledged_sha256,
-            )
-            if (
-                not acknowledged_valid
-                or acknowledged_snapshot is None
-                or acknowledged_snapshot.get("report")
-                != "startrain-disaster-recovery-snapshot"
-                or acknowledged_snapshot.get("run_id") != run_id
-            ):
-                continue
-            completed_ns = payload.get("completed_ns")
-            if (
-                isinstance(completed_ns, bool)
-                or not isinstance(completed_ns, int)
-                or completed_ns <= 0
-                or completed_ns > now_ns
-            ):
-                continue
-            if (
-                latest_ack_completed_ns is None
-                or completed_ns > latest_ack_completed_ns
-            ):
-                latest_ack = {**payload, "path": str(candidate)}
-                latest_ack_completed_ns = completed_ns
     catalog = snapshot.get("catalog")
     return {
         "configured": True,
@@ -490,17 +393,6 @@ def _disaster_recovery_status(
         "source_cutoff_ns": cutoff_ns,
         "source_cutoff_age_seconds": cutoff_age,
         "catalog_files": len(catalog) if isinstance(catalog, dict) else None,
-        "offsite_acknowledgement": latest_ack,
-        "offsite_acknowledges_current_snapshot": (
-            latest_ack is not None
-            and latest_ack.get("snapshot_sha256") == digest
-            and latest_ack.get("snapshot_path") == f"snapshots/{run_id}/{filename}"
-        ),
-        "offsite_ack_age_seconds": (
-            max(0.0, (now_ns - latest_ack_completed_ns) / 1_000_000_000)
-            if latest_ack_completed_ns is not None
-            else None
-        ),
     }
 
 
@@ -1467,7 +1359,6 @@ def collect_snapshot(
     profile_path: Path | None = None,
     continuity_state_path: Path | None = None,
     disaster_backup_root: Path | None = None,
-    mac_acknowledgement_namespace: Path | None = None,
     now_ns: int | None = None,
 ) -> dict[str, object]:
     root = run_root.expanduser().resolve()
@@ -2540,7 +2431,6 @@ def collect_snapshot(
         disaster_backup_root,
         run_id=orchestration.get("run_id"),
         run_root=root,
-        acknowledgement_namespace=mac_acknowledgement_namespace,
         now_ns=now,
     )
     if (
@@ -2551,7 +2441,7 @@ def collect_snapshot(
             warnings,
             "ERROR",
             "disaster_backup_invalid",
-            "off-host disaster-recovery snapshot is missing or invalid",
+            "Lambda disaster-recovery snapshot is missing or invalid",
         )
     disaster_age = disaster_recovery.get("source_cutoff_age_seconds")
     if (
@@ -2563,26 +2453,7 @@ def collect_snapshot(
             warnings,
             "ERROR",
             "disaster_backup_stale",
-            f"latest off-host snapshot age={float(disaster_age):.0f}s",
-        )
-    acknowledgement_age = disaster_recovery.get("offsite_ack_age_seconds")
-    if disaster_recovery.get("valid") is True and acknowledgement_age is None:
-        _add_warning(
-            warnings,
-            "WARN",
-            "offsite_backup_unacknowledged",
-            "latest disaster snapshot has no verified Mac acknowledgement",
-        )
-    elif (
-        isinstance(acknowledgement_age, int | float)
-        and float(acknowledgement_age) > OFFSITE_ACK_STALE_SECONDS
-    ):
-        _add_warning(
-            warnings,
-            "WARN",
-            "offsite_backup_stale",
-            f"latest verified Mac acknowledgement age="
-            f"{float(acknowledgement_age):.0f}s",
+            f"latest Lambda snapshot age={float(disaster_age):.0f}s",
         )
 
     status = max(
@@ -2729,7 +2600,6 @@ def format_text(snapshot: Mapping[str, object]) -> str:
         f"continuity={continuity.get('phase', 'n/a')} "
         f"active_workload={continuity.get('active_workload_id', 'n/a')} "
         f"dr_age={_seconds(disaster_recovery.get('source_cutoff_age_seconds'))} "
-        f"mac_ack_age={_seconds(disaster_recovery.get('offsite_ack_age_seconds'))} "
         f"warnings={warning_codes or '-'}"
     )
 
@@ -2821,22 +2691,12 @@ def run_monitor(
     stop_requested: Callable[[], bool],
     continuity_state_path: Path | None = None,
     disaster_backup_root: Path | None = None,
-    mac_acknowledgement_namespace: Path | None = None,
     telemetry_output: Path | None = None,
 ) -> None:
     next_tick = time.monotonic()
     while not stop_requested():
         try:
-            if mac_acknowledgement_namespace is not None:
-                snapshot = collect_snapshot(
-                    run_root,
-                    unit=unit,
-                    profile_path=profile_path,
-                    continuity_state_path=continuity_state_path,
-                    disaster_backup_root=disaster_backup_root,
-                    mac_acknowledgement_namespace=(mac_acknowledgement_namespace),
-                )
-            elif continuity_state_path is not None and disaster_backup_root is not None:
+            if continuity_state_path is not None and disaster_backup_root is not None:
                 snapshot = collect_snapshot(
                     run_root,
                     unit=unit,
@@ -2934,7 +2794,6 @@ def main(argv: list[str] | None = None) -> int:
             unit=arguments.unit,
             continuity_state_path=arguments.continuity_state,
             disaster_backup_root=arguments.disaster_backup_root,
-            mac_acknowledgement_namespace=None,
         )
     stopped = False
 
@@ -2954,7 +2813,6 @@ def main(argv: list[str] | None = None) -> int:
         stop_requested=lambda: stopped,
         continuity_state_path=target.continuity_state_path,
         disaster_backup_root=target.disaster_backup_root,
-        mac_acknowledgement_namespace=(target.mac_acknowledgement_namespace),
         telemetry_output=arguments.telemetry_output,
     )
     return 0

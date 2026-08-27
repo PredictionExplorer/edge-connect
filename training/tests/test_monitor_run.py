@@ -90,9 +90,6 @@ def _continuity_fixture(tmp_path: Path) -> dict[str, Path]:
             ),
             "disaster_backup_root": str(backup_root),
             "disaster_backup_mount": str(disaster_mount),
-            "mac_acknowledgement_namespace": str(
-                backup_root / "acknowledgements" / owner
-            ),
             "telemetry_service": (f"edgeconnect-startrain-{owner}-monitor.service"),
             "telemetry_output": str(root / "status" / "monitor-5s.jsonl"),
         }
@@ -148,7 +145,6 @@ def _continuity_fixture(tmp_path: Path) -> dict[str, Path]:
         "profile": primary_profile,
         "state": manifest.state_path,
         "disaster_root": disaster_root,
-        "acknowledgements": disaster_root / "acknowledgements" / "primary",
         "fallback_run_root": fallback_root,
         "fallback_profile": fallback_profile,
         "fallback_disaster_root": fallback_disaster_root,
@@ -1033,7 +1029,6 @@ def test_continuity_manifest_resolves_active_monitor_target(tmp_path: Path) -> N
     assert target.unit == "edgeconnect-primary.service"
     assert target.continuity_state_path == paths["state"]
     assert target.disaster_backup_root == paths["disaster_root"]
-    assert target.mac_acknowledgement_namespace == paths["acknowledgements"]
 
 
 def test_continuity_manifest_follows_fallback_active_workload(
@@ -1112,7 +1107,6 @@ def test_main_uses_manifest_resolved_active_workload(
     assert captured["unit"] == "edgeconnect-primary.service"
     assert captured["continuity_state_path"] == paths["state"]
     assert captured["disaster_backup_root"] == paths["disaster_root"]
-    assert captured["mac_acknowledgement_namespace"] == paths["acknowledgements"]
 
 
 def test_run_monitor_once_emits_one_json_record(tmp_path, monkeypatch, capsys) -> None:
@@ -1496,7 +1490,7 @@ def test_monitor_surfaces_optimizer_ema_and_training_health(
     assert snapshot["status"] == "ERROR"
 
 
-def test_disaster_recovery_status_verifies_snapshot_and_mac_ack(tmp_path) -> None:
+def test_disaster_recovery_status_verifies_lambda_snapshot(tmp_path) -> None:
     now_ns = 200_000_000_000
     run_id = "run-1"
     backup_root = tmp_path / "backup"
@@ -1555,19 +1549,6 @@ def test_disaster_recovery_status_verifies_snapshot_and_mac_ack(tmp_path) -> Non
             "created_ns": snapshot["created_ns"],
         },
     )
-    _write_json(
-        backup_root / "acknowledgements" / "mac.json",
-        {
-            "schema_version": 1,
-            "report": "startrain-disaster-recovery-acknowledgement",
-            "snapshot_sha256": snapshot_sha256,
-            "snapshot_path": f"snapshots/{run_id}/{snapshot_name}",
-            "completed_ns": now_ns - 30_000_000_000,
-            "mac_hostname": "mac",
-            "local_verification_status": "verified",
-        },
-    )
-
     status = monitor._disaster_recovery_status(
         backup_root,
         run_id=run_id,
@@ -1578,7 +1559,6 @@ def test_disaster_recovery_status_verifies_snapshot_and_mac_ack(tmp_path) -> Non
     assert status["valid"] is True
     assert status["snapshot_age_seconds"] == 60.0
     assert status["source_cutoff_age_seconds"] == 90.0
-    assert status["offsite_ack_age_seconds"] == 30.0
     assert status["catalog_files"] == 1
 
     newer = {
@@ -1619,8 +1599,8 @@ def test_disaster_recovery_status_verifies_snapshot_and_mac_ack(tmp_path) -> Non
     )
 
     assert pending["valid"] is True
-    assert pending["offsite_ack_age_seconds"] == 30.0
-    assert pending["offsite_acknowledges_current_snapshot"] is False
+    assert pending["snapshot_age_seconds"] == 10.0
+    assert pending["source_cutoff_age_seconds"] == 20.0
 
     other_root = tmp_path / "other-run"
     _write_json(

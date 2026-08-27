@@ -156,6 +156,11 @@ def _fixture(tmp_path: Path) -> SimpleNamespace:
         profile=profile,
         identity=identity,
         experiment=experiment,
+        model=model,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        ema=ema,
+        publisher=publisher,
     )
 
 
@@ -194,6 +199,33 @@ def test_preflight_dry_run_and_apply_are_safe_and_idempotent(tmp_path: Path) -> 
     assert (
         fixture.root / "learner" / "utd-segment.json"
     ).read_bytes() == segment_applied
+
+
+def test_preflight_accepts_cadence_backed_by_newer_candidate(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture(tmp_path)
+    fixture.publisher.publish(
+        model=fixture.model,
+        optimizer=fixture.optimizer,
+        scheduler=fixture.scheduler,
+        ema=fixture.ema,
+        step=11,
+        epoch=0,
+        config=fixture.experiment.as_dict(),
+        examples_consumed=120,
+        global_batch_size=1,
+    )
+    cadence_path = fixture.root / "learner" / "cadence.json"
+    cadence = json.loads(cadence_path.read_text(encoding="utf-8"))
+    cadence["candidate_examples"] = 120
+    _write_json(cadence_path, cadence)
+
+    report = run_state_preflight(fixture.root, fixture.profile)
+
+    assert report["status"] == "ok"
+    assert report["cadence"]["candidate_examples"] == 120
+    assert report["recovery"]["examples_consumed"] == 100
 
 
 def test_preflight_cli_can_skip_a_genuine_first_launch(

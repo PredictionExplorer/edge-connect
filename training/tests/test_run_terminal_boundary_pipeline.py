@@ -42,6 +42,36 @@ def _artifact(path: Path) -> dict[str, object]:
     return {"path": str(path.resolve()), "sha256": _sha256(path)}
 
 
+@pytest.fixture(autouse=True)
+def _verify_fixture_disaster_snapshot(monkeypatch: pytest.MonkeyPatch) -> None:
+    def verify_snapshot(
+        snapshot: str | Path,
+        *,
+        backup_root: str | Path | None = None,
+    ) -> dict[str, object]:
+        path = Path(snapshot).resolve()
+        assert backup_root is not None
+        assert Path(backup_root).resolve() in path.parents
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        return {
+            "status": "ok",
+            "snapshot": str(path),
+            "snapshot_sha256": _sha256(path),
+            "snapshot_bytes": path.stat().st_size,
+            "run_id": payload["run_id"],
+            "generation_family": payload["generation_family"],
+            "created_ns": payload["created_ns"],
+            "catalog_files": payload["catalog_files"],
+            "catalog_bytes": payload["catalog_bytes"],
+            "objects": payload["objects"],
+        }
+
+    monkeypatch.setattr(
+        "scripts.training_disaster_recovery.verify_snapshot",
+        verify_snapshot,
+    )
+
+
 def _model_manifest(
     root: Path,
     *,
@@ -310,11 +340,7 @@ class BoundaryFixture:
                 "replay_max_total_bytes": 1024 * 1024,
                 "disaster_backup_root": str(backup_root),
                 "disaster_backup_mount": str(backup_mount),
-                "off_host_acknowledgement_path": str(
-                    backup_root / "acknowledgements" / "mac.json"
-                ),
-                "off_host_ack_timeout_seconds": 60,
-                "off_host_ack_poll_seconds": 1,
+                "disaster_snapshot_verification": "lambda_attached",
             },
             "snapshot": {
                 "destination": str(tmp_path / "champion-export"),
@@ -445,6 +471,7 @@ class FakeAdapters:
         arena_active: bool = False,
         frozen_fallback: bool = False,
         hardware_unavailable: bool = False,
+        stale_snapshot: bool = False,
     ) -> None:
         self.fixture = fixture
         self.fail_at = fail_at
@@ -453,6 +480,7 @@ class FakeAdapters:
         self.arena_active = arena_active
         self.frozen_fallback = frozen_fallback
         self.hardware_unavailable = hardware_unavailable
+        self.stale_snapshot = stale_snapshot
         self.snapshot_crashed = False
         self.snapshot_side_effects = 0
         self.events: list[str] = []
@@ -514,9 +542,16 @@ class FakeAdapters:
             "bytes": path.stat().st_size,
         }
 
-    def disaster_snapshot(self, policy) -> dict[str, object]:
+    def disaster_snapshot(
+        self,
+        policy,
+        required_after_ns: int,
+    ) -> dict[str, object]:
         self.events.append("disaster_snapshot")
         backup = policy["backup"]
+        created_ns = (
+            required_after_ns - 1 if self.stale_snapshot else required_after_ns + 1
+        )
         snapshot = (
             Path(backup["disaster_backup_root"])
             / "snapshots"
@@ -524,7 +559,17 @@ class FakeAdapters:
             / "snapshot.json"
         )
         if not snapshot.exists():
-            _write_json(snapshot, {"snapshot": "fixture"})
+            _write_json(
+                snapshot,
+                {
+                    "run_id": "source-run",
+                    "generation_family": "source-family",
+                    "created_ns": created_ns,
+                    "catalog_files": 1,
+                    "catalog_bytes": 1,
+                    "objects": 1,
+                },
+            )
             self.snapshot_side_effects += 1
         evidence = {
             "status": "ok",
@@ -532,7 +577,12 @@ class FakeAdapters:
             "path": str(snapshot),
             "snapshot_sha256": _sha256(snapshot),
             "snapshot_bytes": snapshot.stat().st_size,
-            "created_ns": 300,
+            "run_id": "source-run",
+            "generation_family": "source-family",
+            "created_ns": created_ns,
+            "catalog_files": 1,
+            "catalog_bytes": 1,
+            "objects": 1,
         }
         if self.fail_at == "disaster_snapshot":
             raise RuntimeError("injected disaster_snapshot failure")
@@ -540,18 +590,6 @@ class FakeAdapters:
             self.snapshot_crashed = True
             raise RuntimeError("synthetic crash after snapshot publication")
         return evidence
-
-    def off_host_acknowledgement(self, _policy, snapshot) -> dict[str, object]:
-        self._event("off_host_acknowledgement")
-        path = Path(self.fixture.policy["backup"]["off_host_acknowledgement_path"])
-        _write_json(path, {"snapshot_sha256": snapshot["snapshot_sha256"]})
-        return {
-            "status": "verified",
-            "path": str(path),
-            "sha256": _sha256(path),
-            "bytes": path.stat().st_size,
-            "snapshot_sha256": snapshot["snapshot_sha256"],
-        }
 
     def stop_source(self, _policy) -> dict[str, object]:
         self._event("stop_source")
@@ -814,6 +852,28 @@ def test_stale_terminal_status_waits_without_side_effects(tmp_path: Path) -> Non
     assert json.loads(fixture.state_path.read_text())["report"] == STATE_REPORT
 
 
+@pytest.mark.parametrize("verification", [None, "legacy", "lambda"])
+def test_policy_requires_lambda_attached_disaster_snapshot_verification(
+    tmp_path: Path,
+    verification: str | None,
+) -> None:
+    fixture = BoundaryFixture(tmp_path)
+    if verification is None:
+        del fixture.policy["backup"]["disaster_snapshot_verification"]
+    else:
+        fixture.policy["backup"]["disaster_snapshot_verification"] = verification
+    _write_json(fixture.policy_path, fixture.policy)
+
+    with pytest.raises(
+        TerminalBoundaryManifestError,
+        match="disaster snapshot verification must be lambda_attached",
+    ):
+        run_terminal_boundary_pipeline(
+            fixture.policy_path,
+            adapters=FakeAdapters(fixture),
+        )
+
+
 def test_runtime_drift_is_rejected_before_terminal_side_effects(
     tmp_path: Path,
 ) -> None:
@@ -918,6 +978,27 @@ def test_current_terminal_is_accepted_and_launched(tmp_path: Path) -> None:
     assert accepted["decision"] == "reject"
     assert accepted["status"]["sha256"] == _sha256(fixture.status_path)
     assert state["automatic_launch_authorized"] is True
+    activation = json.loads(
+        Path(fixture.policy["queue"]["activation_manifest"]).read_text(encoding="utf-8")
+    )
+    safety = activation["safety"]
+    assert set(safety) == {
+        "operator_hold",
+        "replay_backup",
+        "disaster_snapshot",
+        "source_stop",
+        "source_release",
+        "launch_preflight",
+    }
+    assert safety["disaster_snapshot"]["verification"] == "lambda_attached"
+    assert (
+        safety["disaster_snapshot"]["required_after_ns"]
+        == safety["source_release"]["verified_ns"]
+    )
+    assert (
+        safety["disaster_snapshot"]["created_ns"]
+        >= safety["source_release"]["verified_ns"]
+    )
     assert (
         verify_queue_activation_manifest(
             fixture.policy["queue"]["activation_manifest"],
@@ -1057,9 +1138,9 @@ def test_terminal_evidence_race_fails_before_backup_or_stop(
 
 @pytest.mark.parametrize(
     "failure",
-    ["final_replay_backup", "off_host_acknowledgement"],
+    ["final_replay_backup", "disaster_snapshot"],
 )
-def test_backup_or_ack_failure_requests_fallback_after_source_release(
+def test_backup_failure_requests_fallback_after_source_release(
     tmp_path: Path,
     failure: str,
 ) -> None:
@@ -1093,7 +1174,7 @@ def test_stop_failure_never_prepares_or_launches(tmp_path: Path) -> None:
             adapters=adapters,
         )
 
-    assert "off_host_acknowledgement" not in adapters.events
+    assert "disaster_snapshot" not in adapters.events
     assert "prove_source_release" not in adapters.events
     assert "prepare_calibration" not in adapters.events
     assert "launch_queue" not in adapters.events
@@ -1187,6 +1268,94 @@ def test_failed_snapshot_requests_fallback_and_does_not_restart_cutover(
     assert adapters.events.count("launch_queue") == 0
 
 
+def test_stale_lambda_snapshot_requests_fallback_and_never_launches(
+    tmp_path: Path,
+) -> None:
+    fixture = BoundaryFixture(tmp_path)
+    fixture.make_terminal()
+    adapters = FakeAdapters(fixture, stale_snapshot=True)
+
+    with pytest.raises(
+        TerminalBoundaryManifestError,
+        match="predates verified source release",
+    ):
+        run_terminal_boundary_pipeline(
+            fixture.policy_path,
+            adapters=adapters,
+        )
+
+    state = json.loads(fixture.state_path.read_text(encoding="utf-8"))
+    assert state["automatic_launch_authorized"] is False
+    assert state["fallback"]["status"] == "requested"
+    assert "launch_queue" not in adapters.events
+
+
+def test_invalid_lambda_snapshot_requests_fallback_and_never_launches(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = BoundaryFixture(tmp_path)
+    fixture.make_terminal()
+    adapters = FakeAdapters(fixture)
+
+    def reject_snapshot(*_args, **_kwargs):
+        raise ValueError("catalog object digest mismatch")
+
+    monkeypatch.setattr(
+        "scripts.training_disaster_recovery.verify_snapshot",
+        reject_snapshot,
+    )
+    with pytest.raises(
+        TerminalBoundaryManifestError,
+        match="failed end-to-end verification",
+    ):
+        run_terminal_boundary_pipeline(
+            fixture.policy_path,
+            adapters=adapters,
+        )
+
+    state = json.loads(fixture.state_path.read_text(encoding="utf-8"))
+    assert state["fallback"]["status"] == "requested"
+    assert "launch_queue" not in adapters.events
+
+
+def test_missing_lambda_snapshot_requests_fallback_and_never_launches(
+    tmp_path: Path,
+) -> None:
+    fixture = BoundaryFixture(tmp_path)
+    fixture.make_terminal()
+    adapters = FakeAdapters(fixture)
+
+    def missing_snapshot(_policy, required_after_ns):
+        adapters.events.append("disaster_snapshot")
+        return {
+            "status": "ok",
+            "snapshot": str(tmp_path / "missing-snapshot.json"),
+            "snapshot_sha256": "0" * 64,
+            "snapshot_bytes": 1,
+            "run_id": "source-run",
+            "generation_family": "source-family",
+            "created_ns": required_after_ns + 1,
+            "catalog_files": 1,
+            "catalog_bytes": 1,
+            "objects": 1,
+        }
+
+    adapters.disaster_snapshot = missing_snapshot  # type: ignore[method-assign]
+    with pytest.raises(
+        TerminalBoundaryManifestError,
+        match="cannot read activation Lambda disaster snapshot",
+    ):
+        run_terminal_boundary_pipeline(
+            fixture.policy_path,
+            adapters=adapters,
+        )
+
+    state = json.loads(fixture.state_path.read_text(encoding="utf-8"))
+    assert state["fallback"]["status"] == "requested"
+    assert "launch_queue" not in adapters.events
+
+
 def test_recover_requests_fallback_after_uncaught_service_interruption(
     tmp_path: Path,
 ) -> None:
@@ -1194,7 +1363,7 @@ def test_recover_requests_fallback_after_uncaught_service_interruption(
     fixture.make_terminal()
     adapters = FakeAdapters(fixture)
 
-    def interrupt(_policy):
+    def interrupt(_policy, _required_after_ns):
         raise KeyboardInterrupt
 
     adapters.disaster_snapshot = interrupt  # type: ignore[method-assign]
@@ -1260,7 +1429,6 @@ def test_success_side_effect_order_is_fail_closed(tmp_path: Path) -> None:
         "prove_source_release",
         "final_replay_backup",
         "disaster_snapshot",
-        "off_host_acknowledgement",
         "export_champion",
         "prepare_calibration",
         "run_frozen_calibration",

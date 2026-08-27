@@ -32,16 +32,17 @@
     },
     "disaster_snapshot": {
       "status": "ok",
-      "snapshot": "/mnt/edgeconnect-backup/continuous/snapshots/@RUN_ID@/snapshot-1000000000000000001.json",
+      "verification": "lambda_attached",
+      "required_after_ns": 1000000000000000002,
+      "snapshot": "/lambda/nfs/<filesystem>/edgeconnect-dr/continuous/snapshots/@RUN_ID@/snapshot-1000000000000000003.json",
       "snapshot_sha256": "@DISASTER_SNAPSHOT_SHA256@",
-      "snapshot_bytes": 12345
-    },
-    "off_host_acknowledgement": {
-      "status": "verified",
-      "path": "/mnt/edgeconnect-backup/continuous/acknowledgements/terminal-boundary-mac.json",
-      "sha256": "@OFF_HOST_ACK_SHA256@",
-      "bytes": 1234,
-      "snapshot_sha256": "@DISASTER_SNAPSHOT_SHA256@"
+      "snapshot_bytes": 12345,
+      "run_id": "@RUN_ID@",
+      "generation_family": "@GENERATION_FAMILY@",
+      "created_ns": 1000000000000000003,
+      "catalog_files": 123,
+      "catalog_bytes": 123456789,
+      "objects": 120
     },
     "source_stop": {
       "status": "stopped",
@@ -53,7 +54,8 @@
       "main_pid_released": true,
       "coordinator_lock_released": true,
       "process_groups_released": true,
-      "gpus_released": true
+      "gpus_released": true,
+      "verified_ns": 1000000000000000002
     },
     "launch_preflight": {
       "hardware": {

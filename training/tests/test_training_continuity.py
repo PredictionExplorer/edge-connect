@@ -240,9 +240,6 @@ def _fixture(
                 ),
                 "disaster_backup_root": str(disaster_root),
                 "disaster_backup_mount": str(disaster_mount),
-                "mac_acknowledgement_namespace": str(
-                    disaster_root / "acknowledgements"
-                ),
                 "telemetry_service": (f"edgeconnect-startrain-{owner}-monitor.service"),
                 "telemetry_output": str(run_root / "status" / "monitor-5s.jsonl"),
             }

@@ -79,7 +79,6 @@ class WorkloadProtection:
     disaster_backup_timer: str
     disaster_backup_root: Path
     disaster_backup_mount: Path
-    mac_acknowledgement_namespace: Path
     telemetry_service: str
     telemetry_output: Path
 
@@ -97,7 +96,6 @@ class WorkloadProtection:
             "disaster_backup_timer": self.disaster_backup_timer,
             "disaster_backup_root": str(self.disaster_backup_root),
             "disaster_backup_mount": str(self.disaster_backup_mount),
-            "mac_acknowledgement_namespace": str(self.mac_acknowledgement_namespace),
             "telemetry_service": self.telemetry_service,
             "telemetry_output": str(self.telemetry_output),
         }
@@ -701,7 +699,6 @@ def _parse_workload_protection(
             "disaster_backup_timer",
             "disaster_backup_root",
             "disaster_backup_mount",
-            "mac_acknowledgement_namespace",
             "telemetry_service",
             "telemetry_output",
         },
@@ -740,10 +737,6 @@ def _parse_workload_protection(
         raw.get("disaster_backup_mount"),
         name=f"workload {workload_id} disaster backup mount",
     )
-    acknowledgement_namespace = _absolute_path(
-        raw.get("mac_acknowledgement_namespace"),
-        name=f"workload {workload_id} Mac acknowledgement namespace",
-    )
     telemetry_output = _absolute_path(
         raw.get("telemetry_output"),
         name=f"workload {workload_id} telemetry output",
@@ -757,21 +750,6 @@ def _parse_workload_protection(
     if not disaster_relative.parts:
         raise ContinuityManifestError(
             f"workload {workload_id} disaster backup root must be below its mount"
-        )
-    try:
-        acknowledgement_relative = acknowledgement_namespace.relative_to(disaster_root)
-    except ValueError as exc:
-        raise ContinuityManifestError(
-            f"workload {workload_id} Mac acknowledgement namespace must be "
-            "inside its disaster backup root"
-        ) from exc
-    if (
-        not acknowledgement_relative.parts
-        or acknowledgement_relative.parts[0] != "acknowledgements"
-    ):
-        raise ContinuityManifestError(
-            f"workload {workload_id} Mac acknowledgement namespace must be "
-            "below the disaster backup acknowledgements directory"
         )
     try:
         telemetry_relative = telemetry_output.relative_to(run_root)
@@ -812,7 +790,6 @@ def _parse_workload_protection(
         (runtime_training_dir, "runtime training directory"),
         (disaster_root, "disaster backup root"),
         (disaster_mount, "disaster backup mount"),
-        (acknowledgement_namespace, "Mac acknowledgement namespace"),
         (telemetry_output, "telemetry output"),
     ):
         _systemd_literal_path(path, name=f"workload {workload_id} {name}")
@@ -821,7 +798,6 @@ def _parse_workload_protection(
         disaster_backup_timer=disaster_timer,
         disaster_backup_root=disaster_root,
         disaster_backup_mount=disaster_mount,
-        mac_acknowledgement_namespace=acknowledgement_namespace,
         telemetry_service=telemetry_service,
         telemetry_output=telemetry_output,
     )
@@ -1074,7 +1050,6 @@ def load_continuity_manifest(path: str | Path) -> ContinuityManifest:
         )
     for attribute, label in (
         ("disaster_backup_root", "disaster backup roots"),
-        ("mac_acknowledgement_namespace", "Mac acknowledgement namespaces"),
         ("telemetry_output", "telemetry outputs"),
     ):
         values = [
@@ -1632,11 +1607,6 @@ def verify_workload_protection(
         reasons.append(f"disaster backup namespace cannot be verified: {exc}")
 
     for path, label, expected_kind in (
-        (
-            protection.mac_acknowledgement_namespace,
-            "Mac acknowledgement namespace",
-            "directory",
-        ),
         (protection.telemetry_output, "telemetry output", "file"),
     ):
         if not path.exists():

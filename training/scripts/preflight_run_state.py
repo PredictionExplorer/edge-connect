@@ -538,6 +538,32 @@ def _candidate_manifest(
     return manifest
 
 
+def _manifest_examples(
+    manifest: ModelManifest,
+    *,
+    name: str,
+    run_id: str,
+    generation_family: str,
+) -> int | None:
+    try:
+        metadata = inspect_checkpoint(
+            manifest.checkpoint,
+            expected_run_id=run_id,
+            expected_generation_family=generation_family,
+            expected_sha256=manifest.checkpoint_sha256,
+            expected_bytes=manifest.checkpoint_bytes,
+        )
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise StatePreflightError(f"{name} checkpoint is incompatible: {exc}") from exc
+    extra = metadata.get("extra")
+    if not isinstance(extra, Mapping) or extra.get("examples_consumed") is None:
+        return None
+    return _nonnegative_int(
+        f"{name} examples_consumed",
+        extra.get("examples_consumed"),
+    )
+
+
 def _apply_history_reconciliation(
     run_root: Path,
     *,
@@ -647,6 +673,15 @@ def _plan_cadence(
         run_id=run_id,
         generation_family=generation_family,
     )
+    durable_examples = [examples_consumed]
+    candidate_checkpoint_examples = _manifest_examples(
+        candidate,
+        name="candidate",
+        run_id=run_id,
+        generation_family=generation_family,
+    )
+    if candidate_checkpoint_examples is not None:
+        durable_examples.append(candidate_checkpoint_examples)
     path = run_root / "learner" / "cadence.json"
     selfplay_enabled = (
         experiment.learner.selfplay_snapshot_interval_examples is not None
@@ -674,10 +709,6 @@ def _plan_cadence(
         candidate_examples = examples_consumed
         selfplay_examples = examples_consumed if selfplay_enabled else None
         changed = True
-    if candidate_examples > examples_consumed or (
-        selfplay_examples is not None and selfplay_examples > examples_consumed
-    ):
-        raise StatePreflightError("cadence counters are ahead of recovery examples")
     if selfplay_enabled and selfplay_examples is None:
         selfplay_examples = candidate_examples
         changed = True
@@ -696,8 +727,23 @@ def _plan_cadence(
                 or existing.generation_family != generation_family
             ):
                 raise StatePreflightError("self-play pointer belongs to another run")
+            selfplay_checkpoint_examples = _manifest_examples(
+                existing,
+                name="self-play candidate",
+                run_id=run_id,
+                generation_family=generation_family,
+            )
+            if selfplay_checkpoint_examples is not None:
+                durable_examples.append(selfplay_checkpoint_examples)
         else:
             pointer_changed = True
+    durable_example_limit = max(durable_examples)
+    if candidate_examples > durable_example_limit or (
+        selfplay_examples is not None and selfplay_examples > durable_example_limit
+    ):
+        raise StatePreflightError(
+            "cadence counters are ahead of durable checkpoint examples"
+        )
     payload: dict[str, object] = {
         "schema_version": 1,
         "run_id": run_id,

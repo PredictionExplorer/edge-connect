@@ -708,17 +708,16 @@ object to each workload that may start automatically:
   "disaster_backup_timer": "edgeconnect-startrain-<owner>-disaster-backup.timer",
   "disaster_backup_root": "/lambda/nfs/<filesystem>/edgeconnect-dr/<owner>",
   "disaster_backup_mount": "/lambda/nfs/<filesystem>",
-  "mac_acknowledgement_namespace": "/lambda/nfs/<filesystem>/edgeconnect-dr/<owner>/acknowledgements",
   "telemetry_service": "edgeconnect-startrain-<owner>-monitor.service",
   "telemetry_output": "/absolute/run/root/status/monitor-5s.jsonl"
 }
 ```
 
 The fields are strict: unit and output names must be unique, backup roots may
-not overlap, the DR root must be below its mount, the Mac namespace must be
-below `acknowledgements`, and telemetry must be a JSONL file below that
-workload's `status` directory. A workload may omit `protection`; manifests
-without protection objects retain the legacy behavior and API.
+not overlap, the DR root must be below its attached Lambda mount, and telemetry
+must be a JSONL file below that workload's `status` directory. A workload may
+omit `protection`; manifests without protection objects retain the legacy
+behavior and API.
 
 Keep mutable continuity state under `/var/lib/edgeconnect`, outside every run
 root. Pre-create the shared GPU execution lock for the training user and its
@@ -775,10 +774,10 @@ For a fallback or experiment cutover, first take the old workload's final local
 and DR backups, gracefully stop it, then stop/disable its protection units.
 While the GPU host is stopped, install/enable the target protection units and
 verify the target DR namespace before reconciling the target. Do not share a DR
-root or Mac acknowledgement namespace across workloads. Ownership drift writes
-an immutable `protection_ownership_drift` alert and blocks a new automatic
-start. It does not stop an otherwise healthy active workload; the operator can
-repair protection without sacrificing training progress.
+root across workloads. Ownership drift writes an immutable
+`protection_ownership_drift` alert and blocks a new automatic start. It does not
+stop an otherwise healthy active workload; the operator can repair protection
+without sacrificing training progress.
 
 Install `deploy/edgeconnect-startrain-continuity-trigger.conf.example` as a
 drop-in on finite queue units for immediate handoff. The one-minute timer remains
@@ -945,8 +944,8 @@ candidate arrival/service ratio, supersession, and arena/GPU7 occupancy. Do not
 infer useful Elo efficiency from GPU utilization alone.
 
 On a continuity-managed host, `--continuity-manifest` resolves the run root,
-profile, training unit, DR root, Mac acknowledgement namespace, and continuity
-state from the state's `active_workload_id`:
+profile, training unit, Lambda DR root, and continuity state from the state's
+`active_workload_id`:
 
 ```bash
 "$MONITOR_PYTHON" -u "$MONITOR_TRAINING/scripts/monitor_run.py" \
@@ -1151,7 +1150,7 @@ current candidate/champion, arena-referenced manifests, and recent recovery
 checkpoints remain protected. Whole-volume loss and persistent GPU/driver
 failure still require operator intervention.
 
-## Whole-host disaster recovery and off-host backups
+## Whole-host disaster recovery on Lambda storage
 
 Host continuity and `replay_manifest_backup.py` do not survive loss of the
 instance volume. Keep the active run on local ext4/NVMe for SQLite correctness,
@@ -1184,29 +1183,10 @@ Render and enable
 arm a distinct disaster-backup root and `@BACKUP_ID@`; never let two roots
 publish into the same snapshot namespace.
 
-Pull the latest snapshot to a separate Mac hourly:
-
-```bash
-python scripts/pull_training_snapshot.py \
-  --host ubuntu@<training-ip> \
-  --remote-backup-root "$DR_ROOT" \
-  --local-backup-root "$HOME/Backups/EdgeConnectTraining/<workload-id>" \
-  --known-hosts-file "$HOME/.ssh/edgeconnect-training-known_hosts" \
-  --run-id "$RUN_ID" \
-  --ack-remote-path "$DR_ROOT/acknowledgements/<mac-name>.json"
-```
-
-For a protected continuity workload, place the acknowledgement file below that
-workload's manifest-pinned `mac_acknowledgement_namespace`. The namespace must
-remain below its own DR root's `acknowledgements` directory.
-
-Install the rendered
-`deploy/com.edgeconnect.training-backup.plist.example` with `launchctl`.
-`monitor_run.py --disaster-backup-root "$DR_ROOT"` reports snapshot and Mac
-acknowledgement age. A stale acknowledgement is an alert only; training does
-not stop automatically. Lambda filesystem snapshots target a 15-minute RPO,
-while the independent Mac RPO applies only while that Mac is online. Versioned
-object storage remains the recommended unattended third failure domain.
+`monitor_run.py --disaster-backup-root "$DR_ROOT"` validates the Lambda snapshot
+namespace and reports snapshot age. Missing, invalid, or stale snapshots are
+errors. The attached Lambda filesystem is the supported disaster-backup target
+and the timer targets a 15-minute RPO.
 
 Restore only into an absent destination. Preserve the frozen source profile;
 for a drill or a host with a different absolute root, request a separately
@@ -1240,10 +1220,11 @@ backup timers, then stop and disable the coordinator through systemd and allow
 the full graceful timeout. Do not resume on that GPU because volatile counters
 returned to zero.
 
-Before a provider node or GPU swap, copy the incident bundle, current recovery
-checkpoint, and verified replay-ledger backup off-host and verify their
-recorded SHA-256 digests. Confirm whether the run volume survives a full node
-replacement; a ledger without its replay shards is not a complete run backup.
+Before a provider node or GPU swap, preserve the incident bundle on the attached
+Lambda filesystem, then write and verify a current disaster snapshot containing
+the recovery checkpoint, replay ledger, and referenced shards. Confirm whether
+the run volume survives a full node replacement; a ledger without its replay
+shards is not a complete run backup.
 
 Request provider/NVIDIA Field Diagnostic or DCGM validation and replacement
 review. Resume only after eight full H100s pass the health gate, ring-6/ring-10
@@ -1384,8 +1365,10 @@ root-owned policy based on
 run identity, profile, systemd unit, current promotion-status digest/timestamp,
 continuity operator-hold path, backup namespace, calibration policy, queue
 units, release manifest, and every cutover/calibration script. Runtime hashes
-are rechecked before every durable step. The armed digest is intentionally stale: the service
-waits for a strictly newer, quiescent terminal arena result.
+are rechecked before every durable step. The backup object must explicitly set
+`"disaster_snapshot_verification": "lambda_attached"`; no other verification
+mode is accepted. The armed digest is intentionally stale: the service waits
+for a strictly newer, quiescent terminal arena result.
 
 The terminal-boundary service is restartable. A waiting exit retries without
 touching the run; install the promotion-status path unit for immediate
@@ -1400,8 +1383,8 @@ accepting a boundary it:
    backup work, preventing a new evaluation from racing the cutover;
 3. proves the source service, process group, coordinator lock, and all assigned
    GPUs are released;
-4. creates the final replay backup and DR snapshot and waits for the exact
-   off-host acknowledgement;
+4. creates and fully verifies the final replay backup and Lambda-attached DR
+   snapshot after source release;
 5. runs the bounded read-only frozen-replay calibration suite;
 6. prepares isolated warm starts without activating pointers, then atomically
    activates only control and a unique gate-passing treatment;
@@ -1424,10 +1407,9 @@ prepare/activate split is required; never bypass the launch gate.
 
 If frozen calibration has no unique winner, the service does not create an Elo
 queue. It releases its owned hold and resumes the verified runtime control. Any
-backup, acknowledgement, source-release, artifact, warm-start, hardware, or
-queue failure follows the same continuity fallback path. Never delete failed
-state: the durable saga and immutable evidence make retries and incident review
-possible.
+backup, source-release, artifact, warm-start, hardware, or queue failure follows
+the same continuity fallback path. Never delete failed state: the durable saga
+and immutable evidence make retries and incident review possible.
 
 ### Non-autonomous throughput runs
 

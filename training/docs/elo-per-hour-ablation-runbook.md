@@ -287,12 +287,13 @@ result and model manifest rather than requiring the latest candidate pointer.
 
 At a quiescent boundary it places the continuity operator hold, stops the source
 before lengthy backup work can race a new arena, proves process/GPU release,
-creates replay and DR snapshots, waits for the matching off-host
-acknowledgement, exports the champion, runs frozen calibration, prepares and
-activates isolated warm-start roots, verifies the queue activation manifest,
-launches the queue, then releases its owned hold. Any failure releases only its
-own hold and requests the verified continuity fallback. Every step records
-intent and evidence before continuing, so restart is idempotent.
+creates the replay backup and a fully verified Lambda-attached DR snapshot,
+exports the champion, runs frozen calibration, prepares and activates isolated
+warm-start roots, verifies the queue activation manifest, launches the queue,
+then releases its owned hold. A missing, invalid, or pre-release Lambda snapshot
+fails closed. Any failure releases only its own hold and requests the verified
+continuity fallback. Every step records intent and evidence before continuing,
+so restart is idempotent.
 
 ### Benchmark arena occupancy before changing promotion
 
@@ -730,17 +731,17 @@ Every campaign arm also needs its own rendered
 `edgeconnect-startrain-disaster-backup` service/timer and distinct backup root.
 Forked arms intentionally share a run ID and generation family, so sharing one
 disaster-backup namespace would make `latest.json` ambiguous. Run the timer
-every 15 minutes so an arm release loses at most one snapshot interval, and
-pull each active arm's immutable snapshot to the independent Mac at least
-hourly.
+every 15 minutes so an arm release loses at most one snapshot interval. Keep
+each namespace on the attached Lambda filesystem and verify every published
+snapshot end to end.
 
 The campaign and queue control plane is separate from every arm. Keep its
 campaign config, policy, deployment manifests, queue states, comparisons, and
 handoff requests under one local state root; exclude runtime `.lock` files and
-snapshot that root every five minutes with `control_plane_backup.py`. Use the
-campaign backup service/timer templates and an additional Mac pull job with the
-`confirmation-campaign` namespace. A model snapshot alone cannot resume which
-seed or arm the campaign was running.
+snapshot that root every five minutes with `control_plane_backup.py` into a
+dedicated `confirmation-campaign` namespace on the attached Lambda filesystem.
+Use the campaign backup service/timer templates. A model snapshot alone cannot
+resume which seed or arm the campaign was running.
 
 For dependent experiment stages, use `run_staged_elo_pipeline.py`. It accepts
 only a hash-verified upstream winner snapshot and refuses a downstream fork
