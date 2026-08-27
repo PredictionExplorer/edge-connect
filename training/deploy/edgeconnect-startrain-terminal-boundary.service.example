@@ -2,7 +2,7 @@
 Description=EdgeConnect terminal-boundary calibration cutover
 Wants=network-online.target
 After=network-online.target remote-fs.target @SOURCE_UNIT@
-ConditionPathIsFile=@POLICY_MANIFEST@
+ConditionFileNotEmpty=@POLICY_MANIFEST@
 RequiresMountsFor=@DISASTER_BACKUP_MOUNT@
 StartLimitIntervalSec=0
 
