@@ -14,6 +14,9 @@ import pytest
 import torch
 
 from scripts.run_terminal_boundary_pipeline import (
+    _MAX_JSON_BYTES,
+    _hash_regular_file,
+    _read_json_bytes,
     DefaultTerminalBoundaryAdapters,
     POLICY_REPORT,
     STATE_REPORT,
@@ -35,7 +38,11 @@ def _write_json(path: Path, document: object) -> None:
 
 
 def _sha256(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
 
 def _artifact(path: Path) -> dict[str, object]:
@@ -472,6 +479,7 @@ class FakeAdapters:
         frozen_fallback: bool = False,
         hardware_unavailable: bool = False,
         stale_snapshot: bool = False,
+        large_warm_start_checkpoint: bool = False,
     ) -> None:
         self.fixture = fixture
         self.fail_at = fail_at
@@ -481,6 +489,7 @@ class FakeAdapters:
         self.frozen_fallback = frozen_fallback
         self.hardware_unavailable = hardware_unavailable
         self.stale_snapshot = stale_snapshot
+        self.large_warm_start_checkpoint = large_warm_start_checkpoint
         self.snapshot_crashed = False
         self.snapshot_side_effects = 0
         self.events: list[str] = []
@@ -755,7 +764,11 @@ class FakeAdapters:
         checkpoint = run_root / "learner" / "recovery" / "prepared.pt"
         checkpoint.parent.mkdir(parents=True, exist_ok=True)
         if not checkpoint.exists():
-            checkpoint.write_bytes(b"prepared-checkpoint")
+            if self.large_warm_start_checkpoint:
+                with checkpoint.open("wb") as stream:
+                    stream.truncate(_MAX_JSON_BYTES + 1)
+            else:
+                checkpoint.write_bytes(b"prepared-checkpoint")
         champion = json.loads(
             (self.fixture.champion_pointer).read_text(encoding="utf-8")
         )
@@ -934,6 +947,102 @@ def test_runtime_effective_optimizer_is_derived_from_recovery_state(
     assert evidence["scheduler_last_epoch"] == 123
 
 
+def test_runtime_effective_optimizer_accepts_checkpoint_larger_than_json_limit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = BoundaryFixture(tmp_path)
+    checkpoint = fixture.root / "learner" / "recovery" / "runtime.pt"
+    checkpoint.parent.mkdir(parents=True, exist_ok=True)
+    with checkpoint.open("wb") as stream:
+        stream.truncate(_MAX_JSON_BYTES + 1)
+    _write_json(
+        fixture.root / "learner" / "recovery.json",
+        {
+            "checkpoint": "recovery/runtime.pt",
+            "checkpoint_sha256": _sha256(checkpoint),
+            "checkpoint_bytes": checkpoint.stat().st_size,
+        },
+    )
+    payload = {
+        "optimizer": {
+            "param_groups": [
+                {"algorithm": "muon", "initial_lr": 0.0003125},
+                {"algorithm": "adamw", "initial_lr": 0.0000046875},
+            ]
+        },
+        "scheduler": {
+            "base_lrs": [0.0003125, 0.0000046875],
+            "last_epoch": 123,
+        },
+    }
+
+    def load(path: Path, *, map_location: str, weights_only: bool) -> object:
+        assert Path(path) == checkpoint
+        assert map_location == "cpu"
+        assert weights_only is True
+        return payload
+
+    monkeypatch.setattr(torch, "load", load)
+
+    evidence = DefaultTerminalBoundaryAdapters()._runtime_effective_optimizer(
+        fixture.policy
+    )
+
+    assert evidence["muon_lr"] == pytest.approx(0.0003125)
+    assert evidence["adamw_lr"] == pytest.approx(0.0000046875)
+    assert evidence["recovery_checkpoint"]["bytes"] == _MAX_JSON_BYTES + 1
+
+
+def test_binary_verifier_rejects_symlink(tmp_path: Path) -> None:
+    target = tmp_path / "checkpoint.pt"
+    target.write_bytes(b"checkpoint")
+    link = tmp_path / "checkpoint-link.pt"
+    link.symlink_to(target)
+
+    with pytest.raises(TerminalBoundaryManifestError, match="cannot hash checkpoint"):
+        _hash_regular_file(link, name="checkpoint")
+
+
+def test_binary_verifier_detects_change_during_hash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkpoint = tmp_path / "checkpoint.pt"
+    checkpoint.write_bytes(b"x" * (2 * 1024 * 1024))
+    original_read = os.read
+    changed = False
+
+    def read_and_change(descriptor: int, size: int) -> bytes:
+        nonlocal changed
+        data = original_read(descriptor, size)
+        if data and not changed:
+            changed = True
+            metadata = checkpoint.stat()
+            os.utime(
+                checkpoint,
+                ns=(metadata.st_atime_ns, metadata.st_mtime_ns + 1_000_000),
+            )
+        return data
+
+    monkeypatch.setattr(
+        "scripts.run_terminal_boundary_pipeline.os.read",
+        read_and_change,
+    )
+
+    with pytest.raises(TerminalBoundaryManifestError, match="changed while being hashed"):
+        _hash_regular_file(checkpoint, name="checkpoint")
+
+
+def test_json_reader_retains_size_limit(tmp_path: Path) -> None:
+    document = tmp_path / "oversized.json"
+    with document.open("wb") as stream:
+        stream.truncate(_MAX_JSON_BYTES + 1)
+
+    with pytest.raises(TerminalBoundaryManifestError, match="is too large"):
+        _read_json_bytes(document, name="oversized document")
+
+
 def test_cli_does_not_restart_after_execution_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -960,6 +1069,53 @@ def test_cli_treats_normal_waiting_state_as_success(
     )
 
     assert main(["run", "--manifest", str(fixture.policy_path)]) == 0
+
+
+def test_probe_treats_absent_state_as_runnable_without_creating_it(
+    tmp_path: Path,
+) -> None:
+    fixture = BoundaryFixture(tmp_path)
+
+    assert main(["probe", "--manifest", str(fixture.policy_path)]) == 0
+    assert not fixture.state_path.exists()
+
+
+def test_probe_treats_waiting_state_as_runnable(tmp_path: Path) -> None:
+    fixture = BoundaryFixture(tmp_path)
+    state = run_terminal_boundary_pipeline(
+        fixture.policy_path,
+        adapters=FakeAdapters(fixture),
+    )
+
+    assert state["status"] == "waiting"
+    assert main(["probe", "--manifest", str(fixture.policy_path)]) == 0
+
+
+@pytest.mark.parametrize("status", ["blocked", "completed", "failed"])
+def test_probe_skips_terminal_state(tmp_path: Path, status: str) -> None:
+    fixture = BoundaryFixture(tmp_path)
+    run_terminal_boundary_pipeline(
+        fixture.policy_path,
+        adapters=FakeAdapters(fixture),
+    )
+    state = json.loads(fixture.state_path.read_text(encoding="utf-8"))
+    state["status"] = status
+    _write_json(fixture.state_path, state)
+
+    assert main(["probe", "--manifest", str(fixture.policy_path)]) == 1
+
+
+def test_probe_fails_closed_for_incompatible_state(tmp_path: Path) -> None:
+    fixture = BoundaryFixture(tmp_path)
+    run_terminal_boundary_pipeline(
+        fixture.policy_path,
+        adapters=FakeAdapters(fixture),
+    )
+    state = json.loads(fixture.state_path.read_text(encoding="utf-8"))
+    state["policy_id"] = "different-policy"
+    _write_json(fixture.state_path, state)
+
+    assert main(["probe", "--manifest", str(fixture.policy_path)]) == 255
 
 
 def test_current_terminal_is_accepted_and_launched(tmp_path: Path) -> None:
@@ -1344,7 +1500,7 @@ def test_missing_lambda_snapshot_requests_fallback_and_never_launches(
     adapters.disaster_snapshot = missing_snapshot  # type: ignore[method-assign]
     with pytest.raises(
         TerminalBoundaryManifestError,
-        match="cannot read activation Lambda disaster snapshot",
+        match="cannot hash activation Lambda disaster snapshot",
     ):
         run_terminal_boundary_pipeline(
             fixture.policy_path,
@@ -1539,6 +1695,28 @@ def test_activation_rejects_tampered_warm_start_checkpoint(
             fixture.policy["queue"]["activation_manifest"],
             policy_path=fixture.policy_path,
         )
+
+
+def test_activation_accepts_warm_start_checkpoint_larger_than_json_limit(
+    tmp_path: Path,
+) -> None:
+    fixture = BoundaryFixture(tmp_path)
+    fixture.make_terminal()
+    state = run_terminal_boundary_pipeline(
+        fixture.policy_path,
+        adapters=FakeAdapters(
+            fixture,
+            large_warm_start_checkpoint=True,
+        ),
+    )
+
+    report = verify_queue_activation_manifest(
+        fixture.policy["queue"]["activation_manifest"],
+        policy_path=fixture.policy_path,
+    )
+
+    assert state["status"] == "completed"
+    assert report["status"] == "verified"
 
 
 def test_default_runtime_ownership_handoff_covers_profiles_and_queue_manifest(

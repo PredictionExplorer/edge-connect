@@ -37,6 +37,7 @@ TERMINAL_DECISIONS = frozenset(
     }
 )
 CONTROL_BOUNDARY_DECISIONS = frozenset({"plateau_reset", "plateau_recover"})
+TERMINAL_STATE_STATUSES = frozenset({"blocked", "completed", "failed"})
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _MAX_JSON_BYTES = 64 * 1024 * 1024
@@ -191,7 +192,16 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _read_regular_bytes(path: Path, *, name: str) -> bytes:
+def _stat_fence(metadata: os.stat_result) -> tuple[int, int, int, int]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+    )
+
+
+def _read_json_bytes(path: Path, *, name: str) -> bytes:
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
     try:
         descriptor = os.open(path, flags)
@@ -211,21 +221,36 @@ def _read_regular_bytes(path: Path, *, name: str) -> bytes:
         after = os.fstat(descriptor)
     finally:
         os.close(descriptor)
-    before_fence = (
-        before.st_dev,
-        before.st_ino,
-        before.st_size,
-        before.st_mtime_ns,
-    )
-    after_fence = (
-        after.st_dev,
-        after.st_ino,
-        after.st_size,
-        after.st_mtime_ns,
-    )
-    if before_fence != after_fence:
+    if _stat_fence(before) != _stat_fence(after):
         raise TerminalBoundaryManifestError(f"{name} changed while being read: {path}")
     return b"".join(blocks)
+
+
+def _hash_regular_file(path: Path, *, name: str) -> tuple[str, int]:
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise TerminalBoundaryManifestError(
+            f"cannot hash {name} {path}: {error}"
+        ) from error
+    digest = hashlib.sha256()
+    total = 0
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise TerminalBoundaryManifestError(f"{name} is not a regular file: {path}")
+        while block := os.read(descriptor, 1024 * 1024):
+            digest.update(block)
+            total += len(block)
+        after = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    if _stat_fence(before) != _stat_fence(after) or total != after.st_size:
+        raise TerminalBoundaryManifestError(
+            f"{name} changed while being hashed: {path}"
+        )
+    return digest.hexdigest(), total
 
 
 def _json_object(data: bytes, *, name: str) -> dict[str, Any]:
@@ -245,7 +270,7 @@ def _read_json_with_digest(
     *,
     name: str,
 ) -> tuple[dict[str, Any], str, bytes]:
-    data = _read_regular_bytes(path, name=name)
+    data = _read_json_bytes(path, name=name)
     return _json_object(data, name=name), _sha256_bytes(data), data
 
 
@@ -726,7 +751,7 @@ def _validate_policy(document: dict[str, Any], policy_path: Path) -> LoadedPolic
             "calibration roots may not be inside the source run root"
         )
     del profile_path, base_config, queue_unit_path, finalize_path, environment_path
-    data = _read_regular_bytes(policy_path, name="terminal-boundary policy")
+    data = _read_json_bytes(policy_path, name="terminal-boundary policy")
     return LoadedPolicy(
         path=policy_path,
         sha256=_sha256_bytes(data),
@@ -739,7 +764,7 @@ def _validate_policy(document: dict[str, Any], policy_path: Path) -> LoadedPolic
 
 def load_terminal_boundary_policy(path: str | Path) -> LoadedPolicy:
     policy_path = Path(path).expanduser().resolve()
-    data = _read_regular_bytes(policy_path, name="terminal-boundary policy")
+    data = _read_json_bytes(policy_path, name="terminal-boundary policy")
     document = _json_object(data, name="terminal-boundary policy")
     loaded = _validate_policy(document, policy_path)
     if loaded.data != data:
@@ -765,13 +790,13 @@ def verify_terminal_boundary_policy(path: str | Path) -> dict[str, object]:
 
 
 def _verify_policy_unchanged(policy: LoadedPolicy) -> None:
-    current = _read_regular_bytes(policy.path, name="terminal-boundary policy")
+    current = _read_json_bytes(policy.path, name="terminal-boundary policy")
     if current != policy.data:
         raise TerminalBoundaryManifestError(
             "terminal-boundary policy changed after loading"
         )
     if policy.pinned_path.is_file():
-        pinned = _read_regular_bytes(policy.pinned_path, name="pinned policy")
+        pinned = _read_json_bytes(policy.pinned_path, name="pinned policy")
         if pinned != policy.data:
             raise TerminalBoundaryManifestError(
                 "atomically pinned policy differs from the source policy"
@@ -785,7 +810,7 @@ def _write_new_or_verify(path: Path, data: bytes, *, mode: int = 0o600) -> None:
         descriptor = os.open(path, flags, mode)
     except FileExistsError:
         if (
-            _read_regular_bytes(path, name=f"existing immutable artifact {path}")
+            _read_json_bytes(path, name=f"existing immutable artifact {path}")
             != data
         ):
             raise TerminalBoundaryManifestError(
@@ -897,11 +922,9 @@ def _initial_state(policy: LoadedPolicy) -> dict[str, Any]:
     }
 
 
-def _load_state(policy: LoadedPolicy) -> dict[str, Any]:
+def _read_existing_state(policy: LoadedPolicy) -> dict[str, Any] | None:
     if not policy.state_path.exists():
-        state = _initial_state(policy)
-        _persist_state(policy, state)
-        return state
+        return None
     document, _digest_value, _ = _read_json_with_digest(
         policy.state_path,
         name="terminal-boundary state",
@@ -921,6 +944,42 @@ def _load_state(policy: LoadedPolicy) -> dict[str, Any]:
             "durable state does not match the immutable policy"
         )
     return document
+
+
+def _load_state(policy: LoadedPolicy) -> dict[str, Any]:
+    state = _read_existing_state(policy)
+    if state is not None:
+        return state
+    state = _initial_state(policy)
+    _persist_state(policy, state)
+    return state
+
+
+def probe_terminal_boundary_policy(path: str | Path) -> dict[str, object]:
+    """Report whether a policy has runnable work without creating durable state."""
+    policy = load_terminal_boundary_policy(path)
+    state = _read_existing_state(policy)
+    state_status = state.get("status") if state is not None else None
+    terminal = state_status in TERMINAL_STATE_STATUSES
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "report": "startrain-terminal-boundary-probe",
+        "status": "terminal" if terminal else "runnable",
+        "should_run": not terminal,
+        "reason": (
+            f"state_{state_status}"
+            if terminal
+            else "state_absent"
+            if state is None
+            else f"state_{state_status}"
+        ),
+        "policy": str(policy.path),
+        "policy_sha256": policy.sha256,
+        "policy_id": policy.raw["policy_id"],
+        "policy_version": policy.raw["policy_version"],
+        "state_path": str(policy.state_path),
+        "state_status": state_status,
+    }
 
 
 def _persist_state(policy: LoadedPolicy, state: dict[str, Any]) -> None:
@@ -1310,7 +1369,7 @@ def _capture_terminal_bundle(
                     "terminal result baseline differs from the champion pointer"
                 )
 
-    status_again = _read_regular_bytes(
+    status_again = _read_json_bytes(
         Path(source["promotion_status"]),
         name="promotion status recheck",
     )
@@ -1401,7 +1460,7 @@ def _assert_terminal_bundle_current(bundle: Mapping[str, object]) -> None:
     for raw_path, expected in paths.items():
         path = Path(raw_path)
         observed = _sha256_bytes(
-            _read_regular_bytes(path, name="accepted terminal evidence")
+            _read_json_bytes(path, name="accepted terminal evidence")
         )
         if observed != expected:
             raise TerminalBoundaryExecutionError(
@@ -1686,7 +1745,7 @@ def _deployment_manifest_evidence(
         raise TerminalBoundaryExecutionError(
             "queue generator did not publish the configured deployment manifest"
         )
-    data = _read_regular_bytes(path, name="queue deployment manifest")
+    data = _read_json_bytes(path, name="queue deployment manifest")
     return {
         **dict(evidence),
         "path": str(path),
@@ -1822,8 +1881,8 @@ def _verify_evidence_file(
         evidence.get(bytes_key),
         name=f"{name} bytes",
     )
-    data = _read_regular_bytes(path, name=name)
-    if len(data) != expected_bytes or _sha256_bytes(data) != expected_sha256:
+    observed_sha256, observed_bytes = _hash_regular_file(path, name=name)
+    if observed_bytes != expected_bytes or observed_sha256 != expected_sha256:
         raise TerminalBoundaryManifestError(
             f"{name} changed after activation was pinned"
         )
@@ -2085,7 +2144,7 @@ def verify_queue_activation_manifest(
         name="activation champion snapshot pin",
     )
     champion_pin = _json_object(
-        _read_regular_bytes(
+        _read_json_bytes(
             champion_pin_path,
             name="activation champion snapshot pin",
         ),
@@ -2145,7 +2204,7 @@ def verify_queue_activation_manifest(
         raise TerminalBoundaryManifestError(
             "queue activation target differs from the immutable policy"
         )
-    deployment_data = _read_regular_bytes(
+    deployment_data = _read_json_bytes(
         deployment_path,
         name="activation deployment manifest",
     )
@@ -2200,7 +2259,7 @@ def verify_queue_activation_manifest(
         )
     plan = _mapping(calibration.get("plan"), name="activation plan")
     plan_path = _absolute_path(plan.get("path"), name="activation plan path")
-    plan_data = _read_regular_bytes(plan_path, name="activation plan")
+    plan_data = _read_json_bytes(plan_path, name="activation plan")
     if _sha256_bytes(plan_data) != _digest(
         plan.get("sha256"), name="activation plan SHA-256"
     ) or len(plan_data) != _positive_int(
@@ -2251,7 +2310,7 @@ def verify_queue_activation_manifest(
             name="activation warm-start resume cutover",
         )
         marker_document = _json_object(
-            _read_regular_bytes(
+            _read_json_bytes(
                 marker_path,
                 name="activation warm-start marker",
             ),
@@ -3642,13 +3701,13 @@ class DefaultTerminalBoundaryAdapters:
             recovery.get("checkpoint_bytes"),
             name="runtime recovery checkpoint bytes",
         )
-        checkpoint_data = _read_regular_bytes(
+        observed_sha256, observed_bytes = _hash_regular_file(
             checkpoint,
             name="runtime recovery checkpoint",
         )
         if (
-            len(checkpoint_data) != expected_bytes
-            or _sha256_bytes(checkpoint_data) != expected_sha256
+            observed_bytes != expected_bytes
+            or observed_sha256 != expected_sha256
         ):
             raise TerminalBoundaryExecutionError(
                 "runtime recovery checkpoint changed before calibration"
@@ -4039,7 +4098,7 @@ class DefaultTerminalBoundaryAdapters:
         queue = self._queue(policy)
         output = Path(queue["deployment_manifest"])
         if output.is_file():
-            data = _read_regular_bytes(output, name="existing queue deployment")
+            data = _read_json_bytes(output, name="existing queue deployment")
             return {
                 "status": "existing",
                 "path": str(output),
@@ -4068,7 +4127,7 @@ class DefaultTerminalBoundaryAdapters:
             continue_after_fatal=bool(queue["continue_after_fatal"]),
             provisioned_gpus=int(queue["provisioned_gpus"]),
         )
-        data = _read_regular_bytes(output, name="queue deployment manifest")
+        data = _read_json_bytes(output, name="queue deployment manifest")
         return {
             "status": "generated",
             "path": str(output),
@@ -4097,7 +4156,7 @@ class DefaultTerminalBoundaryAdapters:
         from startrain.continuity import SystemdUnitManager
 
         activation = _json_object(
-            _read_regular_bytes(
+            _read_json_bytes(
                 activation_manifest,
                 name="queue activation manifest",
             ),
@@ -4285,7 +4344,7 @@ class DefaultTerminalBoundaryAdapters:
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
-    for command in ("verify", "run", "recover"):
+    for command in ("probe", "verify", "run", "recover"):
         subparser = commands.add_parser(command)
         subparser.add_argument("--manifest", required=True, type=Path)
     return parser
@@ -4294,7 +4353,10 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     arguments = _parser().parse_args(argv)
     try:
-        if arguments.command == "verify":
+        if arguments.command == "probe":
+            report = probe_terminal_boundary_policy(arguments.manifest)
+            status = 0 if report["should_run"] is True else 1
+        elif arguments.command == "verify":
             report = verify_terminal_boundary_policy(arguments.manifest)
             status = 0
         elif arguments.command == "recover":
@@ -4317,7 +4379,7 @@ def main(argv: list[str] | None = None) -> int:
             "status": "busy",
             "error": str(error),
         }
-        status = 75
+        status = 255 if arguments.command == "probe" else 75
     except TerminalBoundaryExecutionError as error:
         report = {
             "schema_version": SCHEMA_VERSION,
@@ -4325,7 +4387,7 @@ def main(argv: list[str] | None = None) -> int:
             "status": "failed",
             "error": f"{type(error).__name__}: {error}",
         }
-        status = 3
+        status = 255 if arguments.command == "probe" else 3
     except (
         FileExistsError,
         FileNotFoundError,
@@ -4340,7 +4402,7 @@ def main(argv: list[str] | None = None) -> int:
             "status": "error",
             "error": f"{type(error).__name__}: {error}",
         }
-        status = 2
+        status = 255 if arguments.command == "probe" else 2
     print(json.dumps(report, sort_keys=True, allow_nan=False))
     return status
 

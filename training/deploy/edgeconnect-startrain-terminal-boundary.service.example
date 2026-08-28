@@ -14,6 +14,7 @@ Environment=PYTHONUNBUFFERED=1
 Environment=PYTHONDONTWRITEBYTECODE=1
 Environment=PYTHONPATH=@TRAINING_DIR@
 Environment=PATH=@TRAINING_DIR@/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecCondition=@TRAINING_DIR@/.venv/bin/python @TRAINING_DIR@/scripts/run_terminal_boundary_pipeline.py probe --manifest @POLICY_MANIFEST@
 ExecStartPre=@TRAINING_DIR@/.venv/bin/python @TRAINING_DIR@/scripts/run_terminal_boundary_pipeline.py verify --manifest @POLICY_MANIFEST@
 ExecStart=@TRAINING_DIR@/.venv/bin/python @TRAINING_DIR@/scripts/run_terminal_boundary_pipeline.py run --manifest @POLICY_MANIFEST@
 ExecStopPost=-@TRAINING_DIR@/.venv/bin/python @TRAINING_DIR@/scripts/run_terminal_boundary_pipeline.py recover --manifest @POLICY_MANIFEST@

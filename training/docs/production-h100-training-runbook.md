@@ -1370,12 +1370,14 @@ are rechecked before every durable step. The backup object must explicitly set
 mode is accepted. The armed digest is intentionally stale: the service waits
 for a strictly newer, quiescent terminal arena result.
 
-The terminal-boundary service is restartable. A waiting exit retries without
+The terminal-boundary service is restartable. Its `ExecCondition` probe permits
+absent and non-terminal state, but skips expensive execution after durable
+`blocked`, `failed`, or `completed` state. A waiting exit retries without
 touching the run; install the promotion-status path unit for immediate
-event-driven activation and keep the five-second timer as an independent
-backstop. Do not enable the oneshot service itself. `ExecStopPost` recovers an interrupted process by
-releasing only its owned hold and requesting continuity fallback. After
-accepting a boundary it:
+event-driven activation and keep the sixty-second timer as an independent
+backstop. Do not enable the oneshot service itself. `ExecStopPost` recovers an
+interrupted process by releasing only its owned hold and requesting continuity
+fallback. After accepting a boundary it:
 
 1. verifies the terminal result, evaluated model manifest, current champion,
    systemd/coordinator identity, arena lease, and fresh GPU health;
@@ -1396,7 +1398,9 @@ recovery checkpoint and derives Muon/AdamW control rates from matching optimizer
 `initial_lr` and scheduler `base_lrs` entries. It refuses missing, zero,
 ambiguous, or mismatched rates. This prevents a fresh warm start from
 accidentally restoring higher YAML learning rates after runtime plateau
-reductions.
+reductions. Recovery checkpoints are verified with a streaming byte-count and
+SHA-256 pass; the bounded JSON reader and its size limit do not apply to binary
+checkpoint artifacts.
 
 `prepare_champion_warm_start.py --prepare-only` writes an immutable prepared
 checkpoint, cadence/UTD evidence, and `cutover-staging.json`, but no active
@@ -1410,6 +1414,14 @@ queue. It releases its owned hold and resumes the verified runtime control. Any
 backup, source-release, artifact, warm-start, hardware, or queue failure follows
 the same continuity fallback path. Never delete failed state: the durable saga
 and immutable evidence make retries and incident review possible.
+
+After a policy reaches `blocked` or `failed`, disable its timer and path units,
+verify that continuity has resumed a healthy workload and released the
+policy-owned hold, then preserve the policy, pinned state, fallback request, and
+step evidence in place. A replacement policy must use a new policy version and
+state path, pin the current promotion-status digest/timestamp as its stale arm,
+and pass `probe`, `verify`, and one side-effect-free `run` before its path and
+timer are enabled. Never edit or reuse the failed policy state.
 
 ### Non-autonomous throughput runs
 
