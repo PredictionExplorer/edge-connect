@@ -809,10 +809,7 @@ def _write_new_or_verify(path: Path, data: bytes, *, mode: int = 0o600) -> None:
     try:
         descriptor = os.open(path, flags, mode)
     except FileExistsError:
-        if (
-            _read_json_bytes(path, name=f"existing immutable artifact {path}")
-            != data
-        ):
+        if _read_json_bytes(path, name=f"existing immutable artifact {path}") != data:
             raise TerminalBoundaryManifestError(
                 f"immutable artifact already exists with different content: {path}"
             ) from None
@@ -3705,10 +3702,7 @@ class DefaultTerminalBoundaryAdapters:
             checkpoint,
             name="runtime recovery checkpoint",
         )
-        if (
-            observed_bytes != expected_bytes
-            or observed_sha256 != expected_sha256
-        ):
+        if observed_bytes != expected_bytes or observed_sha256 != expected_sha256:
             raise TerminalBoundaryExecutionError(
                 "runtime recovery checkpoint changed before calibration"
             )

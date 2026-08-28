@@ -1030,7 +1030,9 @@ def test_binary_verifier_detects_change_during_hash(
         read_and_change,
     )
 
-    with pytest.raises(TerminalBoundaryManifestError, match="changed while being hashed"):
+    with pytest.raises(
+        TerminalBoundaryManifestError, match="changed while being hashed"
+    ):
         _hash_regular_file(checkpoint, name="checkpoint")
 
 
