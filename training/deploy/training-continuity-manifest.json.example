@@ -1,6 +1,6 @@
 {
   "format": "startrain.training-continuity-manifest",
-  "schema_version": 1,
+  "schema_version": 2,
   "state_root": "@STATE_ROOT@",
   "locks": {
     "transition": "@STATE_ROOT@/transition.lock",
@@ -40,7 +40,13 @@
         "disaster_backup_root": "@PRIMARY_DISASTER_BACKUP_ROOT@",
         "disaster_backup_mount": "@PRIMARY_DISASTER_BACKUP_MOUNT@",
         "telemetry_service": "edgeconnect-startrain-@PRIMARY_PROTECTION_ID@-monitor.service",
-        "telemetry_output": "@PRIMARY_RUN_ROOT@/status/monitor-5s.jsonl"
+        "telemetry_output": "@PRIMARY_RUN_ROOT@/status/monitor-5s.jsonl",
+        "telemetry_max_bytes": 52428800,
+        "telemetry_retain_files": 7,
+        "report_service": "edgeconnect-startrain-@PRIMARY_PROTECTION_ID@-report.service",
+        "report_timer": "edgeconnect-startrain-@PRIMARY_PROTECTION_ID@-report.timer",
+        "report_provisioned_gpus": @PROVISIONED_GPUS@,
+        "service_user": "@USER@"
       }
     },
     {
@@ -70,7 +76,13 @@
         "disaster_backup_root": "@FALLBACK_DISASTER_BACKUP_ROOT@",
         "disaster_backup_mount": "@FALLBACK_DISASTER_BACKUP_MOUNT@",
         "telemetry_service": "edgeconnect-startrain-@FALLBACK_PROTECTION_ID@-monitor.service",
-        "telemetry_output": "@FALLBACK_RUN_ROOT@/status/monitor-5s.jsonl"
+        "telemetry_output": "@FALLBACK_RUN_ROOT@/status/monitor-5s.jsonl",
+        "telemetry_max_bytes": 52428800,
+        "telemetry_retain_files": 7,
+        "report_service": "edgeconnect-startrain-@FALLBACK_PROTECTION_ID@-report.service",
+        "report_timer": "edgeconnect-startrain-@FALLBACK_PROTECTION_ID@-report.timer",
+        "report_provisioned_gpus": @PROVISIONED_GPUS@,
+        "service_user": "@USER@"
       },
       "last_known_good": {
         "verified_ns": @FALLBACK_VERIFIED_NS@,

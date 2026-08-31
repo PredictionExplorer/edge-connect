@@ -36,9 +36,11 @@ MANIFEST_FORMAT = "startrain.training-continuity-manifest"
 STATE_FORMAT = "startrain.training-continuity-state"
 QUARANTINE_FORMAT = "startrain.training-continuity-quarantine"
 ALERT_FORMAT = "startrain.training-continuity-alert"
-MANIFEST_SCHEMA_VERSION = 1
+LEGACY_MANIFEST_SCHEMA_VERSION = 1
+MANIFEST_SCHEMA_VERSION = 2
 STATE_SCHEMA_VERSION = 1
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_SYSTEM_USER = re.compile(r"^[a-z_][a-z0-9_-]{0,63}\$?$")
 _UNIT = re.compile(r"^[A-Za-z0-9@_.:-]+\.service$")
 _TIMER = re.compile(r"^[A-Za-z0-9@_.:-]+\.timer$")
 _REPLAY_BACKUP_TIMER = re.compile(
@@ -47,10 +49,18 @@ _REPLAY_BACKUP_TIMER = re.compile(
 _DISASTER_BACKUP_TIMER = re.compile(
     r"^edgeconnect-startrain-(?P<owner>[A-Za-z0-9@_.:-]+)-disaster-backup\.timer$"
 )
+_REPORT_SERVICE = re.compile(
+    r"^edgeconnect-startrain-(?P<owner>[A-Za-z0-9@_.:-]+)-report\.service$"
+)
+_REPORT_TIMER = re.compile(
+    r"^edgeconnect-startrain-(?P<owner>[A-Za-z0-9@_.:-]+)-report\.timer$"
+)
 _ACTIVE_STATES = frozenset({"active", "activating", "reloading"})
 _ENABLED_UNIT_FILE_STATES = frozenset(
     {"enabled", "enabled-runtime", "linked", "linked-runtime"}
 )
+DEFAULT_TELEMETRY_MAX_BYTES = 50 * 1024 * 1024
+DEFAULT_TELEMETRY_RETAIN_FILES = 7
 
 
 class ContinuityError(RuntimeError):
@@ -81,6 +91,12 @@ class WorkloadProtection:
     disaster_backup_mount: Path
     telemetry_service: str
     telemetry_output: Path
+    report_service: str | None = None
+    report_timer: str | None = None
+    report_provisioned_gpus: int | None = None
+    service_user: str | None = None
+    telemetry_max_bytes: int | None = None
+    telemetry_retain_files: int | None = None
 
     @property
     def replay_backup_service(self) -> str:
@@ -91,7 +107,7 @@ class WorkloadProtection:
         return self.disaster_backup_timer.removesuffix(".timer") + ".service"
 
     def as_dict(self) -> dict[str, object]:
-        return {
+        payload: dict[str, object] = {
             "replay_backup_timer": self.replay_backup_timer,
             "disaster_backup_timer": self.disaster_backup_timer,
             "disaster_backup_root": str(self.disaster_backup_root),
@@ -99,6 +115,26 @@ class WorkloadProtection:
             "telemetry_service": self.telemetry_service,
             "telemetry_output": str(self.telemetry_output),
         }
+        for name in (
+            "report_service",
+            "report_timer",
+            "report_provisioned_gpus",
+            "service_user",
+            "telemetry_max_bytes",
+            "telemetry_retain_files",
+        ):
+            value = getattr(self, name)
+            if value is not None:
+                payload[name] = value
+        return payload
+
+    @property
+    def effective_telemetry_max_bytes(self) -> int:
+        return self.telemetry_max_bytes or DEFAULT_TELEMETRY_MAX_BYTES
+
+    @property
+    def effective_telemetry_retain_files(self) -> int:
+        return self.telemetry_retain_files or DEFAULT_TELEMETRY_RETAIN_FILES
 
 
 @dataclass(frozen=True, slots=True)
@@ -687,10 +723,19 @@ def _parse_workload_protection(
     run_root: Path,
     profile_path: Path,
     runtime_training_dir: Path,
+    manifest_schema_version: int,
 ) -> WorkloadProtection | None:
     if value is None:
         return None
     raw = _mapping(value, name=f"workload {workload_id} protection")
+    report_fields = {
+        "report_service",
+        "report_timer",
+        "report_provisioned_gpus",
+        "service_user",
+        "telemetry_max_bytes",
+        "telemetry_retain_files",
+    }
     _strict_keys(
         raw,
         name=f"workload {workload_id} protection",
@@ -701,7 +746,17 @@ def _parse_workload_protection(
             "disaster_backup_mount",
             "telemetry_service",
             "telemetry_output",
-        },
+        }
+        | (
+            report_fields
+            if manifest_schema_version >= MANIFEST_SCHEMA_VERSION
+            else set()
+        ),
+        optional=(
+            set()
+            if manifest_schema_version >= MANIFEST_SCHEMA_VERSION
+            else report_fields
+        ),
     )
     replay_timer = _protection_unit(
         raw.get("replay_backup_timer"),
@@ -729,6 +784,73 @@ def _parse_workload_protection(
         raise ContinuityManifestError(
             f"workload {workload_id} has an invalid telemetry service"
         )
+    report_service = raw.get("report_service")
+    report_timer = raw.get("report_timer")
+    report_provisioned_gpus = raw.get("report_provisioned_gpus")
+    service_user = raw.get("service_user")
+    if (
+        len(
+            {
+                report_service is None,
+                report_timer is None,
+                report_provisioned_gpus is None,
+                service_user is None,
+            }
+        )
+        != 1
+    ):
+        raise ContinuityManifestError(
+            f"workload {workload_id} report service, timer, GPU count, and user "
+            "must be configured together"
+        )
+    if report_service is not None:
+        report_service_match = (
+            _REPORT_SERVICE.fullmatch(report_service)
+            if isinstance(report_service, str)
+            else None
+        )
+        report_timer_match = (
+            _REPORT_TIMER.fullmatch(report_timer)
+            if isinstance(report_timer, str)
+            else None
+        )
+        if (
+            report_service_match is None
+            or report_timer_match is None
+            or not isinstance(service_user, str)
+            or _SYSTEM_USER.fullmatch(service_user) is None
+        ):
+            raise ContinuityManifestError(
+                f"workload {workload_id} has invalid report units"
+            )
+        assert isinstance(report_timer, str)
+        if (
+            report_service_match.group("owner") != report_timer_match.group("owner")
+            or report_timer.removesuffix(".timer") + ".service" != report_service
+        ):
+            raise ContinuityManifestError(
+                f"workload {workload_id} report timer and service names differ"
+            )
+        report_provisioned_gpus = _positive_int(
+            report_provisioned_gpus,
+            name=f"workload {workload_id} report provisioned GPUs",
+        )
+    telemetry_max_bytes = (
+        _positive_int(
+            raw.get("telemetry_max_bytes"),
+            name=f"workload {workload_id} telemetry maximum bytes",
+        )
+        if raw.get("telemetry_max_bytes") is not None
+        else None
+    )
+    telemetry_retain_files = (
+        _positive_int(
+            raw.get("telemetry_retain_files"),
+            name=f"workload {workload_id} telemetry retained files",
+        )
+        if raw.get("telemetry_retain_files") is not None
+        else None
+    )
     disaster_root = _absolute_path(
         raw.get("disaster_backup_root"),
         name=f"workload {workload_id} disaster backup root",
@@ -800,10 +922,21 @@ def _parse_workload_protection(
         disaster_backup_mount=disaster_mount,
         telemetry_service=telemetry_service,
         telemetry_output=telemetry_output,
+        report_service=report_service,
+        report_timer=report_timer,
+        report_provisioned_gpus=report_provisioned_gpus,
+        service_user=service_user,
+        telemetry_max_bytes=telemetry_max_bytes,
+        telemetry_retain_files=telemetry_retain_files,
     )
 
 
-def _parse_workload(value: object, *, index: int) -> Workload:
+def _parse_workload(
+    value: object,
+    *,
+    index: int,
+    manifest_schema_version: int,
+) -> Workload:
     raw = _mapping(value, name=f"workload {index}")
     _strict_keys(
         raw,
@@ -932,11 +1065,17 @@ def _parse_workload(value: object, *, index: int) -> Workload:
         run_root=run_root,
         profile_path=profile_path,
         runtime_training_dir=runtime_training_dir,
+        manifest_schema_version=manifest_schema_version,
     )
     if protection is not None and protection.telemetry_service == unit:
         raise ContinuityManifestError(
             f"workload {workload_id} telemetry and training units must differ"
         )
+    if protection is not None and protection.report_service is not None:
+        if protection.report_service in {unit, protection.telemetry_service}:
+            raise ContinuityManifestError(
+                f"workload {workload_id} report unit must be unique"
+            )
     return Workload(
         workload_id=workload_id,
         role=str(role),
@@ -990,11 +1129,13 @@ def load_continuity_manifest(path: str | Path) -> ContinuityManifest:
         },
         optional={"failure_artifacts", "policy", "alerts"},
     )
-    if (
-        raw.get("format") != MANIFEST_FORMAT
-        or raw.get("schema_version") != MANIFEST_SCHEMA_VERSION
-    ):
+    schema_version = raw.get("schema_version")
+    if raw.get("format") != MANIFEST_FORMAT or schema_version not in {
+        LEGACY_MANIFEST_SCHEMA_VERSION,
+        MANIFEST_SCHEMA_VERSION,
+    }:
         raise ContinuityManifestError("unsupported continuity manifest")
+    assert isinstance(schema_version, int)
     state_root = _absolute_path(raw.get("state_root"), name="state root")
     locks = _mapping(raw.get("locks"), name="continuity locks")
     _strict_keys(
@@ -1013,7 +1154,11 @@ def load_continuity_manifest(path: str | Path) -> ContinuityManifest:
             "continuity requires a primary and at least one fallback"
         )
     workloads = tuple(
-        _parse_workload(value, index=index)
+        _parse_workload(
+            value,
+            index=index,
+            manifest_schema_version=schema_version,
+        )
         for index, value in enumerate(workload_values)
     )
     ids = [workload.workload_id for workload in workloads]
@@ -1042,6 +1187,16 @@ def load_continuity_manifest(path: str | Path) -> ContinuityManifest:
                 protection_value.telemetry_service,
             )
         )
+        if (
+            protection_value.report_service is not None
+            and protection_value.report_timer is not None
+        ):
+            protection_units.extend(
+                (
+                    protection_value.report_service,
+                    protection_value.report_timer,
+                )
+            )
     if len(protection_units) != len(set(protection_units)):
         raise ContinuityManifestError("workload protection units must be unique")
     if set(protection_units) & set(units):
@@ -1366,7 +1521,7 @@ def verify_continuity_manifest(
     ]
     return {
         "format": MANIFEST_FORMAT,
-        "schema_version": MANIFEST_SCHEMA_VERSION,
+        "schema_version": manifest.raw["schema_version"],
         "status": "ok",
         "manifest": str(manifest.path),
         "manifest_sha256": manifest.sha256,
@@ -1399,6 +1554,33 @@ def _effective_unit_values(
     return values
 
 
+def _effective_section_settings(
+    definition: str,
+    *,
+    section: str,
+) -> dict[str, list[str]]:
+    active_section: str | None = None
+    settings: set[str] = set()
+    for raw_line in definition.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith(("#", ";")):
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            active_section = line[1:-1]
+            continue
+        key, separator, _value = line.partition("=")
+        if separator and active_section == section:
+            settings.add(key.strip())
+    return {
+        setting: _effective_unit_values(
+            definition,
+            section=section,
+            setting=setting,
+        )
+        for setting in sorted(settings)
+    }
+
+
 def workload_protection_commands(
     manifest: ContinuityManifest,
     workload: Workload,
@@ -1408,7 +1590,14 @@ def workload_protection_commands(
     assert workload.runtime_training_dir is not None
     training = workload.runtime_training_dir
     python = training / ".venv" / "bin" / "python"
-    return {
+    telemetry_limits = ""
+    if protection.telemetry_max_bytes is not None:
+        telemetry_limits += f" --telemetry-max-bytes {protection.telemetry_max_bytes}"
+    if protection.telemetry_retain_files is not None:
+        telemetry_limits += (
+            f" --telemetry-retain-files {protection.telemetry_retain_files}"
+        )
+    commands = {
         protection.replay_backup_service: (
             f"{python} {training}/scripts/replay_manifest_backup.py backup "
             f"--run-root {workload.run_root} --retain 3"
@@ -1428,8 +1617,18 @@ def workload_protection_commands(
             f"--disaster-backup-root {protection.disaster_backup_root} "
             "--interval 5 --format jsonl "
             f"--telemetry-output {protection.telemetry_output}"
+            f"{telemetry_limits}"
         ),
     }
+    if protection.report_service is not None:
+        assert protection.report_provisioned_gpus is not None
+        commands[protection.report_service] = (
+            f"{python} {training}/scripts/strength_efficiency_report.py "
+            f"--run-root {workload.run_root} "
+            f"--provisioned-gpus {protection.report_provisioned_gpus} "
+            f"--output {workload.run_root}/strength-efficiency.json --quiet"
+        )
+    return commands
 
 
 def verify_workload_protection(
@@ -1455,15 +1654,18 @@ def verify_workload_protection(
     active_inspector = SystemdUnitManager() if inspector is None else inspector
     reasons: list[str] = []
     units: dict[str, dict[str, object]] = {}
-    top_level_units = (
+    top_level_units = [
         protection.replay_backup_timer,
         protection.disaster_backup_timer,
         protection.telemetry_service,
-    )
-    service_units = (
+    ]
+    service_units = [
         protection.replay_backup_service,
         protection.disaster_backup_service,
-    )
+    ]
+    if protection.report_timer is not None and protection.report_service is not None:
+        top_level_units.append(protection.report_timer)
+        service_units.append(protection.report_service)
 
     for unit in (*top_level_units, *service_units):
         status = active_inspector.status(unit)
@@ -1478,9 +1680,15 @@ def verify_workload_protection(
             and status.unit_file_state not in _ENABLED_UNIT_FILE_STATES
         ):
             reasons.append(f"{unit}: unit is not enabled")
+        if unit == protection.report_service and (
+            status.result not in (None, "success")
+            or status.exec_main_status not in (None, 0)
+        ):
+            reasons.append(f"{unit}: latest report execution failed")
         activity_required = require_active or unit in {
             protection.replay_backup_timer,
             protection.disaster_backup_timer,
+            protection.report_timer,
         }
         if activity_required and unit in top_level_units and not status.active:
             reasons.append(f"{unit}: unit is not active")
@@ -1489,11 +1697,14 @@ def verify_workload_protection(
         other_protection = other.protection
         if other.workload_id == workload_id or other_protection is None:
             continue
-        for unit in (
+        competing_units = [
             other_protection.replay_backup_timer,
             other_protection.disaster_backup_timer,
             other_protection.telemetry_service,
-        ):
+        ]
+        if other_protection.report_timer is not None:
+            competing_units.append(other_protection.report_timer)
+        for unit in competing_units:
             status = active_inspector.status(unit)
             units[unit] = status.as_dict()
             if status.query_error is not None:
@@ -1510,6 +1721,8 @@ def verify_workload_protection(
         protection.replay_backup_timer: protection.replay_backup_service,
         protection.disaster_backup_timer: protection.disaster_backup_service,
     }
+    if protection.report_timer is not None and protection.report_service is not None:
+        expected_timers[protection.report_timer] = protection.report_service
     for timer, expected_service in expected_timers.items():
         try:
             definition = active_inspector.definition(timer)
@@ -1525,6 +1738,22 @@ def verify_workload_protection(
         )
         if targets != [expected_service]:
             reasons.append(f"{timer}: timer target differs from {expected_service}")
+        if timer == protection.report_timer:
+            expected_report_timer = {
+                "AccuracySec": ["1min"],
+                "OnBootSec": ["5min"],
+                "OnUnitActiveSec": ["15min"],
+                "Persistent": ["true"],
+                "RandomizedDelaySec": ["1min"],
+                "Unit": [expected_service],
+            }
+            if (
+                _effective_section_settings(definition, section="Timer")
+                != expected_report_timer
+            ):
+                reasons.append(
+                    f"{timer}: complete timer definition differs from pinned cadence"
+                )
 
     for service, expected_command in workload_protection_commands(
         manifest,
@@ -1544,6 +1773,49 @@ def verify_workload_protection(
         )
         if commands != [expected_command]:
             reasons.append(f"{service}: ExecStart ownership differs from manifest")
+        if service == protection.report_service:
+            assert protection.service_user is not None
+            assert workload.runtime_training_dir is not None
+            expected_settings = {
+                "ExecStart": [expected_command],
+                "Type": ["oneshot"],
+                "User": [protection.service_user],
+                "WorkingDirectory": [str(workload.runtime_training_dir)],
+                "Environment": [
+                    "PYTHONUNBUFFERED=1",
+                    "PYTHONDONTWRITEBYTECODE=1",
+                    f"PYTHONPATH={workload.runtime_training_dir}",
+                ],
+                "StandardOutput": ["null"],
+                "StandardError": ["journal"],
+                "Nice": ["10"],
+                "IOSchedulingClass": ["idle"],
+                "UMask": ["0027"],
+                "ProtectSystem": ["strict"],
+                "ProtectHome": ["read-only"],
+                "ReadWritePaths": [str(workload.run_root)],
+                "PrivateTmp": ["true"],
+                "ProtectClock": ["true"],
+                "ProtectControlGroups": ["true"],
+                "ProtectHostname": ["true"],
+                "ProtectKernelLogs": ["true"],
+                "ProtectKernelModules": ["true"],
+                "ProtectKernelTunables": ["true"],
+                "RestrictAddressFamilies": ["AF_UNIX"],
+                "RestrictNamespaces": ["true"],
+                "RestrictRealtime": ["true"],
+                "RestrictSUIDSGID": ["true"],
+                "LockPersonality": ["true"],
+                "SystemCallArchitectures": ["native"],
+                "NoNewPrivileges": ["true"],
+            }
+            if (
+                _effective_section_settings(definition, section="Service")
+                != expected_settings
+            ):
+                reasons.append(
+                    f"{service}: complete service definition differs from pinned hardening"
+                )
 
     try:
         mounted = active_inspector.is_mount(protection.disaster_backup_mount)

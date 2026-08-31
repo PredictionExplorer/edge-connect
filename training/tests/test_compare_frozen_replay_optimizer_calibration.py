@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from scripts import compare_frozen_replay_optimizer_calibration as comparator
 from scripts import run_frozen_replay_optimizer_calibration as runner
 from scripts.prepare_elo_ablation import (
@@ -57,11 +59,13 @@ def _config_contract(arm: str) -> dict[str, object]:
 def _payload(
     arm: str,
     *,
+    cache_root: Path,
     throughput: float,
     candidate_composites: tuple[float, ...],
     clipping: float,
     finite: bool = True,
 ) -> dict[str, object]:
+    cache_root_text = str(cache_root)
     reference = {"policy": 0.6, "value": 0.6, "composite": 1.2}
     observations = [
         {
@@ -92,6 +96,67 @@ def _payload(
             "resolved": "cuda:0",
             "precision": "bf16",
             "compile": True,
+            "preimport_compile_cache_bootstrap": (
+                runner._compile_cache_bootstrap_token(cache_root.parent.parent)
+            ),
+            "compile_cache": {
+                "schema_version": 1,
+                "layout": "startrain-isolated-compile-cache-v1",
+                "root": cache_root_text,
+                "owner_marker": f"{cache_root_text}/cache-owner.json",
+                "required_unset_environment": [
+                    "TRITON_CACHE_MANAGER",
+                    "TRITON_REMOTE_CACHE_BACKEND",
+                    "TORCHINDUCTOR_FX_GRAPH_REMOTE_CACHE",
+                    "TORCHINDUCTOR_AUTOTUNE_REMOTE_CACHE",
+                    "TORCHINDUCTOR_AUTOGRAD_REMOTE_CACHE",
+                    "TORCHINDUCTOR_FORCE_DISABLE_CACHES",
+                    "TORCHINDUCTOR_BUNDLED_AUTOTUNE_REMOTE_CACHE",
+                    "TORCHINDUCTOR_FX_GRAPH_CACHE",
+                    "TORCHINDUCTOR_AUTOGRAD_CACHE",
+                    "TORCH_DYNAMO_AUTOMATIC_DYNAMIC_LOCAL_PGO",
+                    "TORCH_DYNAMO_AUTOMATIC_DYNAMIC_REMOTE_PGO",
+                    "TORCH_COMPILE_JOB_ID",
+                    "TORCH_COMPILE_FORCE_DISABLE_CACHES",
+                    "CUDA_CACHE_DISABLE",
+                ],
+                "rejected_environment_prefixes": [
+                    "TORCHINDUCTOR_",
+                    "TORCH_COMPILE_",
+                    "TORCH_DYNAMO_",
+                    "TRITON_",
+                    "CUDA_CACHE_",
+                ],
+                "environment": {
+                    "HOME": f"{cache_root_text}/home",
+                    "TORCHINDUCTOR_CACHE_DIR": f"{cache_root_text}/inductor",
+                    "TORCHINDUCTOR_PERSISTENT_AUTOTUNE_DIR": (
+                        f"{cache_root_text}/inductor-autotune"
+                    ),
+                    "TRITON_HOME": f"{cache_root_text}/triton-home",
+                    "TRITON_CACHE_DIR": f"{cache_root_text}/triton",
+                    "TRITON_DUMP_DIR": f"{cache_root_text}/triton-dump",
+                    "TRITON_OVERRIDE_DIR": f"{cache_root_text}/triton-override",
+                    "XDG_CACHE_HOME": f"{cache_root_text}/xdg",
+                    "CUDA_CACHE_PATH": f"{cache_root_text}/cuda",
+                },
+                "runtime": {
+                    "python_version": "3.11.13",
+                    "torch_version": "2.13.0+cu130",
+                    "cuda_runtime_version": "13.0",
+                    "triton_version": "3.6.0",
+                },
+            },
+            "hardware": {
+                "logical_index": 0,
+                "physical_index": 0,
+                "uuid": "GPU-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+                "name": "NVIDIA H100 80GB HBM3",
+                "nvidia_smi_name": "NVIDIA H100 80GB HBM3",
+                "compute_capability": [9, 0],
+                "total_memory_bytes": 80 * 1024**3,
+                "driver_version": "580.105.08",
+            },
         },
         "config_contract": _config_contract(arm),
         "champion": {
@@ -238,11 +303,42 @@ def _write_suite(
     paths = []
     for arm in RING10_OPTIMIZER_CALIBRATION_TREATMENTS:
         throughput, composites, clipping = candidates[arm]
+        cache_root = (tmp_path / "outputs" / arm / "compile-cache" / "v1").resolve()
+        for suffix in (
+            "home",
+            "inductor",
+            "inductor-autotune",
+            "triton-home",
+            "triton",
+            "triton-dump",
+            "triton-override",
+            "xdg",
+            "cuda",
+        ):
+            (cache_root / suffix).mkdir(parents=True, exist_ok=True)
         payload = _payload(
             arm,
+            cache_root=cache_root,
             throughput=throughput,
             candidate_composites=composites,
             clipping=clipping,
+        )
+        cache = payload["device"]["compile_cache"]
+        (cache_root / "cache-owner.json").write_text(
+            json.dumps(
+                {
+                    "format": "startrain.compile-cache-owner",
+                    "schema_version": 1,
+                    "layout": cache["layout"],
+                    "arm": arm,
+                    "run_contract_sha256": payload["run_contract_sha256"],
+                    "root": cache["root"],
+                    "environment": dict(sorted(cache["environment"].items())),
+                    "runtime": dict(sorted(cache["runtime"].items())),
+                },
+                sort_keys=True,
+            ),
+            encoding="utf-8",
         )
         if reference_drift and arm == "ring10-optimizer-clip-norm-5":
             payload["heldout"]["observations"][0]["reference"]["composite"] = 1.3
@@ -315,6 +411,115 @@ def test_comparator_rejects_execution_setting_drift(
     assert treatment["gates"]["common_source_and_partition_parity"] is False
     assert treatment["passes_all_selection_gates"] is False
     assert result["selection"]["selected_arm"] != "ring10-optimizer-clip-norm-5"
+
+
+def test_comparator_rejects_shared_or_missing_compile_cache(tmp_path: Path) -> None:
+    shared_paths = _write_suite(tmp_path / "shared")
+    first_payload = json.loads(shared_paths[0].read_text(encoding="utf-8"))
+    shared_root = first_payload["device"]["compile_cache"]["root"]
+    for path in shared_paths:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        cache = payload["device"]["compile_cache"]
+        cache["root"] = shared_root
+        cache["owner_marker"] = f"{shared_root}/cache-owner.json"
+        for name, suffix in {
+            "HOME": "home",
+            "TORCHINDUCTOR_CACHE_DIR": "inductor",
+            "TORCHINDUCTOR_PERSISTENT_AUTOTUNE_DIR": "inductor-autotune",
+            "TRITON_HOME": "triton-home",
+            "TRITON_CACHE_DIR": "triton",
+            "TRITON_DUMP_DIR": "triton-dump",
+            "TRITON_OVERRIDE_DIR": "triton-override",
+            "XDG_CACHE_HOME": "xdg",
+            "CUDA_CACHE_PATH": "cuda",
+        }.items():
+            cache["environment"][name] = f"{shared_root}/{suffix}"
+        unsigned = dict(payload)
+        unsigned.pop("result_sha256")
+        payload["result_sha256"] = runner._digest(unsigned)
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="cache"):
+        comparator.compare_results(shared_paths, bootstrap_samples=100)
+
+    missing_paths = _write_suite(tmp_path / "missing")
+    payload = json.loads(missing_paths[0].read_text(encoding="utf-8"))
+    payload["device"]["compile_cache"] = None
+    unsigned = dict(payload)
+    unsigned.pop("result_sha256")
+    payload["result_sha256"] = runner._digest(unsigned)
+    missing_paths[0].write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="cache"):
+        comparator.compare_results(missing_paths, bootstrap_samples=100)
+
+
+def test_comparator_rejects_nested_compile_cache_roots(tmp_path: Path) -> None:
+    paths = _write_suite(tmp_path)
+    control = json.loads(paths[0].read_text(encoding="utf-8"))
+    treatment_path = paths[1]
+    treatment = json.loads(treatment_path.read_text(encoding="utf-8"))
+    nested_root = (
+        Path(control["device"]["compile_cache"]["root"]) / "inductor" / "nested"
+    )
+    cache = treatment["device"]["compile_cache"]
+    cache["root"] = str(nested_root)
+    cache["owner_marker"] = str(nested_root / "cache-owner.json")
+    suffixes = {
+        "HOME": "home",
+        "TORCHINDUCTOR_CACHE_DIR": "inductor",
+        "TORCHINDUCTOR_PERSISTENT_AUTOTUNE_DIR": "inductor-autotune",
+        "TRITON_HOME": "triton-home",
+        "TRITON_CACHE_DIR": "triton",
+        "TRITON_DUMP_DIR": "triton-dump",
+        "TRITON_OVERRIDE_DIR": "triton-override",
+        "XDG_CACHE_HOME": "xdg",
+        "CUDA_CACHE_PATH": "cuda",
+    }
+    for name, suffix in suffixes.items():
+        path = nested_root / suffix
+        path.mkdir(parents=True, exist_ok=True)
+        cache["environment"][name] = str(path)
+    (nested_root / "cache-owner.json").write_text(
+        json.dumps(
+            {
+                "format": "startrain.compile-cache-owner",
+                "schema_version": 1,
+                "layout": cache["layout"],
+                "arm": treatment["arm"],
+                "run_contract_sha256": treatment["run_contract_sha256"],
+                "root": cache["root"],
+                "environment": dict(sorted(cache["environment"].items())),
+                "runtime": dict(sorted(cache["runtime"].items())),
+            }
+        ),
+        encoding="utf-8",
+    )
+    unsigned = dict(treatment)
+    unsigned.pop("result_sha256")
+    treatment["result_sha256"] = runner._digest(unsigned)
+    treatment_path.write_text(json.dumps(treatment), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="disjoint"):
+        comparator.compare_results(paths, bootstrap_samples=100)
+
+
+def test_suite_hardware_drift_forces_control_fallback(tmp_path: Path) -> None:
+    paths = _write_suite(tmp_path)
+    treatment_path = paths[1]
+    payload = json.loads(treatment_path.read_text(encoding="utf-8"))
+    payload["device"]["hardware"]["driver_version"] = "different"
+    unsigned = dict(payload)
+    unsigned.pop("result_sha256")
+    payload["result_sha256"] = runner._digest(unsigned)
+    treatment_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    result = comparator.compare_results(paths, bootstrap_samples=100)
+
+    assert result["common_contract"]["suite_common_parity"] is False
+    assert result["control_valid"] is False
+    assert result["selection"]["selected_arm"] == runner.CONTROL_ARM
+    assert result["selection"]["fallback_to_control"] is True
 
 
 def test_comparator_rejects_actual_progress_drift_in_isolation(

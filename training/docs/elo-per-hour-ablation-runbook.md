@@ -260,6 +260,20 @@ and is capped at two H100-hours. The queue falls back to deterministic
 sequential waves until shared-replay concurrency has separately cleared its
 throughput gate.
 
+Compiled calibration must retain the hardened systemd sandbox. Every arm owns
+`<arm-output>/compile-cache/v1/` with distinct Inductor, Triton, XDG, and CUDA
+cache directories. The runner configures those paths before `torch.compile`,
+records their paths and runtime versions in its signed evidence, reuses them
+only for a contract-matching resume, and restores the prior process environment
+between arms. The sequential queue executes every arm in a fresh child process
+whose cache environment is present before Torch import and CUDA initialization,
+preventing Dynamo, Inductor, Triton, allocator, or autotune state from leaking
+from control into a later treatment. `HOME` is arm-local too; remote-cache,
+cache-disable, and alternate cache-manager controls must be unset. A
+home-directory cache, shared or nested cross-arm cache, missing provenance,
+hardware/driver drift, symlink, special file, or unwritable cache fails closed;
+never disable compilation or weaken `ProtectHome` to rescue a calibration.
+
 The frozen comparator requires:
 
 - zero non-finite loss or gradient events;
@@ -720,12 +734,17 @@ python scripts/monitor_run.py \
   --profile /absolute/path/to/profile-elo-ablation.yaml \
   --interval 5 \
   --format jsonl \
-  --telemetry-output /absolute/path/to/status/monitor-5s.jsonl
+  --telemetry-output /absolute/path/to/status/monitor-5s.jsonl \
+  --telemetry-max-bytes 52428800 \
+  --telemetry-retain-files 7
 ```
 
 The snapshot records GPU telemetry, UTD and learner duty inputs, replay
 model-step lag, candidate arrival/service ratio, supersession, and current arena
-GPU7 occupancy.
+GPU7 occupancy. Rotation holds one sidecar lock, repairs an incomplete tail,
+renames only complete JSONL files, fsyncs the directory, and retains the newest
+configured archives. The 15-minute strength report must be atomically replaced;
+an active run reports stale strength evidence after the timer's grace window.
 
 Every campaign arm also needs its own rendered
 `edgeconnect-startrain-disaster-backup` service/timer and distinct backup root.

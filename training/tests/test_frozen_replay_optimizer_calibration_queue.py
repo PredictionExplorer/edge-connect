@@ -55,11 +55,21 @@ def _run(
 ) -> tuple[dict[str, object], list[str]]:
     calls: list[str] = []
 
-    def fake_run(settings):
+    def fake_run(settings, *, environment):
         calls.append(settings.arm)
+        assert environment["TRITON_CACHE_DIR"].startswith(str(settings.output_dir))
+        assert environment["HOME"].startswith(str(settings.output_dir))
         result_path = settings.output_dir / "result.json"
-        _write_json(result_path, {"arm": settings.arm, "status": "complete"})
-        return {"arm": settings.arm, "status": "complete"}
+        compile_cache = {
+            "root": str(settings.output_dir / "compile-cache" / "v1"),
+        }
+        result = {
+            "arm": settings.arm,
+            "status": "complete",
+            "device": {"compile_cache": compile_cache},
+        }
+        _write_json(result_path, result)
+        return result, {"returncode": 0}
 
     def fake_compare(_paths):
         return {
@@ -73,7 +83,7 @@ def _run(
             },
         }
 
-    monkeypatch.setattr(queue, "run_calibration", fake_run)
+    monkeypatch.setattr(queue, "_run_calibration_process", fake_run)
     monkeypatch.setattr(queue, "compare_results", fake_compare)
     plan = _plan(tmp_path)
     state = queue.run_calibration_queue(
@@ -106,6 +116,13 @@ def test_queue_builds_control_vs_unique_winner_screen_plan(
 
     assert state["status"] == "completed"
     assert calls == list(RING10_OPTIMIZER_CALIBRATION_TREATMENTS)
+    assert {
+        arm: state["arms"][arm]["compile_cache"]["root"]
+        for arm in RING10_OPTIMIZER_CALIBRATION_TREATMENTS
+    } == {
+        arm: str(tmp_path / "output" / arm / "compile-cache" / "v1")
+        for arm in RING10_OPTIMIZER_CALIBRATION_TREATMENTS
+    }
     screen_path = Path(state["screen_plan"]["path"])
     screen = json.loads(screen_path.read_text(encoding="utf-8"))
     assert [item["treatment"] for item in screen["treatments"]] == [
@@ -147,3 +164,79 @@ def test_queue_falls_back_without_screen_when_no_treatment_passes(
     assert state["status"] == "completed"
     assert state["screen_plan"] is None
     assert not (tmp_path / "screen" / "ablation-plan.json").exists()
+
+
+def test_queue_records_isolated_child_failure_and_stops(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_child(_settings, *, environment):
+        assert environment["TORCHINDUCTOR_CACHE_DIR"]
+        raise RuntimeError("injected child failure")
+
+    monkeypatch.setattr(queue, "_run_calibration_process", fail_child)
+    state = queue.run_calibration_queue(
+        plan_path=_plan(tmp_path),
+        champion=tmp_path / "champion.json",
+        replay_root=tmp_path / "replay",
+        replay_cutoff=42,
+        output_root=tmp_path / "output",
+        steps=10,
+        device="cuda:0",
+        budget_h100_hours=2,
+        screen_plan_path=tmp_path / "screen" / "ablation-plan.json",
+        screen_wall_budget_hours=8,
+        screen_leaf_budget=2_000_000_000,
+    )
+
+    assert state["status"] == "failed"
+    assert state["error"]["arm"] == CONTROL_ARM
+    assert state["arms"][CONTROL_ARM]["status"] == "failed"
+    assert "injected child failure" in state["arms"][CONTROL_ARM]["error"]["message"]
+
+
+def test_queue_rejects_symlinked_output_before_creating_state(tmp_path: Path) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    output = tmp_path / "output"
+    output.symlink_to(target, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="contains a symlink"):
+        queue.run_calibration_queue(
+            plan_path=_plan(tmp_path),
+            champion=tmp_path / "champion.json",
+            replay_root=tmp_path / "replay",
+            replay_cutoff=42,
+            output_root=output,
+            steps=10,
+            device="cuda:0",
+            budget_h100_hours=2,
+            screen_plan_path=tmp_path / "screen" / "ablation-plan.json",
+            screen_wall_budget_hours=8,
+            screen_leaf_budget=2_000_000_000,
+        )
+
+    assert not (target / "queue-state.json").exists()
+
+
+def test_queue_rejects_replay_overlap_before_creating_cache(tmp_path: Path) -> None:
+    replay = tmp_path / "replay"
+    replay.mkdir()
+    output = replay / "calibration"
+
+    with pytest.raises(ValueError, match="must not overlap"):
+        queue.run_calibration_queue(
+            plan_path=_plan(tmp_path),
+            champion=tmp_path / "champion.json",
+            replay_root=replay,
+            replay_cutoff=42,
+            output_root=output,
+            steps=10,
+            device="cuda:0",
+            budget_h100_hours=2,
+            screen_plan_path=tmp_path / "screen" / "ablation-plan.json",
+            screen_wall_budget_hours=8,
+            screen_leaf_budget=2_000_000_000,
+        )
+
+    assert not output.exists()

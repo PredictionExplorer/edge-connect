@@ -9,6 +9,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import shutil
 import signal
 import sqlite3
@@ -33,6 +34,11 @@ else:
 SEVERITY = {"OK": 0, "WARN": 1, "ERROR": 2}
 CONTINUITY_STALE_SECONDS = 180.0
 DISASTER_BACKUP_STALE_SECONDS = 30.0 * 60.0
+STRENGTH_REPORT_WARN_SECONDS = 20.0 * 60.0
+STRENGTH_REPORT_ERROR_SECONDS = 45.0 * 60.0
+STRENGTH_REPORT_CLOCK_SKEW_SECONDS = 5.0
+DEFAULT_TELEMETRY_MAX_BYTES = 50 * 1024 * 1024
+DEFAULT_TELEMETRY_RETAIN_FILES = 7
 _DIGEST_CACHE: dict[Path, tuple[int, int, int, str]] = {}
 _ARENA_RESULT_CACHE: dict[Path, tuple[int, int, dict[str, object]]] = {}
 
@@ -73,6 +79,18 @@ def _parser() -> argparse.ArgumentParser:
         "--telemetry-output",
         type=Path,
         help="append every full snapshot as durable JSONL; use --interval 5 for 5s GPU telemetry",
+    )
+    parser.add_argument(
+        "--telemetry-max-bytes",
+        type=int,
+        default=DEFAULT_TELEMETRY_MAX_BYTES,
+        help="rotate durable telemetry before the active JSONL exceeds this size",
+    )
+    parser.add_argument(
+        "--telemetry-retain-files",
+        type=int,
+        default=DEFAULT_TELEMETRY_RETAIN_FILES,
+        help="number of complete rotated telemetry JSONL files to retain",
     )
     return parser
 
@@ -1206,10 +1224,51 @@ def _weighted_arena_progress(
     }
 
 
-def _strength_efficiency_status(run_root: Path) -> dict[str, object]:
-    report = _read_json(run_root / "strength-efficiency.json", attempts=1)
+def _strength_efficiency_status(
+    run_root: Path,
+    *,
+    now_ns: int,
+) -> dict[str, object]:
+    path = run_root / "strength-efficiency.json"
+    report = _read_json(path, attempts=1)
     if report is None:
-        return {"available": False}
+        return {
+            "available": False,
+            "path": str(path),
+            "present": path.is_file(),
+        }
+    run_identity = _read_json(run_root / "run.json", attempts=1) or {}
+    observed_until_ns = report.get("observed_until_ns")
+    run_id = run_identity.get("run_id")
+    generation_family = run_identity.get("generation_family")
+    started_ns = run_identity.get("created_ns")
+    if (
+        not isinstance(run_id, str)
+        or not run_id
+        or not isinstance(generation_family, str)
+        or not generation_family
+        or isinstance(started_ns, bool)
+        or not isinstance(started_ns, int)
+        or started_ns <= 0
+        or report.get("report") != "startrain-strength-efficiency"
+        or report.get("schema_version") != 1
+        or report.get("status") != "complete"
+        or report.get("run_id") != run_id
+        or report.get("generation_family") != generation_family
+        or report.get("run_root") != str(run_root.resolve())
+        or report.get("started_ns") != started_ns
+        or isinstance(observed_until_ns, bool)
+        or not isinstance(observed_until_ns, int)
+        or observed_until_ns <= 0
+        or observed_until_ns
+        > now_ns + int(STRENGTH_REPORT_CLOCK_SKEW_SECONDS * 1_000_000_000)
+    ):
+        return {
+            "available": False,
+            "path": str(path),
+            "present": True,
+            "reason": "report_contract_invalid",
+        }
     autonomous = _mapping(report.get("autonomous_elo"))
     headline = _mapping(autonomous.get("headline"))
     headline_elo = _number(autonomous.get("headline_elo"))
@@ -1233,13 +1292,29 @@ def _strength_efficiency_status(run_root: Path) -> dict[str, object]:
         and all(_number(value) is not None for value in confidence_interval)
     ):
         confidence_interval = None
+    report_age_seconds = (
+        max(0.0, (now_ns - observed_until_ns) / 1_000_000_000)
+        if isinstance(observed_until_ns, int)
+        and not isinstance(observed_until_ns, bool)
+        and 0
+        < observed_until_ns
+        <= now_ns + int(STRENGTH_REPORT_CLOCK_SKEW_SECONDS * 1_000_000_000)
+        else None
+    )
+    aggregate = _mapping(autonomous.get("aggregate"))
     return {
         "available": True,
+        "present": True,
+        "path": str(path),
         "status": report.get("status"),
+        "observed_until_ns": observed_until_ns,
+        "age_seconds": report_age_seconds,
         "headline": dict(headline) if headline else None,
         "headline_elo": headline_elo,
         "headline_source": source if isinstance(source, str) else None,
         "headline_confidence_interval": confidence_interval,
+        "statistical_role": aggregate.get("statistical_role"),
+        "adoption_ranking_authorized": aggregate.get("adoption_ranking_authorized"),
     }
 
 
@@ -2310,7 +2385,61 @@ def collect_snapshot(
                     f"{continuation_waves} post-minimum waves; newer candidates may "
                     "supersede completed evaluation work",
                 )
-    strength_efficiency = _strength_efficiency_status(root)
+    strength_efficiency = _strength_efficiency_status(root, now_ns=now)
+    strength_age = _number(strength_efficiency.get("age_seconds"))
+    run_created_ns = run_identity.get("created_ns")
+    run_age_seconds = (
+        max(0.0, (now - run_created_ns) / 1_000_000_000)
+        if isinstance(run_created_ns, int)
+        and not isinstance(run_created_ns, bool)
+        and 0 < run_created_ns <= now
+        else None
+    )
+    if (
+        coordinator.get("state") in ("running", "draining")
+        and strength_efficiency.get("present") is True
+        and strength_efficiency.get("available") is not True
+    ):
+        _add_warning(
+            warnings,
+            "ERROR",
+            "strength_report_invalid",
+            "strength-efficiency report failed its schema, identity, or timestamp contract",
+        )
+    elif (
+        coordinator.get("state") in ("running", "draining")
+        and strength_efficiency.get("present") is False
+        and run_age_seconds is not None
+        and run_age_seconds > STRENGTH_REPORT_ERROR_SECONDS
+    ):
+        _add_warning(
+            warnings,
+            "ERROR",
+            "strength_report_missing",
+            f"active run has no strength report after {run_age_seconds:.0f}s",
+        )
+    elif (
+        coordinator.get("state") in ("running", "draining")
+        and strength_age is not None
+        and strength_age > STRENGTH_REPORT_ERROR_SECONDS
+    ):
+        _add_warning(
+            warnings,
+            "ERROR",
+            "strength_report_stale",
+            f"strength-efficiency report age={strength_age:.0f}s",
+        )
+    elif (
+        coordinator.get("state") in ("running", "draining")
+        and strength_age is not None
+        and strength_age > STRENGTH_REPORT_WARN_SECONDS
+    ):
+        _add_warning(
+            warnings,
+            "WARN",
+            "strength_report_stale",
+            f"strength-efficiency report age={strength_age:.0f}s",
+        )
     pause_request = _read_json(root / "status" / "arena-gpu-pause.json")
     pause_ack = _read_json(root / "status" / "arena-gpu-pause.ack.json")
     if (
@@ -2640,44 +2769,110 @@ def _seconds(value: object) -> str:
     return f"{number:.4f}s" if abs(number) < 0.01 else f"{_compact(number)}s"
 
 
-def _append_snapshot_jsonl(path: Path, snapshot: Mapping[str, object]) -> None:
-    output = path.expanduser().resolve()
+def _repair_partial_jsonl_tail(stream) -> int:
+    size = stream.seek(0, os.SEEK_END)
+    if not size:
+        return 0
+    stream.seek(size - 1)
+    if stream.read(1) == b"\n":
+        return size
+    scan_end = size
+    complete_offset = 0
+    while scan_end > 0:
+        scan_start = max(0, scan_end - 1024 * 1024)
+        stream.seek(scan_start)
+        block = stream.read(scan_end - scan_start)
+        last_newline = block.rfind(b"\n")
+        if last_newline >= 0:
+            complete_offset = scan_start + last_newline + 1
+            break
+        scan_end = scan_start
+    stream.truncate(complete_offset)
+    stream.flush()
+    os.fsync(stream.fileno())
+    return complete_offset
+
+
+def _fsync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _rotate_telemetry_jsonl(output: Path, *, retain_files: int) -> None:
+    pattern = re.compile(
+        rf"^{re.escape(output.stem)}\.(?P<sequence>[0-9]+)"
+        rf"{re.escape(output.suffix)}$"
+    )
+    archives: list[tuple[int, Path]] = []
+    for path in output.parent.iterdir():
+        match = pattern.fullmatch(path.name)
+        if match is None:
+            continue
+        if path.is_symlink() or not path.is_file():
+            raise OSError(f"telemetry archive is unsafe: {path}")
+        archives.append((int(match.group("sequence")), path))
+    sequence = max(
+        time.time_ns(),
+        max((existing for existing, _path in archives), default=0) + 1,
+    )
+    rotated = output.with_name(f"{output.stem}.{sequence}{output.suffix}")
+    if rotated.exists() or rotated.is_symlink():
+        raise OSError(f"telemetry rotation destination already exists: {rotated}")
+    os.replace(output, rotated)
+    archives.append((sequence, rotated))
+    archives.sort()
+    for _sequence, stale in archives[:-retain_files]:
+        if stale.is_symlink() or not stale.is_file():
+            raise OSError(f"telemetry archive is unsafe: {stale}")
+        stale.unlink()
+    _fsync_directory(output.parent)
+
+
+def _append_snapshot_jsonl(
+    path: Path,
+    snapshot: Mapping[str, object],
+    *,
+    maximum_bytes: int = DEFAULT_TELEMETRY_MAX_BYTES,
+    retain_files: int = DEFAULT_TELEMETRY_RETAIN_FILES,
+) -> None:
+    if maximum_bytes <= 0:
+        raise ValueError("telemetry maximum bytes must be positive")
+    if retain_files <= 0:
+        raise ValueError("telemetry retained files must be positive")
+    source = path.expanduser()
+    if source.is_symlink():
+        raise OSError(f"telemetry output may not be a symlink: {source}")
+    output = source.resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
-    created = not output.exists()
     line = (json.dumps(snapshot, sort_keys=True, separators=(",", ":")) + "\n").encode(
         "utf-8"
     )
-    with output.open("a+b") as stream:
-        fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+    if len(line) > maximum_bytes:
+        raise ValueError("one telemetry snapshot exceeds the configured file limit")
+    lock_path = output.with_name(f".{output.name}.lock")
+    with lock_path.open("a+b") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         try:
-            size = stream.seek(0, os.SEEK_END)
-            if size:
-                stream.seek(size - 1)
-                if stream.read(1) != b"\n":
-                    scan_end = size
-                    complete_offset = 0
-                    while scan_end > 0:
-                        scan_start = max(0, scan_end - 1024 * 1024)
-                        stream.seek(scan_start)
-                        block = stream.read(scan_end - scan_start)
-                        last_newline = block.rfind(b"\n")
-                        if last_newline >= 0:
-                            complete_offset = scan_start + last_newline + 1
-                            break
-                        scan_end = scan_start
-                    stream.truncate(complete_offset)
-            stream.seek(0, os.SEEK_END)
-            stream.write(line)
-            stream.flush()
-            os.fsync(stream.fileno())
+            created = not output.exists()
+            if output.exists() and (output.is_symlink() or not output.is_file()):
+                raise OSError(f"telemetry output is unsafe: {output}")
+            with output.open("a+b") as stream:
+                size = _repair_partial_jsonl_tail(stream)
+            if size and size + len(line) > maximum_bytes:
+                _rotate_telemetry_jsonl(output, retain_files=retain_files)
+                created = True
+            with output.open("a+b") as stream:
+                stream.seek(0, os.SEEK_END)
+                stream.write(line)
+                stream.flush()
+                os.fsync(stream.fileno())
+            if created:
+                _fsync_directory(output.parent)
         finally:
-            fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
-    if created:
-        directory = os.open(output.parent, os.O_RDONLY)
-        try:
-            os.fsync(directory)
-        finally:
-            os.close(directory)
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
 
 def run_monitor(
@@ -2692,6 +2887,8 @@ def run_monitor(
     continuity_state_path: Path | None = None,
     disaster_backup_root: Path | None = None,
     telemetry_output: Path | None = None,
+    telemetry_max_bytes: int = DEFAULT_TELEMETRY_MAX_BYTES,
+    telemetry_retain_files: int = DEFAULT_TELEMETRY_RETAIN_FILES,
 ) -> None:
     next_tick = time.monotonic()
     while not stop_requested():
@@ -2739,8 +2936,13 @@ def run_monitor(
             }
         if telemetry_output is not None:
             try:
-                _append_snapshot_jsonl(telemetry_output, snapshot)
-            except OSError as error:
+                _append_snapshot_jsonl(
+                    telemetry_output,
+                    snapshot,
+                    maximum_bytes=telemetry_max_bytes,
+                    retain_files=telemetry_retain_files,
+                )
+            except (OSError, ValueError) as error:
                 raw_warnings = snapshot.get("warnings")
                 warnings = raw_warnings if isinstance(raw_warnings, list) else []
                 warnings.append(
@@ -2771,6 +2973,10 @@ def main(argv: list[str] | None = None) -> int:
     arguments = parser.parse_args(argv)
     if arguments.interval <= 0:
         raise SystemExit("--interval must be positive")
+    if arguments.telemetry_max_bytes <= 0:
+        raise SystemExit("--telemetry-max-bytes must be positive")
+    if arguments.telemetry_retain_files <= 0:
+        raise SystemExit("--telemetry-retain-files must be positive")
     if arguments.continuity_manifest is not None:
         try:
             target = resolve_monitor_target(
@@ -2814,6 +3020,8 @@ def main(argv: list[str] | None = None) -> int:
         continuity_state_path=target.continuity_state_path,
         disaster_backup_root=target.disaster_backup_root,
         telemetry_output=arguments.telemetry_output,
+        telemetry_max_bytes=arguments.telemetry_max_bytes,
+        telemetry_retain_files=arguments.telemetry_retain_files,
     )
     return 0
 

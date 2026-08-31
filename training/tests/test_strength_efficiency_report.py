@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 
+from scripts import strength_efficiency_report as report_module
 from scripts.strength_efficiency_report import (
     REPORT_NAME,
     _actor_summary,
@@ -218,6 +220,51 @@ def test_report_surfaces_jsonl_parse_failures_and_cli_exit_status(
     assert main(["--run-root", str(root)]) == 3
     output = json.loads(capsys.readouterr().out)
     assert output["status"] == "incomplete"
+
+
+def test_report_cli_publishes_atomically_and_supports_quiet_mode(
+    tmp_path,
+    monkeypatch,
+    capsys,
+) -> None:
+    root = tmp_path / "run"
+    root.mkdir()
+    (root / "run.json").write_text(
+        json.dumps(
+            {
+                "run_id": "run",
+                "generation_family": "family",
+                "created_ns": 1,
+            }
+        ),
+        encoding="utf-8",
+    )
+    output = tmp_path / "report.json"
+    writes = []
+    real_atomic_json = report_module.atomic_json
+
+    def recording_atomic_json(path, payload):
+        writes.append(Path(path))
+        real_atomic_json(path, payload)
+
+    monkeypatch.setattr(report_module, "atomic_json", recording_atomic_json)
+
+    assert (
+        main(
+            [
+                "--run-root",
+                str(root),
+                "--output",
+                str(output),
+                "--quiet",
+            ]
+        )
+        == 0
+    )
+    assert writes == [output]
+    assert json.loads(output.read_text())["status"] == "complete"
+    assert capsys.readouterr().out == ""
+    assert not list(tmp_path.glob(".report.json.*.tmp"))
 
 
 def test_report_uses_coordinator_terminal_timestamp_for_idle_wall_time(

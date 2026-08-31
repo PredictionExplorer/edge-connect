@@ -5,7 +5,29 @@ Description=EdgeConnect StarTrain autonomous Elo report
 Type=oneshot
 User=@USER@
 WorkingDirectory=@TRAINING_DIR@
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
 Environment=PYTHONPATH=@TRAINING_DIR@
-ExecStart=@TRAINING_DIR@/.venv/bin/python @TRAINING_DIR@/scripts/strength_efficiency_report.py --run-root @RUN_ROOT@ --provisioned-gpus @PROVISIONED_GPUS@ --output @RUN_ROOT@/strength-efficiency.json
+ExecStart=@TRAINING_DIR@/.venv/bin/python @TRAINING_DIR@/scripts/strength_efficiency_report.py --run-root @RUN_ROOT@ --provisioned-gpus @PROVISIONED_GPUS@ --output @RUN_ROOT@/strength-efficiency.json --quiet
+StandardOutput=null
+StandardError=journal
+Nice=10
+IOSchedulingClass=idle
 NoNewPrivileges=true
 UMask=0027
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=@RUN_ROOT@
+PrivateTmp=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+SystemCallArchitectures=native

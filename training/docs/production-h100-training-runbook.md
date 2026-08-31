@@ -709,15 +709,27 @@ object to each workload that may start automatically:
   "disaster_backup_root": "/lambda/nfs/<filesystem>/edgeconnect-dr/<owner>",
   "disaster_backup_mount": "/lambda/nfs/<filesystem>",
   "telemetry_service": "edgeconnect-startrain-<owner>-monitor.service",
-  "telemetry_output": "/absolute/run/root/status/monitor-5s.jsonl"
+  "telemetry_output": "/absolute/run/root/status/monitor-5s.jsonl",
+  "telemetry_max_bytes": 52428800,
+  "telemetry_retain_files": 7,
+  "report_service": "edgeconnect-startrain-<owner>-report.service",
+  "report_timer": "edgeconnect-startrain-<owner>-report.timer",
+  "report_provisioned_gpus": 8,
+  "service_user": "<training-user>"
 }
 ```
 
-The fields are strict: unit and output names must be unique, backup roots may
+Schema-v2 protection fields are strict: unit and output names must be unique, backup roots may
 not overlap, the DR root must be below its attached Lambda mount, and telemetry
-must be a JSONL file below that workload's `status` directory. A workload may
-omit `protection`; manifests without protection objects retain the legacy
-behavior and API.
+must be a JSONL file below that workload's `status` directory. Report fields are
+an all-or-nothing extension: the timer must target the pinned report service,
+whose command and provisioned-GPU denominator are verified with the other
+protection units. The service user, working directory, environment, timer
+cadence, absence of auxiliary commands, and complete sandbox are verified too.
+Schema-v1 protection objects without report or retention
+fields remain valid and retain their original command bytes for migration;
+schema v2 requires those fields. A workload may omit `protection`; manifests
+without protection objects retain the legacy behavior and API.
 
 Keep mutable continuity state under `/var/lib/edgeconnect`, outside every run
 root. Pre-create the shared GPU execution lock for the training user and its
@@ -951,7 +963,9 @@ profile, training unit, Lambda DR root, and continuity state from the state's
 "$MONITOR_PYTHON" -u "$MONITOR_TRAINING/scripts/monitor_run.py" \
   --continuity-manifest "$STATE_ROOT/continuity-manifest.json" \
   --interval 5 --format jsonl \
-  --telemetry-output "$RUN_ROOT/status/monitor-5s.jsonl"
+  --telemetry-output "$RUN_ROOT/status/monitor-5s.jsonl" \
+  --telemetry-max-bytes 52428800 \
+  --telemetry-retain-files 7
 ```
 
 An explicit `--run-root`, `--profile`, `--unit`, `--continuity-state`, or
@@ -1392,6 +1406,21 @@ fallback. After accepting a boundary it:
    activates only control and a unique gate-passing treatment;
 7. pins and verifies the queue activation manifest, starts the queue, and
    releases its operator hold.
+
+The boundary unit keeps `ProtectHome=read-only`. Compiled frozen-replay arms
+must redirect `HOME`, Inductor, Triton, XDG, and CUDA caches into the
+policy-owned frozen-calibration tree. The runner further isolates each arm
+under `<arm-output>/compile-cache/v1`, verifies that no path is a symlink or
+escapes the arm, tests writability before model initialization, and records
+runtime/cache and H100/driver provenance. The sequential queue launches each
+arm in a fresh process with the cache environment set before Torch import and
+CUDA initialization. `HOME` is arm-local, alternate/remote cache controls are
+unset, and cache ownership is contract-bound and recursively revalidated on
+resume. Distinct arms may not share or nest compile caches, and a driver/GPU
+identity change invalidates the complete suite. A cache failure follows the
+normal fail-closed continuity fallback; do not add
+`/root/.triton` to `ReadWritePaths` and do not disable production-faithful
+compilation.
 
 Before profile generation, the controller reads the stopped run's pinned
 recovery checkpoint and derives Muon/AdamW control rates from matching optimizer

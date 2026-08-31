@@ -95,7 +95,12 @@ def test_finite_and_continuous_systemd_restart_policies_are_distinct() -> None:
     report_timer = (DEPLOY / "edgeconnect-startrain-report.timer.example").read_text()
     assert "strength_efficiency_report.py" in report_service
     assert "@PROVISIONED_GPUS@" in report_service
+    assert "--quiet" in report_service
+    assert "ProtectSystem=strict" in report_service
+    assert "ReadWritePaths=@RUN_ROOT@" in report_service
+    assert "StandardOutput=null" in report_service
     assert "OnUnitActiveSec=15min" in report_timer
+    assert "AccuracySec=1min" in report_timer
     assert "edgeconnect-startrain-@RUN_ID@-report.service" in report_timer
 
 

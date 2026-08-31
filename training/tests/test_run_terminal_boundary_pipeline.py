@@ -28,6 +28,8 @@ from scripts.run_terminal_boundary_pipeline import (
     verify_queue_activation_manifest,
 )
 
+DEPLOY = Path(__file__).parents[1] / "deploy"
+
 
 def _write_json(path: Path, document: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -47,6 +49,28 @@ def _sha256(path: Path) -> str:
 
 def _artifact(path: Path) -> dict[str, object]:
     return {"path": str(path.resolve()), "sha256": _sha256(path)}
+
+
+def test_terminal_boundary_unit_redirects_compile_caches() -> None:
+    unit = (
+        DEPLOY / "edgeconnect-startrain-terminal-boundary.service.example"
+    ).read_text(encoding="utf-8")
+
+    assert "ProtectHome=read-only" in unit
+    assert "ReadWritePaths=" in unit
+    for name in (
+        "HOME",
+        "XDG_CACHE_HOME",
+        "TORCHINDUCTOR_CACHE_DIR",
+        "TORCHINDUCTOR_PERSISTENT_AUTOTUNE_DIR",
+        "TRITON_HOME",
+        "TRITON_CACHE_DIR",
+        "TRITON_DUMP_DIR",
+        "TRITON_OVERRIDE_DIR",
+        "CUDA_CACHE_PATH",
+    ):
+        assert f"Environment={name}=@FROZEN_CALIBRATION_OUTPUT_ROOT@/" in unit
+    assert "UnsetEnvironment=TRITON_CACHE_MANAGER" in unit
 
 
 @pytest.fixture(autouse=True)

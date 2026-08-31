@@ -242,6 +242,12 @@ def _fixture(
                 "disaster_backup_mount": str(disaster_mount),
                 "telemetry_service": (f"edgeconnect-startrain-{owner}-monitor.service"),
                 "telemetry_output": str(run_root / "status" / "monitor-5s.jsonl"),
+                "telemetry_max_bytes": 50 * 1024 * 1024,
+                "telemetry_retain_files": 7,
+                "report_service": (f"edgeconnect-startrain-{owner}-report.service"),
+                "report_timer": (f"edgeconnect-startrain-{owner}-report.timer"),
+                "report_provisioned_gpus": 1,
+                "service_user": "ubuntu",
             }
     if alert_command is not None:
         raw["alerts"]["command"] = alert_command
@@ -342,14 +348,18 @@ def _protection_inspector(
         protection = workload.protection
         assert protection is not None
         active = workload.workload_id == active_workload_id
-        for unit in (
+        top_level_units = [
             protection.replay_backup_timer,
             protection.disaster_backup_timer,
             protection.telemetry_service,
-        ):
+        ]
+        if protection.report_timer is not None:
+            top_level_units.append(protection.report_timer)
+        for unit in top_level_units:
             timer = unit in {
                 protection.replay_backup_timer,
                 protection.disaster_backup_timer,
+                protection.report_timer,
             }
             staged = (
                 active_workload_id is None
@@ -362,10 +372,13 @@ def _protection_inspector(
                 load_state="loaded",
                 unit_file_state="enabled",
             )
-        for service in (
+        service_units = [
             protection.replay_backup_service,
             protection.disaster_backup_service,
-        ):
+        ]
+        if protection.report_service is not None:
+            service_units.append(protection.report_service)
+        for service in service_units:
             inspector.statuses[service] = continuity.UnitStatus(
                 service,
                 "inactive",
@@ -378,11 +391,58 @@ def _protection_inspector(
         inspector.definitions[protection.disaster_backup_timer] = (
             f"[Timer]\nUnit={protection.disaster_backup_service}\n"
         )
+        if (
+            protection.report_timer is not None
+            and protection.report_service is not None
+        ):
+            inspector.definitions[protection.report_timer] = (
+                "[Timer]\n"
+                "OnBootSec=5min\n"
+                "OnUnitActiveSec=15min\n"
+                "RandomizedDelaySec=1min\n"
+                "AccuracySec=1min\n"
+                "Persistent=true\n"
+                f"Unit={protection.report_service}\n"
+            )
         for service, command in continuity.workload_protection_commands(
             manifest,
             workload,
         ).items():
-            inspector.definitions[service] = f"[Service]\nExecStart={command}\n"
+            hardening = (
+                "Type=oneshot\n"
+                "User=ubuntu\n"
+                f"WorkingDirectory={workload.runtime_training_dir}\n"
+                "Environment=PYTHONUNBUFFERED=1\n"
+                "Environment=PYTHONDONTWRITEBYTECODE=1\n"
+                f"Environment=PYTHONPATH={workload.runtime_training_dir}\n"
+                "StandardOutput=null\n"
+                "StandardError=journal\n"
+                "Nice=10\n"
+                "IOSchedulingClass=idle\n"
+                "UMask=0027\n"
+                "ProtectSystem=strict\n"
+                "ProtectHome=read-only\n"
+                f"ReadWritePaths={workload.run_root}\n"
+                "PrivateTmp=true\n"
+                "ProtectClock=true\n"
+                "ProtectControlGroups=true\n"
+                "ProtectHostname=true\n"
+                "ProtectKernelLogs=true\n"
+                "ProtectKernelModules=true\n"
+                "ProtectKernelTunables=true\n"
+                "RestrictAddressFamilies=AF_UNIX\n"
+                "RestrictNamespaces=true\n"
+                "RestrictRealtime=true\n"
+                "RestrictSUIDSGID=true\n"
+                "LockPersonality=true\n"
+                "SystemCallArchitectures=native\n"
+                "NoNewPrivileges=true\n"
+                if service == protection.report_service
+                else ""
+            )
+            inspector.definitions[service] = (
+                f"[Service]\nExecStart={command}\n{hardening}"
+            )
     return inspector
 
 
@@ -828,6 +888,98 @@ def test_optional_protection_metadata_is_strict_and_backward_compatible(
         match="protection is missing fields",
     ):
         continuity.load_continuity_manifest(fixture.manifest)
+
+
+def test_legacy_protection_keeps_original_monitor_command(tmp_path: Path) -> None:
+    fixture = _fixture(tmp_path, protection=True)
+    raw = json.loads(fixture.manifest.read_text(encoding="utf-8"))
+    for workload in raw["workloads"]:
+        protection = workload["protection"]
+        for name in (
+            "report_service",
+            "report_timer",
+            "report_provisioned_gpus",
+            "service_user",
+            "telemetry_max_bytes",
+            "telemetry_retain_files",
+        ):
+            protection.pop(name)
+    _write_json(fixture.manifest, raw)
+
+    manifest = continuity.load_continuity_manifest(fixture.manifest)
+    primary = manifest.workload("primary")
+    assert primary.protection is not None
+    command = continuity.workload_protection_commands(
+        manifest,
+        primary,
+    )[primary.protection.telemetry_service]
+
+    assert "--telemetry-max-bytes" not in command
+    assert "--telemetry-retain-files" not in command
+    assert primary.protection.report_service is None
+
+
+def test_schema_v2_requires_report_and_telemetry_retention_fields(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture(tmp_path, protection=True)
+    raw = json.loads(fixture.manifest.read_text(encoding="utf-8"))
+    raw["schema_version"] = continuity.MANIFEST_SCHEMA_VERSION
+    raw["workloads"][0]["protection"].pop("report_service")
+    _write_json(fixture.manifest, raw)
+
+    with pytest.raises(
+        continuity.ContinuityManifestError,
+        match="protection is missing fields",
+    ):
+        continuity.load_continuity_manifest(fixture.manifest)
+
+
+def test_protection_verifies_pinned_strength_report_timer(tmp_path: Path) -> None:
+    fixture = _fixture(tmp_path, protection=True)
+    inspector = _protection_inspector(fixture)
+    manifest = continuity.load_continuity_manifest(fixture.manifest)
+    primary = manifest.workload("primary")
+    assert primary.protection is not None
+    assert primary.protection.report_timer is not None
+
+    verified = continuity.verify_workload_protection(
+        manifest,
+        "primary",
+        inspector=inspector,
+        require_active=False,
+    )
+    assert verified.valid is True
+
+    inspector.definitions[primary.protection.report_timer] = (
+        "[Timer]\nUnit=edgeconnect-startrain-wrong-report.service\n"
+    )
+    drifted = continuity.verify_workload_protection(
+        manifest,
+        "primary",
+        inspector=inspector,
+        require_active=False,
+    )
+    assert drifted.valid is False
+    assert any("timer target differs" in reason for reason in drifted.reasons)
+
+    inspector = _protection_inspector(fixture)
+    assert primary.protection.report_service is not None
+    definition = inspector.definitions[primary.protection.report_service]
+    inspector.definitions[primary.protection.report_service] = definition.replace(
+        "User=ubuntu",
+        "User=root",
+    )
+    weakened = continuity.verify_workload_protection(
+        manifest,
+        "primary",
+        inspector=inspector,
+        require_active=False,
+    )
+    assert weakened.valid is False
+    assert any(
+        "complete service definition differs" in reason for reason in weakened.reasons
+    )
 
 
 def test_protection_drift_blocks_automatic_workload_start_with_durable_alert(

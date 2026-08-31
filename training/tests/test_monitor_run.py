@@ -154,6 +154,15 @@ def _continuity_fixture(tmp_path: Path) -> dict[str, Path]:
 def _fixture(tmp_path: Path, *, now_ns: int) -> Path:
     root = tmp_path / "run"
     root.mkdir()
+    _write_json(
+        root / "run.json",
+        {
+            "schema_version": 1,
+            "run_id": "monitor-run",
+            "generation_family": "monitor-family",
+            "created_ns": now_ns - 1_000_000_000,
+        },
+    )
     (root / "profile.yaml").write_text(
         yaml.safe_dump(
             {
@@ -1192,6 +1201,48 @@ def test_telemetry_tail_repair_preserves_history_beyond_scan_window(tmp_path) ->
     ]
 
 
+def test_telemetry_rotation_retains_complete_bounded_archives(tmp_path) -> None:
+    output = tmp_path / "monitor-5s.jsonl"
+    unrelated = tmp_path / "monitor-5s.manual.jsonl"
+    unrelated.write_text('{"preserve":true}\n', encoding="utf-8")
+
+    for index in range(8):
+        monitor._append_snapshot_jsonl(
+            output,
+            {"index": index},
+            maximum_bytes=25,
+            retain_files=2,
+        )
+
+    archives = sorted(tmp_path.glob("monitor-5s.*.jsonl"))
+    generated = [path for path in archives if path != unrelated]
+    assert len(generated) == 2
+    assert unrelated.read_text(encoding="utf-8") == '{"preserve":true}\n'
+    for path in [*generated, output]:
+        assert path.read_bytes().endswith(b"\n")
+        assert all(json.loads(line) for line in path.read_text().splitlines())
+        assert path.stat().st_size <= 25
+    assert json.loads(output.read_text().splitlines()[-1])["index"] == 7
+
+
+def test_telemetry_rotation_sequence_survives_wall_clock_rollback(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    output = tmp_path / "monitor-5s.jsonl"
+    output.write_text('{"current":true}\n', encoding="utf-8")
+    (tmp_path / "monitor-5s.100.jsonl").write_text(
+        '{"old":true}\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(monitor.time, "time_ns", lambda: 50)
+
+    monitor._rotate_telemetry_jsonl(output, retain_files=2)
+
+    assert (tmp_path / "monitor-5s.100.jsonl").is_file()
+    assert (tmp_path / "monitor-5s.101.jsonl").is_file()
+
+
 def test_telemetry_failure_does_not_stop_stdout_monitor(
     tmp_path,
     monkeypatch,
@@ -1308,7 +1359,14 @@ def test_monitor_shows_headline_segment_loader_and_result_kind_counts(
     _write_json(
         root / "strength-efficiency.json",
         {
+            "report": "startrain-strength-efficiency",
+            "schema_version": 1,
             "status": "complete",
+            "run_id": "monitor-run",
+            "generation_family": "monitor-family",
+            "run_root": str(root),
+            "started_ns": now_ns - 1_000_000_000,
+            "observed_until_ns": now_ns,
             "autonomous_elo": {
                 "headline": {
                     "source": "aggregate",
@@ -1417,15 +1475,37 @@ def test_monitor_softly_ignores_malformed_strength_report(
 
     snapshot: Any = monitor.collect_snapshot(root, now_ns=now_ns)
 
-    assert snapshot["strength_efficiency"] == {"available": False}
+    assert snapshot["strength_efficiency"] == {
+        "available": False,
+        "path": str(root / "strength-efficiency.json"),
+        "present": True,
+    }
+    assert "strength_report_invalid" in {
+        warning["code"] for warning in snapshot["warnings"]
+    }
     assert "elo=n/a" in monitor.format_text(snapshot)
 
 
 def test_monitor_derives_aggregate_headline_from_legacy_report(tmp_path) -> None:
     _write_json(
+        tmp_path / "run.json",
+        {
+            "run_id": "legacy-run",
+            "generation_family": "legacy-family",
+            "created_ns": 1,
+        },
+    )
+    _write_json(
         tmp_path / "strength-efficiency.json",
         {
+            "report": "startrain-strength-efficiency",
+            "schema_version": 1,
             "status": "complete",
+            "run_id": "legacy-run",
+            "generation_family": "legacy-family",
+            "run_root": str(tmp_path),
+            "started_ns": 1,
+            "observed_until_ns": 10,
             "autonomous_elo": {
                 "latest": {"source": "ring_10", "rating": 500.0},
                 "latest_elo": 500.0,
@@ -1440,11 +1520,80 @@ def test_monitor_derives_aggregate_headline_from_legacy_report(tmp_path) -> None
         },
     )
 
-    status = monitor._strength_efficiency_status(tmp_path)
+    status = monitor._strength_efficiency_status(tmp_path, now_ns=10)
 
     assert status["headline_elo"] == 300.0
     assert status["headline_source"] == "aggregate"
     assert status["headline_confidence_interval"] == [250.0, 350.0]
+
+
+def test_monitor_escalates_stale_strength_report_for_active_run(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    now_ns = 4_000_000_000_000
+    root = _fixture(tmp_path, now_ns=now_ns)
+    _write_json(
+        root / "strength-efficiency.json",
+        {
+            "report": "startrain-strength-efficiency",
+            "schema_version": 1,
+            "status": "complete",
+            "run_id": "monitor-run",
+            "generation_family": "monitor-family",
+            "run_root": str(root),
+            "started_ns": now_ns - 1_000_000_000,
+            "observed_until_ns": now_ns
+            - int((monitor.STRENGTH_REPORT_ERROR_SECONDS + 1) * 1e9),
+            "autonomous_elo": {
+                "headline": {"source": "aggregate", "rating": 100.0},
+                "headline_elo": 100.0,
+                "aggregate": {
+                    "statistical_role": "descriptive_only",
+                    "adoption_ranking_authorized": False,
+                },
+            },
+        },
+    )
+    _healthy_dependencies(monkeypatch)
+
+    snapshot: Any = monitor.collect_snapshot(root, now_ns=now_ns)
+
+    warning = next(
+        item for item in snapshot["warnings"] if item["code"] == "strength_report_stale"
+    )
+    assert warning["severity"] == "ERROR"
+    assert snapshot["strength_efficiency"]["statistical_role"] == "descriptive_only"
+    assert snapshot["strength_efficiency"]["adoption_ranking_authorized"] is False
+
+
+def test_strength_report_requires_exact_run_root_and_allows_small_clock_skew(
+    tmp_path,
+) -> None:
+    now_ns = 20_000_000_000
+    root = _fixture(tmp_path, now_ns=now_ns)
+    report = {
+        "report": "startrain-strength-efficiency",
+        "schema_version": 1,
+        "status": "complete",
+        "run_id": "monitor-run",
+        "generation_family": "monitor-family",
+        "run_root": str(root),
+        "started_ns": now_ns - 1_000_000_000,
+        "observed_until_ns": now_ns + 1_000_000_000,
+        "autonomous_elo": {},
+    }
+    _write_json(root / "strength-efficiency.json", report)
+
+    accepted = monitor._strength_efficiency_status(root, now_ns=now_ns)
+    assert accepted["available"] is True
+    assert accepted["age_seconds"] == 0
+
+    report["run_root"] = str(tmp_path / "sibling")
+    _write_json(root / "strength-efficiency.json", report)
+    rejected = monitor._strength_efficiency_status(root, now_ns=now_ns)
+    assert rejected["available"] is False
+    assert rejected["reason"] == "report_contract_invalid"
 
 
 def test_monitor_surfaces_optimizer_ema_and_training_health(

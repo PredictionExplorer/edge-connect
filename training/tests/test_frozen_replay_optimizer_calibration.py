@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
+import subprocess
+import sys
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -22,7 +25,7 @@ from startrain.optim import build_optimizer
 from startrain.replay import ReplaySample, write_replay_shard
 from startrain.runtime import RunIdentity
 from startrain.topology import get_topology
-from startrain.training import build_scheduler
+from startrain.training import build_scheduler, isolated_compile_cache
 
 TRAINING_ROOT = Path(__file__).parents[1]
 RUN_ID = "calibration-run"
@@ -339,3 +342,149 @@ def test_resume_charges_wall_clock_downtime_to_h100_budget(
 
     assert exhausted["status"] == "budget_exhausted"
     assert exhausted["progress"]["completed_steps"] == 1
+
+
+def test_compile_cache_owner_is_contract_bound_and_tamper_evident(
+    tmp_path: Path,
+) -> None:
+    config, champion, replay_root, _manifest, _shard = _fixture(tmp_path)
+    settings = _settings(
+        tmp_path,
+        config,
+        champion,
+        replay_root,
+        dry_run=False,
+    )
+    contract_sha256 = "a" * 64
+
+    with isolated_compile_cache(settings.output_dir) as cache:
+        owner = calibration._bind_compile_cache(
+            settings,
+            cache,
+            contract_sha256,
+        )
+        assert owner["run_contract_sha256"] == contract_sha256
+        marker = cache.root / "cache-owner.json"
+        tampered = json.loads(marker.read_text(encoding="utf-8"))
+        tampered["arm"] = "different"
+        marker.write_text(json.dumps(tampered), encoding="utf-8")
+
+        with pytest.raises(ValueError, match="ownership marker"):
+            calibration._bind_compile_cache(settings, cache, contract_sha256)
+
+
+def test_new_calibration_rejects_unowned_cache_content(tmp_path: Path) -> None:
+    config, champion, replay_root, _manifest, _shard = _fixture(tmp_path)
+    settings = _settings(
+        tmp_path,
+        config,
+        champion,
+        replay_root,
+        dry_run=False,
+    )
+
+    with isolated_compile_cache(settings.output_dir) as cache:
+        (cache.root / "inductor" / "poisoned.bin").write_bytes(b"poison")
+        with pytest.raises(ValueError, match="new calibration cache is not empty"):
+            calibration._validated_state(settings, "b" * 64, cache)
+
+
+def test_runner_rejects_replay_overlap_before_creating_cache(tmp_path: Path) -> None:
+    config, champion, replay_root, _manifest, _shard = _fixture(tmp_path)
+    output = replay_root / "calibration"
+    settings = replace(
+        _settings(
+            tmp_path,
+            config,
+            champion,
+            replay_root,
+            dry_run=False,
+        ),
+        output_dir=output,
+    )
+
+    with pytest.raises(ValueError, match="must not overlap"):
+        calibration.run_calibration(settings)
+    assert not output.exists()
+
+
+def test_owned_compile_cache_is_recursively_revalidated_on_resume(
+    tmp_path: Path,
+) -> None:
+    config, champion, replay_root, _manifest, _shard = _fixture(tmp_path)
+    settings = _settings(
+        tmp_path,
+        config,
+        champion,
+        replay_root,
+        dry_run=False,
+    )
+
+    with isolated_compile_cache(settings.output_dir) as cache:
+        calibration._bind_compile_cache(settings, cache, "c" * 64)
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (cache.root / "inductor" / "unsafe").symlink_to(
+            outside,
+            target_is_directory=True,
+        )
+        with pytest.raises(ValueError, match="contains a symlink"):
+            calibration._bind_compile_cache(settings, cache, "c" * 64)
+
+
+def test_cli_reexecutes_with_cache_bound_before_runner_process(
+    tmp_path: Path,
+) -> None:
+    config, champion, replay_root, _manifest, _shard = _fixture(tmp_path)
+    output = tmp_path / "subprocess-output"
+    read_only_home = tmp_path / "read-only-home"
+    read_only_home.mkdir(mode=0o500)
+    environment = os.environ.copy()
+    environment["HOME"] = str(read_only_home)
+    environment.pop(calibration.PREIMPORT_CACHE_BOOTSTRAP_ENV, None)
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(Path(calibration.__file__).resolve()),
+            "--config",
+            str(config),
+            "--champion",
+            str(champion),
+            "--replay-root",
+            str(replay_root),
+            "--replay-cutoff",
+            "7",
+            "--output-dir",
+            str(output),
+            "--arm",
+            calibration.CONTROL_ARM,
+            "--steps",
+            "2",
+            "--batch-size",
+            "1",
+            "--evaluation-batch-size",
+            "1",
+            "--max-samples",
+            "8",
+            "--holdout-fraction",
+            "0.25",
+            "--seed",
+            "23",
+            "--device",
+            "cpu",
+            "--budget-h100-hours",
+            "0.01",
+            "--checkpoint-interval",
+            "1",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+        timeout=30,
+    )
+
+    assert completed.returncode == 0, completed.stderr or completed.stdout
+    assert (output / "compile-cache" / "v1" / "home").is_dir()
+    assert json.loads(completed.stdout)["status"] == "complete"

@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import sys
 import time
 from collections import defaultdict
 from collections.abc import Iterable, Mapping
@@ -13,6 +14,7 @@ from pathlib import Path
 from typing import cast
 
 from startrain.autonomous_elo import DecisiveMatch, fit_bradley_terry_elo
+from startrain.runtime import atomic_json
 
 SCHEMA_VERSION = 1
 REPORT_NAME = "startrain-strength-efficiency"
@@ -28,6 +30,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--run-root", type=Path, required=True)
     parser.add_argument("--provisioned-gpus", type=int, default=8)
     parser.add_argument("--output", type=Path)
+    parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="suppress the complete report on stdout; errors still use stderr",
+    )
     return parser
 
 
@@ -2046,14 +2053,15 @@ def main(argv: list[str] | None = None) -> int:
                     "error": f"{type(error).__name__}: {error}",
                 },
                 sort_keys=True,
-            )
+            ),
+            file=sys.stderr if arguments.quiet else sys.stdout,
         )
         return 2
     serialized = json.dumps(report, indent=2, sort_keys=True) + "\n"
     if arguments.output is not None:
-        arguments.output.parent.mkdir(parents=True, exist_ok=True)
-        arguments.output.write_text(serialized, encoding="utf-8")
-    print(serialized, end="")
+        atomic_json(arguments.output, report)
+    if not arguments.quiet:
+        print(serialized, end="")
     return 0 if report["status"] == "complete" else 3
 
 

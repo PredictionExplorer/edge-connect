@@ -155,6 +155,12 @@ def _manifest(tmp_path: Path) -> Path:
         "disaster_backup_mount": str(disaster_mount),
         "telemetry_service": "edgeconnect-startrain-primary-monitor.service",
         "telemetry_output": str(primary_root / "status" / "monitor-5s.jsonl"),
+        "telemetry_max_bytes": 50 * 1024 * 1024,
+        "telemetry_retain_files": 7,
+        "report_service": "edgeconnect-startrain-primary-report.service",
+        "report_timer": "edgeconnect-startrain-primary-report.timer",
+        "report_provisioned_gpus": 8,
+        "service_user": "ubuntu",
     }
     pinned = state_root / "continuity-manifest.json"
     _write_json(
@@ -217,6 +223,19 @@ def test_renderer_is_deterministic_and_resolves_all_templates(
     assert (
         b"--interval 5 --format jsonl"
         in first["edgeconnect-startrain-primary-monitor.service"]
+    )
+    assert (
+        b"--telemetry-max-bytes 52428800"
+        in first["edgeconnect-startrain-primary-monitor.service"]
+    )
+    assert (
+        b"--telemetry-retain-files 7"
+        in first["edgeconnect-startrain-primary-monitor.service"]
+    )
+    assert b"--quiet" in first["edgeconnect-startrain-primary-report.service"]
+    assert (
+        b"Unit=edgeconnect-startrain-primary-report.service"
+        in first["edgeconnect-startrain-primary-report.timer"]
     )
     assert (
         b"Unit=edgeconnect-startrain-primary-backup.service"

@@ -209,11 +209,12 @@ Decision: retain the runtime workload; do not confirm or adopt the 5M cadence
 ```text
 ID: R10-OPTIMIZER-CAL-01
 Phase: 1 — frozen-replay optimizer/clipping calibration
-Status: implementation complete; automatic terminal-boundary execution pending
+Status: v4 failed closed before calibration; v5 cache-isolation repair implemented,
+  immutable release and execution pending
 Hypothesis: a less restrictive clip norm or a further 0.5x effective-LR
   reduction improves held-out policy/value calibration without sacrificing
   learner throughput, then converts to positive pair-valid Elo/hour
-Commit: pending reviewed implementation commit
+Commit: pending cache-isolation implementation commit
 Release: pending immutable release
 Control: exact runtime-effective frozen source profile
 Treatments: clip norm 2; clip norm 5; follow-on 0.5x effective LR
@@ -229,9 +230,13 @@ Statistical gate: strictly positive one-sided held-out composite lower bound;
   pair-valid Elo/hour remains the advancement and adoption authority
 Lambda snapshot verification: `lambda_attached`; a complete snapshot newer than
   verified source release is required before source cutover completes
-Result: pending
-Decision: automatic fallback to runtime control on no winner, tie, invalid
-  evidence, or any cutover failure
+Result: v4 accepted a quiescent step-719537 plateau boundary, then PyTorch
+  Inductor/Triton attempted to write `/root/.triton` inside a read-only home;
+  continuity released the hold and resumed the verified fallback
+Decision: preserve v4 evidence, retire its activators, and deploy a fresh v5
+  policy with per-arm allowlisted compile caches. Automatic fallback to runtime
+  control remains mandatory on no winner, tie, invalid evidence, or any cutover
+  failure
 ```
 
 ## Compute ledger
@@ -268,3 +273,13 @@ example candidate-publication treatment. The completed optimizer, EMA,
 freshness, and clinch screen had no promoted frontier gain, so those arms are
 excluded. Backlog relief is necessary but insufficient: the treatment must also
 pass the standard pair-valid Elo/hour gates.
+
+### 2026-08-31 — Preserve the sandbox and isolate compiled calibration
+
+Decision: do not weaken `ProtectHome`, permit `/root/.triton`, disable
+production-faithful compilation, or reuse failed v4 state. Configure distinct
+arm-owned Inductor/Triton caches under the already allowlisted calibration
+output, require cache/runtime provenance in comparison evidence, retire v4
+activators, and arm a new v5 policy against the current stale promotion digest.
+Keep cadence, 19-lane, learner-sharing, and UTD changes out of this experiment;
+none has positive pair-valid frontier Elo/hour authority.

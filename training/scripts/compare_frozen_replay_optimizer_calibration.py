@@ -8,6 +8,7 @@ import copy
 import hashlib
 import json
 import math
+import os
 import random
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -45,6 +46,40 @@ SCHEMA_VERSION = 1
 MINIMUM_CONTROL_THROUGHPUT_FRACTION = 0.9
 DEFAULT_CONFIDENCE = 0.95
 DEFAULT_BOOTSTRAP_SAMPLES = 10_000
+COMPILE_CACHE_ENVIRONMENT = {
+    "HOME",
+    "TORCHINDUCTOR_CACHE_DIR",
+    "TORCHINDUCTOR_PERSISTENT_AUTOTUNE_DIR",
+    "TRITON_HOME",
+    "TRITON_CACHE_DIR",
+    "TRITON_DUMP_DIR",
+    "TRITON_OVERRIDE_DIR",
+    "XDG_CACHE_HOME",
+    "CUDA_CACHE_PATH",
+}
+UNSAFE_COMPILE_ENVIRONMENT = {
+    "TRITON_CACHE_MANAGER",
+    "TRITON_REMOTE_CACHE_BACKEND",
+    "TORCHINDUCTOR_FX_GRAPH_REMOTE_CACHE",
+    "TORCHINDUCTOR_AUTOTUNE_REMOTE_CACHE",
+    "TORCHINDUCTOR_AUTOGRAD_REMOTE_CACHE",
+    "TORCHINDUCTOR_FORCE_DISABLE_CACHES",
+    "TORCHINDUCTOR_BUNDLED_AUTOTUNE_REMOTE_CACHE",
+    "TORCHINDUCTOR_FX_GRAPH_CACHE",
+    "TORCHINDUCTOR_AUTOGRAD_CACHE",
+    "TORCH_DYNAMO_AUTOMATIC_DYNAMIC_LOCAL_PGO",
+    "TORCH_DYNAMO_AUTOMATIC_DYNAMIC_REMOTE_PGO",
+    "TORCH_COMPILE_JOB_ID",
+    "TORCH_COMPILE_FORCE_DISABLE_CACHES",
+    "CUDA_CACHE_DISABLE",
+}
+COMPILE_CONTROL_PREFIXES = {
+    "TORCHINDUCTOR_",
+    "TORCH_COMPILE_",
+    "TORCH_DYNAMO_",
+    "TRITON_",
+    "CUDA_CACHE_",
+}
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -147,12 +182,162 @@ def _arm(payload: Mapping[str, object]) -> str:
     return value
 
 
+def _verify_compile_cache_tree(root: Path) -> None:
+    for directory, names, filenames in os.walk(root, followlinks=False):
+        parent = Path(directory)
+        for name in names:
+            path = parent / name
+            if path.is_symlink():
+                raise ValueError(
+                    f"compiled calibration cache contains a symlink: {path}"
+                )
+        for name in filenames:
+            path = parent / name
+            if path.is_symlink() or not path.is_file():
+                raise ValueError(
+                    f"compiled calibration cache contains an unsafe file: {path}"
+                )
+
+
+def _compile_cache(payload: Mapping[str, object]) -> dict[str, object] | None:
+    device = _mapping(payload.get("device"), "device")
+    raw = device.get("compile_cache")
+    if device.get("compile") is not True:
+        raise ValueError("optimizer calibration must use CUDA compilation")
+    cache = _mapping(raw, "compiled calibration cache")
+    if (
+        cache.get("schema_version") != 1
+        or cache.get("layout") != "startrain-isolated-compile-cache-v1"
+    ):
+        raise ValueError("compiled calibration cache schema is invalid")
+    raw_root = cache.get("root")
+    if not isinstance(raw_root, str):
+        raise ValueError("compiled calibration cache root is missing")
+    try:
+        root = Path(raw_root).resolve(strict=True)
+    except OSError as error:
+        raise ValueError("compiled calibration cache root is unavailable") from error
+    if not Path(raw_root).is_absolute() or raw_root != str(root):
+        raise ValueError("compiled calibration cache root is not canonical")
+    _verify_compile_cache_tree(root)
+    owner_marker = cache.get("owner_marker")
+    if owner_marker != str(root / "cache-owner.json"):
+        raise ValueError("compiled calibration cache owner marker is invalid")
+    required_unset = cache.get("required_unset_environment")
+    if (
+        not isinstance(required_unset, list)
+        or set(required_unset) != UNSAFE_COMPILE_ENVIRONMENT
+    ):
+        raise ValueError("compiled calibration unsafe environment policy changed")
+    rejected_prefixes = cache.get("rejected_environment_prefixes")
+    if (
+        not isinstance(rejected_prefixes, list)
+        or set(rejected_prefixes) != COMPILE_CONTROL_PREFIXES
+    ):
+        raise ValueError("compiled calibration environment prefix policy changed")
+    environment = _mapping(
+        cache.get("environment"),
+        "compiled calibration cache environment",
+    )
+    if set(environment) != COMPILE_CACHE_ENVIRONMENT:
+        raise ValueError("compiled calibration cache environment is incomplete")
+    for name, raw_path in environment.items():
+        if not isinstance(raw_path, str):
+            raise ValueError(f"compiled calibration cache {name} is not a path")
+        try:
+            path = Path(raw_path).resolve(strict=True)
+        except OSError as error:
+            raise ValueError(
+                f"compiled calibration cache {name} is unavailable"
+            ) from error
+        if (
+            not Path(raw_path).is_absolute()
+            or raw_path != str(path)
+            or (path != root and root not in path.parents)
+        ):
+            raise ValueError(f"compiled calibration cache {name} escaped its root")
+    runtime = _mapping(cache.get("runtime"), "compiled calibration cache runtime")
+    for name in ("python_version", "torch_version", "triton_version"):
+        if not isinstance(runtime.get(name), str) or not runtime.get(name):
+            raise ValueError(f"compiled calibration cache runtime {name} is missing")
+    cuda = runtime.get("cuda_runtime_version")
+    if cuda is not None and (not isinstance(cuda, str) or not cuda):
+        raise ValueError("compiled calibration CUDA runtime version is invalid")
+    marker_path = Path(str(owner_marker))
+    if marker_path.is_symlink() or not marker_path.is_file():
+        raise ValueError("compiled calibration cache owner marker is unavailable")
+    try:
+        marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(
+            "compiled calibration cache owner marker is unreadable"
+        ) from error
+    expected_marker = {
+        "format": "startrain.compile-cache-owner",
+        "schema_version": 1,
+        "layout": "startrain-isolated-compile-cache-v1",
+        "arm": payload.get("arm"),
+        "run_contract_sha256": payload.get("run_contract_sha256"),
+        "root": str(root),
+        "environment": dict(sorted(environment.items())),
+        "runtime": dict(sorted(runtime.items())),
+    }
+    if marker != expected_marker:
+        raise ValueError("compiled calibration cache owner marker changed")
+    return {
+        "schema_version": cache["schema_version"],
+        "layout": cache["layout"],
+        "root": str(root),
+        "runtime": dict(runtime),
+    }
+
+
+def _cuda_h100_device(
+    payload: Mapping[str, object],
+    *,
+    compile_cache: Mapping[str, object],
+) -> dict[str, object]:
+    device = _mapping(payload.get("device"), "device")
+    expected_bootstrap = hashlib.sha256(
+        str(compile_cache["root"]).encode("utf-8")
+    ).hexdigest()
+    if (
+        device.get("compile") is not True
+        or not str(device.get("requested", "")).startswith("cuda")
+        or not str(device.get("resolved", "")).startswith("cuda")
+        or device.get("preimport_compile_cache_bootstrap") != expected_bootstrap
+    ):
+        raise ValueError("optimizer calibration must use a compiled CUDA device")
+    hardware = _mapping(device.get("hardware"), "CUDA hardware identity")
+    capability = hardware.get("compute_capability")
+    total_memory = hardware.get("total_memory_bytes")
+    if (
+        "H100" not in str(hardware.get("name", ""))
+        or "H100" not in str(hardware.get("nvidia_smi_name", ""))
+        or not isinstance(hardware.get("uuid"), str)
+        or not str(hardware["uuid"]).startswith("GPU-")
+        or capability != [9, 0]
+        or type(hardware.get("logical_index")) is not int
+        or type(hardware.get("physical_index")) is not int
+        or isinstance(total_memory, bool)
+        or not isinstance(total_memory, int)
+        or total_memory <= 0
+        or not isinstance(hardware.get("driver_version"), str)
+        or not hardware["driver_version"]
+    ):
+        raise ValueError("optimizer calibration requires a complete H100 identity")
+    return dict(hardware)
+
+
 def _common_projection(payload: Mapping[str, object]) -> dict[str, object]:
     champion = _mapping(payload.get("champion"), "champion")
     replay = _mapping(payload.get("replay"), "replay")
     partition = _mapping(payload.get("partition"), "partition")
     training = _mapping(payload.get("training"), "training")
     device = _mapping(payload.get("device"), "device")
+    cache = _compile_cache(payload)
+    assert cache is not None
+    hardware = _cuda_h100_device(payload, compile_cache=cache)
     return {
         "champion": champion,
         "replay": {
@@ -197,6 +382,16 @@ def _common_projection(payload: Mapping[str, object]) -> dict[str, object]:
                 key: device.get(key)
                 for key in ("requested", "resolved", "precision", "compile")
             },
+            "hardware": hardware,
+            "compile_cache_runtime": (
+                {
+                    "schema_version": cache["schema_version"],
+                    "layout": cache["layout"],
+                    "runtime": cache["runtime"],
+                }
+                if cache is not None
+                else None
+            ),
         },
     }
 
@@ -488,10 +683,25 @@ def compare_results(
         raise ValueError(
             "comparison requires the complete frozen optimizer calibration suite"
         )
+    compile_caches = {arm: _compile_cache(payload) for arm, payload in payloads.items()}
+    cache_roots = [
+        Path(str(cache["root"]))
+        for cache in compile_caches.values()
+        if cache is not None
+    ]
+    for index, left in enumerate(cache_roots):
+        for right in cache_roots[index + 1 :]:
+            if left == right or left in right.parents or right in left.parents:
+                raise ValueError(
+                    "compiled calibration cache roots must be distinct and disjoint"
+                )
     control = payloads[CONTROL_ARM]
     treatment_count = len(expected) - 1
     per_treatment_confidence = 1.0 - (1.0 - confidence) / treatment_count
     common = _common_projection(control)
+    suite_common_parity = all(
+        _common_projection(payload) == common for payload in payloads.values()
+    )
     common_sha256 = _digest(common)
     control_contract = _mapping(
         control.get("config_contract"),
@@ -510,7 +720,7 @@ def compare_results(
     eligible: list[tuple[str, float]] = []
     for arm in RING10_OPTIMIZER_CALIBRATION_TREATMENTS:
         payload = payloads[arm]
-        common_parity = _common_projection(payload) == common
+        common_parity = suite_common_parity and _common_projection(payload) == common
         actual_contract = _mapping(payload.get("config_contract"), "config contract")
         one_factor = dict(actual_contract) == _expected_config_contract(
             control_contract,
@@ -622,6 +832,7 @@ def compare_results(
         "input_results": pins,
         "common_contract": {
             "sha256": common_sha256,
+            "suite_common_parity": suite_common_parity,
             "source_champion_manifest_sha256": _mapping(
                 _mapping(common["champion"], "common champion").get("manifest"),
                 "common champion manifest",
@@ -652,6 +863,7 @@ def compare_results(
             "bootstrap_samples": bootstrap_samples,
             "strict_positive_heldout_lower_bound_required": True,
             "clip_reduction_is_diagnostic_only": True,
+            "isolated_compile_cache_required": True,
             "ties_and_no_winner_fall_back_to_control": True,
         },
         "control_valid": control_valid,

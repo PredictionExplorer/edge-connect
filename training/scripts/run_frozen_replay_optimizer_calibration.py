@@ -7,7 +7,10 @@ import argparse
 import hashlib
 import json
 import math
+import os
 import sqlite3
+import subprocess
+import sys
 import time
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
@@ -55,7 +58,14 @@ from startrain.replay import (
 from startrain.replay_store import MANIFEST_SCHEMA_VERSION
 from startrain.runtime import atomic_json
 from startrain.symmetry import deterministic_transform
-from startrain.training import build_scheduler, maybe_compile_model, train_step
+from startrain.training import (
+    CompileCacheProvenance,
+    build_scheduler,
+    configure_isolated_compile_cache,
+    isolated_compile_cache,
+    maybe_compile_model,
+    train_step,
+)
 
 if __package__:
     from .prepare_elo_ablation import (
@@ -74,6 +84,7 @@ STATE_FORMAT = "startrain.frozen-replay-optimizer-calibration-state"
 MAX_H100_HOURS_PER_ARM = 2.0
 CONTROL_ARM = "ring10-optimizer-runtime-effective-control"
 FOLLOW_ON_ARM = "ring10-optimizer-0.5x-effective-lr"
+PREIMPORT_CACHE_BOOTSTRAP_ENV = "STARTRAIN_COMPILE_CACHE_BOOTSTRAP"
 
 
 @dataclass(frozen=True, slots=True)
@@ -237,7 +248,7 @@ def _settings(arguments: argparse.Namespace) -> CalibrationSettings:
         champion=arguments.champion.expanduser().resolve(),
         replay_root=arguments.replay_root.expanduser().resolve(),
         replay_cutoff=arguments.replay_cutoff,
-        output_dir=arguments.output_dir.expanduser().resolve(),
+        output_dir=Path(os.path.abspath(arguments.output_dir.expanduser())),
         arm=arguments.arm,
         steps=arguments.steps,
         batch_size=arguments.batch_size,
@@ -264,6 +275,52 @@ def _canonical(value: object) -> bytes:
 
 def _digest(value: object) -> str:
     return hashlib.sha256(_canonical(value)).hexdigest()
+
+
+def _compile_cache_bootstrap_token(output_dir: Path) -> str:
+    cache_root = output_dir.resolve(strict=False) / "compile-cache" / "v1"
+    return hashlib.sha256(str(cache_root).encode("utf-8")).hexdigest()
+
+
+def _ensure_preimport_compile_cache(
+    settings: CalibrationSettings,
+    *,
+    argv: Sequence[str],
+) -> None:
+    token = _compile_cache_bootstrap_token(settings.output_dir)
+    observed = os.environ.get(PREIMPORT_CACHE_BOOTSTRAP_ENV)
+    if observed is None:
+        configure_isolated_compile_cache(settings.output_dir)
+        environment = os.environ.copy()
+        environment[PREIMPORT_CACHE_BOOTSTRAP_ENV] = token
+        os.execve(
+            sys.executable,
+            [
+                sys.executable,
+                str(Path(__file__).resolve()),
+                *argv,
+            ],
+            environment,
+        )
+    if observed != token:
+        raise ValueError("compile-cache bootstrap token does not match the arm output")
+    before = {
+        name: os.environ.get(name)
+        for name in (
+            "HOME",
+            "TORCHINDUCTOR_CACHE_DIR",
+            "TORCHINDUCTOR_PERSISTENT_AUTOTUNE_DIR",
+            "TRITON_HOME",
+            "TRITON_CACHE_DIR",
+            "TRITON_DUMP_DIR",
+            "TRITON_OVERRIDE_DIR",
+            "XDG_CACHE_HOME",
+            "CUDA_CACHE_PATH",
+        )
+    }
+    provenance = configure_isolated_compile_cache(settings.output_dir)
+    if before != provenance.environment:
+        raise ValueError("compile-cache environment was not bound before Torch import")
 
 
 def _pin(path: Path) -> ArtifactPin:
@@ -326,8 +383,11 @@ def validate_settings(settings: CalibrationSettings) -> None:
         raise ValueError("checkpoint interval must be positive")
     if settings.stop_after_steps is not None and settings.stop_after_steps <= 0:
         raise ValueError("stop-after-steps must be positive")
-    if _inside(settings.output_dir, settings.replay_root):
-        raise ValueError("output directory cannot be inside source replay")
+    if _inside(settings.output_dir, settings.replay_root) or _inside(
+        settings.replay_root,
+        settings.output_dir,
+    ):
+        raise ValueError("output directory and source replay must not overlap")
     if settings.output_dir == settings.replay_root:
         raise ValueError("output directory cannot replace source replay")
 
@@ -654,6 +714,67 @@ def _config_contract(config: ExperimentConfig) -> dict[str, object]:
     }
 
 
+def _device_contract(
+    *,
+    requested: str,
+    device: torch.device,
+    precision: str,
+    compile_enabled: bool,
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "requested": requested,
+        "resolved": str(device),
+        "precision": precision,
+        "compile": compile_enabled,
+    }
+    if device.type != "cuda":
+        return payload
+    logical_index = (
+        device.index if device.index is not None else torch.cuda.current_device()
+    )
+    properties = torch.cuda.get_device_properties(logical_index)
+    uuid = str(getattr(properties, "uuid", ""))
+    if not uuid:
+        raise ValueError("CUDA device UUID is unavailable")
+    try:
+        completed = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=index,uuid,name,driver_version",
+                "--format=csv,noheader,nounits",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise ValueError(f"cannot query CUDA driver identity: {error}") from error
+    if completed.returncode != 0:
+        detail = completed.stderr.strip() or f"exit {completed.returncode}"
+        raise ValueError(f"cannot query CUDA driver identity: {detail}")
+    normalized_uuid = uuid.removeprefix("GPU-")
+    physical = None
+    for line in completed.stdout.splitlines():
+        fields = [field.strip() for field in line.split(",", 3)]
+        if len(fields) == 4 and fields[1].removeprefix("GPU-") == normalized_uuid:
+            physical = fields
+            break
+    if physical is None:
+        raise ValueError("CUDA device UUID is absent from nvidia-smi")
+    payload["hardware"] = {
+        "logical_index": logical_index,
+        "physical_index": int(physical[0]),
+        "uuid": f"GPU-{normalized_uuid}",
+        "name": properties.name,
+        "nvidia_smi_name": physical[2],
+        "compute_capability": [properties.major, properties.minor],
+        "total_memory_bytes": properties.total_memory,
+        "driver_version": physical[3],
+    }
+    return payload
+
+
 def _run_contract(
     settings: CalibrationSettings,
     config: ExperimentConfig,
@@ -662,6 +783,8 @@ def _run_contract(
     replay: FrozenReplay,
     *,
     batch_size: int,
+    compile_cache: CompileCacheProvenance | None,
+    device: Mapping[str, object],
 ) -> dict[str, object]:
     selected_shards = {
         reference.shard.shard_id: reference.shard
@@ -675,6 +798,7 @@ def _run_contract(
         "phase": "follow_on" if settings.arm == FOLLOW_ON_ARM else "primary",
         "config": config_pin.as_dict(),
         "config_contract": _config_contract(config),
+        "device": dict(device),
         "champion": champion.as_dict(),
         "replay": {
             "root": str(settings.replay_root),
@@ -707,6 +831,9 @@ def _run_contract(
             "fresh_optimizer": True,
             "fresh_scheduler": True,
             "initial_weights": "champion_ema",
+            "compile_cache": (
+                compile_cache.as_dict() if compile_cache is not None else None
+            ),
         },
         "evaluation": {
             "batch_size": settings.evaluation_batch_size,
@@ -735,7 +862,53 @@ def _load_json(path: Path) -> dict[str, object]:
     return loaded
 
 
-def _new_state(contract_sha256: str) -> dict[str, object]:
+def _compile_cache_files(root: Path) -> list[Path]:
+    files: list[Path] = []
+    for directory, names, filenames in os.walk(root, followlinks=False):
+        parent = Path(directory)
+        for name in names:
+            path = parent / name
+            if path.is_symlink():
+                raise ValueError(f"compile cache contains a symlink: {path}")
+        for name in filenames:
+            path = parent / name
+            if path.is_symlink() or not path.is_file():
+                raise ValueError(f"compile cache contains an unsafe file: {path}")
+            files.append(path)
+    return sorted(files)
+
+
+def _bind_compile_cache(
+    settings: CalibrationSettings,
+    compile_cache: CompileCacheProvenance,
+    contract_sha256: str,
+) -> dict[str, object]:
+    marker = compile_cache.root / "cache-owner.json"
+    expected = {
+        "format": "startrain.compile-cache-owner",
+        "schema_version": 1,
+        "layout": "startrain-isolated-compile-cache-v1",
+        "arm": settings.arm,
+        "run_contract_sha256": contract_sha256,
+        "root": str(compile_cache.root),
+        "environment": dict(sorted(compile_cache.environment.items())),
+        "runtime": dict(sorted(compile_cache.runtime.items())),
+    }
+    existing = _compile_cache_files(compile_cache.root)
+    if marker.exists():
+        if marker.is_symlink() or _load_json(marker) != expected:
+            raise ValueError("compile cache ownership marker is incompatible")
+        return expected
+    if existing:
+        raise ValueError("compile cache has content without an ownership marker")
+    atomic_json(marker, expected)
+    return expected
+
+
+def _new_state(
+    contract_sha256: str,
+    compile_cache: CompileCacheProvenance | None,
+) -> dict[str, object]:
     return {
         "format": STATE_FORMAT,
         "schema_version": SCHEMA_VERSION,
@@ -753,20 +926,31 @@ def _new_state(contract_sha256: str) -> dict[str, object]:
         "nonfinite_gradient_count": 0,
         "checkpoint": None,
         "first_step_optimizer_diagnostics": [],
+        "compile_cache": (
+            compile_cache.as_dict() if compile_cache is not None else None
+        ),
     }
 
 
 def _validated_state(
     settings: CalibrationSettings,
     contract_sha256: str,
+    compile_cache: CompileCacheProvenance | None,
 ) -> dict[str, object]:
     state_path = _state_path(settings)
     plan_path = _plan_path(settings)
     if not state_path.exists():
-        if settings.output_dir.exists() and any(settings.output_dir.iterdir()):
+        existing = (
+            {path.name for path in settings.output_dir.iterdir()}
+            if settings.output_dir.exists()
+            else set()
+        )
+        if existing - {"compile-cache"}:
             raise ValueError("output directory is non-empty but has no resumable state")
+        if compile_cache is not None and _compile_cache_files(compile_cache.root):
+            raise ValueError("new calibration cache is not empty")
         settings.output_dir.mkdir(parents=True, exist_ok=True)
-        return _new_state(contract_sha256)
+        return _new_state(contract_sha256, compile_cache)
     if not plan_path.is_file():
         raise ValueError("resumable calibration state has no frozen run plan")
     state = _load_json(state_path)
@@ -776,6 +960,8 @@ def _validated_state(
         or state.get("schema_version") != SCHEMA_VERSION
         or state.get("run_contract_sha256") != contract_sha256
         or plan.get("semantic_sha256") != contract_sha256
+        or state.get("compile_cache")
+        != (compile_cache.as_dict() if compile_cache is not None else None)
     ):
         raise ValueError("resumable calibration state differs from requested run")
     return state
@@ -1146,6 +1332,31 @@ def _plan_payload(
 
 
 def run_calibration(settings: CalibrationSettings) -> dict[str, object]:
+    """Run one arm with a private compile cache when CUDA compilation is active."""
+
+    validate_settings(settings)
+    config = load_config(settings.config)
+    requested_device = settings.device or config.learner.device
+    device = torch.device(resolve_device_string(requested_device))
+    compile_enabled = bool(config.train.compile) if device.type == "cuda" else False
+    if compile_enabled and (
+        os.environ.get(PREIMPORT_CACHE_BOOTSTRAP_ENV)
+        != _compile_cache_bootstrap_token(settings.output_dir)
+    ):
+        raise ValueError(
+            "compiled calibration must start through the pre-import cache bootstrap"
+        )
+    if settings.dry_run or not compile_enabled:
+        return _run_calibration(settings, compile_cache=None)
+    with isolated_compile_cache(settings.output_dir) as compile_cache:
+        return _run_calibration(settings, compile_cache=compile_cache)
+
+
+def _run_calibration(
+    settings: CalibrationSettings,
+    *,
+    compile_cache: CompileCacheProvenance | None,
+) -> dict[str, object]:
     validate_settings(settings)
     config_pin = _pin(settings.config)
     config = load_config(settings.config)
@@ -1154,6 +1365,35 @@ def run_calibration(settings: CalibrationSettings) -> dict[str, object]:
     batch_size = settings.batch_size or config.train.per_rank_batch_size
     champion = _champion_pin(settings.champion, config)
     replay = freeze_replay(settings, champion, decode=not settings.dry_run)
+    requested_device = settings.device or config.learner.device
+    device = torch.device(resolve_device_string(requested_device))
+    precision = resolve_precision(config.train.precision, device)
+    compile_enabled = bool(config.train.compile) if device.type == "cuda" else False
+    if compile_enabled != (compile_cache is not None):
+        if not settings.dry_run:
+            raise ValueError(
+                "compile-cache configuration disagrees with CUDA compilation"
+            )
+    device_evidence = (
+        {
+            "requested": requested_device,
+            "resolved": str(device),
+            "precision": precision,
+            "compile": compile_enabled,
+            "dry_run_non_authoritative": True,
+        }
+        if settings.dry_run
+        else _device_contract(
+            requested=requested_device,
+            device=device,
+            precision=precision,
+            compile_enabled=compile_enabled,
+        )
+    )
+    if compile_enabled and not settings.dry_run:
+        device_evidence["preimport_compile_cache_bootstrap"] = (
+            _compile_cache_bootstrap_token(settings.output_dir)
+        )
     contract = _run_contract(
         settings,
         config,
@@ -1161,6 +1401,8 @@ def run_calibration(settings: CalibrationSettings) -> dict[str, object]:
         champion,
         replay,
         batch_size=batch_size,
+        compile_cache=compile_cache,
+        device=device_evidence,
     )
     contract_sha256 = _digest(contract)
     plan = _plan_payload(
@@ -1171,10 +1413,16 @@ def run_calibration(settings: CalibrationSettings) -> dict[str, object]:
     if settings.dry_run:
         return plan
 
-    state = _validated_state(settings, contract_sha256)
+    state = _validated_state(settings, contract_sha256, compile_cache)
     plan_path = _plan_path(settings)
     if not plan_path.exists():
         atomic_json(plan_path, plan)
+        atomic_json(_state_path(settings), state)
+    if compile_cache is not None:
+        owner = _bind_compile_cache(settings, compile_cache, contract_sha256)
+        if state.get("compile_cache_owner") not in (None, owner):
+            raise ValueError("calibration state compile-cache owner changed")
+        state["compile_cache_owner"] = owner
         atomic_json(_state_path(settings), state)
     if state.get("status") == "complete":
         result_path = settings.output_dir / "result.json"
@@ -1182,10 +1430,6 @@ def run_calibration(settings: CalibrationSettings) -> dict[str, object]:
             raise ValueError("complete calibration state has no result artifact")
         return _load_json(result_path)
 
-    requested_device = settings.device or config.learner.device
-    device = torch.device(resolve_device_string(requested_device))
-    precision = resolve_precision(config.train.precision, device)
-    compile_enabled = bool(config.train.compile) if device.type == "cuda" else False
     enable_fast_math(device)
     (
         model,
@@ -1369,10 +1613,10 @@ def run_calibration(settings: CalibrationSettings) -> dict[str, object]:
         **plan,
         "status": "complete",
         "device": {
-            "requested": requested_device,
-            "resolved": str(device),
-            "precision": precision,
-            "compile": compile_enabled,
+            **device_evidence,
+            "compile_cache": (
+                compile_cache.as_dict() if compile_cache is not None else None
+            ),
         },
         "optimizer": {
             "fresh_from_champion_ema": True,
@@ -1430,8 +1674,15 @@ def _error_payload(error: BaseException) -> dict[str, object]:
 
 
 def main(argv: list[str] | None = None) -> int:
-    settings = _settings(_parser().parse_args(argv))
+    cli_arguments = list(sys.argv[1:] if argv is None else argv)
+    settings = _settings(_parser().parse_args(cli_arguments))
     try:
+        validate_settings(settings)
+        if not settings.dry_run:
+            _ensure_preimport_compile_cache(
+                settings,
+                argv=cli_arguments,
+            )
         result = run_calibration(settings)
     except (
         FloatingPointError,

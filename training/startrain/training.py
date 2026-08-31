@@ -2,9 +2,15 @@
 
 from __future__ import annotations
 
+import importlib.metadata
 import math
+import os
+import platform
+import time
 from collections.abc import Iterable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, cast
 
 import torch
@@ -24,6 +30,42 @@ from .optim import (
 )
 from .replay import ReplayBatch
 
+COMPILE_CACHE_SCHEMA_VERSION = 1
+_COMPILE_CACHE_ENVIRONMENT = (
+    "HOME",
+    "TORCHINDUCTOR_CACHE_DIR",
+    "TORCHINDUCTOR_PERSISTENT_AUTOTUNE_DIR",
+    "TRITON_HOME",
+    "TRITON_CACHE_DIR",
+    "TRITON_DUMP_DIR",
+    "TRITON_OVERRIDE_DIR",
+    "XDG_CACHE_HOME",
+    "CUDA_CACHE_PATH",
+)
+_UNSAFE_COMPILE_ENVIRONMENT = (
+    "TRITON_CACHE_MANAGER",
+    "TRITON_REMOTE_CACHE_BACKEND",
+    "TORCHINDUCTOR_FX_GRAPH_REMOTE_CACHE",
+    "TORCHINDUCTOR_AUTOTUNE_REMOTE_CACHE",
+    "TORCHINDUCTOR_AUTOGRAD_REMOTE_CACHE",
+    "TORCHINDUCTOR_FORCE_DISABLE_CACHES",
+    "TORCHINDUCTOR_BUNDLED_AUTOTUNE_REMOTE_CACHE",
+    "TORCHINDUCTOR_FX_GRAPH_CACHE",
+    "TORCHINDUCTOR_AUTOGRAD_CACHE",
+    "TORCH_DYNAMO_AUTOMATIC_DYNAMIC_LOCAL_PGO",
+    "TORCH_DYNAMO_AUTOMATIC_DYNAMIC_REMOTE_PGO",
+    "TORCH_COMPILE_JOB_ID",
+    "TORCH_COMPILE_FORCE_DISABLE_CACHES",
+    "CUDA_CACHE_DISABLE",
+)
+_COMPILE_CONTROL_PREFIXES = (
+    "TORCHINDUCTOR_",
+    "TORCH_COMPILE_",
+    "TORCH_DYNAMO_",
+    "TRITON_",
+    "CUDA_CACHE_",
+)
+
 
 class NonFiniteTrainingError(FloatingPointError):
     """Fatal non-finite step carrying counters for durable reporting."""
@@ -39,6 +81,140 @@ class NonFiniteTrainingError(FloatingPointError):
         )
         self.nonfinite_loss_count = nonfinite_loss_count
         self.nonfinite_gradient_count = nonfinite_gradient_count
+
+
+@dataclass(frozen=True, slots=True)
+class CompileCacheProvenance:
+    """Pinned, per-invocation compile-cache identity."""
+
+    root: Path
+    environment: dict[str, str]
+    runtime: dict[str, str | None]
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "schema_version": COMPILE_CACHE_SCHEMA_VERSION,
+            "layout": "startrain-isolated-compile-cache-v1",
+            "root": str(self.root),
+            "owner_marker": str(self.root / "cache-owner.json"),
+            "environment": dict(sorted(self.environment.items())),
+            "required_unset_environment": list(_UNSAFE_COMPILE_ENVIRONMENT),
+            "rejected_environment_prefixes": list(_COMPILE_CONTROL_PREFIXES),
+            "runtime": dict(sorted(self.runtime.items())),
+        }
+
+
+def _secure_cache_directory(path: Path) -> None:
+    if path.exists() and (path.is_symlink() or not path.is_dir()):
+        raise ValueError(f"compile cache path is not a regular directory: {path}")
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if path.is_symlink() or not path.is_dir():
+        raise ValueError(f"compile cache path became unsafe: {path}")
+    path.chmod(0o700)
+
+
+def _reject_symlink_components(path: Path) -> None:
+    absolute = path.absolute()
+    for component in (absolute, *absolute.parents):
+        if component.is_symlink():
+            raise ValueError(f"compile cache path contains a symlink: {component}")
+
+
+def configure_isolated_compile_cache(
+    output_dir: str | Path,
+) -> CompileCacheProvenance:
+    """Configure writable Inductor/Triton caches below one arm output."""
+
+    source = Path(output_dir).expanduser()
+    _reject_symlink_components(source)
+    inherited = {
+        name: value
+        for name, value in os.environ.items()
+        if value
+        and name not in _COMPILE_CACHE_ENVIRONMENT
+        and (
+            name in _UNSAFE_COMPILE_ENVIRONMENT
+            or name.startswith(_COMPILE_CONTROL_PREFIXES)
+        )
+    }
+    if inherited:
+        raise ValueError(
+            "unsupported inherited compiler controls: " + ", ".join(sorted(inherited))
+        )
+    output = source.resolve(strict=False)
+    cache_root = output / "compile-cache" / f"v{COMPILE_CACHE_SCHEMA_VERSION}"
+    try:
+        cache_root.relative_to(output)
+    except ValueError as error:  # pragma: no cover - defensive path invariant
+        raise ValueError("compile cache escaped its arm output") from error
+
+    directories = {
+        "HOME": cache_root / "home",
+        "TORCHINDUCTOR_CACHE_DIR": cache_root / "inductor",
+        "TORCHINDUCTOR_PERSISTENT_AUTOTUNE_DIR": cache_root / "inductor-autotune",
+        "TRITON_HOME": cache_root / "triton-home",
+        "TRITON_CACHE_DIR": cache_root / "triton",
+        "TRITON_DUMP_DIR": cache_root / "triton-dump",
+        "TRITON_OVERRIDE_DIR": cache_root / "triton-override",
+        "XDG_CACHE_HOME": cache_root / "xdg",
+        "CUDA_CACHE_PATH": cache_root / "cuda",
+    }
+    for path in (output, output / "compile-cache", cache_root, *directories.values()):
+        _secure_cache_directory(path)
+
+    sentinel = cache_root / f".write-test-{os.getpid()}-{time.time_ns()}"
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(
+            sentinel,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
+        os.write(descriptor, b"startrain-compile-cache-v1\n")
+        os.fsync(descriptor)
+    except OSError as error:
+        raise ValueError(
+            f"compile cache is not writable: {cache_root}: {error}"
+        ) from error
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        sentinel.unlink(missing_ok=True)
+
+    environment = {name: str(path) for name, path in directories.items()}
+    os.environ.update(environment)
+    try:
+        triton_version = importlib.metadata.version("triton")
+    except importlib.metadata.PackageNotFoundError:
+        triton_version = None
+    return CompileCacheProvenance(
+        root=cache_root,
+        environment=environment,
+        runtime={
+            "python_version": platform.python_version(),
+            "torch_version": str(torch.__version__),
+            "cuda_runtime_version": torch.version.cuda,
+            "triton_version": triton_version,
+        },
+    )
+
+
+@contextmanager
+def isolated_compile_cache(
+    output_dir: str | Path,
+) -> Iterator[CompileCacheProvenance]:
+    """Temporarily bind all compile caches to one arm-owned directory."""
+
+    previous = {name: os.environ.get(name) for name in _COMPILE_CACHE_ENVIRONMENT}
+    try:
+        provenance = configure_isolated_compile_cache(output_dir)
+        yield provenance
+    finally:
+        for name, value in previous.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
 
 
 @dataclass(frozen=True, slots=True)

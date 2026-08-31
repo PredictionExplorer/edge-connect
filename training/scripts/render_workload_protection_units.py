@@ -152,8 +152,26 @@ def rendered_workload_protection_units(
         protection.disaster_backup_timer,
         suffix="-disaster-backup.timer",
     )
-    report_service = f"edgeconnect-startrain-{verification.run_id}-report.service"
-    report_timer = f"edgeconnect-startrain-{verification.run_id}-report.timer"
+    report_service = (
+        protection.report_service
+        or f"edgeconnect-startrain-{verification.run_id}-report.service"
+    )
+    report_timer = (
+        protection.report_timer
+        or f"edgeconnect-startrain-{verification.run_id}-report.timer"
+    )
+    if (
+        protection.report_provisioned_gpus is not None
+        and protection.report_provisioned_gpus != provisioned_gpus
+    ):
+        raise RenderProtectionError(
+            "rendered report GPU count differs from the pinned workload protection"
+        )
+    if protection.service_user is not None and protection.service_user != user:
+        raise RenderProtectionError(
+            "rendered service user differs from the pinned workload protection"
+        )
+    report_owner = _owner(report_service, suffix="-report.service")
     rendered = {
         protection.replay_backup_service: _template(
             templates["replay_service"],
@@ -193,7 +211,7 @@ def rendered_workload_protection_units(
         ),
         report_timer: _template(
             templates["report_timer"],
-            {"RUN_ID": verification.run_id},
+            {"RUN_ID": report_owner},
         ),
         protection.telemetry_service: _monitor_unit(
             manifest,
