@@ -209,13 +209,13 @@ Decision: retain the runtime workload; do not confirm or adopt the 5M cadence
 ```text
 ID: R10-OPTIMIZER-CAL-01
 Phase: 1 — frozen-replay optimizer/clipping calibration
-Status: v4 failed closed before calibration; v5 cache-isolation repair implemented,
-  immutable release and execution pending
+Status: v4 failed closed before calibration; v5 staging retired without a
+  boundary after later hardening superseded its release; v6 execution pending
 Hypothesis: a less restrictive clip norm or a further 0.5x effective-LR
   reduction improves held-out policy/value calibration without sacrificing
   learner throughput, then converts to positive pair-valid Elo/hour
-Commit: pending cache-isolation implementation commit
-Release: pending immutable release
+Commit: ead648f plus the current cache/security hardening follow-up
+Release: v5 preserved as no-side-effect waiting evidence; v6 pending
 Control: exact runtime-effective frozen source profile
 Treatments: clip norm 2; clip norm 5; follow-on 0.5x effective LR
 Anchor/replay cutoff: atomically selected from the next quiescent terminal
@@ -233,7 +233,7 @@ Lambda snapshot verification: `lambda_attached`; a complete snapshot newer than
 Result: v4 accepted a quiescent step-719537 plateau boundary, then PyTorch
   Inductor/Triton attempted to write `/root/.triton` inside a read-only home;
   continuity released the hold and resumed the verified fallback
-Decision: preserve v4 evidence, retire its activators, and deploy a fresh v5
+Decision: preserve v4/v5 evidence, retire their activators, and deploy a fresh v6
   policy with per-arm allowlisted compile caches. Automatic fallback to runtime
   control remains mandatory on no winner, tie, invalid evidence, or any cutover
   failure
@@ -279,7 +279,7 @@ pass the standard pair-valid Elo/hour gates.
 Decision: do not weaken `ProtectHome`, permit `/root/.triton`, disable
 production-faithful compilation, or reuse failed v4 state. Configure distinct
 arm-owned Inductor/Triton caches under the already allowlisted calibration
-output, require cache/runtime provenance in comparison evidence, retire v4
-activators, and arm a new v5 policy against the current stale promotion digest.
+output, require cache/runtime provenance in comparison evidence, retire prior
+activators, and arm a new v6 policy against the current stale promotion digest.
 Keep cadence, 19-lane, learner-sharing, and UTD changes out of this experiment;
 none has positive pair-valid frontier Elo/hour authority.
