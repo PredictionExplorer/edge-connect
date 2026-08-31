@@ -209,13 +209,15 @@ Decision: retain the runtime workload; do not confirm or adopt the 5M cadence
 ```text
 ID: R10-OPTIMIZER-CAL-01
 Phase: 1 — frozen-replay optimizer/clipping calibration
-Status: v4 failed closed before calibration; v5 staging retired without a
-  boundary after later hardening superseded its release; v6 execution pending
+Status: v6 deployed and armed; waiting for a strictly newer quiescent terminal
+  while the verified fallback continues training
 Hypothesis: a less restrictive clip norm or a further 0.5x effective-LR
   reduction improves held-out policy/value calibration without sacrificing
   learner throughput, then converts to positive pair-valid Elo/hour
-Commit: ead648f plus the current cache/security hardening follow-up
-Release: v5 preserved as no-side-effect waiting evidence; v6 pending
+Commit: 44fe41dbacc30619f964c175dfd4117ccfce69c4
+Release: main-44fe41d-elo-v6
+Policy: optimizer-auto-lambda-v6, SHA-256
+  06cd535197f80018bd527cd0acd440ae7bf513d0a89c5d628ef85fa7891f6aa3
 Control: exact runtime-effective frozen source profile
 Treatments: clip norm 2; clip norm 5; follow-on 0.5x effective LR
 Anchor/replay cutoff: atomically selected from the next quiescent terminal
@@ -232,11 +234,15 @@ Lambda snapshot verification: `lambda_attached`; a complete snapshot newer than
   verified source release is required before source cutover completes
 Result: v4 accepted a quiescent step-719537 plateau boundary, then PyTorch
   Inductor/Triton attempted to write `/root/.triton` inside a read-only home;
-  continuity released the hold and resumed the verified fallback
-Decision: preserve v4/v5 evidence, retire their activators, and deploy a fresh v6
-  policy with per-arm allowlisted compile caches. Automatic fallback to runtime
-  control remains mandatory on no winner, tie, invalid evidence, or any cutover
-  failure
+  continuity released the hold and resumed the verified fallback. V5 completed
+  only policy pinning/waiting and was retired before any boundary or source
+  mutation when its release was superseded. V6 passed local and Linux suites,
+  sandbox cache-write verification, policy verify/probe, and a side-effect-free
+  waiting run; monitoring and 15-minute strength reports are active
+Decision: preserve v4/v5 evidence, keep their activators retired, and retain the
+  fresh v6 policy with per-arm allowlisted compile caches. Automatic fallback
+  to runtime control remains mandatory on no winner, tie, invalid evidence, or
+  any cutover failure
 ```
 
 ## Compute ledger
