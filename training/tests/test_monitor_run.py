@@ -418,6 +418,59 @@ def test_collect_snapshot_reports_healthy_run(tmp_path, monkeypatch) -> None:
     assert "elo=42.00" in monitor.format_text(snapshot)
 
 
+def test_monitor_warns_about_reduced_and_collapsed_learning_rates(
+    tmp_path, monkeypatch
+) -> None:
+    now_ns = 10_000_000_000
+    root = _fixture(tmp_path, now_ns=now_ns)
+    _healthy_dependencies(monkeypatch)
+    profile = yaml.safe_load((root / "profile.yaml").read_text(encoding="utf-8"))
+    profile["optimizer"] = {"kind": "muon_adamw", "muon_lr": 5e-3, "adamw_lr": 7.5e-5}
+    (root / "profile.yaml").write_text(yaml.safe_dump(profile), encoding="utf-8")
+    metrics_path = root / "learner" / "metrics.jsonl"
+    metric = json.loads(metrics_path.read_text(encoding="utf-8"))
+
+    # A governed learner running below its reference is a warning.
+    metric.update(
+        {
+            "learning_rates": [1.5e-4, 2.25e-6, 2.25e-6],
+            "learning_rate_multiplier": 0.5,
+            "reference_learning_rates": [3e-4, 4.5e-6, 4.5e-6],
+            "scheduler_segment": "cosine",
+        }
+    )
+    metrics_path.write_text(json.dumps(metric) + "\n", encoding="utf-8")
+    snapshot: Any = monitor.collect_snapshot(root, now_ns=now_ns)
+    codes = {warning["code"] for warning in snapshot["warnings"]}
+    assert "learning_rate_reduced" in codes
+    assert "learning_rate_collapsed" not in codes
+    assert snapshot["learner"]["learning_rate_multiplier"] == 0.5
+    assert snapshot["learner"]["reference_learning_rates"] == [3e-4, 4.5e-6, 4.5e-6]
+
+    # A legacy learner whose live rate sits far below the profile schedule has
+    # compounded plateau reductions; that is an error, not a warning.
+    metric.pop("learning_rate_multiplier")
+    metric.pop("reference_learning_rates")
+    metric["learning_rates"] = [1.35e-5, 2e-7, 2e-7]
+    metrics_path.write_text(json.dumps(metric) + "\n", encoding="utf-8")
+    snapshot = monitor.collect_snapshot(root, now_ns=now_ns)
+    collapsed = [
+        warning
+        for warning in snapshot["warnings"]
+        if warning["code"] == "learning_rate_collapsed"
+    ]
+    assert len(collapsed) == 1
+    assert collapsed[0]["severity"] == "ERROR"
+
+    # Warmup legitimately runs below the schedule.
+    metric["scheduler_segment"] = "warmup"
+    metrics_path.write_text(json.dumps(metric) + "\n", encoding="utf-8")
+    snapshot = monitor.collect_snapshot(root, now_ns=now_ns)
+    assert not any(
+        warning["code"].startswith("learning_rate") for warning in snapshot["warnings"]
+    )
+
+
 def test_monitor_exposes_training_objective(tmp_path, monkeypatch) -> None:
     now_ns = 10_000_000_000
     root = _fixture(tmp_path, now_ns=now_ns)

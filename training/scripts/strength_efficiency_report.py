@@ -879,15 +879,39 @@ def _arena_result_category(result: Mapping[str, object]) -> str:
     )
 
 
-def _arena_results(
-    root: Path,
+def _ancestor_arena_directories(root: Path) -> list[tuple[int, Path]]:
+    """Return rotated ancestor arena directories, nearest ancestor first.
+
+    ``fork_elo_ablation.py`` moves a forked run's prior ``arena/`` into
+    ``ablation-parent/arena`` and nests older generations under ``ancestor/``.
+    The forked run keeps the same run identity and champion lineage, so those
+    results remain part of one connected Elo ladder.
+    """
+
+    directories: list[tuple[int, Path]] = []
+    parent = root / "ablation-parent"
+    depth = 1
+    seen: set[Path] = set()
+    while parent.is_dir() and depth <= 64:
+        resolved = parent.resolve()
+        if resolved in seen:
+            break
+        seen.add(resolved)
+        arena = parent / "arena"
+        if arena.is_dir():
+            directories.append((depth, arena))
+        parent = parent / "ancestor"
+        depth += 1
+    return directories
+
+
+def _load_arena_directory(
+    arena: Path,
     *,
     failures: list[dict[str, object]],
+    ancestry_depth: int,
 ) -> list[dict[str, object]]:
-    results = []
-    arena = root / "arena"
-    if not arena.is_dir():
-        return results
+    results: list[dict[str, object]] = []
     for path in sorted(arena.glob("*.json")):
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
@@ -901,8 +925,138 @@ def _arena_results(
             and "candidate" in payload
             and "baseline" in payload
         ):
-            results.append({**payload, "_path": str(path)})
+            results.append(
+                {
+                    **payload,
+                    "_path": str(path),
+                    "_ancestry_depth": ancestry_depth,
+                }
+            )
     return results
+
+
+def _arena_results(
+    root: Path,
+    *,
+    failures: list[dict[str, object]],
+    include_ancestors: bool = True,
+) -> list[dict[str, object]]:
+    results: list[dict[str, object]] = []
+    arena = root / "arena"
+    if arena.is_dir():
+        results.extend(
+            _load_arena_directory(arena, failures=failures, ancestry_depth=0)
+        )
+    if include_ancestors:
+        for depth, ancestor in _ancestor_arena_directories(root):
+            results.extend(
+                _load_arena_directory(
+                    ancestor,
+                    failures=failures,
+                    ancestry_depth=depth,
+                )
+            )
+    return results
+
+
+def _arena_conclusiveness(result: Mapping[str, object]) -> bool | None:
+    """Return whether a terminal result carried sequential evidence.
+
+    Results written before the arena recorded ``conclusive`` infer it from the
+    decision: exhausting the pair budget (``reject_max_pairs``) and supersession
+    are terminal without evidence either way.
+    """
+
+    if not result.get("terminal"):
+        return None
+    recorded = result.get("conclusive")
+    if isinstance(recorded, bool):
+        return recorded
+    promotion = result.get("promotion")
+    decision = promotion.get("decision") if isinstance(promotion, Mapping) else None
+    return decision not in ("reject_max_pairs", "superseded")
+
+
+def _learning_rate_governance_summary(
+    records: list[dict[str, object]],
+) -> dict[str, object]:
+    """Summarize effective versus reference learning rates and recoveries.
+
+    ``legacy_reset_count`` and ``legacy_compounded_scale`` reconstruct the
+    schedule damage from plateau resets recorded before the governor existed:
+    each reset from a new champion multiplied the inherited rates again.
+    """
+
+    latest_multiplier: float | None = None
+    latest_reference: list[float] | None = None
+    latest_effective: list[float] | None = None
+    minimum_multiplier: float | None = None
+    reductions = 0
+    lag_releases = 0
+    restorations = 0
+    legacy_events = 0
+    legacy_resets = 0
+    legacy_champions: dict[str, float] = {}
+    for record in records:
+        event = record.get("event")
+        multiplier = _number(record.get("learning_rate_multiplier"))
+        if multiplier is not None:
+            latest_multiplier = multiplier
+            minimum_multiplier = (
+                multiplier
+                if minimum_multiplier is None
+                else min(minimum_multiplier, multiplier)
+            )
+        reference = record.get("reference_learning_rates")
+        if isinstance(reference, list) and reference:
+            latest_reference = [float(value) for value in reference]
+        effective = record.get("learning_rates")
+        if isinstance(effective, list) and effective and event is None:
+            latest_effective = [float(value) for value in effective]
+        if event == "learning_rate_governor_legacy":
+            legacy_events += 1
+        elif event == "plateau_scale_restored":
+            restorations += 1
+        elif event in ("plateau_reset", "plateau_recovery"):
+            reduced = record.get("learning_rate_reduced")
+            if isinstance(reduced, bool):
+                if reduced:
+                    reductions += 1
+                else:
+                    lag_releases += 1
+            else:
+                legacy_resets += 1
+                scale = _number(record.get("learning_rate_scale"))
+                champion = record.get("champion_identity")
+                if scale is not None and isinstance(champion, str):
+                    legacy_champions.setdefault(champion, scale)
+    legacy_compounded_scale = 1.0
+    for scale in legacy_champions.values():
+        legacy_compounded_scale *= scale
+    if latest_multiplier is not None:
+        status = "governed"
+    elif legacy_resets:
+        status = "legacy"
+    else:
+        status = "unknown"
+    collapse = (
+        latest_multiplier is not None and latest_multiplier < 0.5
+    ) or legacy_compounded_scale < 0.5
+    return {
+        "status": status,
+        "latest_multiplier": latest_multiplier,
+        "minimum_multiplier_observed": minimum_multiplier,
+        "latest_reference_learning_rates": latest_reference,
+        "latest_effective_learning_rates": latest_effective,
+        "reductions": reductions,
+        "lag_releases": lag_releases,
+        "restorations": restorations,
+        "legacy_reference_events": legacy_events,
+        "legacy_reset_count": legacy_resets,
+        "legacy_reset_champions": len(legacy_champions),
+        "legacy_compounded_scale": legacy_compounded_scale,
+        "collapse_warning": collapse,
+    }
 
 
 def _arena_summary(
@@ -919,6 +1073,12 @@ def _arena_summary(
             continue
         baseline = str(result.get("baseline") or "unknown")
         completed_ns = _timestamp(result)
+        promotion_payload = result.get("promotion")
+        decision = (
+            promotion_payload.get("decision")
+            if isinstance(promotion_payload, Mapping)
+            else None
+        )
         elo = _number(aggregate.get("elo_difference"))
         interval = aggregate.get("anytime_elo_interval")
         lower = (
@@ -933,11 +1093,15 @@ def _arena_summary(
         )
         item = {
             "path": result["_path"],
+            "ancestry_depth": result.get("_ancestry_depth", 0),
             "result_kind": _arena_result_kind(result),
             "result_category": _arena_result_category(result),
             "candidate": result.get("candidate"),
             "baseline": baseline,
             "baseline_metadata": result.get("baseline_metadata"),
+            "terminal": bool(result.get("terminal")),
+            "conclusive": _arena_conclusiveness(result),
+            "decision": decision,
             "completed_ns": completed_ns,
             "elo_difference": elo,
             "anytime_elo_lower": lower,
@@ -990,6 +1154,16 @@ def _arena_summary(
         kind: sum(item.get("result_category") == kind for item in serialized)
         for kind in ("promotion", "crossplay", "unknown")
     }
+    terminal_promotions = [
+        item
+        for item in serialized
+        if item.get("result_category") == "promotion"
+        and item.get("terminal")
+        and item.get("decision") != "superseded"
+    ]
+    inconclusive = [
+        item for item in terminal_promotions if item.get("conclusive") is False
+    ]
     return {
         "results": sorted(
             serialized,
@@ -1000,6 +1174,16 @@ def _arena_summary(
         "result_category_counts": result_category_counts,
         "promotion_result_count": result_category_counts["promotion"],
         "crossplay_result_count": result_category_counts["crossplay"],
+        "ancestor_result_count": sum(
+            1 for item in serialized if item.get("ancestry_depth")
+        ),
+        "terminal_evaluation_count": len(terminal_promotions),
+        "inconclusive_evaluation_count": len(inconclusive),
+        "inconclusive_evaluation_fraction": (
+            len(inconclusive) / len(terminal_promotions)
+            if terminal_promotions
+            else None
+        ),
     }
 
 
@@ -1991,7 +2175,10 @@ def build_strength_efficiency_report(
         observation_end_source = "latest_metric"
     wall_seconds = max(0.0, (observed_until_ns - started_ns) / 1_000_000_000)
     provisioned_gpu_hours = provisioned_gpus * wall_seconds / 3_600.0
-    learner_summary = _learner_summary(learner_records)
+    learner_summary = {
+        **_learner_summary(learner_records),
+        "learning_rate_governance": _learning_rate_governance_summary(learner_records),
+    }
     actor_summary = _actor_summary(actor_records)
     migration_summary = _migration_summary(
         root,

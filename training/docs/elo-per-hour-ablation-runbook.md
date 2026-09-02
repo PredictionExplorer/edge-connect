@@ -289,6 +289,47 @@ derived screen plan containing only runtime control and that treatment; those
 two roots then use the normal pair-valid Elo queue. Production advancement
 still requires seed 17, seeds 17/18/19, and the 24-hour canary gates.
 
+### Learning-rate recovery after compounded plateau reductions
+
+Use `--suite ring10-lr-recovery` when a champion lineage has inherited plateau
+learning-rate cuts (see the runbook's learning-rate governance section). The
+suite has exactly one treatment, `ring10-lr-recovery-3e-4`, and it must be
+generated from the stopped runtime's exact frozen profile inside its source run
+root:
+
+```bash
+python scripts/prepare_elo_ablation.py \
+  --base-config "$RUN_ROOT/profile-relocated.yaml" \
+  --output-dir /absolute/path/to/lr-recovery-plan \
+  --run-root-parent /absolute/path/to/run-root-parent \
+  --run-id "$RUN_ID" \
+  --source-run-root "$RUN_ROOT" \
+  --prefix lr-recovery \
+  --seed 17 \
+  --suite ring10-lr-recovery \
+  --wall-budget-hours 720 \
+  --leaf-budget 1000000000000
+```
+
+The treatment changes only these fields of the live profile: Muon `3.0e-4` and
+AdamW `4.5e-6` (the profile's 66.7:1 ratio, the Aug 20-25 runtime regime that
+delivered about 7 frontier Elo per training hour); scheduler warmup `2000`
+steps and `min_lr_ratio: 0.33`; `reduce_lr_keep_weights` plateau recovery with
+a `0.25` floor, restore-on-promotion, and the replay-lag bound as the soft lag;
+`candidate_champion_mix` self-play at `candidate_probability: 0.8` with a
+1M-example self-play snapshot cadence. The arena, model, loss, optimizer kind,
+replay policy, and run identity are unchanged. Generation refuses bases that
+already publish self-play snapshots, use AdamW-only routing, or lack the frozen
+UTD 1.0 and candidate cadence.
+
+Fork the stopped source with `fork_elo_ablation.py`, then run
+`prepare_champion_warm_start.py --prepare-only` and `--apply` on the fork. The
+warm start builds a fresh optimizer and scheduler from the recovery profile and
+records them as the learning-rate governor reference, so the rates cannot be
+lowered again by inheritance. The wall and leaf budgets in the plan are
+informational for a continuity workload; the fork is run by the continuity
+service, not the ablation queue.
+
 ### Automatic terminal-boundary staging
 
 `run_terminal_boundary_pipeline.py` may be armed from a separate immutable

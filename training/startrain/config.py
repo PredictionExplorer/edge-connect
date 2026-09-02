@@ -754,6 +754,11 @@ class PlateauConfig:
     consecutive_terminal_rejections: int = 3
     action: Literal["pause", "reset_from_champion", "reduce_lr_keep_weights"] = "pause"
     reset_learning_rate_scale: float = 1.0
+    # The recovery multiplier is absolute against the profile's reference rates
+    # and never below this floor, so repeated recoveries cannot compound.
+    minimum_learning_rate_scale: float = 0.25
+    # Restore the reference rates once a recovery segment produces a promotion.
+    restore_scale_on_promotion: bool = True
     clear_optimizer_state_on_recovery: bool = True
     poll_seconds: float = 10.0
 
@@ -761,17 +766,24 @@ class PlateauConfig:
         if (
             type(self.enabled) is not bool
             or type(self.clear_optimizer_state_on_recovery) is not bool
+            or type(self.restore_scale_on_promotion) is not bool
         ):
             raise ConfigError("plateau booleans must be boolean")
         if (
             self.max_learner_champion_lag_steps < 0
             or self.consecutive_terminal_rejections <= 0
             or not 0 < self.reset_learning_rate_scale <= 1
+            or not 0 < self.minimum_learning_rate_scale <= 1
             or self.poll_seconds <= 0
             or self.action
             not in ("pause", "reset_from_champion", "reduce_lr_keep_weights")
         ):
             raise ConfigError("plateau policy settings are invalid")
+        if self.reset_learning_rate_scale < self.minimum_learning_rate_scale:
+            raise ConfigError(
+                "plateau reset_learning_rate_scale cannot be below "
+                "minimum_learning_rate_scale"
+            )
 
 
 @dataclass(frozen=True, slots=True)

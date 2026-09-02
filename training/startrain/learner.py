@@ -59,6 +59,13 @@ from .device import (
     synchronize_device,
 )
 from .losses import LossWeights
+from .lr_governor import (
+    LEARNING_RATE_GOVERNOR_KEY,
+    LearningRateGovernorState,
+    apply_governor,
+    governor_from_checkpoint_extra,
+    reduced_multiplier,
+)
 from .model import MODEL_SCHEMA_VERSION, GraphResTNet
 from .optim import OptimizerRoutingMetadata, build_optimizer, optimizer_routing_metadata
 from .replay import (
@@ -958,6 +965,7 @@ class ImmutableModelPublisher:
         examples_consumed: int | None = None,
         global_batch_size: int | None = None,
         utd_segment: Mapping[str, object] | None = None,
+        extra: Mapping[str, object] | None = None,
     ) -> ModelManifest:
         if self.candidate_path.is_file():
             try:
@@ -972,6 +980,21 @@ class ImmutableModelPublisher:
                 ):
                     self._record_model_history(current)
                     return current
+        additional = dict(extra or {})
+        reserved = {
+            "training_step_version",
+            "run_id",
+            "generation_family",
+            "examples_consumed",
+            "global_batch_size",
+            "utd_segment",
+        }
+        collision = reserved & additional.keys()
+        if collision:
+            raise ValueError(
+                "publication extra metadata overrides reserved fields: "
+                + ", ".join(sorted(collision))
+            )
         staged = self.checkpoint_directory / f".candidate-{step:012d}.staging.pt"
         save_checkpoint(
             staged,
@@ -995,6 +1018,7 @@ class ImmutableModelPublisher:
                     else {}
                 ),
                 **({"utd_segment": dict(utd_segment)} if utd_segment else {}),
+                **additional,
             },
         )
         checkpoint_sha256 = sha256_file(staged)
@@ -1116,6 +1140,9 @@ class LearnerLoop:
         except ValueError:
             self._optimizer_routing = None
         self.scheduler = scheduler
+        # The freshly built scheduler carries the profile's reference rates;
+        # plateau recovery only ever applies a floored absolute multiplier.
+        self._lr_governor = LearningRateGovernorState.from_scheduler(scheduler)
         self.ema = ema
         self.learner_config = learner_config
         device = next(self.model.parameters()).device
@@ -1297,6 +1324,42 @@ class LearnerLoop:
         self._resume_utd_target = resume_utd_target
         self._resume_utd_segment_state = resume_utd_segment
         self._last_recovery_step = self.step
+        self._adopt_checkpoint_governor(metadata.get("extra"))
+
+    def _adopt_checkpoint_governor(self, extra: object) -> None:
+        """Adopt the resumed checkpoint's learning-rate governance.
+
+        Legacy checkpoints (no governor record) keep their stored scheduler rates
+        as the reference, so resuming them never changes the effective rate.
+        """
+
+        self._lr_governor = governor_from_checkpoint_extra(extra, self.scheduler)
+        apply_governor(self.optimizer, self.scheduler, self._lr_governor)
+        if self.rank == 0 and self._lr_governor.legacy_reference:
+            self.metrics.append(
+                {
+                    "schema_version": 1,
+                    "timestamp_ns": time.time_ns(),
+                    "worker": "learner",
+                    "event": "learning_rate_governor_legacy",
+                    "step": self.step,
+                    "reference_learning_rates": list(
+                        self._lr_governor.reference_base_lrs
+                    ),
+                }
+            )
+
+    def _checkpoint_extra(self) -> dict[str, object]:
+        return {LEARNING_RATE_GOVERNOR_KEY: self._lr_governor.as_dict()}
+
+    def _learning_rate_metrics(self) -> dict[str, object]:
+        return {
+            "learning_rate_multiplier": self._lr_governor.multiplier,
+            "reference_learning_rates": list(self._lr_governor.reference_base_lrs),
+            "learning_rate_scaled_champion_identity": (
+                self._lr_governor.scaled_champion_identity
+            ),
+        }
 
     def _validate_resume_metadata(self, metadata: Mapping[str, object]) -> None:
         examples_consumed = self._resume_examples_consumed(metadata)
@@ -1809,6 +1872,7 @@ class LearnerLoop:
                                     interval_health.nonfinite_gradient_count
                                 ),
                                 "learning_rates": host_metrics.learning_rates,
+                                **self._learning_rate_metrics(),
                                 "optimizer_routing": optimizer_routing,
                                 "optimizer_routing_hash": (
                                     self._optimizer_routing.routing_hash
@@ -1963,6 +2027,7 @@ class LearnerLoop:
                             phase="training",
                             step=self.step,
                             epoch=self.epoch,
+                            learning_rate_multiplier=self._lr_governor.multiplier,
                         )
                     if target is not None and self.step >= target:
                         break
@@ -2537,6 +2602,7 @@ class LearnerLoop:
             examples_consumed=self.examples_consumed,
             global_batch_size=self.train_config.global_batch_size(self.world_size),
             utd_segment=utd_segment.as_dict() if utd_segment is not None else None,
+            extra=self._checkpoint_extra(),
         )
 
     def _load_cadence_state(self) -> None:
@@ -2746,22 +2812,52 @@ class LearnerLoop:
             self._write_cadence_state()
         return candidate, selfplay
 
-    def _scale_learning_rates(self, scale: float) -> None:
-        if scale == 1.0:
-            return
+    def _scale_learning_rates(
+        self,
+        scale: float,
+        *,
+        champion_identity: str | None = None,
+    ) -> float:
+        """Run below the reference schedule by one floored absolute multiplier.
+
+        The multiplier replaces, rather than compounds with, any multiplier that
+        is already active, so repeated recoveries from successive champions can
+        never drive the effective rate geometrically toward zero.
+        """
+
         if not 0 < scale <= 1:
             raise ValueError("learning-rate scale must be in (0, 1]")
-        for group in self.optimizer.param_groups:
-            group["lr"] = float(group["lr"]) * scale
-            if "initial_lr" in group:
-                group["initial_lr"] = float(group["initial_lr"]) * scale
-        self.scheduler.base_lrs = [
-            float(learning_rate) * scale for learning_rate in self.scheduler.base_lrs
-        ]
-        if hasattr(self.scheduler, "_last_lr"):
-            self.scheduler._last_lr = [
-                float(group["lr"]) for group in self.optimizer.param_groups
-            ]
+        configured = self._plateau_config()
+        multiplier = reduced_multiplier(scale, configured.minimum_learning_rate_scale)
+        if multiplier == 1.0:
+            return 1.0
+        self._lr_governor = self._lr_governor.with_multiplier(
+            multiplier,
+            scaled_champion_identity=champion_identity,
+        )
+        apply_governor(self.optimizer, self.scheduler, self._lr_governor)
+        return multiplier
+
+    def _restore_learning_rates(self) -> None:
+        self._lr_governor = self._lr_governor.restored()
+        apply_governor(self.optimizer, self.scheduler, self._lr_governor)
+
+    def _carry_governor_across_rewind(
+        self,
+        live: LearningRateGovernorState,
+    ) -> None:
+        """Keep the live multiplier after rewinding weights to a champion.
+
+        A champion checkpoint records the multiplier of the segment that produced
+        it, which is stale once the live policy has moved on. The live multiplier
+        is the policy's single source of truth for the current segment.
+        """
+
+        self._lr_governor = self._lr_governor.with_multiplier(
+            live.multiplier,
+            scaled_champion_identity=live.scaled_champion_identity,
+        )
+        apply_governor(self.optimizer, self.scheduler, self._lr_governor)
 
     def _clear_optimizer_state(self) -> None:
         self.optimizer.state.clear()
@@ -2799,6 +2895,7 @@ class LearnerLoop:
             examples_consumed=self.examples_consumed,
             global_batch_size=self.train_config.global_batch_size(self.world_size),
             utd_segment=utd_segment.as_dict() if utd_segment is not None else None,
+            extra=self._checkpoint_extra(),
         )
         self._last_recovery_step = self.step
         self.metrics.append(
@@ -3502,6 +3599,7 @@ class LearnerLoop:
         if not configured.enabled or self.promotion_status_path is None:
             return True
         boundary_applied = False
+        self._maybe_restore_learning_rates_after_promotion(configured)
         while True:
             action = (
                 self._rank_zero_plateau_action(configured) if self.rank == 0 else None
@@ -3515,6 +3613,11 @@ class LearnerLoop:
             if not boundary_applied and on_boundary is not None:
                 on_boundary()
                 boundary_applied = True
+            # Inconclusive evidence (a candidate that merely exhausted its arena
+            # budget) may release the replay-lag cap but never lowers the rate.
+            reduce_learning_rate = (
+                action.get("reset_reason") == "terminal_rejection_streak"
+            )
             if kind == "reset":
                 checkpoint = Path(str(action["checkpoint"]))
                 previous_step = self.step
@@ -3525,12 +3628,18 @@ class LearnerLoop:
                         self.publisher.champion_path
                     )
                 self._distributed_barrier()
+                live_governor = self._lr_governor
                 self.resume(
                     checkpoint,
                     expected_sha256=str(action["sha256"]),
                     expected_bytes=int(action["bytes"]),
                 )
-                self._scale_learning_rates(configured.reset_learning_rate_scale)
+                self._carry_governor_across_rewind(live_governor)
+                if reduce_learning_rate:
+                    self._scale_learning_rates(
+                        configured.reset_learning_rate_scale,
+                        champion_identity=str(action["champion_identity"]),
+                    )
                 self._rebase_state_after_rewind(
                     previous_step=previous_step,
                     previous_examples=previous_examples,
@@ -3574,7 +3683,9 @@ class LearnerLoop:
                                 "champion_step": champion_manifest.model_step,
                                 "decision": "plateau_reset",
                                 "terminal": True,
+                                "conclusive": True,
                                 "consecutive_terminal_rejections": 0,
+                                "consecutive_conclusive_rejections": 0,
                                 "cutover_created_ns": cutover_created_ns,
                                 "updated_ns": time.time_ns(),
                             },
@@ -3592,6 +3703,8 @@ class LearnerLoop:
                             "learning_rate_scale": (
                                 configured.reset_learning_rate_scale
                             ),
+                            "learning_rate_reduced": reduce_learning_rate,
+                            **self._learning_rate_metrics(),
                             "learning_rates": [
                                 float(group["lr"])
                                 for group in self.optimizer.param_groups
@@ -3614,8 +3727,15 @@ class LearnerLoop:
             if kind == "recover":
                 previous_step = self.step
                 previous_examples = getattr(self, "examples_consumed", None)
-                self._scale_learning_rates(configured.reset_learning_rate_scale)
-                if configured.clear_optimizer_state_on_recovery:
+                if reduce_learning_rate:
+                    self._scale_learning_rates(
+                        configured.reset_learning_rate_scale,
+                        champion_identity=str(action["champion_identity"]),
+                    )
+                if (
+                    reduce_learning_rate
+                    and configured.clear_optimizer_state_on_recovery
+                ):
                     self._clear_optimizer_state()
                 if previous_examples is not None:
                     self._rebase_state_after_rewind(
@@ -3649,7 +3769,9 @@ class LearnerLoop:
                                 "champion_step": action["champion_step"],
                                 "decision": "plateau_recover",
                                 "terminal": True,
+                                "conclusive": True,
                                 "consecutive_terminal_rejections": 0,
+                                "consecutive_conclusive_rejections": 0,
                                 "cutover_created_ns": cutover_created_ns,
                                 "updated_ns": time.time_ns(),
                             },
@@ -3668,8 +3790,11 @@ class LearnerLoop:
                             "learning_rate_scale": (
                                 configured.reset_learning_rate_scale
                             ),
+                            "learning_rate_reduced": reduce_learning_rate,
+                            **self._learning_rate_metrics(),
                             "optimizer_state_cleared": (
-                                configured.clear_optimizer_state_on_recovery
+                                reduce_learning_rate
+                                and configured.clear_optimizer_state_on_recovery
                             ),
                             "learning_rates": [
                                 float(group["lr"])
@@ -3912,6 +4037,71 @@ class LearnerLoop:
                 }
             )
 
+    def _maybe_restore_learning_rates_after_promotion(self, configured) -> None:
+        """Return to the reference schedule once a reduced segment promotes."""
+
+        restore = False
+        if self.rank == 0:
+            governor = self._lr_governor
+            if (
+                configured.restore_scale_on_promotion
+                and governor.multiplier < 1.0
+                and governor.scaled_champion_identity is not None
+                and self.publisher.champion_path.is_file()
+            ):
+                champion = load_model_manifest(self.publisher.champion_path)
+                restore = champion.model_identity != governor.scaled_champion_identity
+        restore = self._collective_any(restore)
+        if not restore:
+            return
+        previous = self._lr_governor.multiplier
+        self._restore_learning_rates()
+        if self.rank == 0:
+            self.metrics.append(
+                {
+                    "schema_version": 1,
+                    "timestamp_ns": time.time_ns(),
+                    "worker": "learner",
+                    "event": "plateau_scale_restored",
+                    "step": self.step,
+                    "previous_learning_rate_multiplier": previous,
+                    **self._learning_rate_metrics(),
+                    "learning_rates": [
+                        float(group["lr"]) for group in self.optimizer.param_groups
+                    ],
+                }
+            )
+
+    @staticmethod
+    def _promotion_status_rejection(
+        status: Mapping[str, object],
+    ) -> tuple[bool, int]:
+        """Return (terminal rejection, conclusive rejection streak).
+
+        ``reject_max_pairs`` is a terminal but inconclusive outcome: the arena
+        exhausted its budget without evidence either way. It still releases the
+        replay-lag cap, but only conclusive rejections accumulate toward the
+        learning-rate reduction streak. Status files written before the arena
+        recorded conclusiveness fall back to the legacy terminal streak.
+        """
+
+        decision = status.get("decision")
+        terminal_rejection = bool(status.get("terminal")) and decision in (
+            "reject",
+            "reject_ring_regression",
+            "reject_max_pairs",
+        )
+        raw_streak = status.get(
+            "consecutive_conclusive_rejections",
+            status.get("consecutive_terminal_rejections", 0),
+        )
+        streak = (
+            raw_streak
+            if isinstance(raw_streak, int) and not isinstance(raw_streak, bool)
+            else 0
+        )
+        return terminal_rejection, streak
+
     def _rank_zero_plateau_action(self, configured) -> dict[str, object]:
         if not self.publisher.champion_path.is_file():
             return {"kind": "proceed"}
@@ -3940,15 +4130,7 @@ class LearnerLoop:
             candidate is not None
             and status.get("candidate_identity") == candidate.model_identity
         )
-        terminal_rejection = bool(status.get("terminal")) and status.get(
-            "decision"
-        ) in ("reject", "reject_ring_regression", "reject_max_pairs")
-        raw_streak = status.get("consecutive_terminal_rejections", 0)
-        streak = (
-            raw_streak
-            if isinstance(raw_streak, int) and not isinstance(raw_streak, bool)
-            else 0
-        )
+        terminal_rejection, streak = self._promotion_status_rejection(status)
         reset_token = (
             champion.model_identity,
             candidate.model_identity if candidate is not None else "",

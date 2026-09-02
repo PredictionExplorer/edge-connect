@@ -16,6 +16,9 @@ from scripts.prepare_elo_ablation import (
     RING10_CAPACITY_TREATMENTS,
     RING10_EFFICIENCY_TREATMENTS,
     RING10_LIVE_CADENCE_TREATMENTS,
+    RING10_LR_RECOVERY_ADAMW_LR,
+    RING10_LR_RECOVERY_MUON_LR,
+    RING10_LR_RECOVERY_TREATMENTS,
     RING10_ONLY_TREATMENTS,
     RING10_OPTIMIZATION_TREATMENTS,
     RING10_OPTIMIZER_CALIBRATION_LABELS,
@@ -866,6 +869,174 @@ def test_live_ring10_cadence_treatments_require_complete_suite(
             guard_floor_elo=-35,
             treatments=RING10_LIVE_CADENCE_TREATMENTS,
             guard_rings=(),
+        )
+    assert not output.exists()
+
+
+def _write_frozen_source_profile(
+    tmp_path: Path,
+) -> tuple[Path, Path, dict[str, object]]:
+    """Install a champion-only live ring-10 profile inside its source run root."""
+
+    _, raw = _write_live_ring10_profile(tmp_path)
+    source = tmp_path / "source-run"
+    source.mkdir()
+    base = source / "profile-relocated.yaml"
+    base.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+    return source, base, raw
+
+
+def test_prepare_generates_ring10_lr_recovery_suite(tmp_path: Path) -> None:
+    source, base, frozen = _write_frozen_source_profile(tmp_path)
+    output = tmp_path / "lr-recovery-profiles"
+    run_root_parent = tmp_path / "lr-recovery-runs"
+
+    manifest = prepare_elo_ablation(
+        base_config=base,
+        output_dir=output,
+        run_root_parent=run_root_parent,
+        run_id="shared-parent-run",
+        source_run_root=source,
+        prefix="lr-recovery",
+        seed=17,
+        wall_budget_hours=720,
+        leaf_budget=10**12,
+        guard_floor_elo=-35,
+        treatments=RING10_LR_RECOVERY_TREATMENTS,
+        guard_rings=(),
+        suite="ring10-lr-recovery",
+    )
+
+    assert manifest["suite"] == "ring10-lr-recovery"
+    assert manifest["initialization"] == "fork"
+    assert manifest["training_objective"] == "ring10_only"
+    assert manifest["promotion_objective"] == "ring_10_only"
+    assert [item["treatment"] for item in _treatment_records(manifest)] == [
+        "ring10-lr-recovery-3e-4"
+    ]
+
+    generated_path = output / "ring10-lr-recovery-3e-4.yaml"
+    generated = yaml.safe_load(generated_path.read_text(encoding="utf-8"))
+    expected = deepcopy(frozen)
+    orchestration = expected["orchestration"]
+    assert isinstance(orchestration, dict)
+    orchestration["run_id"] = "shared-parent-run"
+    directories = orchestration["directories"]
+    assert isinstance(directories, dict)
+    directories["root"] = str(
+        run_root_parent / "lr-recovery-ring10-lr-recovery-3e-4-seed17"
+    )
+    optimizer = expected["optimizer"]
+    assert isinstance(optimizer, dict)
+    optimizer["muon_lr"] = RING10_LR_RECOVERY_MUON_LR
+    optimizer["adamw_lr"] = RING10_LR_RECOVERY_ADAMW_LR
+    train = expected["train"]
+    assert isinstance(train, dict)
+    scheduler = train["scheduler"]
+    assert isinstance(scheduler, dict)
+    scheduler["warmup_steps"] = 2_000
+    scheduler["min_lr_ratio"] = 0.33
+    learner = expected["learner"]
+    assert isinstance(learner, dict)
+    learner["selfplay_snapshot_interval_examples"] = 1_000_000
+    plateau = orchestration["plateau"]
+    assert isinstance(plateau, dict)
+    plateau.update(
+        {
+            "enabled": True,
+            "action": "reduce_lr_keep_weights",
+            "reset_learning_rate_scale": 0.5,
+            "minimum_learning_rate_scale": 0.25,
+            "restore_scale_on_promotion": True,
+            "clear_optimizer_state_on_recovery": True,
+            "max_learner_champion_lag_steps": learner["max_replay_lag_steps"],
+            "consecutive_terminal_rejections": 2,
+        }
+    )
+    refresh = orchestration["model_refresh"]
+    assert isinstance(refresh, dict)
+    refresh.update(
+        {
+            "selfplay_source": "candidate_champion_mix",
+            "candidate_probability": 0.8,
+            "history_probability": 0.0,
+        }
+    )
+    assert generated == expected
+
+    profile = load_config(generated_path)
+    assert profile.optimizer.muon_lr == pytest.approx(3e-4)
+    assert profile.optimizer.adamw_lr == pytest.approx(4.5e-6)
+    assert profile.optimizer.muon_lr / profile.optimizer.adamw_lr == pytest.approx(
+        frozen["optimizer"]["muon_lr"] / frozen["optimizer"]["adamw_lr"],  # type: ignore[index]
+        rel=1e-3,
+    )
+    assert profile.train.scheduler.total_steps == 1_000_000
+    assert profile.orchestration.plateau.action == "reduce_lr_keep_weights"
+    assert profile.orchestration.plateau.minimum_learning_rate_scale == 0.25
+    assert profile.orchestration.plateau.restore_scale_on_promotion is True
+    assert profile.orchestration.plateau.max_learner_champion_lag_steps == (
+        profile.learner.max_replay_lag_steps
+    )
+    assert profile.orchestration.model_refresh.selfplay_source == (
+        "candidate_champion_mix"
+    )
+    assert profile.learner.selfplay_snapshot_interval_examples == 1_000_000
+    assert profile.learner.candidate_interval_examples == 2_000_000
+    assert profile.arena == load_config(base).arena
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected_error"),
+    [
+        ("base-outside-source", "exact frozen profile"),
+        ("selfplay-snapshots-enabled", "champion-only live profile"),
+        ("missing-utd", "frozen UTD=1.0"),
+        ("adamw-only", "Muon\\+AdamW routing"),
+        ("incomplete-suite", "complete --suite ring10-lr-recovery"),
+    ],
+)
+def test_ring10_lr_recovery_rejects_unsafe_inputs(
+    tmp_path: Path,
+    mutation: str,
+    expected_error: str,
+) -> None:
+    source, base, raw = _write_frozen_source_profile(tmp_path)
+    suite: str | None = "ring10-lr-recovery"
+    learner = raw["learner"]
+    assert isinstance(learner, dict)
+    if mutation == "base-outside-source":
+        base = tmp_path / "frozen-live-ring10.yaml"
+    elif mutation == "selfplay-snapshots-enabled":
+        learner["selfplay_snapshot_interval_examples"] = 3_000_000
+    elif mutation == "missing-utd":
+        learner.pop("target_updates_per_new_sample")
+    elif mutation == "adamw-only":
+        optimizer = raw["optimizer"]
+        assert isinstance(optimizer, dict)
+        optimizer["kind"] = "adamw"
+    elif mutation == "incomplete-suite":
+        suite = None
+    else:
+        raise AssertionError(f"unsupported mutation: {mutation}")
+    base.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+    output = tmp_path / "profiles"
+
+    with pytest.raises(ValueError, match=expected_error):
+        prepare_elo_ablation(
+            base_config=base,
+            output_dir=output,
+            run_root_parent=tmp_path / "runs",
+            run_id="shared-parent-run",
+            source_run_root=source,
+            prefix="lr-recovery",
+            seed=17,
+            wall_budget_hours=720,
+            leaf_budget=10**12,
+            guard_floor_elo=-35,
+            treatments=RING10_LR_RECOVERY_TREATMENTS,
+            guard_rings=(),
+            suite=suite,
         )
     assert not output.exists()
 

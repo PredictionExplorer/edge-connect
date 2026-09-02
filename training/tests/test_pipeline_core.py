@@ -3068,6 +3068,31 @@ def test_plateau_policy_keeps_replay_live_and_resets_after_rejections() -> None:
     )
 
 
+def _governed_learner(
+    optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler.LRScheduler,
+    *,
+    minimum_scale: float = 0.25,
+) -> LearnerLoop:
+    from startrain.lr_governor import LearningRateGovernorState
+
+    learner = object.__new__(LearnerLoop)
+    learner.optimizer = optimizer
+    learner.scheduler = scheduler
+    learner._lr_governor = LearningRateGovernorState.from_scheduler(scheduler)
+    learner.serialized_config = {
+        "orchestration": {
+            "plateau": {
+                "enabled": True,
+                "action": "reduce_lr_keep_weights",
+                "reset_learning_rate_scale": 0.5,
+                "minimum_learning_rate_scale": minimum_scale,
+            }
+        }
+    }
+    return learner
+
+
 def test_plateau_learning_rate_scale_updates_optimizer_and_scheduler() -> None:
     parameter = torch.nn.Parameter(torch.ones(()))
     optimizer = torch.optim.SGD([parameter], lr=1.0)
@@ -3075,11 +3100,9 @@ def test_plateau_learning_rate_scale_updates_optimizer_and_scheduler() -> None:
         optimizer,
         SchedulerConfig(warmup_steps=0, total_steps=10, min_lr_ratio=0.1),
     )
-    learner = object.__new__(LearnerLoop)
-    learner.optimizer = optimizer
-    learner.scheduler = scheduler
+    learner = _governed_learner(optimizer, scheduler)
 
-    learner._scale_learning_rates(0.5)
+    assert learner._scale_learning_rates(0.5) == pytest.approx(0.5)
 
     assert optimizer.param_groups[0]["lr"] == pytest.approx(0.5)
     assert optimizer.param_groups[0]["initial_lr"] == pytest.approx(0.5)
@@ -3098,6 +3121,121 @@ def test_plateau_learning_rate_scale_updates_optimizer_and_scheduler() -> None:
     assert not adam.state
 
 
+def test_plateau_learning_rate_scale_never_compounds_and_restores() -> None:
+    """Repeated recoveries stay at one floored multiplier of the reference."""
+
+    parameter = torch.nn.Parameter(torch.ones(()))
+    optimizer = torch.optim.SGD([parameter], lr=1.0)
+    scheduler = build_scheduler(
+        optimizer,
+        SchedulerConfig(warmup_steps=0, total_steps=100, min_lr_ratio=0.1),
+    )
+    learner = _governed_learner(optimizer, scheduler)
+
+    learner._scale_learning_rates(0.5, champion_identity="sha256-a")
+    learner._scale_learning_rates(0.5, champion_identity="sha256-b")
+    learner._scale_learning_rates(0.5, champion_identity="sha256-c")
+    assert scheduler.base_lrs == pytest.approx([0.5])
+    assert optimizer.param_groups[0]["initial_lr"] == pytest.approx(0.5)
+    assert learner._lr_governor.multiplier == pytest.approx(0.5)
+    assert learner._lr_governor.scaled_champion_identity == "sha256-c"
+    assert learner._lr_governor.reference_base_lrs == (1.0,)
+
+    # A stronger requested cut is clamped at the configured floor.
+    assert learner._scale_learning_rates(0.1) == pytest.approx(0.25)
+    assert scheduler.base_lrs == pytest.approx([0.25])
+
+    # The scheduler position is preserved: the live rate follows the cosine.
+    for _ in range(50):
+        optimizer.step()
+        scheduler.step()
+    before_restore = optimizer.param_groups[0]["lr"]
+    learner._restore_learning_rates()
+    assert learner._lr_governor.multiplier == 1.0
+    assert scheduler.base_lrs == pytest.approx([1.0])
+    assert optimizer.param_groups[0]["lr"] == pytest.approx(before_restore * 4.0)
+    assert scheduler.get_last_lr() == pytest.approx([before_restore * 4.0])
+
+
+def test_plateau_learning_rate_governor_survives_checkpoint_round_trip(
+    tmp_path,
+) -> None:
+    """Champion checkpoints record the multiplier separately from the reference.
+
+    Resuming a checkpoint saved during a reduced segment restores that segment's
+    multiplier, and a later reduction is still absolute rather than compounding.
+    Legacy checkpoints keep their stored rates without any jump.
+    """
+
+    from startrain.checkpoint import load_checkpoint, save_checkpoint
+    from startrain.lr_governor import (
+        LEARNING_RATE_GOVERNOR_KEY,
+        apply_governor,
+        governor_from_checkpoint_extra,
+    )
+
+    model = torch.nn.Linear(2, 1)
+    optimizer = torch.optim.SGD(model.parameters(), lr=1.0)
+    scheduler = build_scheduler(
+        optimizer,
+        SchedulerConfig(warmup_steps=0, total_steps=100, min_lr_ratio=0.1),
+    )
+    learner = _governed_learner(optimizer, scheduler)
+    learner._scale_learning_rates(0.5, champion_identity="sha256-a")
+    ema = ExponentialMovingAverage(model, decay=0.9)
+    reduced = tmp_path / "reduced.pt"
+    save_checkpoint(
+        reduced,
+        model=model,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        ema=ema,
+        step=10,
+        extra=learner._checkpoint_extra(),
+    )
+
+    fresh_model = torch.nn.Linear(2, 1)
+    fresh_optimizer = torch.optim.SGD(fresh_model.parameters(), lr=1.0)
+    fresh_scheduler = build_scheduler(
+        fresh_optimizer,
+        SchedulerConfig(warmup_steps=0, total_steps=100, min_lr_ratio=0.1),
+    )
+    metadata = load_checkpoint(
+        reduced,
+        model=fresh_model,
+        optimizer=fresh_optimizer,
+        scheduler=fresh_scheduler,
+        ema=ExponentialMovingAverage(fresh_model, decay=0.9),
+    )
+    state = governor_from_checkpoint_extra(metadata["extra"], fresh_scheduler)
+    assert not state.legacy_reference
+    assert state.reference_base_lrs == (1.0,)
+    assert state.multiplier == pytest.approx(0.5)
+    assert state.scaled_champion_identity == "sha256-a"
+    apply_governor(fresh_optimizer, fresh_scheduler, state)
+    assert fresh_scheduler.base_lrs == pytest.approx([0.5])
+
+    resumed = _governed_learner(fresh_optimizer, fresh_scheduler)
+    resumed._lr_governor = state
+    resumed._scale_learning_rates(0.5, champion_identity="sha256-b")
+    assert fresh_scheduler.base_lrs == pytest.approx([0.5])
+    assert resumed._lr_governor.reference_base_lrs == (1.0,)
+
+    legacy_model = torch.nn.Linear(2, 1)
+    legacy_optimizer = torch.optim.SGD(legacy_model.parameters(), lr=0.0625)
+    legacy_scheduler = build_scheduler(
+        legacy_optimizer,
+        SchedulerConfig(warmup_steps=0, total_steps=100, min_lr_ratio=0.1),
+    )
+    legacy = governor_from_checkpoint_extra({}, legacy_scheduler)
+    assert legacy.legacy_reference
+    assert legacy.reference_base_lrs == pytest.approx((0.0625,))
+    assert legacy.multiplier == 1.0
+    apply_governor(legacy_optimizer, legacy_scheduler, legacy)
+    assert legacy_optimizer.param_groups[0]["lr"] == pytest.approx(0.0625)
+    assert LEARNING_RATE_GOVERNOR_KEY not in {}
+
+
 def test_plateau_recovery_preserves_weights_and_creates_durable_cutover(
     tmp_path,
     monkeypatch,
@@ -3113,15 +3251,21 @@ def test_plateau_recovery_preserves_weights_and_creates_durable_cutover(
     before = parameter.detach().clone()
     events = []
     cutovers = []
+    from startrain.lr_governor import LearningRateGovernorState
+
     learner = object.__new__(LearnerLoop)
     learner.rank = 0
     learner.world_size = 1
     learner.step = 100
     learner.optimizer = optimizer
     learner.scheduler = scheduler
+    learner._lr_governor = LearningRateGovernorState.from_scheduler(scheduler)
     learner._last_recovery_step = 90
     learner._last_plateau_reset = None
-    learner.publisher = SimpleNamespace(root=tmp_path / "learner")
+    learner.publisher = SimpleNamespace(
+        root=tmp_path / "learner",
+        champion_path=tmp_path / "learner" / "champion.json",
+    )
     learner.promotion_status_path = tmp_path / "arena" / "promotion-status.json"
     learner.run_identity = SimpleNamespace(
         run_id="run-autonomous",
@@ -3164,12 +3308,208 @@ def test_plateau_recovery_preserves_weights_and_creates_durable_cutover(
     assert optimizer.param_groups[0]["lr"] == pytest.approx(0.05)
     assert learner.step == 100
     assert learner._last_plateau_reset == ("champion", "candidate")
+    assert learner._lr_governor.multiplier == pytest.approx(0.5)
+    assert learner._lr_governor.scaled_champion_identity == "champion"
     assert len(cutovers) == 1
     status = json.loads(learner.promotion_status_path.read_text(encoding="utf-8"))
     assert status["decision"] == "plateau_recover"
     assert status["candidate_step"] == 100
+    assert status["conclusive"] is True
+    assert status["consecutive_conclusive_rejections"] == 0
     assert events[-1]["event"] == "plateau_recovery"
     assert events[-1]["optimizer_state_cleared"] is True
+    assert events[-1]["learning_rate_reduced"] is True
+    assert events[-1]["learning_rate_multiplier"] == pytest.approx(0.5)
+
+    # A second recovery from another champion replaces rather than compounds.
+    learner._last_plateau_reset = None
+    action["champion_identity"] = "champion-2"
+    assert learner._plateau_control(stop_requested=lambda: False, progress=None)
+    assert optimizer.param_groups[0]["lr"] == pytest.approx(0.05)
+    assert learner._lr_governor.multiplier == pytest.approx(0.5)
+
+    # Releasing the replay-lag cap on inconclusive evidence keeps the rate and
+    # the optimizer moments.
+    parameter.grad = torch.ones_like(parameter)
+    optimizer.step()
+    assert optimizer.state
+    learner._last_plateau_reset = None
+    action["reset_reason"] = "hard_replay_lag"
+    action["champion_identity"] = "champion-3"
+    assert learner._plateau_control(stop_requested=lambda: False, progress=None)
+    assert optimizer.state
+    assert optimizer.param_groups[0]["lr"] == pytest.approx(0.05)
+    assert events[-1]["learning_rate_reduced"] is False
+    assert events[-1]["optimizer_state_cleared"] is False
+
+
+def test_plateau_action_reduces_rates_only_on_conclusive_rejections(
+    tmp_path, monkeypatch
+) -> None:
+    """Inconclusive budget exhaustion releases the lag cap without a rate cut."""
+
+    learner_root = tmp_path / "learner"
+    learner_root.mkdir()
+    champion_path = learner_root / "champion.json"
+    candidate_path = learner_root / "candidate.json"
+    status_path = tmp_path / "arena" / "promotion-status.json"
+    status_path.parent.mkdir()
+
+    def write_pointer(path: Path, identity: str, step: int) -> None:
+        path.write_text(json.dumps({"model_identity": identity, "model_step": step}))
+
+    monkeypatch.setattr(
+        "startrain.learner.load_model_manifest",
+        lambda path: SimpleNamespace(
+            **json.loads(Path(path).read_text()),
+            checkpoint=Path(path).with_suffix(".pt"),
+            checkpoint_sha256="a" * 64,
+            checkpoint_bytes=1,
+        ),
+    )
+    write_pointer(champion_path, "sha256-champion", 100_000)
+    write_pointer(candidate_path, "sha256-candidate", 145_000)
+
+    learner = object.__new__(LearnerLoop)
+    learner.publisher = SimpleNamespace(
+        champion_path=champion_path, candidate_path=candidate_path
+    )
+    learner.promotion_status_path = status_path
+    learner.learner_config = SimpleNamespace(max_replay_lag_steps=60_000)
+    learner._last_plateau_reset = None
+    configured = PlateauConfig(
+        enabled=True,
+        action="reduce_lr_keep_weights",
+        reset_learning_rate_scale=0.5,
+        max_learner_champion_lag_steps=40_000,
+        consecutive_terminal_rejections=2,
+    )
+
+    def status(**fields: object) -> None:
+        payload = {
+            "candidate_identity": "sha256-candidate",
+            "decision": "reject_max_pairs",
+            "terminal": True,
+            "conclusive": False,
+            "consecutive_terminal_rejections": 5,
+            "consecutive_conclusive_rejections": 0,
+        }
+        payload.update(fields)
+        status_path.write_text(json.dumps(payload))
+
+    # Below the soft lag nothing happens regardless of status.
+    learner.step = 130_000
+    status()
+    assert learner._rank_zero_plateau_action(configured) == {"kind": "proceed"}
+
+    # Between soft and hard lag, five inconclusive results are not a streak.
+    learner.step = 145_000
+    assert learner._rank_zero_plateau_action(configured) == {"kind": "proceed"}
+
+    # Two conclusive rejections are a streak: recover with a rate cut.
+    status(
+        decision="reject",
+        conclusive=True,
+        consecutive_terminal_rejections=2,
+        consecutive_conclusive_rejections=2,
+    )
+    action = learner._rank_zero_plateau_action(configured)
+    assert action["kind"] == "recover"
+    assert action["reset_reason"] == "terminal_rejection_streak"
+    assert action["champion_identity"] == "sha256-champion"
+
+    # At the hard lag an inconclusive terminal result only releases the cap.
+    learner.step = 160_000
+    status()
+    action = learner._rank_zero_plateau_action(configured)
+    assert action["kind"] == "recover"
+    assert action["reset_reason"] == "hard_replay_lag"
+
+    # A status that predates conclusiveness falls back to the terminal streak.
+    status_path.write_text(
+        json.dumps(
+            {
+                "candidate_identity": "sha256-candidate",
+                "decision": "reject_max_pairs",
+                "terminal": True,
+                "consecutive_terminal_rejections": 2,
+            }
+        )
+    )
+    learner.step = 145_000
+    action = learner._rank_zero_plateau_action(configured)
+    assert action["kind"] == "recover"
+    assert action["reset_reason"] == "terminal_rejection_streak"
+
+    # Evidence for another candidate never triggers recovery.
+    status(candidate_identity="sha256-other")
+    learner.step = 160_000
+    assert learner._rank_zero_plateau_action(configured)["kind"] == "pause"
+
+
+def test_plateau_scale_restores_after_promotion(tmp_path, monkeypatch) -> None:
+    from startrain.lr_governor import LearningRateGovernorState
+
+    parameter = torch.nn.Parameter(torch.tensor(2.0))
+    optimizer = torch.optim.SGD([parameter], lr=1.0)
+    scheduler = build_scheduler(
+        optimizer,
+        SchedulerConfig(warmup_steps=0, total_steps=100),
+    )
+    events = []
+    learner = object.__new__(LearnerLoop)
+    learner.rank = 0
+    learner.world_size = 1
+    learner.step = 120
+    learner.optimizer = optimizer
+    learner.scheduler = scheduler
+    learner._lr_governor = LearningRateGovernorState.from_scheduler(scheduler)
+    learner.metrics = SimpleNamespace(append=events.append)
+    learner.serialized_config = {
+        "orchestration": {
+            "plateau": {
+                "enabled": True,
+                "action": "reduce_lr_keep_weights",
+                "reset_learning_rate_scale": 0.5,
+            }
+        }
+    }
+    champion_path = tmp_path / "learner" / "champion.json"
+    learner.publisher = SimpleNamespace(
+        root=tmp_path / "learner", champion_path=champion_path
+    )
+    learner._scale_learning_rates(0.5, champion_identity="sha256-old")
+    assert optimizer.param_groups[0]["lr"] == pytest.approx(0.5)
+    configured = learner._plateau_config()
+
+    # No champion pointer yet: nothing to compare against.
+    learner._maybe_restore_learning_rates_after_promotion(configured)
+    assert learner._lr_governor.multiplier == pytest.approx(0.5)
+
+    champion_path.parent.mkdir(parents=True)
+
+    def write_champion(identity: str) -> None:
+        champion_path.write_text(
+            json.dumps({"model_identity": identity, "model_step": 100})
+        )
+
+    monkeypatch.setattr(
+        "startrain.learner.load_model_manifest",
+        lambda path: SimpleNamespace(
+            model_identity=json.loads(Path(path).read_text())["model_identity"]
+        ),
+    )
+    write_champion("sha256-old")
+    learner._maybe_restore_learning_rates_after_promotion(configured)
+    assert learner._lr_governor.multiplier == pytest.approx(0.5)
+
+    write_champion("sha256-new")
+    learner._maybe_restore_learning_rates_after_promotion(configured)
+    assert learner._lr_governor.multiplier == 1.0
+    assert learner._lr_governor.scaled_champion_identity is None
+    assert optimizer.param_groups[0]["lr"] == pytest.approx(1.0)
+    assert events[-1]["event"] == "plateau_scale_restored"
+    assert events[-1]["previous_learning_rate_multiplier"] == pytest.approx(0.5)
 
 
 def test_ddp_replay_selection_metadata_is_broadcast_from_rank_zero(

@@ -288,6 +288,40 @@ def test_promotion_candidates_respect_durable_resume_cutover(tmp_path) -> None:
     cutover_payload = json.loads((publisher.root / "resume-cutover.json").read_text())
     assert status["cutover_created_ns"] == cutover_payload["created_ns"]
     assert status["consecutive_terminal_rejections"] == 1
+    assert status["conclusive"] is True
+    assert status["consecutive_conclusive_rejections"] == 1
+
+    # Exhausting the pair budget is terminal but inconclusive: it extends the
+    # legacy terminal streak without accumulating conclusive evidence.
+    inconclusive = publisher.publish(
+        model=model,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        ema=ema,
+        step=3,
+        epoch=3,
+        config=experiment.as_dict(),
+    )
+    supervisor._write_status(
+        candidate=inconclusive,
+        champion=cutover,
+        decision="reject_max_pairs",
+        terminal=True,
+    )
+    status = json.loads(supervisor.status_path.read_text())
+    assert status["conclusive"] is False
+    assert status["consecutive_terminal_rejections"] == 2
+    assert status["consecutive_conclusive_rejections"] == 1
+    supervisor._write_status(
+        candidate=inconclusive,
+        champion=inconclusive,
+        decision="promote",
+        terminal=True,
+    )
+    status = json.loads(supervisor.status_path.read_text())
+    assert status["conclusive"] is True
+    assert status["consecutive_terminal_rejections"] == 0
+    assert status["consecutive_conclusive_rejections"] == 0
     collect_model_garbage(
         publisher.root,
         retain_candidate_manifests=1,

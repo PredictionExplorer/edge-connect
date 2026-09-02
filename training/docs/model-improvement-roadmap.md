@@ -33,6 +33,11 @@ do not infer progress from loss, throughput, or promotion counts alone.
   acquire its queue lock.
 - Durability: Lambda-attached active-arm disaster snapshots, campaign
   control-plane snapshots, and verified continuity fallback are active.
+- Champion frontier as of 2026-09-02: step 742,979 at +832 connected ring-10
+  Elo over the anchor; unchanged since 2026-08-30 08:32 UTC. Frontier gain per
+  training hour by learning-rate regime: 7.0 (Muon 3.0e-4), 3.6 (1.3e-4), 1.7
+  (6.1e-5), 1.3 (2.9e-5), 0.0 (1.4e-5). The regimes were produced by plateau
+  resets compounding through the champion lineage, not by a schedule.
 
 ## Status legend
 
@@ -242,7 +247,44 @@ Result: v4 accepted a quiescent step-719537 plateau boundary, then PyTorch
 Decision: preserve v4/v5 evidence, keep their activators retired, and retain the
   fresh v6 policy with per-arm allowlisted compile caches. Automatic fallback
   to runtime control remains mandatory on no winner, tie, invalid evidence, or
-  any cutover failure
+  any cutover failure. Superseded 2026-09-02: v6 completed on 2026-09-01
+  00:09-01:35 UTC with no passing treatment; every arm tested an equal or lower
+  effective rate, which is consistent with the rate itself being the problem
+```
+
+```text
+ID: R10-LR-RECOVERY-01
+Phase: 1 — training dynamics / learning-rate governance
+Status: release built; cutover pending
+Hypothesis: the collapse of frontier Elo per hour is caused by plateau resets
+  compounding a 0.5x learning-rate cut through every champion checkpoint
+  (Muon 6.1e-4 -> 3.06e-4 -> 1.33e-4 -> 6.1e-5 -> 2.9e-5 -> 1.38e-5, five
+  champion generations, 44x lower and ~70x below the profile schedule), and
+  restoring the Muon 3.0e-4 regime with non-compounding recovery and
+  candidate-mixed self-play restores positive Elo per hour
+Commit: recorded at cutover
+Release: main-<sha>-lr-recovery
+Control: the stopped fallback-lkg runtime (champion 742,979, Muon 1.35e-5)
+Treatment: ring10-lr-recovery-3e-4 forked from the same root and warm-started
+  from champion 742,979 with a fresh optimizer/scheduler (Muon 3.0e-4, AdamW
+  4.5e-6, warmup 2000, min_lr_ratio 0.33), reduce_lr_keep_weights plateau
+  recovery floored at 0.25 with restore-on-promotion, and
+  candidate_champion_mix self-play at 0.8 with 1M-example snapshots
+Anchor/replay cutoff: champion 742,979
+  sha256-70a4e7ad5a8e1a41a60fd597f1603826df6c44f64e79c5649c202bfc03a8939b;
+  replay hard-linked from the fallback root; stale candidates excluded by the
+  warm-start resume cutover
+Seeds: 17 (production continuation, not a preregistered screen)
+Budget: continuous; success is judged on the live frontier
+System gates: finite training, unchanged actor throughput (~365 samples/s),
+  learner UTD 1.0, arena unchanged (1024 simulations, 50/50/200 pairs)
+Statistical gate: at least one promotion within 12 hours and candidate point
+  Elo versus champion trending above +50; abort on two consecutive conclusive
+  rejections below -50 Elo or any non-finite event
+Lambda snapshot verification: final fallback snapshot verified before cutover;
+  baseline snapshot of the fork after cutover
+Result: pending
+Decision: pending
 ```
 
 ## Compute ledger
@@ -279,6 +321,22 @@ example candidate-publication treatment. The completed optimizer, EMA,
 freshness, and clinch screen had no promoted frontier gain, so those arms are
 excluded. Backlog relief is necessary but insufficient: the treatment must also
 pass the standard pair-valid Elo/hour gates.
+
+### 2026-09-02 — Stop compounding plateau learning-rate cuts
+
+Decision: the plateau policy, not model capacity or the gate alone, caused the
+zero-Elo plateau. `reset_from_champion` restored the champion checkpoint and
+scaled the rates stored inside it by 0.5, so each new champion inherited the
+cut and the next reset halved it again; frontier gain fell 7.0 → 3.6 → 1.7 →
+1.3 → 0.0 Elo per training hour in lockstep with five halvings. Ship a
+learning-rate governor that keeps the profile rates as the reference and applies
+one floored, absolute multiplier that restores on promotion; count only
+conclusive rejections toward recovery; require that contract in the continuous
+validator; and warm-start champion 742,979 at the proven Muon 3.0e-4 regime with
+candidate-mixed self-play. Do not return to the YAML 5e-3 schedule: that regime
+collapsed the model on 2026-08-18 (candidates scored 0-2%). Keep the arena
+unchanged in this release so the effect of the rate is attributable; the gate
+budget redesign follows as a separate in-place migration.
 
 ### 2026-08-31 — Preserve the sandbox and isolate compiled calibration
 

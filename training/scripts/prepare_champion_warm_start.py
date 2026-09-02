@@ -27,6 +27,10 @@ from startrain.checkpoint import (
     write_resume_cutover,
 )
 from startrain.config import load_config
+from startrain.lr_governor import (
+    LEARNING_RATE_GOVERNOR_KEY,
+    LearningRateGovernorState,
+)
 from startrain.manifest_selection import (
     ManifestEvidence,
     ManifestSelectionError,
@@ -1125,6 +1129,10 @@ def prepare_champion_warm_start(
     scheduler = build_scheduler(optimizer, experiment.train.scheduler)
     if optimizer.state or ema.num_updates != 0:
         raise WarmStartError("fresh optimizer/EMA state was not initialized")
+    # A fresh scheduler carries exactly the profile's rates, so the warm start
+    # pins them as the reference schedule that plateau recovery may scale but
+    # never permanently lower.
+    learning_rate_governor = LearningRateGovernorState.from_scheduler(scheduler)
 
     plan: dict[str, object] = {
         "status": "ok",
@@ -1144,6 +1152,7 @@ def prepare_champion_warm_start(
         "utd_segment": utd_segment,
         "cadence": cadence,
         "training_segment": training_segment,
+        "learning_rate_governor": learning_rate_governor.as_dict(),
         "preflight": preflight,
         "replaces_warm_start": (
             {
@@ -1205,7 +1214,10 @@ def prepare_champion_warm_start(
             examples_consumed=examples_consumed,
             global_batch_size=experiment.train.global_batch_size(world_size),
             utd_segment=utd_segment,
-            extra={"training_segment": training_segment},
+            extra={
+                "training_segment": training_segment,
+                LEARNING_RATE_GOVERNOR_KEY: learning_rate_governor.as_dict(),
+            },
         )
         marker: dict[str, Any] = {
             "format": WARM_START_FORMAT,

@@ -711,6 +711,180 @@ def test_report_classifies_crossplay_and_legacy_arena_results(tmp_path) -> None:
     ]
 
 
+def test_report_follows_forked_arena_ancestry_and_conclusiveness(tmp_path) -> None:
+    """Forked runs keep one connected ladder and separate inconclusive results."""
+
+    root = tmp_path / "run"
+    root.mkdir()
+    (root / "run.json").write_text(
+        json.dumps(
+            {
+                "run_id": "run-fork",
+                "generation_family": "family-fork",
+                "created_ns": 1_000_000_000,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def promotion_result(
+        *,
+        completed_ns: int,
+        decision: str,
+        conclusive: bool | None,
+    ) -> dict:
+        result = {
+            **_arena_result(completed_ns=completed_ns, elo=5.0, lower=-30.0),
+            "result_kind": "promotion",
+            "terminal": True,
+            "promotion": {"decision": decision},
+        }
+        if conclusive is not None:
+            result["conclusive"] = conclusive
+        return result
+
+    current = root / "arena"
+    current.mkdir()
+    parent = root / "ablation-parent" / "arena"
+    parent.mkdir(parents=True)
+    grandparent = root / "ablation-parent" / "ancestor" / "arena"
+    grandparent.mkdir(parents=True)
+    (grandparent / "oldest.json").write_text(
+        json.dumps(
+            promotion_result(
+                completed_ns=2_000_000_000, decision="promote", conclusive=None
+            )
+        ),
+        encoding="utf-8",
+    )
+    (parent / "capped.json").write_text(
+        json.dumps(
+            promotion_result(
+                completed_ns=3_000_000_000,
+                decision="reject_max_pairs",
+                conclusive=None,
+            )
+        ),
+        encoding="utf-8",
+    )
+    (parent / "superseded.json").write_text(
+        json.dumps(
+            promotion_result(
+                completed_ns=3_500_000_000, decision="superseded", conclusive=None
+            )
+        ),
+        encoding="utf-8",
+    )
+    (current / "recorded.json").write_text(
+        json.dumps(
+            promotion_result(
+                completed_ns=4_000_000_000, decision="reject", conclusive=True
+            )
+        ),
+        encoding="utf-8",
+    )
+    (current / "recorded-capped.json").write_text(
+        json.dumps(
+            promotion_result(
+                completed_ns=5_000_000_000,
+                decision="reject_max_pairs",
+                conclusive=False,
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    report = build_strength_efficiency_report(root)
+    arena = report["arena"]
+    results = arena["results"]
+    assert [item["ancestry_depth"] for item in results] == [2, 1, 1, 0, 0]
+    assert [item["conclusive"] for item in results] == [True, False, False, True, False]
+    assert arena["ancestor_result_count"] == 3
+    assert arena["terminal_evaluation_count"] == 4
+    assert arena["inconclusive_evaluation_count"] == 2
+    assert arena["inconclusive_evaluation_fraction"] == pytest.approx(0.5)
+    assert report_module._ancestor_arena_directories(root) == [
+        (1, parent),
+        (2, grandparent),
+    ]
+    assert report_module._ancestor_arena_directories(tmp_path / "missing") == []
+
+
+def test_learning_rate_governance_summary_reconstructs_legacy_compounding() -> None:
+    from scripts.strength_efficiency_report import _learning_rate_governance_summary
+
+    legacy_records = [
+        {"step": 10, "learning_rates": [6.1e-4, 9e-6]},
+        {
+            "event": "plateau_reset",
+            "champion_identity": "sha256-a",
+            "learning_rate_scale": 0.5,
+            "learning_rates": [3.05e-4, 4.5e-6],
+        },
+        {
+            "event": "plateau_reset",
+            "champion_identity": "sha256-a",
+            "learning_rate_scale": 0.5,
+            "learning_rates": [3.05e-4, 4.5e-6],
+        },
+        {
+            "event": "plateau_reset",
+            "champion_identity": "sha256-b",
+            "learning_rate_scale": 0.5,
+            "learning_rates": [1.5e-4, 2.25e-6],
+        },
+        {"step": 20, "learning_rates": [1.5e-4, 2.25e-6]},
+    ]
+    legacy = _learning_rate_governance_summary(legacy_records)
+    assert legacy["status"] == "legacy"
+    assert legacy["legacy_reset_count"] == 3
+    assert legacy["legacy_reset_champions"] == 2
+    assert legacy["legacy_compounded_scale"] == pytest.approx(0.25)
+    assert legacy["collapse_warning"] is True
+    assert legacy["latest_effective_learning_rates"] == [1.5e-4, 2.25e-6]
+
+    governed_records = [
+        {"event": "learning_rate_governor_legacy", "step": 0},
+        {
+            "step": 10,
+            "learning_rates": [3e-4, 4.5e-6],
+            "learning_rate_multiplier": 1.0,
+            "reference_learning_rates": [3e-4, 4.5e-6],
+        },
+        {
+            "event": "plateau_recovery",
+            "learning_rate_reduced": True,
+            "learning_rate_multiplier": 0.5,
+            "reference_learning_rates": [3e-4, 4.5e-6],
+        },
+        {
+            "event": "plateau_recovery",
+            "learning_rate_reduced": False,
+            "learning_rate_multiplier": 0.5,
+        },
+        {"event": "plateau_scale_restored", "learning_rate_multiplier": 1.0},
+        {
+            "step": 20,
+            "learning_rates": [2.9e-4, 4.4e-6],
+            "learning_rate_multiplier": 1.0,
+            "reference_learning_rates": [3e-4, 4.5e-6],
+        },
+    ]
+    governed = _learning_rate_governance_summary(governed_records)
+    assert governed["status"] == "governed"
+    assert governed["latest_multiplier"] == 1.0
+    assert governed["minimum_multiplier_observed"] == 0.5
+    assert governed["reductions"] == 1
+    assert governed["lag_releases"] == 1
+    assert governed["restorations"] == 1
+    assert governed["legacy_reference_events"] == 1
+    assert governed["legacy_reset_count"] == 0
+    assert governed["legacy_compounded_scale"] == 1.0
+    assert governed["collapse_warning"] is False
+    assert governed["latest_reference_learning_rates"] == [3e-4, 4.5e-6]
+    assert _learning_rate_governance_summary([])["status"] == "unknown"
+
+
 def test_report_identifies_saturated_one_sided_pairings(tmp_path) -> None:
     root = tmp_path / "run"
     root.mkdir()

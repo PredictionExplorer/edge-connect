@@ -81,6 +81,17 @@ RING10_LIVE_CADENCE_TREATMENTS = (
     "ring10-live-cadence-control",
     "ring10-live-cadence-5m",
 )
+# Learning-rate recovery after compounding plateau reductions. The rates are the
+# Aug 20-25 runtime regime (Muon 3.0e-4 with the profile's 66.7:1 AdamW ratio)
+# that delivered about 7 frontier Elo per training hour before repeated
+# champion-inherited halvings drove the schedule 44x lower.
+RING10_LR_RECOVERY_TREATMENTS = ("ring10-lr-recovery-3e-4",)
+RING10_LR_RECOVERY_MUON_LR = 3.0e-4
+RING10_LR_RECOVERY_ADAMW_LR = 4.5e-6
+RING10_LR_RECOVERY_WARMUP_STEPS = 2_000
+RING10_LR_RECOVERY_MIN_LR_RATIO = 0.33
+RING10_LR_RECOVERY_SELFPLAY_SNAPSHOT_EXAMPLES = 1_000_000
+RING10_LR_RECOVERY_CANDIDATE_PROBABILITY = 0.8
 RING10_TRAINING_DYNAMICS_TREATMENTS = (
     "ring10-dynamics-control",
     "ring10-dynamics-adamw",
@@ -109,6 +120,7 @@ RING10_OBJECTIVE_TREATMENTS = frozenset(
         *RING10_OPTIMIZATION_TREATMENTS,
         *RING10_OPTIMIZER_CALIBRATION_TREATMENTS,
         *RING10_LIVE_CADENCE_TREATMENTS,
+        *RING10_LR_RECOVERY_TREATMENTS,
         *RING10_TRAINING_DYNAMICS_TREATMENTS,
         *RING10_ATTENTION_TREATMENTS,
         *RING10_RELATIONAL_TREATMENTS,
@@ -121,6 +133,7 @@ TREATMENT_SUITES = {
     "ring10-optimization": RING10_OPTIMIZATION_TREATMENTS,
     "ring10-optimizer-calibration": RING10_OPTIMIZER_CALIBRATION_TREATMENTS,
     "ring10-live-cadence": RING10_LIVE_CADENCE_TREATMENTS,
+    "ring10-lr-recovery": RING10_LR_RECOVERY_TREATMENTS,
     "ring10-training-dynamics": RING10_TRAINING_DYNAMICS_TREATMENTS,
     "ring10-attention-reallocation": RING10_ATTENTION_TREATMENTS,
     "ring10-relational": RING10_RELATIONAL_TREATMENTS,
@@ -191,6 +204,7 @@ def _parser() -> argparse.ArgumentParser:
             *RING10_EFFICIENCY_TREATMENTS,
             *RING10_OPTIMIZATION_TREATMENTS,
             *RING10_LIVE_CADENCE_TREATMENTS,
+            *RING10_LR_RECOVERY_TREATMENTS,
             *RING10_TRAINING_DYNAMICS_TREATMENTS,
             *RING10_ATTENTION_TREATMENTS,
             *RING10_RELATIONAL_TREATMENTS,
@@ -334,6 +348,51 @@ def _ring_ten_live_cadence_control(_config: RawConfig) -> None:
 def _ring_ten_live_cadence_five_million(config: RawConfig) -> None:
     _mapping(config, "learner")["candidate_interval_examples"] = (
         RING10_LIVE_CADENCE_TARGET_EXAMPLES
+    )
+
+
+def _ring_ten_lr_recovery(config: RawConfig) -> None:
+    """Restore the proven learning-rate regime with non-compounding recovery.
+
+    Applied to the exact live profile. A fresh warm-start scheduler makes the
+    cosine segment effectively flat for several days, and ``min_lr_ratio``
+    keeps the floor near 1e-4, the regime that still produced measurable
+    frontier gain. Self-play follows the latest candidate so the data
+    distribution is no longer frozen at a stale champion, while the arena keeps
+    the champion as the safety net.
+    """
+
+    optimizer = _mapping(config, "optimizer")
+    optimizer["muon_lr"] = RING10_LR_RECOVERY_MUON_LR
+    optimizer["adamw_lr"] = RING10_LR_RECOVERY_ADAMW_LR
+    scheduler = _mapping(_mapping(config, "train"), "scheduler")
+    scheduler["warmup_steps"] = RING10_LR_RECOVERY_WARMUP_STEPS
+    scheduler["min_lr_ratio"] = RING10_LR_RECOVERY_MIN_LR_RATIO
+    learner = _mapping(config, "learner")
+    learner["selfplay_snapshot_interval_examples"] = (
+        RING10_LR_RECOVERY_SELFPLAY_SNAPSHOT_EXAMPLES
+    )
+    orchestration = _mapping(config, "orchestration")
+    plateau = _mapping(orchestration, "plateau")
+    plateau.update(
+        {
+            "enabled": True,
+            "action": "reduce_lr_keep_weights",
+            "reset_learning_rate_scale": 0.5,
+            "minimum_learning_rate_scale": 0.25,
+            "restore_scale_on_promotion": True,
+            "clear_optimizer_state_on_recovery": True,
+            "max_learner_champion_lag_steps": int(learner["max_replay_lag_steps"]),
+            "consecutive_terminal_rejections": 2,
+        }
+    )
+    refresh = _mapping(orchestration, "model_refresh")
+    refresh.update(
+        {
+            "selfplay_source": "candidate_champion_mix",
+            "candidate_probability": RING10_LR_RECOVERY_CANDIDATE_PROBABILITY,
+            "history_probability": 0.0,
+        }
     )
 
 
@@ -654,6 +713,7 @@ TREATMENTS: dict[str, Treatment] = {
     "ring10-optimizer-0.5x-effective-lr": _half_effective_learning_rates,
     "ring10-live-cadence-control": _ring_ten_live_cadence_control,
     "ring10-live-cadence-5m": _ring_ten_live_cadence_five_million,
+    "ring10-lr-recovery-3e-4": _ring_ten_lr_recovery,
     "ring10-dynamics-control": _ring_ten_dynamics_control,
     "ring10-dynamics-adamw": _ring_ten_dynamics_adamw,
     "ring10-dynamics-ema-1m": _ring_ten_dynamics_ema_one_million,
@@ -1039,9 +1099,11 @@ def _validate_ring10_optimizer_calibration_base(
             )
 
 
-def _validate_ring10_optimizer_calibration_source(
+def _validate_frozen_source_profile(
     base_config: Path,
     source_run_root: Path,
+    *,
+    suite_label: str,
 ) -> None:
     allowed = {
         (source_run_root / name).resolve()
@@ -1053,8 +1115,55 @@ def _validate_ring10_optimizer_calibration_source(
     }
     if base_config.resolve() not in allowed:
         raise ValueError(
-            "ring10 optimizer calibration must use the stopped runtime's exact "
-            "frozen profile"
+            f"{suite_label} must use the stopped runtime's exact frozen profile"
+        )
+
+
+def _validate_ring10_optimizer_calibration_source(
+    base_config: Path,
+    source_run_root: Path,
+) -> None:
+    _validate_frozen_source_profile(
+        base_config,
+        source_run_root,
+        suite_label="ring10 optimizer calibration",
+    )
+
+
+def _validate_ring10_lr_recovery_base(
+    raw: RawConfig,
+    experiment: ExperimentConfig,
+) -> None:
+    """Freeze the exact live runtime before restoring its learning rates."""
+
+    _validate_ring10_efficiency_base(experiment)
+    if _mapping(raw, "optimizer").get("kind") != "muon_adamw":
+        raise ValueError("ring10 learning-rate recovery requires Muon+AdamW routing")
+    if experiment.learner.target_updates_per_new_sample != 1.0:
+        raise ValueError("ring10 learning-rate recovery requires frozen UTD=1.0")
+    if experiment.learner.candidate_interval_examples is None:
+        raise ValueError(
+            "ring10 learning-rate recovery requires an explicit "
+            "learner.candidate_interval_examples"
+        )
+    if experiment.learner.selfplay_snapshot_interval_examples is not None:
+        raise ValueError(
+            "ring10 learning-rate recovery expects a champion-only live profile"
+        )
+
+
+def _validate_ring10_lr_recovery_transition(
+    before: RawConfig,
+    after: RawConfig,
+    treatment: str,
+) -> None:
+    if treatment not in RING10_LR_RECOVERY_TREATMENTS:
+        raise ValueError(f"unsupported ring10 learning-rate recovery: {treatment}")
+    expected = deepcopy(before)
+    _ring_ten_lr_recovery(expected)
+    if after != expected:
+        raise ValueError(
+            f"{treatment} violated the frozen learning-rate recovery contract"
         )
 
 
@@ -1247,6 +1356,14 @@ def prepare_elo_ablation(
             "ring10 optimizer calibration treatments require the complete "
             "--suite ring10-optimizer-calibration"
         )
+    if any(name in RING10_LR_RECOVERY_TREATMENTS for name in treatments) and (
+        suite != "ring10-lr-recovery"
+        or tuple(treatments) != RING10_LR_RECOVERY_TREATMENTS
+    ):
+        raise ValueError(
+            "ring10 learning-rate recovery requires the complete "
+            "--suite ring10-lr-recovery"
+        )
     _validate_inputs(
         prefix=prefix,
         seed=seed,
@@ -1338,6 +1455,13 @@ def prepare_elo_ablation(
     elif suite == "ring10-optimizer-calibration":
         _validate_ring10_optimizer_calibration_base(raw_base, load_config(base))
         _validate_ring10_optimizer_calibration_source(base, source)
+    elif suite == "ring10-lr-recovery":
+        _validate_ring10_lr_recovery_base(raw_base, load_config(base))
+        _validate_frozen_source_profile(
+            base,
+            source,
+            suite_label="ring10 learning-rate recovery",
+        )
     elif (suite is not None and suite.startswith("ring10-")) or any(
         treatment in RING10_EFFICIENCY_VARIANTS
         or treatment in RING10_TRAINING_DYNAMICS_TREATMENTS
@@ -1392,6 +1516,12 @@ def prepare_elo_ablation(
             )
         if treatment_name in RING10_OPTIMIZER_CALIBRATION_TREATMENTS:
             _validate_ring10_optimizer_calibration_transition(
+                before_treatment,
+                profile,
+                treatment_name,
+            )
+        if treatment_name in RING10_LR_RECOVERY_TREATMENTS:
+            _validate_ring10_lr_recovery_transition(
                 before_treatment,
                 profile,
                 treatment_name,

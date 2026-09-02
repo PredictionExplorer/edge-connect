@@ -409,6 +409,8 @@ orchestration:
   plateau:
     consecutive_terminal_rejections: 2
     reset_learning_rate_scale: 0.5
+    minimum_learning_rate_scale: 0.25
+    restore_scale_on_promotion: true
   retention:
     enabled: true
     dry_run: false
@@ -421,9 +423,41 @@ are not promotion candidates and do not change the throughput profile's
 28,000-step arena cadence. Autonomous profiles publish promotion candidates by
 `candidate_interval_examples` while independently refreshing actor models with
 the `selfplay_snapshot_*` example cadence.
-At the hard replay-lag boundary, a terminal rejection resets to the champion
-even if candidate supersession prevented the configured rejection streak.
-Each plateau reset scales the restored optimizer and scheduler rates by 0.5.
+
+### Learning-rate governance during plateau recovery
+
+The profile's optimizer rates are the *reference schedule*. Plateau recovery
+may run below it only through one absolute multiplier that the learner records
+next to the reference in every checkpoint (`extra.learning_rate_governor`):
+
+- A recovery sets the multiplier to
+  `max(minimum_learning_rate_scale, reset_learning_rate_scale)`. It never
+  multiplies the multiplier that is already active, so repeated recoveries
+  converge to the floor instead of decaying geometrically.
+- Only *conclusive* rejections (`reject`, `reject_ring_regression`) count toward
+  `consecutive_terminal_rejections`. A candidate that merely exhausts its pair
+  budget (`reject_max_pairs`) is terminal but inconclusive: at the hard
+  replay-lag boundary it still releases the lag cap, but it never lowers the
+  rate or clears optimizer moments. The arena writes `conclusive` and
+  `consecutive_conclusive_rejections` into `promotion-status.json`.
+- When `restore_scale_on_promotion` is true and the champion changes after a
+  reduction, the learner returns to the reference schedule and records a
+  `plateau_scale_restored` metric event.
+- Checkpoints written before the governor existed carry only scaled scheduler
+  rates. Resuming them adopts those rates as the reference (metric event
+  `learning_rate_governor_legacy`) so a resume never jumps the effective rate;
+  a champion warm start from a new profile is the supported way to restore a
+  higher schedule.
+
+Before this contract, each `reset_from_champion` halved the rates that were
+saved inside the champion checkpoint, so every later champion inherited the
+cut and the next reset halved it again. On the production run five champion
+generations compounded Muon from 6.1e-4 to 1.4e-5 and frontier gain fell from
+about 7 Elo per training hour to zero. `validate_continuous_profile.py` now
+rejects profiles without a floor of at least 0.25 and restore-on-promotion, and
+`monitor_run.py` raises `learning_rate_reduced` whenever the multiplier is below
+one and `learning_rate_collapsed` when a legacy learner's live Muon rate is
+under 5% of its configured schedule outside warmup.
 
 Validate and print the effective topology:
 

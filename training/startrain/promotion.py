@@ -59,6 +59,25 @@ from .runtime import (
 )
 from .training import maybe_compile_model
 
+REJECTION_DECISIONS = frozenset(
+    {"reject", "reject_ring_regression", "reject_max_pairs"}
+)
+# Exhausting the pair budget is terminal but carries no evidence either way.
+INCONCLUSIVE_DECISIONS = frozenset({"reject_max_pairs"})
+
+
+def decision_is_conclusive(decision: str, *, terminal: bool) -> bool:
+    """Return whether a terminal arena decision rests on sequential evidence."""
+
+    return bool(terminal) and decision not in INCONCLUSIVE_DECISIONS
+
+
+def _status_counter(status: Mapping[str, object], key: str) -> int:
+    value = status.get(key, 0)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return 0
+    return value
+
 
 def load_manifest_evaluator(
     experiment: ExperimentConfig,
@@ -1229,6 +1248,7 @@ class PromotionSupervisor:
             promotion_result["decision"] = decision
         terminal = decision != "continue"
         result["terminal"] = terminal
+        result["conclusive"] = decision_is_conclusive(decision, terminal=terminal)
         result_path = self._result_path(candidate, champion)
         atomic_json(result_path, result)
         if decision == "promote":
@@ -1461,6 +1481,7 @@ class PromotionSupervisor:
             raise ValueError("persisted arena promotion is invalid")
         promotion_result["decision"] = "reject_max_pairs"
         result["terminal"] = True
+        result["conclusive"] = False
         self._annotate_result(result, candidate, champion)
         atomic_json(self._result_path(candidate, champion), result)
         self._write_status(
@@ -1668,6 +1689,7 @@ class PromotionSupervisor:
         }
         payload["schema_version"] = ARENA_RESULT_SCHEMA_VERSION
         payload["terminal"] = True
+        payload["conclusive"] = False
         payload["promotion"] = {
             "decision": "superseded",
             "superseded_by": superseded_by.model_identity,
@@ -1693,37 +1715,33 @@ class PromotionSupervisor:
                     prior = loaded
             except (OSError, json.JSONDecodeError):
                 prior = {}
-        raw_streak = prior.get("consecutive_terminal_rejections", 0)
-        streak = (
-            raw_streak
-            if isinstance(raw_streak, int) and not isinstance(raw_streak, bool)
-            else 0
+        streak = _status_counter(prior, "consecutive_terminal_rejections")
+        conclusive_streak = _status_counter(
+            prior,
+            "consecutive_conclusive_rejections",
         )
         cutover = self._resume_cutover()
         cutover_created_ns = cutover[0] if cutover is not None else None
         if prior.get("cutover_created_ns") != cutover_created_ns:
             streak = 0
+            conclusive_streak = 0
         prior_candidate = prior.get("candidate_identity")
         prior_terminal = bool(prior.get("terminal"))
         prior_decision = prior.get("decision")
-        rejection = decision in (
-            "reject",
-            "reject_ring_regression",
-            "reject_max_pairs",
+        rejection = decision in REJECTION_DECISIONS
+        conclusive = decision_is_conclusive(decision, terminal=terminal)
+        already_counted = (
+            prior_candidate == candidate.model_identity
+            and prior_terminal
+            and prior_decision in REJECTION_DECISIONS
         )
         if decision in ("promote", "bootstrap"):
             streak = 0
-        elif (
-            terminal
-            and rejection
-            and not (
-                prior_candidate == candidate.model_identity
-                and prior_terminal
-                and prior_decision
-                in ("reject", "reject_ring_regression", "reject_max_pairs")
-            )
-        ):
+            conclusive_streak = 0
+        elif terminal and rejection and not already_counted:
             streak += 1
+            if conclusive:
+                conclusive_streak += 1
         atomic_json(
             self.status_path,
             {
@@ -1734,7 +1752,9 @@ class PromotionSupervisor:
                 "champion_step": champion.model_step,
                 "decision": decision,
                 "terminal": terminal,
+                "conclusive": conclusive,
                 "consecutive_terminal_rejections": streak,
+                "consecutive_conclusive_rejections": conclusive_streak,
                 "cutover_created_ns": cutover_created_ns,
                 "updated_ns": time.time_ns(),
             },

@@ -1647,6 +1647,40 @@ def collect_snapshot(
             "python_feature_path",
             f"learner feature path={learner_metric.get('feature_path')}",
         )
+    learning_rate_multiplier = _number(learner_metric.get("learning_rate_multiplier"))
+    if learning_rate_multiplier is not None and learning_rate_multiplier < 1.0:
+        _add_warning(
+            warnings,
+            "WARN",
+            "learning_rate_reduced",
+            "learner runs at "
+            f"{learning_rate_multiplier:.3f}x of its reference learning rates",
+        )
+    configured_optimizer = _mapping(profile.get("optimizer"))
+    configured_muon_lr = _number(configured_optimizer.get("muon_lr"))
+    live_learning_rates = learner_metric.get("learning_rates")
+    live_muon_lr = (
+        _number(live_learning_rates[0])
+        if isinstance(live_learning_rates, list) and live_learning_rates
+        else None
+    )
+    if (
+        learning_rate_multiplier is None
+        and configured_muon_lr
+        and live_muon_lr is not None
+        and learner_metric.get("scheduler_segment") != "warmup"
+        and live_muon_lr < configured_muon_lr * 0.05
+    ):
+        # Runs predating the learning-rate governor only expose scheduler rates;
+        # a live rate this far below the profile schedule floor means plateau
+        # resets compounded through the champion lineage.
+        _add_warning(
+            warnings,
+            "ERROR",
+            "learning_rate_collapsed",
+            f"live Muon LR {live_muon_lr:.3e} is below 5% of the configured "
+            f"{configured_muon_lr:.3e}; plateau reductions have compounded",
+        )
     step_seconds = _number(learner_metric.get("step_seconds"))
     data_wait_seconds = _number(learner_metric.get("data_wait_seconds"))
     data_wait_fraction = (
@@ -1833,6 +1867,8 @@ def collect_snapshot(
         "scheduler_age_steps": learner_metric.get("scheduler_age_steps"),
         "scheduler_segment": learner_metric.get("scheduler_segment"),
         "scheduler_segment_position": learner_metric.get("scheduler_segment_position"),
+        "learning_rate_multiplier": learner_metric.get("learning_rate_multiplier"),
+        "reference_learning_rates": learner_metric.get("reference_learning_rates"),
         "ema": learner_metric.get("ema"),
         "raw_vs_ema_distance": learner_metric.get("raw_vs_ema_distance"),
         "raw_vs_ema_relative_distance": learner_metric.get(

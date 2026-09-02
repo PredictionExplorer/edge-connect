@@ -67,6 +67,12 @@ The following switches are deliberately first-class and recorded in metrics:
   smaller-ring regression guards.
 - `orchestration.plateau.action: reduce_lr_keep_weights`, which clears stale
   optimizer moments and lowers rates without discarding the learner branch.
+- `orchestration.plateau.minimum_learning_rate_scale` and
+  `restore_scale_on_promotion`, which bound plateau recovery to one absolute,
+  floored multiplier of the profile's reference rates and return to the
+  reference after the next promotion. Reductions are triggered only by
+  conclusive rejections; budget exhaustion (`reject_max_pairs`) releases the
+  replay-lag cap without touching rates.
 
 Candidate/champion/history mixing keeps pointer roles and run identities strict.
 Models are refreshed only between complete game batches, so no game contains

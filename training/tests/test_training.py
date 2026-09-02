@@ -18,6 +18,7 @@ from startrain.config import (
     DataConfig,
     HistoricalEvaluationConfig,
     ModelRefreshConfig,
+    PlateauConfig,
     SchedulerConfig,
     load_config,
 )
@@ -540,6 +541,47 @@ def test_old_config_schema_and_noncanonical_rings_are_rejected(tmp_path) -> None
     odd.write_text(source.replace("rings: 4", "rings: 5", 1))
     with pytest.raises(ConfigError, match="one of"):
         load_config(odd)
+
+
+def test_continuous_validator_requires_non_compounding_plateau_recovery() -> None:
+    ring10_only = load_config(CONFIGS / "h100-8gpu-ring10-only.yaml")
+    plateau = ring10_only.orchestration.plateau
+    assert plateau.minimum_learning_rate_scale == 0.25
+    assert plateau.restore_scale_on_promotion is True
+
+    def with_plateau(**changes: object):
+        return replace(
+            ring10_only,
+            orchestration=replace(
+                ring10_only.orchestration,
+                plateau=replace(plateau, **changes),
+            ),
+        )
+
+    validate_continuous_config(with_plateau(action="reduce_lr_keep_weights"))
+    validate_continuous_config(with_plateau(reset_learning_rate_scale=1.0))
+    validate_continuous_config(
+        with_plateau(
+            action="reduce_lr_keep_weights",
+            consecutive_terminal_rejections=3,
+        )
+    )
+    for changes in (
+        {"action": "pause"},
+        {"action": "reduce_lr_keep_weights", "consecutive_terminal_rejections": 4},
+        {"restore_scale_on_promotion": False},
+        {"minimum_learning_rate_scale": 0.1, "reset_learning_rate_scale": 0.5},
+    ):
+        with pytest.raises(ValueError, match="non-compounding plateau recovery"):
+            validate_continuous_config(with_plateau(**changes))
+    with pytest.raises(ValueError, match="plateau"):
+        validate_continuous_config(with_plateau(enabled=False))
+    with pytest.raises(ConfigError, match="cannot be below"):
+        PlateauConfig(reset_learning_rate_scale=0.1, minimum_learning_rate_scale=0.25)
+    with pytest.raises(ConfigError, match="plateau policy settings are invalid"):
+        PlateauConfig(minimum_learning_rate_scale=0.0)
+    with pytest.raises(ConfigError, match="plateau booleans"):
+        PlateauConfig(restore_scale_on_promotion="yes")  # type: ignore[arg-type]
 
 
 def test_plateau_candidate_cadence_fits_replay_lag() -> None:

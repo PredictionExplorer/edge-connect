@@ -114,13 +114,21 @@ def _validate_safe_throughput_invariants(config: ExperimentConfig) -> None:
             "continuous service requires ring-scaled search and weighted fast targets"
         )
     plateau = config.orchestration.plateau
+    # Recovery may run below the reference schedule only through one floored,
+    # non-compounding multiplier that returns to the schedule on promotion. The
+    # earlier contract required an unfloored 0.5x reset; each champion inherited
+    # the cut and five generations compounded the rate 44x lower.
     if (
         not plateau.enabled
-        or plateau.action != "reset_from_champion"
-        or plateau.consecutive_terminal_rejections > 2
-        or plateau.reset_learning_rate_scale > 0.5
+        or plateau.action not in ("reset_from_champion", "reduce_lr_keep_weights")
+        or plateau.consecutive_terminal_rejections > 3
+        or plateau.minimum_learning_rate_scale < 0.25
+        or not plateau.restore_scale_on_promotion
     ):
-        raise ValueError("continuous service requires bounded lower-LR champion resets")
+        raise ValueError(
+            "continuous service requires floored, non-compounding plateau recovery "
+            "that restores the reference learning rates on promotion"
+        )
     arena = config.arena
     continuation = arena.continuation_pairs_per_ring or arena.pairs_per_ring
     continuation_limit = (
