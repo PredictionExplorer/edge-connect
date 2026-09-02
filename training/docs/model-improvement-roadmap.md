@@ -293,14 +293,30 @@ Lambda snapshot verification: fallback snapshot
   completed 04:15:28 UTC (14 seconds before the stop); a final post-stop
   snapshot was started at 04:16:33; the fork's own 14-minute snapshot timer
   publishes to edgeconnect-dr/continuity/lr-recovery-742979
-Result: pending
-Decision: pending
+Result: twelve-hour verification (16:55 UTC) — system healthy: Muon 3.0e-4 at
+  multiplier 1.0 throughout, UTD 1.00, zero non-finite events, zero plateau
+  events, eight candidates on the 1.55-hour cadence, actors ~370 samples/s,
+  hourly losses flat (total 3.44-3.47, policy ~1.37, gradient norm ~8.3 versus
+  3.37/1.33/9.4 under the collapsed rate). Frontier evidence at the unchanged
+  1024-simulation gate: 746,886 +1.7 (400 games, inconclusive; warmup-era
+  candidate), 754,700 +8.7 (400 games, inconclusive), 762,514 +11.6 after 300
+  games (continuing). Trend positive and monotone but all evaluations remain
+  inconclusive at the 400-game cap, so the twelve-hour promotion criterion was
+  not testable at this gate; the abort criteria were not approached
+Decision: keep the recovery rates; proceed with R10-ARENA-GATE-02 so the gate
+  can conclude on effects of this size, then judge Elo per hour on the
+  1024-simulation measurement ladder
 Notes: the fork refused sixteen root-owned SQLite temp sidecars left in the
   source's recovery/replay-manifest by the root-run terminal-boundary
   pipelines; their ownership was corrected to ubuntu before forking. The
   completed seed-17 handoff artifact was removed from the continuity manifest
   so the fresh state does not treat it as a new failure; seeds 18/19 remain
-  registered. The stale `primary-recovery` workload entry was replaced.
+  registered. The stale `primary-recovery` workload entry was replaced. The
+  post-stop disaster snapshot of the stopped source entered an SQLite backup
+  restart loop (13 TB read, 4 MB written in 68 minutes) and was stopped; the
+  earlier verified snapshot remains `latest`. The same loop left temp sidecars
+  after the Aug 22 stopped-boundary snapshots, so the snapshot tool's
+  replay-ledger step misbehaves on stopped roots and needs a fix.
 ```
 
 ```text
