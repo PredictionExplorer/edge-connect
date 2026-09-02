@@ -322,15 +322,18 @@ Notes: the fork refused sixteen root-owned SQLite temp sidecars left in the
 ```text
 ID: R10-ARENA-GATE-02
 Phase: 1 — promotion evidence efficiency
-Status: implemented and tested; in-place migration scheduled after the
-  R10-LR-RECOVERY-01 twelve-hour verification
+Status: live since 2026-09-02 17:32 UTC (in-place migration at learner step
+  775,955; four minutes of GPU idle time, stopped at the arena boundary right
+  after candidate 762,514's terminal decision so no evaluation mixes budgets)
 Hypothesis: gating at 256 simulations with a 600-pair cap concludes true +35
   to +45 Elo candidates in about 500 games (roughly 1.2 hours) instead of
   exhausting a 400-game cap, while a 100-pair measurement crossplay at 1024
   simulations against the direct predecessor keeps the champion-frontier ladder
   on its historical scale
-Commit: recorded at migration
-Release: recorded at migration
+Commit: 2ccd895 (migration chain 22df338 -> 2ccd895; the root's source
+  authority had stayed at the parent's commit through the R1 release cutover,
+  which the migration reason records)
+Release: main-2ccd895-arena-gate (profile-arena-gate.yaml, sha256 d1be1905...)
 Control: the R10-LR-RECOVERY-01 gate (1024 simulations, 50/50/200 pairs)
 Treatment: arena.simulations 256, arena.max_pairs_per_ring 600,
   historical_evaluation {measure_direct_predecessor, simulations 1024,
@@ -345,7 +348,9 @@ Statistical gate: the 1024-simulation ladder (report
   autonomous_elo.search_budget.ladder) continues to extend the anchor chain;
   256-simulation results are excluded from it by construction
 Lambda snapshot verification: fork snapshot timer continues unchanged
-Result: pending
+Result: pending (first gate decision under the new budget expected within
+  about two hours of the cutover; first measurement link after the first
+  promotion)
 Decision: pending
 ```
 
