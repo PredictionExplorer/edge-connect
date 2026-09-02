@@ -537,6 +537,80 @@ def test_snapshot_omits_obsolete_warm_start_with_missing_checkpoint(
     assert (restored / "learner" / "resume-cutover.json").is_file()
 
 
+def test_snapshot_keeps_active_warm_start_superseded_by_later_cutover(
+    tmp_path: Path,
+) -> None:
+    """A learner-written cutover after activation makes the marker provenance.
+
+    Plateau recovery writes a new resume cutover while the warm-start marker
+    stays active and still points at the warm-start checkpoint. The marker is
+    then historical provenance, not the resume point, and must neither fail the
+    snapshot nor be required to agree with the cutover.
+    """
+
+    fixture = _fixture(tmp_path)
+    marker_path = fixture.root / "learner" / "champion-warm-start.json"
+    cutover_path = fixture.root / "learner" / "resume-cutover.json"
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    cutover = json.loads(cutover_path.read_text(encoding="utf-8"))
+    activation_ns = int(cutover["created_ns"])
+    marker["cutover_created_ns"] = activation_ns
+    _write_json(marker_path, marker)
+
+    later, later_digest = _content_addressed_file(
+        fixture.root / "learner" / "recovery",
+        prefix="sha256-",
+        suffix=".pt",
+        data=b"recovery checkpoint written by plateau recovery after the warm start",
+    )
+    cutover.update(
+        {
+            "checkpoint": f"recovery/{later.name}",
+            "checkpoint_sha256": later_digest,
+            "checkpoint_bytes": later.stat().st_size,
+            "step": 12,
+            "created_ns": activation_ns + 1,
+        }
+    )
+    _write_json(cutover_path, cutover)
+
+    snapshot = _snapshot(fixture, tmp_path / "backup")
+    payload = _snapshot_payload(snapshot)
+    assert "learner/champion-warm-start.json" in payload["catalog"]
+    assert recovery.verify_snapshot(snapshot)["status"] == "ok"
+    restored = recovery.restore_snapshot(
+        snapshot,
+        tmp_path / "restored-with-superseded-warm-start",
+        relocate_profile=True,
+    )
+    restored_cutover = json.loads(
+        (restored / "learner" / "resume-cutover.json").read_text(encoding="utf-8")
+    )
+    assert restored_cutover["checkpoint_sha256"] == later_digest
+    assert (restored / "learner" / "champion-warm-start.json").is_file()
+
+    # A cutover that predates or coincides with activation must still agree.
+    for created_ns in (activation_ns, activation_ns - 1):
+        cutover["created_ns"] = created_ns
+        _write_json(cutover_path, cutover)
+        with pytest.raises(
+            recovery.DisasterRecoveryError,
+            match="disagrees with resume cutover",
+        ):
+            _snapshot(fixture, tmp_path / f"backup-{created_ns}")
+
+    # Markers without an activation stamp keep the strict rule.
+    cutover["created_ns"] = activation_ns + 1
+    _write_json(cutover_path, cutover)
+    del marker["cutover_created_ns"]
+    _write_json(marker_path, marker)
+    with pytest.raises(
+        recovery.DisasterRecoveryError,
+        match="disagrees with resume cutover",
+    ):
+        _snapshot(fixture, tmp_path / "backup-unstamped")
+
+
 def test_snapshot_rejects_missing_shard_without_publishing_latest(
     tmp_path: Path,
 ) -> None:

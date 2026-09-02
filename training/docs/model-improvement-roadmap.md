@@ -409,8 +409,14 @@ Statistical gate: the first stage (Muon 1.5e-4) fires on the next conclusive
 Result: first stage fired 14 seconds after startup (19:37:57 UTC,
   plateau_recovery from the pre-existing streak of two: 774,235 -19.1 and
   778,142 -22.6, both conclusive at 400 games), Muon 3.0e-4 -> 1.5e-4,
-  optimizer moments cleared, streak reset, learner kept training; anneal
-  evidence pending
+  optimizer moments cleared, streak reset, learner kept training. 21:26 UTC:
+  learner 2,590 steps/hour with no pauses (lag 42,345); mean training loss
+  3.367 over the last hour versus 3.44-3.47 under 3.0e-4; the first candidate
+  with any annealed training (782,049, about 1,200 steps at 1.5e-4 before
+  publication) stood at 0.0 Elo after 500 games against -19.1 and -22.6 for
+  the two candidates before it, still under evaluation. Side effect found: the
+  recovery's new resume cutover broke the disaster snapshot (see the decision
+  log entry "Keep disaster snapshots through plateau recovery")
 Decision: pending
 ```
 
@@ -456,6 +462,19 @@ example candidate-publication treatment. The completed optimizer, EMA,
 freshness, and clinch screen had no promoted frontier gain, so those arms are
 excluded. Backlog relief is necessary but insufficient: the treatment must also
 pass the standard pair-valid Elo/hour gates.
+
+### 2026-09-02 — Keep disaster snapshots through plateau recovery
+
+Decision: the first plateau recovery (19:37 UTC) wrote a new resume cutover and
+the 14-minute disaster snapshot failed closed on every run afterwards with
+`active warm-start marker disagrees with resume cutover` (seven failures by
+21:16, last verified snapshot 19:36). The equality rule is only meaningful until
+the learner's own first cutover; afterwards the warm-start marker is provenance.
+Treat a cutover created after the marker's `cutover_created_ns` as superseding
+it, keep the marker in the catalog, and ship as a runtime-only release with a
+snapshot run and verify immediately after cutover. Unstamped markers keep the
+strict rule. Follow-up: the snapshot tool's SQLite restart loop on stopped roots
+(noted under R10-LR-RECOVERY-01) remains open.
 
 ### 2026-09-02 — Decouple keep-weights plateau recovery from champion lag
 

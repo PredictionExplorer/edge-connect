@@ -1240,6 +1240,15 @@ copies replay, identity, profile, model, recovery, cadence, arena, and status
 artifacts into content-addressed objects. It publishes the immutable snapshot
 manifest and `latest.json` only after end-to-end verification.
 
+An active `learner/champion-warm-start.json` must agree with
+`learner/resume-cutover.json` only until the learner writes its own cutover
+(plateau recovery or reset, for example). Activation stamps the marker with
+`cutover_created_ns`; any later cutover supersedes the warm start, and the
+snapshot keeps the marker as provenance instead of failing. Before this rule a
+warm-started run lost disaster coverage at its first plateau recovery
+(`active warm-start marker disagrees with resume cutover` every 14 minutes),
+which is exactly when a backup matters most.
+
 Render and enable
 `deploy/edgeconnect-startrain-disaster-backup.{service,timer}.example` for a
 15-minute RPO. Distinct ablation roots retain one run identity, so give every

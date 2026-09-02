@@ -2079,6 +2079,31 @@ def _validate_jsonl(
                 )
 
 
+def _warm_start_superseded(
+    marker: Mapping[str, object],
+    cutover: Mapping[str, object],
+) -> bool:
+    """Whether the learner has durably moved past an active warm start.
+
+    Activation stamps the marker with the resume cutover it wrote. Any cutover
+    created later (a plateau recovery or reset, for example) belongs to the
+    learner's own progress, so the marker is historical provenance rather than
+    the current resume point and no longer has to agree with the cutover.
+    Markers without an activation stamp keep the strict agreement rule.
+    """
+
+    activation_ns = marker.get("cutover_created_ns")
+    created_ns = cutover.get("created_ns")
+    if (
+        isinstance(activation_ns, bool)
+        or not isinstance(activation_ns, int)
+        or isinstance(created_ns, bool)
+        or not isinstance(created_ns, int)
+    ):
+        return False
+    return created_ns > activation_ns
+
+
 def _verify_snapshot_document(
     snapshot: Path,
     backup_root: Path,
@@ -2363,10 +2388,9 @@ def _verify_snapshot_document(
                 "learner/resume-cutover.json",
                 name="active warm-start resume cutover",
             )
-            if cutover.get("checkpoint_sha256") != catalog[
-                warm_checkpoint
-            ].sha256 or cutover.get("checkpoint_sha256") != warm.get(
-                "checkpoint_sha256"
+            if not _warm_start_superseded(warm, cutover) and (
+                cutover.get("checkpoint_sha256") != catalog[warm_checkpoint].sha256
+                or cutover.get("checkpoint_sha256") != warm.get("checkpoint_sha256")
             ):
                 raise DisasterRecoveryError(
                     "active warm-start marker disagrees with resume cutover"
