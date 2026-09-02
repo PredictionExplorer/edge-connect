@@ -1561,13 +1561,28 @@ The utility rejects live workers, autonomous provenance, schema/model/game/loss/
 optimizer drift, unverified checkpoints, incomplete replay history, and every
 profile field outside the narrow allowlist: learner batch, candidate lag,
 plateau lag, in-flight candidate handling, arena continuation, the arena gate
-budget (`arena.simulations`, `arena.max_pairs_per_ring`), and the measurement
-crossplay block (`orchestration.historical_evaluation.*`).
+budget (`arena.simulations`, `arena.max_pairs_per_ring`), the measurement
+crossplay block (`orchestration.historical_evaluation.*`), and the
+update-to-data target with its example-based publication cadence
+(`learner.target_updates_per_new_sample`, `learner.candidate_interval_examples`,
+`learner.selfplay_snapshot_interval_examples`,
+`learner.selfplay_snapshot_warmup_interval_examples`).
 It writes a new read-only profile and checksum, an append-only
 `continuous-migrations.jsonl`, and a rollback bundle. Repoint the training and
 backup units to the new immutable release and newly named profile, then start
 normally. The service still runs profile validation, H100 health, and replay
 restore gates before the coordinator starts.
+
+A change to an existing update-to-data target is prospective: the migrator
+writes `learner/utd-segment.json` with the recovery checkpoint's consumed
+examples and the ledger's committed samples as the new baselines, so the new
+ratio applies only to samples generated from the boundary on and never grants a
+catch-up burst over the historical ledger. The example-based intervals must
+scale with the target (UTD 1.0 -> 1.5 turns 2M/1M into 3M/1.5M) so candidate and
+self-play publications stay constant per newly generated replay sample; the
+migrator refuses a disproportionate cadence, a live segment that disagrees with
+the source profile, and removing UTD control. Introducing UTD control to a run
+that never had it still requires a separately reviewed migration.
 
 ### Cheaper promotion gate with measurement crossplay
 
@@ -1613,9 +1628,9 @@ chunks and bounds shutdown loss. Leaving it null preserves the full requested
 ring batch for throughput; any non-null production value requires an H100
 throughput benchmark because smaller batches can reduce evaluator efficiency.
 
-This utility intentionally does not introduce update-to-data control. Adding a
-UTD target to an existing throughput run requires a separately reviewed
-prospective segment migration; adding only the YAML value fails closed.
+This utility does not introduce update-to-data control to a run that never had
+it; adding only the YAML value fails closed. Changing an existing target is
+supported as the prospective segment migration described above.
 
 ### Autonomous runs
 

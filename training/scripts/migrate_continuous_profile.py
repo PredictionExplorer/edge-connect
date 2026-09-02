@@ -33,6 +33,10 @@ else:
 
 
 MIGRATION_SCHEMA_VERSION = 1
+UTD_SEGMENT_SCHEMA_VERSION = 1
+UTD_SEGMENT_FILENAME = "utd-segment.json"
+# Publication cadence may drift from exact proportionality only by rounding.
+_CADENCE_SCALE_TOLERANCE = 0.01
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _COMMIT = re.compile(r"^[0-9a-f]{7,64}$")
 _PROFILE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,122}\.ya?ml$")
@@ -43,6 +47,14 @@ _ALLOWED_PROFILE_PATHS = {
     ("train", "per_rank_batch_size"),
     ("learner", "candidate_interval"),
     ("learner", "max_replay_lag_steps"),
+    # Update-to-data control and the example-based publication cadence. A UTD
+    # change is prospective: the migration writes a fresh segment baseline at
+    # the durable boundary, and the cadence intervals must scale with the target
+    # so publications stay constant per newly generated replay sample.
+    ("learner", "target_updates_per_new_sample"),
+    ("learner", "candidate_interval_examples"),
+    ("learner", "selfplay_snapshot_interval_examples"),
+    ("learner", "selfplay_snapshot_warmup_interval_examples"),
     ("orchestration", "plateau", "max_learner_champion_lag_steps"),
     ("orchestration", "promotion", "finish_inflight_candidate"),
     ("arena", "continuation_pairs_per_ring"),
@@ -136,6 +148,11 @@ class MigrationPlan:
     replay_updated_ns: int
     champion_model_identity: str
     coordinator_lock_status: str
+    utd_segment_payload: Mapping[str, object] | None = None
+
+    @property
+    def utd_segment_path(self) -> Path:
+        return self.run_root / "learner" / UTD_SEGMENT_FILENAME
 
     def output(self, *, mode: str, backup: Path | None = None) -> dict[str, object]:
         return {
@@ -172,12 +189,22 @@ class MigrationPlan:
                 for path, old, new in self.changes
             ],
             "backup_bundle": str(backup or self.backup_directory),
+            "utd_segment": (
+                dict(self.utd_segment_payload)
+                if self.utd_segment_payload is not None
+                else None
+            ),
             "writes": [
                 str(self.target_profile),
                 str(self.target_profile_checksum),
                 str(self.run_root / "continuous-migrations.jsonl"),
                 str(self.run_root / "profile.sha256"),
                 str(self.run_root / "source-commit.txt"),
+                *(
+                    [str(self.utd_segment_path)]
+                    if self.utd_segment_payload is not None
+                    else []
+                ),
             ],
         }
 
@@ -431,6 +458,148 @@ def _validate_profile_pair(
         (".".join(path), _json_value(before), _json_value(after))
         for path, before, after in differences
     )
+
+
+def _read_previous_utd_segment(
+    path: Path,
+    *,
+    run_id: str,
+    generation_family: str,
+    expected_target: float,
+    examples_consumed: int,
+    committed_replay_samples: int,
+) -> dict[str, Any]:
+    payload, _ = _read_json(path, "previous UTD segment")
+    required = {
+        "schema_version",
+        "run_id",
+        "generation_family",
+        "target_updates_per_new_sample",
+        "baseline_examples_consumed",
+        "baseline_committed_replay_samples",
+    }
+    if not required <= set(payload) or set(payload) - (required | {"created_ns"}):
+        raise MigrationError("previous UTD segment fields are invalid")
+    target = payload.get("target_updates_per_new_sample")
+    if (
+        payload.get("schema_version") != UTD_SEGMENT_SCHEMA_VERSION
+        or payload.get("run_id") != run_id
+        or payload.get("generation_family") != generation_family
+        or isinstance(target, bool)
+        or not isinstance(target, int | float)
+        or float(target) != expected_target
+    ):
+        raise MigrationError("previous UTD segment does not match the source profile")
+    previous_examples = _nonnegative_int(
+        "previous UTD baseline examples",
+        payload.get("baseline_examples_consumed"),
+    )
+    previous_samples = _nonnegative_int(
+        "previous UTD baseline replay samples",
+        payload.get("baseline_committed_replay_samples"),
+    )
+    if (
+        previous_examples > examples_consumed
+        or previous_samples > committed_replay_samples
+    ):
+        raise MigrationError("previous UTD segment is ahead of the durable boundary")
+    return payload
+
+
+def _require_proportional_cadence(
+    old: ExperimentConfig,
+    new: ExperimentConfig,
+    *,
+    scale: float,
+) -> None:
+    """Keep publications constant per newly generated replay sample.
+
+    The example-based intervals count learner examples, and a UTD change alters
+    how many examples the learner consumes per new sample, so the intervals must
+    scale with the target or the wall-clock cadence silently changes with it.
+    """
+
+    for name in (
+        "candidate_interval_examples",
+        "selfplay_snapshot_interval_examples",
+        "selfplay_snapshot_warmup_interval_examples",
+    ):
+        before = getattr(old.learner, name)
+        after = getattr(new.learner, name)
+        if before is None and after is None:
+            continue
+        if before is None or after is None or before <= 0:
+            raise MigrationError(
+                f"learner.{name} must stay configured across an update-to-data change"
+            )
+        if abs(after / before - scale) > _CADENCE_SCALE_TOLERANCE * scale:
+            raise MigrationError(
+                f"learner.{name} must scale with the update-to-data target "
+                f"({before} -> {after} is not {scale:g}x)"
+            )
+
+
+def _plan_utd_segment(
+    run_root: Path,
+    *,
+    old: ExperimentConfig,
+    new: ExperimentConfig,
+    run_id: str,
+    generation_family: str,
+    examples_consumed: int,
+    committed_replay_samples: int,
+    timestamp_ns: int,
+) -> dict[str, Any] | None:
+    """Return the prospective UTD segment a target change requires, if any.
+
+    A changed target never re-rates history: the new segment starts at the
+    durable boundary with the recovery checkpoint's consumed examples and the
+    ledger's committed samples, so the ratio applies only to samples generated
+    from here on. An unchanged target leaves the live segment untouched.
+    """
+
+    old_target = old.learner.target_updates_per_new_sample
+    new_target = new.learner.target_updates_per_new_sample
+    previous_path = run_root / "learner" / UTD_SEGMENT_FILENAME
+    if new_target is None:
+        if old_target is not None:
+            raise MigrationError("removing update-to-data control is not supported")
+        return None
+    if old_target is not None and float(old_target) == float(new_target):
+        if previous_path.is_file():
+            _read_previous_utd_segment(
+                previous_path,
+                run_id=run_id,
+                generation_family=generation_family,
+                expected_target=float(old_target),
+                examples_consumed=examples_consumed,
+                committed_replay_samples=committed_replay_samples,
+            )
+        return None
+    if old_target is None:
+        raise MigrationError(
+            "introducing update-to-data control requires a separately reviewed "
+            "prospective segment migration"
+        )
+    if previous_path.is_file():
+        _read_previous_utd_segment(
+            previous_path,
+            run_id=run_id,
+            generation_family=generation_family,
+            expected_target=float(old_target),
+            examples_consumed=examples_consumed,
+            committed_replay_samples=committed_replay_samples,
+        )
+    _require_proportional_cadence(old, new, scale=float(new_target) / float(old_target))
+    return {
+        "schema_version": UTD_SEGMENT_SCHEMA_VERSION,
+        "run_id": run_id,
+        "generation_family": generation_family,
+        "target_updates_per_new_sample": float(new_target),
+        "baseline_examples_consumed": examples_consumed,
+        "baseline_committed_replay_samples": committed_replay_samples,
+        "created_ns": timestamp_ns,
+    }
 
 
 def _pid_is_live(pid: int) -> bool:
@@ -1158,6 +1327,16 @@ def plan_migration(request: MigrationRequest) -> MigrationPlan:
     timestamp_ns = time.time_ns()
     if chain and timestamp_ns <= int(chain[-1]["timestamp_ns"]):
         raise MigrationError("system clock does not advance the migration chain")
+    utd_segment_payload = _plan_utd_segment(
+        run_root,
+        old=old_config,
+        new=new_config,
+        run_id=run_id,
+        generation_family=generation_family,
+        examples_consumed=examples_consumed,
+        committed_replay_samples=replay_boundary.committed_samples,
+        timestamp_ns=timestamp_ns,
+    )
     change_records = [
         {"path": path, "from": before, "to": after} for path, before, after in changes
     ]
@@ -1191,6 +1370,8 @@ def plan_migration(request: MigrationRequest) -> MigrationPlan:
         "champion_manifest_sha256": champion_manifest_sha256,
         "champion_pointer_sha256": _sha256_bytes(champion_data),
     }
+    if utd_segment_payload is not None:
+        migration_record["utd_segment"] = dict(utd_segment_payload)
     if resume_cutover_step is not None:
         migration_record.update(
             {
@@ -1214,6 +1395,7 @@ def plan_migration(request: MigrationRequest) -> MigrationPlan:
         (run_root / "source-commit.txt", "source commit"),
         (run_root / "status" / "coordinator.json", "coordinator status"),
         (run_root / "learner" / "candidate.json", "learner candidate"),
+        (run_root / "learner" / UTD_SEGMENT_FILENAME, "UTD segment"),
         (resume_cutover_path, "resume cutover"),
         (run_root / "arena" / "promotion-status.json", "promotion status"),
         (run_root / "replay" / "initialized.json", "replay initialization"),
@@ -1337,6 +1519,7 @@ def plan_migration(request: MigrationRequest) -> MigrationPlan:
         replay_updated_ns=replay_boundary.updated_ns,
         champion_model_identity=champion_identity,
         coordinator_lock_status=lock_status,
+        utd_segment_payload=utd_segment_payload,
     )
 
 
@@ -1656,11 +1839,19 @@ def apply_migration(plan: MigrationPlan) -> dict[str, object]:
             plan.run_root / "continuous-migrations.jsonl",
             plan.run_root / "profile.sha256",
             plan.run_root / "source-commit.txt",
+            plan.utd_segment_path,
         )
         states = tuple(_capture_file_state(path) for path in mutable_paths)
         backup_parent_existed = plan.backup_directory.parent.exists()
         try:
             backup = _create_backup(plan)
+            if plan.utd_segment_payload is not None:
+                _atomic_write_bytes(
+                    plan.utd_segment_path,
+                    _json_bytes(plan.utd_segment_payload),
+                    mode=0o644,
+                    overwrite=True,
+                )
             _atomic_write_bytes(
                 plan.target_profile,
                 plan.target_profile_bytes,

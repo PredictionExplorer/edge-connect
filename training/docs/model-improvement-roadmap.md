@@ -420,6 +420,44 @@ Result: first stage fired 14 seconds after startup (19:37:57 UTC,
 Decision: pending
 ```
 
+```text
+ID: R10-UTD-04
+Phase: 1 — learner utilization
+Status: implemented and tested; in-place migration scheduled for the arena
+  boundary right after the first fully annealed candidate (785,956) has its
+  terminal verdict, so the anneal has one attributable data point at UTD 1.0
+  before the learner budget changes
+Hypothesis: the learner GPU is idle 86% of the time because update-to-data 1.0
+  allows one 512-example update per 512 newly generated samples (2,560 steps
+  per hour against a 0.19-second step; 19,000 steps per hour unthrottled).
+  Raising the target to 1.5 adds 50% more optimizer steps per generated sample
+  at zero hardware cost and raises frontier Elo per hour, because data
+  generation, not optimization, bounds progress
+Commit: recorded at migration
+Release: recorded at migration
+Control: R10-PLATEAU-LAG-03 runtime at UTD 1.0 (candidates 782,049 onward
+  under the 1.5e-4 anneal)
+Treatment: learner.target_updates_per_new_sample 1.0 -> 1.5 with the
+  publication cadence held constant per new replay sample
+  (candidate_interval_examples 2M -> 3M, selfplay_snapshot_interval_examples
+  1M -> 1.5M); prospective UTD segment baselined at the migration boundary
+Anchor/replay cutoff: none; in place with migrate_continuous_profile.py
+Seeds: 17 (production continuation)
+Budget: continuous
+System gates: learner steps per hour rises to about 3,800 within two hours;
+  segment_updates_per_new_sample settles at 1.50; candidate cadence stays
+  about 1.5 hours; actor samples per second unchanged (about 340); the
+  first restart after migration passes preflight with the checkpoint carrying
+  the new target and segment; disaster snapshots keep verifying
+Statistical gate: judged over the next four to six candidates at 256
+  simulations against champion 742,979 (or its successor) compared with the
+  1.5e-4/UTD-1.0 candidates; abort back to UTD 1.0 by migration if training
+  loss diverges from the 1.5e-4 trend (mean total loss above 3.55 for two
+  consecutive hours) or two consecutive candidates conclude below -30 Elo
+Result: pending
+Decision: pending
+```
+
 ## Compute ledger
 
 Record provisioned rather than utilized GPU-hours.
@@ -462,6 +500,20 @@ example candidate-publication treatment. The completed optimizer, EMA,
 freshness, and clinch screen had no promoted frontier gain, so those arms are
 excluded. Backlog relief is necessary but insufficient: the treatment must also
 pass the standard pair-valid Elo/hour gates.
+
+### 2026-09-02 — Use the idle learner: update-to-data 1.5
+
+Decision: with the rate, gate, plateau, and snapshot fixes live, the largest
+remaining idle capacity is the learner GPU (0% utilization 86% of the time under
+UTD 1.0; 0.19-second steps throttled to about 2,560 per hour). Raise the target
+to 1.5 as pre-registered, holding publications constant per newly generated
+sample by scaling the example-based intervals, through the continuous migrator's
+new prospective UTD segment support (ported from the autonomous migrator). Apply
+it at the arena boundary after the first fully annealed candidate has reported,
+so the anneal has one attributable verdict at UTD 1.0; waiting for more would
+idle the learner for hours to sharpen an attribution that a single live run
+cannot make clean anyway. The third actor lane follows as a separate change once
+UTD 1.5 has its own candidates.
 
 ### 2026-09-02 — Keep disaster snapshots through plateau recovery
 

@@ -617,6 +617,206 @@ def test_gate_budget_and_measurement_crossplay_are_migratable(tmp_path: Path) ->
     assert not any(path.startswith("optimizer") for path in changed)
 
 
+def _with_update_to_data(
+    fixture: _Fixture,
+    *,
+    old_target: float,
+    new_target: float,
+    old_intervals: tuple[int, int],
+    new_intervals: tuple[int, int],
+    segment: dict[str, object] | None,
+) -> None:
+    """Give both profiles UTD control and example cadence; seed the live segment."""
+
+    for path, target, intervals in (
+        (fixture.old_profile, old_target, old_intervals),
+        (fixture.candidate_profile, new_target, new_intervals),
+    ):
+        raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+        raw["learner"]["target_updates_per_new_sample"] = target
+        raw["learner"]["candidate_interval_examples"] = intervals[0]
+        raw["learner"]["selfplay_snapshot_interval_examples"] = intervals[1]
+        path.chmod(0o644)
+        path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+        path.chmod(0o444)
+    digest = hashlib.sha256(fixture.old_profile.read_bytes()).hexdigest()
+    (fixture.root / "profile.sha256").write_text(
+        f"{digest}  {fixture.old_profile}\n", encoding="utf-8"
+    )
+    segment_path = fixture.root / "learner" / "utd-segment.json"
+    if segment is None:
+        segment_path.unlink(missing_ok=True)
+    else:
+        _write_json(segment_path, segment)
+
+
+def test_update_to_data_retarget_writes_prospective_segment(tmp_path: Path) -> None:
+    """A UTD change starts a fresh segment at the durable boundary.
+
+    The new ratio must apply only to samples generated from the boundary on;
+    re-rating the historical ledger would grant a burst of updates over stale
+    data. The previous segment is preserved in the rollback bundle.
+    """
+
+    fixture = _fixture(tmp_path)
+    previous = {
+        "schema_version": 1,
+        "run_id": "continuous-test-run",
+        "generation_family": "family-continuous-test",
+        "target_updates_per_new_sample": 1.0,
+        "baseline_examples_consumed": 1_024,
+        "baseline_committed_replay_samples": 2_048,
+        "created_ns": 5,
+    }
+    _with_update_to_data(
+        fixture,
+        old_target=1.0,
+        new_target=1.5,
+        old_intervals=(2_000_000, 1_000_000),
+        new_intervals=(3_000_000, 1_500_000),
+        segment=previous,
+    )
+
+    dry_run = migration.migrate_continuous_profile(fixture.request)
+    assert {change["path"] for change in dry_run["changes"]} >= {
+        "learner.target_updates_per_new_sample",
+        "learner.candidate_interval_examples",
+        "learner.selfplay_snapshot_interval_examples",
+    }
+    expected_segment = {
+        "schema_version": 1,
+        "run_id": "continuous-test-run",
+        "generation_family": "family-continuous-test",
+        "target_updates_per_new_sample": 1.5,
+        "baseline_examples_consumed": 51_200,
+        "baseline_committed_replay_samples": 60_000,
+    }
+    planned = dict(dry_run["utd_segment"])
+    assert planned.pop("created_ns") > 0
+    assert planned == expected_segment
+    assert str(fixture.root / "learner" / "utd-segment.json") in dry_run["writes"]
+    assert (
+        json.loads(
+            (fixture.root / "learner" / "utd-segment.json").read_text(encoding="utf-8")
+        )
+        == previous
+    )
+
+    result = migration.migrate_continuous_profile(fixture.request, apply=True)
+
+    written = json.loads(
+        (fixture.root / "learner" / "utd-segment.json").read_text(encoding="utf-8")
+    )
+    assert written == result["utd_segment"]
+    assert written["created_ns"] == result["utd_segment"]["created_ns"]
+    assert {key: written[key] for key in expected_segment} == expected_segment
+    record = json.loads(
+        (fixture.root / "continuous-migrations.jsonl").read_text(encoding="utf-8")
+    )
+    assert record["utd_segment"] == written
+    backup = Path(result["backup_bundle"])
+    assert (
+        json.loads(
+            (backup / "learner" / "utd-segment.json").read_text(encoding="utf-8")
+        )
+        == previous
+    )
+
+
+def test_unchanged_update_to_data_target_leaves_segment_alone(tmp_path: Path) -> None:
+    fixture = _fixture(tmp_path)
+    previous = {
+        "schema_version": 1,
+        "run_id": "continuous-test-run",
+        "generation_family": "family-continuous-test",
+        "target_updates_per_new_sample": 1.0,
+        "baseline_examples_consumed": 1_024,
+        "baseline_committed_replay_samples": 2_048,
+    }
+    _with_update_to_data(
+        fixture,
+        old_target=1.0,
+        new_target=1.0,
+        old_intervals=(2_000_000, 1_000_000),
+        new_intervals=(2_000_000, 1_000_000),
+        segment=previous,
+    )
+
+    result = migration.migrate_continuous_profile(fixture.request, apply=True)
+
+    assert result["utd_segment"] is None
+    assert str(fixture.root / "learner" / "utd-segment.json") not in result["writes"]
+    assert (
+        json.loads(
+            (fixture.root / "learner" / "utd-segment.json").read_text(encoding="utf-8")
+        )
+        == previous
+    )
+    record = json.loads(
+        (fixture.root / "continuous-migrations.jsonl").read_text(encoding="utf-8")
+    )
+    assert "utd_segment" not in record
+
+
+@pytest.mark.parametrize(
+    ("new_target", "new_intervals", "segment_target", "message"),
+    [
+        (1.5, (2_000_000, 1_000_000), 1.0, "must scale with the update-to-data"),
+        (1.5, (3_000_000, 1_000_000), 1.0, "must scale with the update-to-data"),
+        (1.5, (3_000_000, 1_500_000), 1.25, "does not match the source profile"),
+    ],
+)
+def test_update_to_data_retarget_rejects_unsafe_inputs(
+    tmp_path: Path,
+    new_target: float,
+    new_intervals: tuple[int, int],
+    segment_target: float,
+    message: str,
+) -> None:
+    fixture = _fixture(tmp_path)
+    _with_update_to_data(
+        fixture,
+        old_target=1.0,
+        new_target=new_target,
+        old_intervals=(2_000_000, 1_000_000),
+        new_intervals=new_intervals,
+        segment={
+            "schema_version": 1,
+            "run_id": "continuous-test-run",
+            "generation_family": "family-continuous-test",
+            "target_updates_per_new_sample": segment_target,
+            "baseline_examples_consumed": 1_024,
+            "baseline_committed_replay_samples": 2_048,
+        },
+    )
+    before = _snapshot(fixture.root)
+
+    with pytest.raises(migration.MigrationError, match=message):
+        migration.migrate_continuous_profile(fixture.request, apply=True)
+    assert _snapshot(fixture.root) == before
+
+
+def test_removing_update_to_data_control_is_rejected(tmp_path: Path) -> None:
+    fixture = _fixture(tmp_path)
+    _with_update_to_data(
+        fixture,
+        old_target=1.0,
+        new_target=1.0,
+        old_intervals=(2_000_000, 1_000_000),
+        new_intervals=(2_000_000, 1_000_000),
+        segment=None,
+    )
+    raw = yaml.safe_load(fixture.candidate_profile.read_text(encoding="utf-8"))
+    raw["learner"]["target_updates_per_new_sample"] = None
+    fixture.candidate_profile.chmod(0o644)
+    fixture.candidate_profile.write_text(
+        yaml.safe_dump(raw, sort_keys=False), encoding="utf-8"
+    )
+
+    with pytest.raises(migration.MigrationError, match="removing update-to-data"):
+        migration.migrate_continuous_profile(fixture.request)
+
+
 def test_incomplete_replay_history_is_rejected(tmp_path: Path) -> None:
     fixture = _fixture(tmp_path)
     with sqlite3.connect(fixture.root / "replay" / "manifest.sqlite3") as connection:
