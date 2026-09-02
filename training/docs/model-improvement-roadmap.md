@@ -473,8 +473,13 @@ the learner's own first cutover; afterwards the warm-start marker is provenance.
 Treat a cutover created after the marker's `cutover_created_ns` as superseding
 it, keep the marker in the catalog, and ship as a runtime-only release with a
 snapshot run and verify immediately after cutover. Unstamped markers keep the
-strict rule. Follow-up: the snapshot tool's SQLite restart loop on stopped roots
-(noted under R10-LR-RECOVERY-01) remains open.
+strict rule. Shipped as main-c5559a7-dr-warm-start (commit c5559a7,
+release-manifest sha256 52b3a864...): cutover 21:37:37-21:39:02 UTC (85
+seconds of GPU idle, learner step 785,7xx, resumed at multiplier 0.5 from the
+checkpoint's governor state), first snapshot 21:40:30 verified ok with 8,484
+catalog files; disaster coverage gap 19:36-21:40. Follow-up: the snapshot
+tool's SQLite restart loop on stopped roots (noted under R10-LR-RECOVERY-01)
+remains open.
 
 ### 2026-09-02 — Decouple keep-weights plateau recovery from champion lag
 
