@@ -255,15 +255,22 @@ Decision: preserve v4/v5 evidence, keep their activators retired, and retain the
 ```text
 ID: R10-LR-RECOVERY-01
 Phase: 1 — training dynamics / learning-rate governance
-Status: release built; cutover pending
+Status: cut over 2026-09-02 04:52 UTC (36.8 minutes of downtime from the
+  04:15:42 stop); 12-hour verification in progress
 Hypothesis: the collapse of frontier Elo per hour is caused by plateau resets
   compounding a 0.5x learning-rate cut through every champion checkpoint
   (Muon 6.1e-4 -> 3.06e-4 -> 1.33e-4 -> 6.1e-5 -> 2.9e-5 -> 1.38e-5, five
   champion generations, 44x lower and ~70x below the profile schedule), and
   restoring the Muon 3.0e-4 regime with non-compounding recovery and
   candidate-mixed self-play restores positive Elo per hour
-Commit: recorded at cutover
-Release: main-<sha>-lr-recovery
+Commit: 73d6632c201d7c2232f9afbedc53c2bc6d19955d
+Release: main-73d6632-lr-recovery (release-manifest sha256
+  4c6402c7bdd4456e127cef331d58a7e34cf7951a98ae668e9c1b6245340773bc)
+Workload: continuity primary `lr-recovery-742979`, run root
+  /home/ubuntu/edgeconnect-recovery/lr-recovery-ring10-lr-recovery-3e-4-seed17,
+  profile sha256 ab77e3b36cd04cff74357a48c107b6a938409d14c04ad79a89ff3fdacc4ff016;
+  `fallback-lkg` (the stopped source) remains the verified last-known-good
+  fallback and the rollback path
 Control: the stopped fallback-lkg runtime (champion 742,979, Muon 1.35e-5)
 Treatment: ring10-lr-recovery-3e-4 forked from the same root and warm-started
   from champion 742,979 with a fresh optimizer/scheduler (Muon 3.0e-4, AdamW
@@ -281,10 +288,19 @@ System gates: finite training, unchanged actor throughput (~365 samples/s),
 Statistical gate: at least one promotion within 12 hours and candidate point
   Elo versus champion trending above +50; abort on two consecutive conclusive
   rejections below -50 Elo or any non-finite event
-Lambda snapshot verification: final fallback snapshot verified before cutover;
-  baseline snapshot of the fork after cutover
+Lambda snapshot verification: fallback snapshot
+  1788322266613655941-ba1ed78f68e9da46cef7a0f0f24eec26ef5a6df0760d7df0d15609235909533b
+  completed 04:15:28 UTC (14 seconds before the stop); a final post-stop
+  snapshot was started at 04:16:33; the fork's own 14-minute snapshot timer
+  publishes to edgeconnect-dr/continuity/lr-recovery-742979
 Result: pending
 Decision: pending
+Notes: the fork refused sixteen root-owned SQLite temp sidecars left in the
+  source's recovery/replay-manifest by the root-run terminal-boundary
+  pipelines; their ownership was corrected to ubuntu before forking. The
+  completed seed-17 handoff artifact was removed from the continuity manifest
+  so the fresh state does not treat it as a new failure; seeds 18/19 remain
+  registered. The stale `primary-recovery` workload entry was replaced.
 ```
 
 ## Compute ledger
@@ -297,6 +313,14 @@ Arms:
 Wall hours per arm:
 Provisioned H100-hours:
 Cumulative roadmap H100-hours:
+```
+
+```text
+Experiment: R10-LR-RECOVERY-01 cutover
+Arms: 1 (production continuation)
+Wall hours per arm: 0.61 of downtime (04:15:42-04:52:28 UTC, 2026-09-02)
+Provisioned H100-hours: 4.9 idle during the cutover
+Cumulative roadmap H100-hours: not tracked before this entry
 ```
 
 ## Decision log
