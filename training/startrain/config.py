@@ -726,10 +726,20 @@ class HistoricalEvaluationConfig:
     anchors_per_evaluation: int = 1
     pairs_per_ring: int = 5
     max_pairs_per_ring: int = 10
+    # Optional search budget for crossplay matches. When the promotion gate runs
+    # at a cheaper budget, these keep the historical Elo ladder on one scale.
+    simulations: int | None = None
+    max_considered: int | None = None
+    # Measure every new champion against its direct predecessor before the next
+    # candidate is gated, so the ladder link exists at the measurement budget.
+    measure_direct_predecessor: bool = False
 
     def __post_init__(self) -> None:
-        if type(self.enabled) is not bool:
-            raise ConfigError("historical evaluation enabled must be boolean")
+        if (
+            type(self.enabled) is not bool
+            or type(self.measure_direct_predecessor) is not bool
+        ):
+            raise ConfigError("historical evaluation booleans must be boolean")
         values = (
             self.every_promotions,
             self.anchors_per_evaluation,
@@ -745,6 +755,26 @@ class HistoricalEvaluationConfig:
             raise ConfigError(
                 "historical evaluation maximum must cover one evaluation wave"
             )
+        for name, value in (
+            ("simulations", self.simulations),
+            ("max_considered", self.max_considered),
+        ):
+            if value is not None and (
+                isinstance(value, bool) or not isinstance(value, int) or value <= 0
+            ):
+                raise ConfigError(f"historical evaluation {name} must be positive")
+
+    def search_budget(self, arena: "ArenaConfig") -> tuple[int, int]:
+        """Return the (simulations, max_considered) used for crossplay."""
+
+        return (
+            self.simulations if self.simulations is not None else arena.simulations,
+            (
+                self.max_considered
+                if self.max_considered is not None
+                else arena.max_considered
+            ),
+        )
 
 
 @dataclass(frozen=True, slots=True)

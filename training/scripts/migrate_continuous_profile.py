@@ -46,6 +46,19 @@ _ALLOWED_PROFILE_PATHS = {
     ("orchestration", "plateau", "max_learner_champion_lag_steps"),
     ("orchestration", "promotion", "finish_inflight_candidate"),
     ("arena", "continuation_pairs_per_ring"),
+    # Promotion-gate budget and the measurement crossplay that keeps the Elo
+    # ladder on one search scale. These change arena evidence only; model,
+    # optimizer, replay, and self-play remain immutable.
+    ("arena", "simulations"),
+    ("arena", "max_pairs_per_ring"),
+    ("orchestration", "historical_evaluation", "enabled"),
+    ("orchestration", "historical_evaluation", "every_promotions"),
+    ("orchestration", "historical_evaluation", "anchors_per_evaluation"),
+    ("orchestration", "historical_evaluation", "pairs_per_ring"),
+    ("orchestration", "historical_evaluation", "max_pairs_per_ring"),
+    ("orchestration", "historical_evaluation", "simulations"),
+    ("orchestration", "historical_evaluation", "max_considered"),
+    ("orchestration", "historical_evaluation", "measure_direct_predecessor"),
 }
 
 

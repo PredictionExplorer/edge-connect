@@ -1535,12 +1535,46 @@ python scripts/migrate_continuous_profile.py \
 
 The utility rejects live workers, autonomous provenance, schema/model/game/loss/
 optimizer drift, unverified checkpoints, incomplete replay history, and every
-profile field outside the narrow batch/candidate-lag/arena continuation allowlist.
+profile field outside the narrow allowlist: learner batch, candidate lag,
+plateau lag, in-flight candidate handling, arena continuation, the arena gate
+budget (`arena.simulations`, `arena.max_pairs_per_ring`), and the measurement
+crossplay block (`orchestration.historical_evaluation.*`).
 It writes a new read-only profile and checksum, an append-only
 `continuous-migrations.jsonl`, and a rollback bundle. Repoint the training and
 backup units to the new immutable release and newly named profile, then start
 normally. The service still runs profile validation, H100 health, and replay
 restore gates before the coordinator starts.
+
+### Cheaper promotion gate with measurement crossplay
+
+Elo is only comparable between games played at one search budget. When the
+promotion gate is moved to a cheaper budget (for example 256 simulations so a
+true +40 Elo candidate concludes in roughly 500 games instead of exhausting a
+400-game cap), keep the historical ladder on its original scale with
+`orchestration.historical_evaluation`:
+
+```yaml
+orchestration:
+  historical_evaluation:
+    enabled: true
+    measure_direct_predecessor: true
+    simulations: 1024
+    max_considered: 32
+    pairs_per_ring: 50
+    max_pairs_per_ring: 100
+    every_promotions: 2
+    anchors_per_evaluation: 1
+```
+
+`measure_direct_predecessor` links every new champion to the champion it
+replaced at the measurement budget before the next candidate is gated; that
+link is never yielded to a waiting candidate, so the ladder does not depend on
+arena idle time. The periodic anchor crossplay (`every_promotions`) still runs
+only while no candidate waits. Crossplay results record
+`crossplay_kind` (`measurement` or `anchor`) and their `search` budget;
+`strength_efficiency_report.py` fits the connected ladder at the budget of the
+earliest completed checkpoint result and reports gate results at other budgets
+under `autonomous_elo.search_budget` instead of mixing them in.
 
 The generalist throughput profile uses 25-pair post-minimum continuation waves.
 The separately benchmarked ring-10-only profile uses 50 pairs; four paired H100

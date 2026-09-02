@@ -134,6 +134,107 @@ def test_completed_crossplay_is_idempotent_and_partial_result_resumes(
     )
 
 
+def test_measurement_link_takes_priority_and_uses_measurement_budget(
+    tmp_path: Path,
+) -> None:
+    from startrain.config import ArenaConfig
+
+    zero = manifest(tmp_path, identity="model-zero", step=0)
+    first = manifest(tmp_path, identity="model-first", step=10)
+    champion = manifest(tmp_path, identity="model-champion", step=20)
+    manifests = {item.model_identity: item for item in (zero, first, champion)}
+    results = [
+        promotion(
+            tmp_path,
+            candidate=first.model_identity,
+            baseline=zero.model_identity,
+            completed_ns=1,
+        ),
+        promotion(
+            tmp_path,
+            candidate=champion.model_identity,
+            baseline=first.model_identity,
+            completed_ns=2,
+        ),
+    ]
+    config = HistoricalEvaluationConfig(
+        enabled=True,
+        every_promotions=3,
+        pairs_per_ring=50,
+        max_pairs_per_ring=100,
+        simulations=1024,
+        max_considered=32,
+        measure_direct_predecessor=True,
+    )
+    assert config.search_budget(ArenaConfig(simulations=256, max_considered=16)) == (
+        1024,
+        32,
+    )
+    assert HistoricalEvaluationConfig().search_budget(
+        ArenaConfig(simulations=256, max_considered=16)
+    ) == (256, 16)
+
+    # The direct predecessor link is due immediately, regardless of the anchor
+    # cadence, and is labelled so the supervisor does not yield it to
+    # waiting candidates.
+    plan = select_historical_evaluation(
+        config=config,
+        champion=champion,
+        manifests=manifests,
+        arena_results=results,
+        results_directory=tmp_path,
+    )
+    assert plan is not None
+    assert plan.kind == "measurement"
+    assert plan.baseline is first
+    assert plan.result_path.name == "crossplay-model-champion-vs-model-first.json"
+
+    # A partial measurement resumes; a terminal one falls through to the
+    # anchor cadence, which is not due at three promotions.
+    partial = {
+        "result_kind": HISTORICAL_CROSSPLAY_RESULT_KIND,
+        "candidate": champion.model_identity,
+        "baseline": first.model_identity,
+        "terminal": False,
+        "pairs": [],
+    }
+    resumed = select_historical_evaluation(
+        config=config,
+        champion=champion,
+        manifests=manifests,
+        arena_results=[*results, (plan.result_path, partial)],
+        results_directory=tmp_path,
+    )
+    assert resumed is not None
+    assert resumed.kind == "measurement"
+    assert resumed.previous == partial
+    partial["terminal"] = True
+    assert (
+        select_historical_evaluation(
+            config=config,
+            champion=champion,
+            manifests=manifests,
+            arena_results=[*results, (plan.result_path, partial)],
+            results_directory=tmp_path,
+        )
+        is None
+    )
+    anchor = select_historical_evaluation(
+        config=HistoricalEvaluationConfig(
+            enabled=True,
+            every_promotions=2,
+            measure_direct_predecessor=True,
+        ),
+        champion=champion,
+        manifests=manifests,
+        arena_results=[*results, (plan.result_path, partial)],
+        results_directory=tmp_path,
+    )
+    assert anchor is not None
+    assert anchor.kind == "anchor"
+    assert anchor.baseline is zero
+
+
 def test_schedule_and_legacy_result_classification(tmp_path: Path) -> None:
     zero = manifest(tmp_path, identity="model-zero", step=0)
     first = manifest(tmp_path, identity="model-first", step=10)

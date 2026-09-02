@@ -21,6 +21,10 @@ class HistoricalEvaluationPlan:
     baseline: ModelManifest
     result_path: Path
     previous: dict[str, object] | None
+    # "measurement" links a new champion to its direct predecessor and takes
+    # priority over gating the next candidate; "anchor" is the periodic
+    # non-adjacent crossplay that only runs while no candidate is waiting.
+    kind: str = "anchor"
 
 
 def arena_result_kind(result: Mapping[str, object]) -> str:
@@ -107,6 +111,32 @@ def select_historical_evaluation(
     promoted_identities = {baseline for _, _, _, baseline in promoted}
     promoted_identities.update(candidate for _, _, candidate, _ in promoted)
     promotion_count = len({candidate for _, _, candidate, _ in promoted})
+    if (
+        config.measure_direct_predecessor
+        and direct_predecessor is not None
+        and direct_predecessor in manifests
+        and direct_predecessor != champion.model_identity
+    ):
+        key = (champion.model_identity, direct_predecessor)
+        prior = existing_crossplay.get(key)
+        if prior is None:
+            name = f"crossplay-{champion.model_identity}-vs-{direct_predecessor}.json"
+            return HistoricalEvaluationPlan(
+                candidate=champion,
+                baseline=manifests[direct_predecessor],
+                result_path=Path(results_directory) / name,
+                previous=None,
+                kind="measurement",
+            )
+        path, payload = prior
+        if not bool(payload.get("terminal")):
+            return HistoricalEvaluationPlan(
+                candidate=champion,
+                baseline=manifests[direct_predecessor],
+                result_path=path,
+                previous=payload,
+                kind="measurement",
+            )
     if not promotion_count or promotion_count % config.every_promotions:
         return None
 
@@ -137,5 +167,6 @@ def select_historical_evaluation(
             baseline=baseline,
             result_path=Path(results_directory) / name,
             previous=None,
+            kind="anchor",
         )
     return None

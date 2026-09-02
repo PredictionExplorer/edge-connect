@@ -303,6 +303,36 @@ Notes: the fork refused sixteen root-owned SQLite temp sidecars left in the
   registered. The stale `primary-recovery` workload entry was replaced.
 ```
 
+```text
+ID: R10-ARENA-GATE-02
+Phase: 1 — promotion evidence efficiency
+Status: implemented and tested; in-place migration scheduled after the
+  R10-LR-RECOVERY-01 twelve-hour verification
+Hypothesis: gating at 256 simulations with a 600-pair cap concludes true +35
+  to +45 Elo candidates in about 500 games (roughly 1.2 hours) instead of
+  exhausting a 400-game cap, while a 100-pair measurement crossplay at 1024
+  simulations against the direct predecessor keeps the champion-frontier ladder
+  on its historical scale
+Commit: recorded at migration
+Release: recorded at migration
+Control: the R10-LR-RECOVERY-01 gate (1024 simulations, 50/50/200 pairs)
+Treatment: arena.simulations 256, arena.max_pairs_per_ring 600,
+  historical_evaluation {measure_direct_predecessor, simulations 1024,
+  max_considered 32, pairs 50/100, every_promotions 2}
+Anchor/replay cutoff: none; applied in place with migrate_continuous_profile.py
+Seeds: 17 (production continuation)
+Budget: continuous
+System gates: gate evaluations conclude (inconclusive fraction well below the
+  62% observed under the 400-game cap); measurement links exist for every
+  promotion; arena occupancy including measurement stays below one GPU
+Statistical gate: the 1024-simulation ladder (report
+  autonomous_elo.search_budget.ladder) continues to extend the anchor chain;
+  256-simulation results are excluded from it by construction
+Lambda snapshot verification: fork snapshot timer continues unchanged
+Result: pending
+Decision: pending
+```
+
 ## Compute ledger
 
 Record provisioned rather than utilized GPU-hours.
@@ -345,6 +375,18 @@ example candidate-publication treatment. The completed optimizer, EMA,
 freshness, and clinch screen had no promoted frontier gain, so those arms are
 excluded. Backlog relief is necessary but insufficient: the treatment must also
 pass the standard pair-valid Elo/hour gates.
+
+### 2026-09-02 — Separate the promotion gate from the measurement scale
+
+Decision: 62% of completed evaluations ended `reject_max_pairs` because the
+mixture e-process needs about 250-300 pairs to promote a true +40 and about 380
+pairs to reject a true 0, while the cap was 200 pairs at 1024 simulations (3.8
+hours per candidate). Make gate games cheap (256 simulations, 600-pair cap) so
+evidence concludes, and add a mandatory measurement crossplay at 1024
+simulations between each new champion and its predecessor so the historical
+Elo ladder remains comparable. Fit the ladder per search budget; never mix
+budgets. Apply as an in-place migration after the learning-rate recovery has
+twelve hours of attributable evidence.
 
 ### 2026-09-02 — Stop compounding plateau learning-rate cuts
 

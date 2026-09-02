@@ -483,6 +483,23 @@ class PromotionSupervisor:
                 if item.model_identity != champion.model_identity
                 and item.model_step >= champion.model_step
             ]
+            # A freshly promoted champion is linked to its predecessor at the
+            # measurement budget before any waiting candidate is gated.
+            try:
+                measurement_waves = self._evaluate_historical_if_due(
+                    champion=champion,
+                    stop_requested=stop_requested,
+                    progress=progress,
+                    once=once,
+                    kinds=frozenset({"measurement"}),
+                )
+            except PauseLeaseInterrupted:
+                return evaluated
+            if measurement_waves:
+                evaluated += measurement_waves
+                if once:
+                    return evaluated
+                continue
             started: list[tuple[ModelManifest, dict[str, object]]] = []
             for item in viable:
                 item_result = self._read_result(item, champion)
@@ -659,7 +676,16 @@ class PromotionSupervisor:
         stop_requested: Callable[[], bool],
         progress: Callable[..., None] | None,
         once: bool,
+        kinds: frozenset[str] = frozenset({"measurement", "anchor"}),
     ) -> int:
+        """Run one due crossplay plan whose kind is in ``kinds``.
+
+        Measurement links (new champion versus its direct predecessor at the
+        measurement budget) are also offered while candidates wait, so the Elo
+        ladder never depends on the arena being idle; anchor crossplay only runs
+        when no candidate is waiting.
+        """
+
         configured = self.experiment.orchestration.historical_evaluation
         if not configured.enabled or stop_requested():
             return 0
@@ -675,7 +701,7 @@ class PromotionSupervisor:
             arena_results=load_arena_results(self.results_directory),
             results_directory=self.results_directory,
         )
-        if plan is None:
+        if plan is None or plan.kind not in kinds:
             return 0
         with self._gpu_pause(
             stop_requested=stop_requested,
@@ -690,6 +716,8 @@ class PromotionSupervisor:
                 stop_requested=stop_requested,
                 progress=progress,
                 once=once,
+                yield_to_candidates=plan.kind != "measurement",
+                crossplay_kind=plan.kind,
             )
 
     def _evaluate_historical_waves(
@@ -702,6 +730,8 @@ class PromotionSupervisor:
         stop_requested: Callable[[], bool],
         progress: Callable[..., None] | None,
         once: bool,
+        yield_to_candidates: bool = True,
+        crossplay_kind: str = "anchor",
     ) -> int:
         configured = self.experiment.orchestration.historical_evaluation
         material = (
@@ -709,11 +739,14 @@ class PromotionSupervisor:
             f"{candidate.model_identity}\0{baseline.model_identity}"
         ).encode("utf-8")
         seed = int.from_bytes(hashlib.sha256(material).digest()[:8], "big")
+        simulations, max_considered = configured.search_budget(self.experiment.arena)
         arena_config = replace(
             self.experiment.arena,
             pairs_per_ring=configured.pairs_per_ring,
             minimum_pairs_per_ring=configured.max_pairs_per_ring,
             max_pairs_per_ring=configured.max_pairs_per_ring,
+            simulations=simulations,
+            max_considered=max_considered,
             promotion_pair_ratios={},
             required_regression_rings=None,
             weighted_initial_blocks=0,
@@ -739,7 +772,10 @@ class PromotionSupervisor:
                 waves = 0
                 previous_result = previous
                 while not stop_requested():
-                    if self._newer_candidate(candidate, candidate) is not None:
+                    if (
+                        yield_to_candidates
+                        and self._newer_candidate(candidate, candidate) is not None
+                    ):
                         return waves
                     starts = {
                         ring: (
@@ -768,9 +804,11 @@ class PromotionSupervisor:
                     if progress is not None:
                         progress(
                             phase="historical_crossplay",
+                            crossplay_kind=crossplay_kind,
                             candidate_step=candidate.model_step,
                             baseline_step=baseline.model_step,
                             pairs=len(accumulated),
+                            simulations=arena_config.simulations,
                         )
                     started = time.perf_counter()
                     result = runner.run(
@@ -812,6 +850,7 @@ class PromotionSupervisor:
                             )
                         result["games"] = [*old_games, *new_games]
                     result["result_kind"] = HISTORICAL_CROSSPLAY_RESULT_KIND
+                    result["crossplay_kind"] = crossplay_kind
                     result["candidate_manifest"] = str(
                         (candidate.artifact_manifest or candidate.path).resolve()
                     )

@@ -1434,11 +1434,65 @@ def _decisive_match(
         return None, str(error)
 
 
+def _search_budget_key(result: Mapping[str, object]) -> tuple[int, int] | None:
+    """Return (simulations, max_considered) of an arena result, if recorded.
+
+    Elo is only comparable between games played at one search budget, so the
+    ladder is fitted per budget. Legacy results without a recorded budget are
+    attributed to whichever budget the ladder uses.
+    """
+
+    for source in (
+        result.get("search"),
+        _mapping(result.get("baseline_metadata")).get("search_budget"),
+    ):
+        if not isinstance(source, Mapping):
+            continue
+        simulations = _nonnegative_integer(source.get("simulations"))
+        max_considered = _nonnegative_integer(source.get("max_considered"))
+        if simulations and max_considered:
+            return simulations, max_considered
+    return None
+
+
+def _ladder_search_budget(
+    arena_results: list[dict[str, object]],
+    *,
+    checkpoint_steps: Mapping[str, int],
+) -> tuple[tuple[int, int] | None, dict[str, int]]:
+    """Choose the ladder budget and count decisive games per recorded budget.
+
+    The ladder budget is the one used by the earliest completed checkpoint
+    result: that is the budget the anchor was rated at, so every later
+    measurement match at the same budget extends one connected scale, while a
+    cheaper promotion gate is reported separately instead of silently mixed in.
+    """
+
+    counts: dict[str, int] = {}
+    earliest: tuple[int, tuple[int, int]] | None = None
+    for result in arena_results:
+        kind, _ = _baseline_kind(result, checkpoint_steps=checkpoint_steps)
+        if kind != "checkpoint":
+            continue
+        key = _search_budget_key(result)
+        if key is None:
+            continue
+        match, _ = _decisive_match(result, scope="aggregate")
+        games = match.wins + match.losses if match is not None else 0
+        label = f"{key[0]}x{key[1]}"
+        counts[label] = counts.get(label, 0) + games
+        completed = _timestamp(result)
+        if completed is not None and (earliest is None or completed < earliest[0]):
+            earliest = (completed, key)
+    return (earliest[1] if earliest is not None else None), counts
+
+
 def _scope_inputs(
     arena_results: list[dict[str, object]],
     *,
     scope: str,
     checkpoint_steps: Mapping[str, int],
+    search_budget: tuple[int, int] | None = None,
 ) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
     included = []
     exclusions = []
@@ -1458,6 +1512,25 @@ def _scope_inputs(
                         "reason": kind_evidence,
                     }
                 )
+            continue
+        result_budget = _search_budget_key(result)
+        if (
+            search_budget is not None
+            and result_budget is not None
+            and result_budget != search_budget
+        ):
+            exclusions.append(
+                {
+                    "path": result.get("_path"),
+                    "scope": scope,
+                    "candidate": result.get("candidate"),
+                    "baseline": result.get("baseline"),
+                    "reason": (
+                        f"search budget {result_budget[0]}x{result_budget[1]} differs "
+                        f"from ladder budget {search_budget[0]}x{search_budget[1]}"
+                    ),
+                }
+            )
             continue
         match, reason = _decisive_match(result, scope=scope)
         if match is None:
@@ -1913,15 +1986,21 @@ def _autonomous_elo_summary(
         actor_records=actor_records,
         arena_results=arena_results,
     )
+    ladder_budget, budget_counts = _ladder_search_budget(
+        arena_results,
+        checkpoint_steps=checkpoint_steps,
+    )
     aggregate_inputs, aggregate_exclusions = _scope_inputs(
         arena_results,
         scope="aggregate",
         checkpoint_steps=checkpoint_steps,
+        search_budget=ladder_budget,
     )
     ring_inputs, ring_exclusions = _scope_inputs(
         arena_results,
         scope="ring_10",
         checkpoint_steps=checkpoint_steps,
+        search_budget=ladder_budget,
     )
     anchor_inputs = aggregate_inputs or ring_inputs
     anchor_identity, anchor_selection = _select_anchor(
@@ -1989,6 +2068,15 @@ def _autonomous_elo_summary(
         ),
         "confidence_level": AUTONOMOUS_ELO_CONFIDENCE,
         "primary_ring": PRIMARY_ELO_RING,
+        "search_budget": {
+            "ladder": (
+                {"simulations": ladder_budget[0], "max_considered": ladder_budget[1]}
+                if ladder_budget is not None
+                else None
+            ),
+            "selection": "earliest_completed_checkpoint_result",
+            "decisive_games_by_budget": budget_counts,
+        },
         "anchor": {
             "identity": anchor_identity,
             "step": checkpoint_steps.get(anchor_identity)

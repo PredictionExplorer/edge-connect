@@ -55,6 +55,10 @@ The following switches are deliberately first-class and recorded in metrics:
   while retaining homogeneous tensor shapes.
 - `arena.continuation_pairs_per_ring`, which increases GPU occupancy only after
   the unchanged minimum anytime-valid promotion look.
+- `arena.simulations` and `arena.max_pairs_per_ring`, the promotion-gate search
+  budget and evidence cap. A cheaper gate must be paired with
+  `orchestration.historical_evaluation.measure_direct_predecessor` at the
+  historical budget so the champion-frontier ladder stays on one Elo scale.
 - `arena.promotion_pair_ratios` plus weighted initial, continuation, and maximum
   block counts, which opt into a pre-registered macro-block objective. The
   1/1/1/7 setting weights rings 4/6/8/10 as 10/10/10/70.

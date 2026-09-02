@@ -810,6 +810,123 @@ def test_report_follows_forked_arena_ancestry_and_conclusiveness(tmp_path) -> No
     assert report_module._ancestor_arena_directories(tmp_path / "missing") == []
 
 
+def test_ladder_is_fitted_at_the_anchor_search_budget_only(tmp_path) -> None:
+    """A cheaper promotion gate must not be mixed into the historical ladder."""
+
+    root = tmp_path / "run"
+    root.mkdir()
+    (root / "run.json").write_text(
+        json.dumps(
+            {
+                "run_id": "run-budget",
+                "generation_family": "family-budget",
+                "created_ns": 1_000_000_000,
+            }
+        ),
+        encoding="utf-8",
+    )
+    arena = root / "arena"
+    arena.mkdir()
+    anchor = "sha256-" + "a" * 64
+    second = "sha256-" + "b" * 64
+    third = "sha256-" + "c" * 64
+
+    def budgeted(result: dict, simulations: int, max_considered: int) -> dict:
+        result["search"] = {
+            "simulations": simulations,
+            "max_considered": max_considered,
+        }
+        result["baseline_metadata"]["search_budget"] = {
+            "simulations": simulations,
+            "max_considered": max_considered,
+        }
+        return result
+
+    (arena / "promotion-1024.json").write_text(
+        json.dumps(
+            budgeted(
+                _checkpoint_arena_result(
+                    candidate=second,
+                    baseline=anchor,
+                    completed_ns=2_000_000_000,
+                    wins=120,
+                    losses=80,
+                    ring_wins=120,
+                    ring_losses=80,
+                ),
+                1024,
+                32,
+            )
+        ),
+        encoding="utf-8",
+    )
+    (arena / "gate-256.json").write_text(
+        json.dumps(
+            budgeted(
+                _checkpoint_arena_result(
+                    candidate=third,
+                    baseline=second,
+                    completed_ns=3_000_000_000,
+                    wins=300,
+                    losses=100,
+                    ring_wins=300,
+                    ring_losses=100,
+                ),
+                256,
+                32,
+            )
+        ),
+        encoding="utf-8",
+    )
+    (arena / "measurement-1024.json").write_text(
+        json.dumps(
+            {
+                **budgeted(
+                    _checkpoint_arena_result(
+                        candidate=third,
+                        baseline=second,
+                        completed_ns=4_000_000_000,
+                        wins=110,
+                        losses=90,
+                        ring_wins=110,
+                        ring_losses=90,
+                    ),
+                    1024,
+                    32,
+                ),
+                "result_kind": "historical_crossplay",
+                "crossplay_kind": "measurement",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    report = build_strength_efficiency_report(root)
+    elo = report["autonomous_elo"]
+    assert elo["search_budget"]["ladder"] == {"simulations": 1024, "max_considered": 32}
+    assert elo["search_budget"]["decisive_games_by_budget"] == {
+        "1024x32": 400,
+        "256x32": 400,
+    }
+    ladder = elo["primary_ring_10"]
+    assert ladder["status"] == "available"
+    assert ladder["input"]["decisive_games"] == 400
+    excluded = [
+        item for item in ladder["exclusions"] if "search budget" in item["reason"]
+    ]
+    assert len(excluded) == 1
+    assert excluded[0]["path"].endswith("gate-256.json")
+    assert excluded[0]["reason"] == (
+        "search budget 256x32 differs from ladder budget 1024x32"
+    )
+    ratings = {entry["identity"]: entry["rating"] for entry in ladder["ladder"]}
+    assert ratings[anchor] == 0.0
+    assert ratings[second] > 0.0
+    assert ratings[third] > ratings[second]
+    # The 256-simulation result would have implied a far larger gap.
+    assert ratings[third] - ratings[second] < 100.0
+
+
 def test_learning_rate_governance_summary_reconstructs_legacy_compounding() -> None:
     from scripts.strength_efficiency_report import _learning_rate_governance_summary
 

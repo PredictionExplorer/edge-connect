@@ -579,6 +579,44 @@ def test_disallowed_semantic_diff_is_rejected(tmp_path: Path) -> None:
     assert _snapshot(fixture.root) == before
 
 
+def test_gate_budget_and_measurement_crossplay_are_migratable(tmp_path: Path) -> None:
+    """The arena gate budget and measurement crossplay change arena evidence only."""
+
+    fixture = _fixture(tmp_path)
+    target = yaml.safe_load(fixture.candidate_profile.read_text(encoding="utf-8"))
+    target["arena"]["simulations"] = 256
+    target["arena"]["max_pairs_per_ring"] = 600
+    target["orchestration"]["historical_evaluation"] = {
+        "enabled": True,
+        "every_promotions": 2,
+        "anchors_per_evaluation": 1,
+        "pairs_per_ring": 50,
+        "max_pairs_per_ring": 100,
+        "simulations": 1024,
+        "max_considered": 32,
+        "measure_direct_predecessor": True,
+    }
+    fixture.candidate_profile.write_text(
+        yaml.safe_dump(target, sort_keys=False),
+        encoding="utf-8",
+    )
+
+    result = migration.migrate_continuous_profile(fixture.request)
+
+    changed = {change["path"] for change in result["changes"]}
+    assert {
+        "arena.simulations",
+        "arena.max_pairs_per_ring",
+        "orchestration.historical_evaluation.enabled",
+        "orchestration.historical_evaluation.pairs_per_ring",
+        "orchestration.historical_evaluation.max_pairs_per_ring",
+        "orchestration.historical_evaluation.simulations",
+        "orchestration.historical_evaluation.max_considered",
+        "orchestration.historical_evaluation.measure_direct_predecessor",
+    } <= changed
+    assert not any(path.startswith("optimizer") for path in changed)
+
+
 def test_incomplete_replay_history_is_rejected(tmp_path: Path) -> None:
     fixture = _fixture(tmp_path)
     with sqlite3.connect(fixture.root / "replay" / "manifest.sqlite3") as connection:

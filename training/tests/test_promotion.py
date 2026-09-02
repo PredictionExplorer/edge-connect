@@ -15,6 +15,7 @@ from startrain.checkpoint import (
     ExponentialMovingAverage,
     collect_model_garbage,
     load_model_manifest,
+    write_model_pointer,
     write_resume_cutover,
 )
 from startrain.arena import ARENA_RESULT_SCHEMA_VERSION, ArenaPair
@@ -1368,6 +1369,120 @@ def test_historical_crossplay_persists_bounded_waves_without_promoting(
     assert Path(result["candidate_manifest"]).is_file()
     assert Path(result["baseline_manifest"]).is_file()
     assert not case.publisher.champion_path.exists()
+
+
+def test_measurement_link_runs_before_waiting_candidate_at_its_own_budget(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """A promoted champion is linked to its predecessor before the next gate."""
+
+    case = _promotion_wave_case(tmp_path, monkeypatch)
+    case.supervisor.experiment = replace(
+        case.experiment,
+        orchestration=replace(
+            case.experiment.orchestration,
+            historical_evaluation=HistoricalEvaluationConfig(
+                enabled=True,
+                every_promotions=100,
+                anchors_per_evaluation=1,
+                pairs_per_ring=2,
+                max_pairs_per_ring=2,
+                simulations=16,
+                max_considered=4,
+                measure_direct_predecessor=True,
+            ),
+        ),
+    )
+    configured_budgets: list[tuple[int, int]] = []
+    base_runner = promotion_module.ArenaRunner
+
+    class RecordingArena(base_runner):  # type: ignore[misc,valid-type]
+        def __init__(self, **options):
+            configured_budgets.append(
+                (options["config"].simulations, options["config"].max_considered)
+            )
+            super().__init__(**options)
+
+    monkeypatch.setattr(promotion_module, "ArenaRunner", RecordingArena)
+
+    # Record a completed promotion of the step-1 candidate over the step-0
+    # champion, exactly as the arena would have persisted it.
+    promotion_result = case.supervisor._result_path(case.candidate, case.champion)
+    promotion_result.parent.mkdir(parents=True, exist_ok=True)
+    promotion_result.write_text(
+        json.dumps(
+            {
+                "schema_version": ARENA_RESULT_SCHEMA_VERSION,
+                "candidate": case.candidate.model_identity,
+                "baseline": case.champion.model_identity,
+                "completed_ns": 5,
+                "terminal": True,
+                "conclusive": True,
+                "result_kind": "promotion",
+                "promotion": {"decision": "promote"},
+                "pairs": [],
+                "games": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    write_model_pointer(
+        case.publisher.champion_path,
+        case.candidate,
+        role="champion",
+        promotion_result=str(promotion_result),
+    )
+    with torch.no_grad():
+        next(case.model.parameters()).add_(0.01)
+    case.ema.update(case.model)
+    waiting = case.publisher.publish(
+        model=case.model,
+        optimizer=case.optimizer,
+        scheduler=case.scheduler,
+        ema=case.ema,
+        step=2,
+        epoch=2,
+        config=case.experiment.as_dict(),
+    )
+    phases: list[dict] = []
+
+    def progress(**details) -> None:
+        phases.append(details)
+
+    # First pass: the measurement link runs even though a candidate waits, and
+    # it is not yielded to that candidate.
+    assert (
+        case.supervisor.run(stop_requested=lambda: False, progress=progress, once=True)
+        == 1
+    )
+    crossplay_path = (
+        tmp_path
+        / "arena"
+        / (
+            f"crossplay-{case.candidate.model_identity}-vs-"
+            f"{case.champion.model_identity}.json"
+        )
+    )
+    measurement = json.loads(crossplay_path.read_text(encoding="utf-8"))
+    assert measurement["result_kind"] == "historical_crossplay"
+    assert measurement["crossplay_kind"] == "measurement"
+    assert measurement["terminal"] is True
+    assert measurement["promotion"]["decision"] == "evaluation"
+    assert configured_budgets == [(16, 4)]
+    assert any(
+        item.get("phase") == "historical_crossplay"
+        and item.get("crossplay_kind") == "measurement"
+        and item.get("simulations") == 16
+        for item in phases
+    )
+    assert not case.supervisor._result_path(waiting, case.candidate).exists()
+
+    # Second pass: the link exists, so the waiting candidate is gated at the
+    # arena's own budget.
+    case.supervisor.run(stop_requested=lambda: False, progress=progress, once=True)
+    assert configured_budgets == [(16, 4), (1, 2)]
+    assert case.supervisor._result_path(waiting, case.candidate).exists()
 
 
 def test_promotion_stop_persists_wave_and_once_resumes_next_pair_indices(
