@@ -363,8 +363,9 @@ Decision: keep the gate; the anneal it now drives is corrected in
 ```text
 ID: R10-PLATEAU-LAG-03
 Phase: 1 — training dynamics / plateau policy
-Status: implemented and tested; runtime-only release cutover before the
-  learner reaches 60,000 steps past champion 742,979 (about 03:50 UTC Sep 3)
+Status: live since 2026-09-02 19:37 UTC (runtime-only cutover at learner step
+  780,872, two minutes of GPU idle, stopped right after candidate 778,142's
+  conclusive rejection while the arena was idle; lag was 37,900 steps)
 Hypothesis: the reduce_lr_keep_weights plateau policy inherited
   reset_from_champion's lag gating, and with weights never rewound the lag
   grows without bound between promotions, so past the 60,000-step soft cap the
@@ -377,8 +378,10 @@ Hypothesis: the reduce_lr_keep_weights plateau policy inherited
   (Aug 31 03:39, Sep 1 00:09, Sep 1 22:43) each rewound the learner from
   ~783,000 to 742,979 the moment lag reached the 40,000-step cap, discarding
   40,000 steps of training (including +33 and +38 Elo candidates) every ~16 h
-Commit: recorded at release
-Release: recorded at release
+Commit: 636f79ff509670d236e3b62be1aaa45de6ebcc59
+Release: main-636f79f-plateau-lag (release-manifest sha256
+  418e1ff8c8fe71ba1683ef8dfab8e69d7dff84df2cf6d6bbb1d613f02e2d900e; profile
+  profile-arena-gate.yaml unchanged, sha256 d1be1905...)
 Treatment (code only, profile unchanged):
   - keep-weights policy ignores champion lag entirely: never pauses, recovers
     only on a conclusive streak, and treats a multiplier already at the floor
@@ -402,8 +405,12 @@ System gates: learner steps per hour unchanged (~2,600) after lag passes
 Statistical gate: the first stage (Muon 1.5e-4) fires on the next conclusive
   streak after cutover; judge the anneal by whether candidates evaluated under
   1.5e-4 and 7.5e-5 close the gap to champion 742,979 at 256 simulations
-  (-19.1 and -20.9 so far under 3.0e-4) and by the first promotion
-Result: pending
+  (-19.1 and -22.6 so far under 3.0e-4) and by the first promotion
+Result: first stage fired 14 seconds after startup (19:37:57 UTC,
+  plateau_recovery from the pre-existing streak of two: 774,235 -19.1 and
+  778,142 -22.6, both conclusive at 400 games), Muon 3.0e-4 -> 1.5e-4,
+  optimizer moments cleared, streak reset, learner kept training; anneal
+  evidence pending
 Decision: pending
 ```
 
