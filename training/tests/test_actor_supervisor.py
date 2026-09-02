@@ -181,6 +181,121 @@ def test_actor_supervisor_refreshes_only_at_batch_boundaries_and_emits_metrics(
     assert heartbeat["phase"] == "stopped"
 
 
+@pytest.mark.parametrize(
+    ("learner_step", "expected_role", "expected_step"),
+    [(5_006, "champion", 7), (5_007, "candidate", 4_000)],
+)
+def test_champion_selfplay_falls_back_to_candidate_beyond_replay_window(
+    tmp_path, monkeypatch, learner_step, expected_role, expected_step
+) -> None:
+    """Champion games the learner's replay window would discard are not played.
+
+    small.yaml bounds the learner's replay window at 5,000 steps behind its own
+    step. A champion 4,999 steps behind still plays; at 5,000 the batch switches
+    to the candidate so actor throughput keeps feeding the learner.
+    """
+
+    experiment = load_config(Path(__file__).parents[1] / "configs" / "small.yaml")
+    assert experiment.learner.max_replay_lag_steps == 5_000
+    experiment = replace(
+        experiment,
+        orchestration=replace(
+            experiment.orchestration,
+            model_refresh=replace(
+                experiment.orchestration.model_refresh,
+                selfplay_source="candidate_champion_mix",
+                candidate_probability=0.0,
+            ),
+        ),
+    )
+    identity = RunIdentity(
+        tmp_path / "run.json",
+        "run-actor-stale-champion",
+        "family-actor-stale-champion",
+        1,
+    )
+    evaluators = {
+        role: SimpleNamespace(
+            model_version="sha256-" + marker * 64,
+            model_identity="sha256-" + marker * 64,
+            model_step=step,
+            evaluator_calls=0,
+            evaluator_rows=0,
+        )
+        for role, marker, step in (("champion", "c", 7), ("candidate", "d", 4_000))
+    }
+
+    class FakeProvider:
+        def __init__(self, *_args, **kwargs) -> None:
+            self.role = kwargs.get("expected_role", "champion")
+
+        def wait_for_initial(self, **_kwargs):
+            return evaluators[self.role]
+
+        def refresh(self):
+            return evaluators[self.role]
+
+    stopped = {"value": False}
+    selected: list[object] = []
+
+    class FakeSelfPlayActor:
+        def __init__(self, _native, evaluator, _store, _config, _identity) -> None:
+            selected.append(evaluator)
+            self.evaluator = evaluator
+
+        def run(self, **_kwargs):
+            stopped["value"] = True
+            return [
+                SimpleNamespace(
+                    winner=0,
+                    samples=3,
+                    policy_samples=1,
+                    search_simulations=9,
+                    model_version=self.evaluator.model_version,
+                    model_identity=self.evaluator.model_identity,
+                )
+            ]
+
+        def metrics_snapshot(self) -> SelfPlayMetrics:
+            return SelfPlayMetrics(completed_decisions=3)
+
+    monkeypatch.setattr("startrain.actor.ManifestModelProvider", FakeProvider)
+    monkeypatch.setattr("startrain.actor.SelfPlayActor", FakeSelfPlayActor)
+    learner_heartbeat = tmp_path / "learner.heartbeat.json"
+    learner_heartbeat.write_text(json.dumps({"step": learner_step}), encoding="utf-8")
+    supervisor = ActorSupervisor(
+        native_module=object(),
+        experiment=experiment,
+        gpu=GPUWorkerConfig(
+            gpu_id=2,
+            role="actor",
+            cpu_threads=1,
+            actor_batch_size=1,
+        ),
+        replay_directory=tmp_path / "replay",
+        manifest_path=tmp_path / "champion.json",
+        candidate_manifest_path=tmp_path / "candidate.json",
+        run_identity=identity,
+        heartbeat_path=tmp_path / "heartbeat.json",
+        metrics_path=tmp_path / "metrics.jsonl",
+        learner_heartbeat_path=learner_heartbeat,
+        device="cpu",
+    )
+    candidate = SimpleNamespace(
+        run_id=identity.run_id,
+        generation_family=identity.generation_family,
+        model_step=4_000,
+    )
+    monkeypatch.setattr(supervisor, "_read_candidate", lambda: candidate)
+
+    assert supervisor.run(stop_requested=lambda: stopped["value"]) == 1
+    assert selected == [evaluators[expected_role]]
+    metric = json.loads((tmp_path / "metrics.jsonl").read_text().strip())
+    assert metric["model_role"] == expected_role
+    assert metric["model_step"] == expected_step
+    assert metric["scheduling_step"] == learner_step
+
+
 def test_actor_lane_identity_is_unique_and_range_checked(tmp_path) -> None:
     experiment = load_config(Path(__file__).parents[1] / "configs" / "small.yaml")
     identity = RunIdentity(tmp_path / "run.json", "run-lanes", "family-lanes", 1)

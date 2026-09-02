@@ -30,17 +30,19 @@ def _validated_rates(values: Sequence[float]) -> tuple[float, ...]:
     return rates
 
 
-def reduced_multiplier(scale: float, floor: float) -> float:
-    """Return the absolute multiplier a recovery may apply.
+def reduced_multiplier(scale: float, floor: float, *, current: float = 1.0) -> float:
+    """Return the multiplier the next recovery stage may apply.
 
-    The result never compounds with the current multiplier and never falls below
-    the configured floor, so repeated recoveries converge to ``floor`` instead of
-    decaying geometrically.
+    Within one champion segment successive recoveries descend by ``scale`` from
+    the ``current`` multiplier, so a plateau anneals in stages instead of
+    stopping at a single cut. The descent is bounded by ``floor`` and the
+    multiplier is restored on promotion, so nothing carries across champions and
+    the effective rate can never decay geometrically toward zero.
     """
 
-    if not 0 < scale <= 1 or not 0 < floor <= 1:
-        raise ValueError("learning-rate scale and floor must be in (0, 1]")
-    return max(float(floor), float(scale))
+    if not 0 < scale <= 1 or not 0 < floor <= 1 or not 0 < current <= 1:
+        raise ValueError("learning-rate scale, floor, and multiplier must be in (0, 1]")
+    return max(float(floor), float(current) * float(scale))
 
 
 @dataclass(frozen=True, slots=True)

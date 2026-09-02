@@ -496,6 +496,26 @@ class ActorSupervisor:
                             fallback_step=candidate.model_step
                         )
                     )
+                    if (
+                        model_role == "champion"
+                        and self.candidate_provider is not None
+                        and self._champion_outside_replay_window(
+                            champion_step=evaluator.model_step,
+                            learner_step=scheduling_step,
+                        )
+                    ):
+                        # Champion games this far behind the learner would be
+                        # generated only for the replay window to discard them,
+                        # so the batch plays the candidate instead.
+                        stale_champion_step = evaluator.model_step
+                        model_role, provider = "candidate", self.candidate_provider
+                        evaluator = provider.refresh()
+                        self.heartbeat.advance(
+                            phase="champion_selfplay_stale",
+                            candidate_step=candidate.model_step,
+                            champion_step=stale_champion_step,
+                            scheduling_step=scheduling_step,
+                        )
                     active_ring_weights = (
                         self.experiment.orchestration.ring_mixture.weights_for_step(
                             scheduling_step
@@ -835,6 +855,20 @@ class ActorSupervisor:
         self._candidate_signature = signature
         self._candidate_manifest = manifest
         return manifest
+
+    def _champion_outside_replay_window(
+        self, *, champion_step: int, learner_step: int
+    ) -> bool:
+        """Whether the learner's replay window already excludes champion games.
+
+        The learner trains only on samples whose generating model is within
+        ``max_replay_lag_steps`` of its own step, and it only moves forward, so
+        a champion at or beyond that distance produces samples it will never
+        train on.
+        """
+
+        window = self.experiment.learner.max_replay_lag_steps
+        return learner_step - champion_step >= window
 
     def _read_learner_scheduling_step(self, *, fallback_step: int) -> tuple[int, str]:
         try:

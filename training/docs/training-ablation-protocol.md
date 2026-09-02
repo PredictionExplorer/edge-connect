@@ -72,11 +72,13 @@ The following switches are deliberately first-class and recorded in metrics:
 - `orchestration.plateau.action: reduce_lr_keep_weights`, which clears stale
   optimizer moments and lowers rates without discarding the learner branch.
 - `orchestration.plateau.minimum_learning_rate_scale` and
-  `restore_scale_on_promotion`, which bound plateau recovery to one absolute,
-  floored multiplier of the profile's reference rates and return to the
-  reference after the next promotion. Reductions are triggered only by
-  conclusive rejections; budget exhaustion (`reject_max_pairs`) releases the
-  replay-lag cap without touching rates.
+  `restore_scale_on_promotion`, which bound plateau recovery to a staged,
+  floored multiplier of the profile's reference rates (each stage multiplies
+  the active multiplier by `reset_learning_rate_scale`, never below the floor)
+  and return to the reference after the next promotion. Stages are triggered
+  only by streaks of conclusive rejections, at any champion lag; budget
+  exhaustion (`reject_max_pairs`) never touches rates, and the keep-weights
+  action never pauses the learner while the arena evaluates.
 
 Candidate/champion/history mixing keeps pointer roles and run identities strict.
 Models are refreshed only between complete game batches, so no game contains

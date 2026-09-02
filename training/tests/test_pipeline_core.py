@@ -3003,30 +3003,60 @@ def test_plateau_policy_keeps_replay_live_and_resets_after_rejections() -> None:
         **common,
         "action": "reduce_lr_keep_weights",
     }
+    # Keeping weights, the streak alone decides and lag never idles the learner.
+    for lag in (0, 19, 20, 50, 10_000):
+        assert (
+            plateau_policy_decision(
+                lag_steps=lag,
+                terminal_rejection=True,
+                rejection_streak=3,
+                **autonomous,
+            )
+            == "recover"
+        )
+        assert (
+            plateau_policy_decision(
+                lag_steps=lag,
+                terminal_rejection=True,
+                rejection_streak=1,
+                **autonomous,
+            )
+            == "proceed"
+        )
+        assert (
+            plateau_policy_decision(
+                lag_steps=lag,
+                terminal_rejection=False,
+                rejection_streak=0,
+                **autonomous,
+            )
+            == "proceed"
+        )
     assert (
         plateau_policy_decision(
-            lag_steps=20,
+            lag_steps=50,
             terminal_rejection=True,
             rejection_streak=3,
-            **autonomous,
+            **{**autonomous, "reset_already_applied": True},
         )
-        == "recover"
+        == "proceed"
     )
     assert (
         plateau_policy_decision(
             lag_steps=50,
             terminal_rejection=True,
-            rejection_streak=1,
+            rejection_streak=3,
+            at_rate_floor=True,
             **autonomous,
         )
-        == "recover"
+        == "proceed"
     )
     assert (
         plateau_policy_decision(
             lag_steps=50,
-            terminal_rejection=False,
-            rejection_streak=0,
-            **{**autonomous, "reset_already_applied": True},
+            terminal_rejection=True,
+            rejection_streak=3,
+            **{**autonomous, "status_matches_candidate": False},
         )
         == "proceed"
     )
@@ -3121,8 +3151,8 @@ def test_plateau_learning_rate_scale_updates_optimizer_and_scheduler() -> None:
     assert not adam.state
 
 
-def test_plateau_learning_rate_scale_never_compounds_and_restores() -> None:
-    """Repeated recoveries stay at one floored multiplier of the reference."""
+def test_plateau_learning_rate_scale_descends_in_stages_to_the_floor() -> None:
+    """Recoveries anneal by stages against the reference and stop at the floor."""
 
     parameter = torch.nn.Parameter(torch.ones(()))
     optimizer = torch.optim.SGD([parameter], lr=1.0)
@@ -3132,18 +3162,21 @@ def test_plateau_learning_rate_scale_never_compounds_and_restores() -> None:
     )
     learner = _governed_learner(optimizer, scheduler)
 
-    learner._scale_learning_rates(0.5, champion_identity="sha256-a")
-    learner._scale_learning_rates(0.5, champion_identity="sha256-b")
-    learner._scale_learning_rates(0.5, champion_identity="sha256-c")
+    assert learner._scale_learning_rates(0.5, champion_identity="sha256-a") == 0.5
     assert scheduler.base_lrs == pytest.approx([0.5])
-    assert optimizer.param_groups[0]["initial_lr"] == pytest.approx(0.5)
-    assert learner._lr_governor.multiplier == pytest.approx(0.5)
-    assert learner._lr_governor.scaled_champion_identity == "sha256-c"
-    assert learner._lr_governor.reference_base_lrs == (1.0,)
-
-    # A stronger requested cut is clamped at the configured floor.
-    assert learner._scale_learning_rates(0.1) == pytest.approx(0.25)
+    assert learner._lr_governor.scaled_champion_identity == "sha256-a"
+    assert learner._scale_learning_rates(0.5, champion_identity="sha256-a") == 0.25
     assert scheduler.base_lrs == pytest.approx([0.25])
+    assert optimizer.param_groups[0]["initial_lr"] == pytest.approx(0.25)
+
+    # The floor is absolute: a third stage, or a stronger cut, changes nothing
+    # and leaves the recorded champion untouched.
+    assert learner._scale_learning_rates(0.5, champion_identity="sha256-b") == 0.25
+    assert learner._scale_learning_rates(0.1, champion_identity="sha256-b") == 0.25
+    assert scheduler.base_lrs == pytest.approx([0.25])
+    assert learner._lr_governor.multiplier == pytest.approx(0.25)
+    assert learner._lr_governor.scaled_champion_identity == "sha256-a"
+    assert learner._lr_governor.reference_base_lrs == (1.0,)
 
     # The scheduler position is preserved: the live rate follows the cosine.
     for _ in range(50):
@@ -3163,8 +3196,9 @@ def test_plateau_learning_rate_governor_survives_checkpoint_round_trip(
     """Champion checkpoints record the multiplier separately from the reference.
 
     Resuming a checkpoint saved during a reduced segment restores that segment's
-    multiplier, and a later reduction is still absolute rather than compounding.
-    Legacy checkpoints keep their stored rates without any jump.
+    multiplier against the same reference, so the next stage descends from the
+    recorded multiplier and the reference never drifts. Legacy checkpoints keep
+    their stored rates without any jump.
     """
 
     from startrain.checkpoint import load_checkpoint, save_checkpoint
@@ -3217,8 +3251,8 @@ def test_plateau_learning_rate_governor_survives_checkpoint_round_trip(
 
     resumed = _governed_learner(fresh_optimizer, fresh_scheduler)
     resumed._lr_governor = state
-    resumed._scale_learning_rates(0.5, champion_identity="sha256-b")
-    assert fresh_scheduler.base_lrs == pytest.approx([0.5])
+    assert resumed._scale_learning_rates(0.5, champion_identity="sha256-b") == 0.25
+    assert fresh_scheduler.base_lrs == pytest.approx([0.25])
     assert resumed._lr_governor.reference_base_lrs == (1.0,)
 
     legacy_model = torch.nn.Linear(2, 1)
@@ -3321,12 +3355,16 @@ def test_plateau_recovery_preserves_weights_and_creates_durable_cutover(
     assert events[-1]["learning_rate_reduced"] is True
     assert events[-1]["learning_rate_multiplier"] == pytest.approx(0.5)
 
-    # A second recovery from another champion replaces rather than compounds.
+    # A second recovery descends one more stage and then rests on the floor.
     learner._last_plateau_reset = None
     action["champion_identity"] = "champion-2"
     assert learner._plateau_control(stop_requested=lambda: False, progress=None)
-    assert optimizer.param_groups[0]["lr"] == pytest.approx(0.05)
-    assert learner._lr_governor.multiplier == pytest.approx(0.5)
+    assert optimizer.param_groups[0]["lr"] == pytest.approx(0.025)
+    assert learner._lr_governor.multiplier == pytest.approx(0.25)
+    learner._last_plateau_reset = None
+    assert learner._plateau_control(stop_requested=lambda: False, progress=None)
+    assert optimizer.param_groups[0]["lr"] == pytest.approx(0.025)
+    assert learner._lr_governor.multiplier == pytest.approx(0.25)
 
     # Releasing the replay-lag cap on inconclusive evidence keeps the rate and
     # the optimizer moments.
@@ -3338,16 +3376,12 @@ def test_plateau_recovery_preserves_weights_and_creates_durable_cutover(
     action["champion_identity"] = "champion-3"
     assert learner._plateau_control(stop_requested=lambda: False, progress=None)
     assert optimizer.state
-    assert optimizer.param_groups[0]["lr"] == pytest.approx(0.05)
+    assert optimizer.param_groups[0]["lr"] == pytest.approx(0.025)
     assert events[-1]["learning_rate_reduced"] is False
     assert events[-1]["optimizer_state_cleared"] is False
 
 
-def test_plateau_action_reduces_rates_only_on_conclusive_rejections(
-    tmp_path, monkeypatch
-) -> None:
-    """Inconclusive budget exhaustion releases the lag cap without a rate cut."""
-
+def _plateau_policy_fixture(tmp_path, monkeypatch):
     learner_root = tmp_path / "learner"
     learner_root.mkdir()
     champion_path = learner_root / "champion.json"
@@ -3377,13 +3411,6 @@ def test_plateau_action_reduces_rates_only_on_conclusive_rejections(
     learner.promotion_status_path = status_path
     learner.learner_config = SimpleNamespace(max_replay_lag_steps=60_000)
     learner._last_plateau_reset = None
-    configured = PlateauConfig(
-        enabled=True,
-        action="reduce_lr_keep_weights",
-        reset_learning_rate_scale=0.5,
-        max_learner_champion_lag_steps=40_000,
-        consecutive_terminal_rejections=2,
-    )
 
     def status(**fields: object) -> None:
         payload = {
@@ -3397,16 +3424,49 @@ def test_plateau_action_reduces_rates_only_on_conclusive_rejections(
         payload.update(fields)
         status_path.write_text(json.dumps(payload))
 
-    # Below the soft lag nothing happens regardless of status.
-    learner.step = 130_000
-    status()
+    return learner, status, status_path
+
+
+def test_keep_weights_plateau_policy_ignores_champion_lag(
+    tmp_path, monkeypatch
+) -> None:
+    """Under reduce_lr_keep_weights the learner never idles on champion lag.
+
+    Weights are never rewound, so the only plateau response is a staged rate cut
+    after a streak of conclusive rejections: below, between, and beyond the lag
+    thresholds alike. Inconclusive budget exhaustion never cuts the rate, a
+    candidate under evaluation never pauses training, and once the multiplier
+    sits at its floor there is nothing left to do.
+    """
+
+    from startrain.lr_governor import LearningRateGovernorState
+
+    learner, status, status_path = _plateau_policy_fixture(tmp_path, monkeypatch)
+    learner._lr_governor = LearningRateGovernorState(reference_base_lrs=(1.0,))
+    configured = PlateauConfig(
+        enabled=True,
+        action="reduce_lr_keep_weights",
+        reset_learning_rate_scale=0.5,
+        minimum_learning_rate_scale=0.25,
+        max_learner_champion_lag_steps=40_000,
+        consecutive_terminal_rejections=2,
+    )
+
+    # Inconclusive results are never a streak, at any lag.
+    for step in (130_000, 145_000, 160_000, 400_000):
+        learner.step = step
+        status()
+        assert learner._rank_zero_plateau_action(configured) == {"kind": "proceed"}
+
+    # A candidate still under evaluation never pauses training.
+    learner.step = 160_000
+    status(decision="continue", terminal=False)
+    assert learner._rank_zero_plateau_action(configured) == {"kind": "proceed"}
+    status(decision="continue", terminal=False, candidate_identity="sha256-other")
     assert learner._rank_zero_plateau_action(configured) == {"kind": "proceed"}
 
-    # Between soft and hard lag, five inconclusive results are not a streak.
-    learner.step = 145_000
-    assert learner._rank_zero_plateau_action(configured) == {"kind": "proceed"}
-
-    # Two conclusive rejections are a streak: recover with a rate cut.
+    # Two conclusive rejections are a streak well below the soft lag.
+    learner.step = 120_000
     status(
         decision="reject",
         conclusive=True,
@@ -3417,13 +3477,29 @@ def test_plateau_action_reduces_rates_only_on_conclusive_rejections(
     assert action["kind"] == "recover"
     assert action["reset_reason"] == "terminal_rejection_streak"
     assert action["champion_identity"] == "sha256-champion"
+    assert "checkpoint" not in action
 
-    # At the hard lag an inconclusive terminal result only releases the cap.
-    learner.step = 160_000
-    status()
+    # The same streak beyond the hard replay lag is still a staged cut, never a
+    # lag-driven recovery that would reset the streak without touching the rate.
+    learner.step = 400_000
     action = learner._rank_zero_plateau_action(configured)
     assert action["kind"] == "recover"
-    assert action["reset_reason"] == "hard_replay_lag"
+    assert action["reset_reason"] == "terminal_rejection_streak"
+
+    # Streak evidence for another candidate does not count.
+    status(
+        decision="reject",
+        conclusive=True,
+        consecutive_conclusive_rejections=2,
+        candidate_identity="sha256-other",
+    )
+    assert learner._rank_zero_plateau_action(configured) == {"kind": "proceed"}
+
+    # One recovery per (champion, candidate) pair.
+    status(decision="reject", conclusive=True, consecutive_conclusive_rejections=2)
+    learner._last_plateau_reset = ("sha256-champion", "sha256-candidate")
+    assert learner._rank_zero_plateau_action(configured) == {"kind": "proceed"}
+    learner._last_plateau_reset = None
 
     # A status that predates conclusiveness falls back to the terminal streak.
     status_path.write_text(
@@ -3436,14 +3512,61 @@ def test_plateau_action_reduces_rates_only_on_conclusive_rejections(
             }
         )
     )
-    learner.step = 145_000
-    action = learner._rank_zero_plateau_action(configured)
-    assert action["kind"] == "recover"
-    assert action["reset_reason"] == "terminal_rejection_streak"
+    assert learner._rank_zero_plateau_action(configured)["kind"] == "recover"
 
-    # Evidence for another candidate never triggers recovery.
-    status(candidate_identity="sha256-other")
+    # At the floor a further streak has nothing left to cut.
+    status(decision="reject", conclusive=True, consecutive_conclusive_rejections=2)
+    learner._lr_governor = learner._lr_governor.with_multiplier(
+        0.25, scaled_champion_identity="sha256-champion"
+    )
+    assert learner._rank_zero_plateau_action(configured) == {"kind": "proceed"}
+    learner._lr_governor = learner._lr_governor.with_multiplier(
+        0.5, scaled_champion_identity="sha256-champion"
+    )
+    assert learner._rank_zero_plateau_action(configured)["kind"] == "recover"
+
+
+def test_reset_from_champion_plateau_policy_keeps_lag_gating(
+    tmp_path, monkeypatch
+) -> None:
+    """The rewinding action keeps its lag-gated pause and reset semantics."""
+
+    learner, status, _status_path = _plateau_policy_fixture(tmp_path, monkeypatch)
+    configured = PlateauConfig(
+        enabled=True,
+        action="reset_from_champion",
+        reset_learning_rate_scale=0.5,
+        max_learner_champion_lag_steps=40_000,
+        consecutive_terminal_rejections=2,
+    )
+
+    # Below the soft lag nothing happens regardless of status.
+    learner.step = 130_000
+    status(decision="reject", conclusive=True, consecutive_conclusive_rejections=2)
+    assert learner._rank_zero_plateau_action(configured) == {"kind": "proceed"}
+
+    # Between soft and hard lag, inconclusive results are not a streak.
+    learner.step = 145_000
+    status()
+    assert learner._rank_zero_plateau_action(configured) == {"kind": "proceed"}
+
+    # A conclusive streak rewinds to the champion checkpoint.
+    status(decision="reject", conclusive=True, consecutive_conclusive_rejections=2)
+    action = learner._rank_zero_plateau_action(configured)
+    assert action["kind"] == "reset"
+    assert action["reset_reason"] == "terminal_rejection_streak"
+    assert action["sha256"] == "a" * 64
+
+    # At the hard replay lag an inconclusive terminal result rewinds without a
+    # rate cut, and a candidate still under evaluation pauses training.
     learner.step = 160_000
+    status()
+    action = learner._rank_zero_plateau_action(configured)
+    assert action["kind"] == "reset"
+    assert action["reset_reason"] == "hard_replay_lag"
+    status(decision="continue", terminal=False)
+    assert learner._rank_zero_plateau_action(configured)["kind"] == "pause"
+    status(candidate_identity="sha256-other")
     assert learner._rank_zero_plateau_action(configured)["kind"] == "pause"
 
 

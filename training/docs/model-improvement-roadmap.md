@@ -348,9 +348,62 @@ Statistical gate: the 1024-simulation ladder (report
   autonomous_elo.search_budget.ladder) continues to extend the anchor chain;
   256-simulation results are excluded from it by construction
 Lambda snapshot verification: fork snapshot timer continues unchanged
-Result: pending (first gate decision under the new budget expected within
-  about two hours of the cutover; first measurement link after the first
-  promotion)
+Result: first gate evaluation (candidate 774,235) concluded `reject` after
+  400 games in 56 minutes of arena time (17:36-18:32 UTC; 13 minutes per
+  100-game wave versus 57 at 1024 simulations), conclusive with anytime upper
+  bound +35.3 Elo against the +35 alternative; point estimate -19.1 Elo
+  (score 0.4725). Candidate 778,142 at -20.9 after 200 games, continuing. The
+  gate now resolves in about an hour what the 400-game 1024-simulation gate
+  left open in 3.8 hours. Auditing what the fast verdicts feed exposed the
+  keep-weights lag bug recorded under R10-PLATEAU-LAG-03
+Decision: keep the gate; the anneal it now drives is corrected in
+  R10-PLATEAU-LAG-03
+```
+
+```text
+ID: R10-PLATEAU-LAG-03
+Phase: 1 — training dynamics / plateau policy
+Status: implemented and tested; runtime-only release cutover before the
+  learner reaches 60,000 steps past champion 742,979 (about 03:50 UTC Sep 3)
+Hypothesis: the reduce_lr_keep_weights plateau policy inherited
+  reset_from_champion's lag gating, and with weights never rewound the lag
+  grows without bound between promotions, so past the 60,000-step soft cap the
+  learner would (a) pause during every arena evaluation (about 40% learner
+  idle at the 256-simulation gate), (b) fire a "hard replay lag" recovery on
+  every verdict, resetting the conclusive streak so no further rate stage
+  could ever trigger, and (c) keep 20% of actor throughput on champion games
+  the learner's replay window already excludes. The parent run shows the
+  original design's cost from the other side: three plateau_reset events
+  (Aug 31 03:39, Sep 1 00:09, Sep 1 22:43) each rewound the learner from
+  ~783,000 to 742,979 the moment lag reached the 40,000-step cap, discarding
+  40,000 steps of training (including +33 and +38 Elo candidates) every ~16 h
+Commit: recorded at release
+Release: recorded at release
+Treatment (code only, profile unchanged):
+  - keep-weights policy ignores champion lag entirely: never pauses, recovers
+    only on a conclusive streak, and treats a multiplier already at the floor
+    as nothing to do
+  - recovery stages descend from the active multiplier
+    (max(floor, current * scale): 3.0e-4 -> 1.5e-4 -> 7.5e-5 with the
+    production 0.5/0.25), still restored on promotion, so the cross-champion
+    non-compounding guarantee is unchanged while a plateau gets a real anneal
+    instead of a single cut
+  - actors play the candidate instead of a champion that is
+    learner.max_replay_lag_steps or more behind the learner, recording
+    champion_selfplay_stale
+  - reset_from_champion keeps its lag-gated pause/reset semantics
+Control: R10-ARENA-GATE-02 runtime (main-2ccd895-arena-gate)
+Seeds: 17 (production continuation)
+Budget: continuous
+System gates: learner steps per hour unchanged (~2,600) after lag passes
+  60,000; no plateau_recovery events with reason hard_replay_lag; actor
+  heartbeats show champion_selfplay_stale once lag passes 60,000 and the
+  learner's eligible-sample fraction stays at 1.0
+Statistical gate: the first stage (Muon 1.5e-4) fires on the next conclusive
+  streak after cutover; judge the anneal by whether candidates evaluated under
+  1.5e-4 and 7.5e-5 close the gap to champion 742,979 at 256 simulations
+  (-19.1 and -20.9 so far under 3.0e-4) and by the first promotion
+Result: pending
 Decision: pending
 ```
 
@@ -396,6 +449,21 @@ example candidate-publication treatment. The completed optimizer, EMA,
 freshness, and clinch screen had no promoted frontier gain, so those arms are
 excluded. Backlog relief is necessary but insufficient: the treatment must also
 pass the standard pair-valid Elo/hour gates.
+
+### 2026-09-02 — Decouple keep-weights plateau recovery from champion lag
+
+Decision: the first conclusive verdict from the cheap gate (774,235 rejected in
+56 minutes) made the plateau counter fast, which exposed that the
+keep-weights policy still carried the rewinding policy's lag gates. Weights are
+never rewound under `reduce_lr_keep_weights`, so champion lag is not a reason
+to idle the learner and grows without bound between promotions; past the
+60,000-step cap the policy would have paused training during every evaluation
+and reset the conclusive streak on every verdict, silencing the anneal for good.
+Make the keep-weights policy streak-only at any lag, let stages descend from the
+active multiplier to the floor (a real anneal, still restored on promotion), and
+stop actors from playing a champion whose games the replay window discards. Ship
+as a runtime-only release before the live run reaches the cap. Leave
+`reset_from_champion` semantics untouched.
 
 ### 2026-09-02 — Separate the promotion gate from the measurement scale
 

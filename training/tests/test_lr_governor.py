@@ -37,14 +37,21 @@ def _optimizer_and_scheduler(
     return optimizer, scheduler
 
 
-def test_reduced_multiplier_is_absolute_and_floored() -> None:
+def test_reduced_multiplier_descends_by_stage_and_stops_at_the_floor() -> None:
     assert reduced_multiplier(0.5, 0.25) == 0.5
+    assert reduced_multiplier(0.5, 0.25, current=0.5) == 0.25
+    assert reduced_multiplier(0.5, 0.25, current=0.25) == 0.25
     assert reduced_multiplier(0.1, 0.25) == 0.25
     assert reduced_multiplier(1.0, 0.25) == 1.0
+    assert reduced_multiplier(1.0, 0.25, current=0.5) == 0.5
     with pytest.raises(ValueError):
         reduced_multiplier(0.0, 0.25)
     with pytest.raises(ValueError):
         reduced_multiplier(0.5, 1.5)
+    with pytest.raises(ValueError):
+        reduced_multiplier(0.5, 0.25, current=0.0)
+    with pytest.raises(ValueError):
+        reduced_multiplier(0.5, 0.25, current=1.5)
 
 
 def test_state_validates_and_round_trips_through_checkpoint_metadata() -> None:

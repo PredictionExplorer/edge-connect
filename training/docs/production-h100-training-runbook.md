@@ -427,19 +427,34 @@ the `selfplay_snapshot_*` example cadence.
 ### Learning-rate governance during plateau recovery
 
 The profile's optimizer rates are the *reference schedule*. Plateau recovery
-may run below it only through one absolute multiplier that the learner records
-next to the reference in every checkpoint (`extra.learning_rate_governor`):
+may run below it only through one multiplier of that reference, which the
+learner records next to the reference in every checkpoint
+(`extra.learning_rate_governor`):
 
-- A recovery sets the multiplier to
-  `max(minimum_learning_rate_scale, reset_learning_rate_scale)`. It never
-  multiplies the multiplier that is already active, so repeated recoveries
-  converge to the floor instead of decaying geometrically.
+- Each recovery stage sets the multiplier to
+  `max(minimum_learning_rate_scale, current_multiplier * reset_learning_rate_scale)`,
+  so within one champion segment a plateau anneals in stages (with scale 0.5
+  and floor 0.25: reference, half, quarter) and then rests at the floor. The
+  multiplier is always applied to the reference, never to rates saved inside a
+  checkpoint, so nothing carries across champions.
 - Only *conclusive* rejections (`reject`, `reject_ring_regression`) count toward
   `consecutive_terminal_rejections`. A candidate that merely exhausts its pair
-  budget (`reject_max_pairs`) is terminal but inconclusive: at the hard
-  replay-lag boundary it still releases the lag cap, but it never lowers the
+  budget (`reject_max_pairs`) is terminal but inconclusive and never lowers the
   rate or clears optimizer moments. The arena writes `conclusive` and
-  `consecutive_conclusive_rejections` into `promotion-status.json`.
+  `consecutive_conclusive_rejections` into `promotion-status.json`; each applied
+  stage resets the counter, so the next stage needs a fresh streak.
+- Under `reduce_lr_keep_weights` the champion lag never gates or pauses the
+  learner: weights are never rewound, so idling while the arena works would only
+  waste learner time, and the lag grows without bound between promotions. The
+  streak alone triggers a stage, at any lag, and a multiplier already at the
+  floor leaves nothing to do. `max_learner_champion_lag_steps` and the pause
+  semantics still apply to `reset_from_champion`, whose rewinds keep the lag
+  bounded.
+- Actors keep the replay window in mind: once the learner is
+  `learner.max_replay_lag_steps` past the champion, champion self-play games
+  would only be excluded from training, so a batch drawn for the champion plays
+  the candidate instead and the actor heartbeat records
+  `champion_selfplay_stale`.
 - When `restore_scale_on_promotion` is true and the champion changes after a
   reduction, the learner returns to the reference schedule and records a
   `plateau_scale_restored` metric event.

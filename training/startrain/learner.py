@@ -896,25 +896,26 @@ def plateau_policy_decision(
     reset_after_rejections: int,
     action: str,
     reset_already_applied: bool,
+    at_rate_floor: bool = False,
 ) -> str:
+    if action == "reduce_lr_keep_weights":
+        # Weights are never rewound under this action, so the champion lag is
+        # not a reason to stop training: pausing would only idle the learner
+        # while the arena works, and the lag grows without bound between
+        # promotions. The only plateau response is an evidence-driven rate cut
+        # after a streak of conclusive rejections, and once the multiplier sits
+        # at its floor there is nothing left to cut.
+        if reset_already_applied or at_rate_floor:
+            return "proceed"
+        if (
+            status_matches_candidate
+            and terminal_rejection
+            and rejection_streak >= reset_after_rejections
+        ):
+            return "recover"
+        return "proceed"
     if lag_steps < soft_lag_steps:
         return "proceed"
-    if action == "reduce_lr_keep_weights" and reset_already_applied:
-        return "proceed"
-    recovery_due = (
-        status_matches_candidate
-        and terminal_rejection
-        and (
-            lag_steps >= hard_replay_lag_steps
-            or rejection_streak >= reset_after_rejections
-        )
-    )
-    if (
-        recovery_due
-        and action == "reduce_lr_keep_weights"
-        and not reset_already_applied
-    ):
-        return "recover"
     if (
         status_matches_candidate
         and terminal_rejection
@@ -2818,19 +2819,25 @@ class LearnerLoop:
         *,
         champion_identity: str | None = None,
     ) -> float:
-        """Run below the reference schedule by one floored absolute multiplier.
+        """Descend one recovery stage below the reference schedule.
 
-        The multiplier replaces, rather than compounds with, any multiplier that
-        is already active, so repeated recoveries from successive champions can
-        never drive the effective rate geometrically toward zero.
+        The multiplier is applied against the profile's reference rates, steps
+        down by ``scale`` per recovery within the current champion segment, stops
+        at the configured floor, and is restored when a promotion ends the
+        segment. Returns the multiplier now in force.
         """
 
         if not 0 < scale <= 1:
             raise ValueError("learning-rate scale must be in (0, 1]")
         configured = self._plateau_config()
-        multiplier = reduced_multiplier(scale, configured.minimum_learning_rate_scale)
-        if multiplier == 1.0:
-            return 1.0
+        current = float(self._lr_governor.multiplier)
+        multiplier = reduced_multiplier(
+            scale,
+            configured.minimum_learning_rate_scale,
+            current=current,
+        )
+        if multiplier >= current:
+            return current
         self._lr_governor = self._lr_governor.with_multiplier(
             multiplier,
             scaled_champion_identity=champion_identity,
@@ -4102,12 +4109,22 @@ class LearnerLoop:
         )
         return terminal_rejection, streak
 
+    def _learning_rate_at_floor(self, configured) -> bool:
+        governor = getattr(self, "_lr_governor", None)
+        if governor is None:
+            return False
+        return (
+            float(governor.multiplier)
+            <= float(configured.minimum_learning_rate_scale) + 1e-9
+        )
+
     def _rank_zero_plateau_action(self, configured) -> dict[str, object]:
         if not self.publisher.champion_path.is_file():
             return {"kind": "proceed"}
         champion = load_model_manifest(self.publisher.champion_path)
         lag = self.step - champion.model_step
-        if lag < configured.max_learner_champion_lag_steps:
+        keep_weights = configured.action == "reduce_lr_keep_weights"
+        if not keep_weights and lag < configured.max_learner_champion_lag_steps:
             return {"kind": "proceed"}
         candidate = (
             load_model_manifest(self.publisher.candidate_path)
@@ -4145,6 +4162,7 @@ class LearnerLoop:
             reset_after_rejections=(configured.consecutive_terminal_rejections),
             action=configured.action,
             reset_already_applied=self._last_plateau_reset == reset_token,
+            at_rate_floor=self._learning_rate_at_floor(configured),
         )
         if decision in ("reset", "recover"):
             if candidate is None:
