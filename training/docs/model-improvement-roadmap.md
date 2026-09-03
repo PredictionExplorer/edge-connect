@@ -424,8 +424,12 @@ Result: first stage fired 14 seconds after startup (19:37:57 UTC,
   802,979 and waited in `replay_wait` (`invalid_window_capacity`) until the
   fix (6a23234, main-6a23234-lag-budget) went live at 07:03 UTC: 2 h 53 min of
   learner idle while actors and the arena kept running. The 04:10 status check
-  recorded "lag exactly 60,000" without recognizing the stall; the monitor now
-  needs a stalled-learner-step error (follow-up)
+  recorded "lag exactly 60,000" without recognizing the stall. The monitor now
+  raises `learner_step_stalled` (ERROR) when a running learner's last training
+  step is older than twenty minutes (8acd320); the four protection units run
+  main-8acd320-stall-monitor while the workload stays on
+  main-6a23234-lag-budget, so the detector went live at 07:19 UTC without a
+  workload restart
 Decision: keep the policy; every remaining champion-lag use in the learner is
   now either the replay-window filter or scoped to reset_from_champion
 ```
