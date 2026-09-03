@@ -10,13 +10,20 @@ from typing import Protocol, Sequence, runtime_checkable
 import torch
 from torch import nn
 
-from .contracts import SCORE_MARGIN_MAX, SCORE_MARGIN_MIN
+from .contracts import (
+    FEATURE_SCHEMA_VERSION,
+    LEGACY_FEATURE_SCHEMA_VERSION,
+    SCORE_MARGIN_MAX,
+    SCORE_MARGIN_MIN,
+)
 from .device import resolve_precision
 from .features import EncodedBatch
+from .features_v3 import encode_legacy_batch
 from .native import (
     NativeStateDataProtocol,
     encode_native_feature_data,
     encode_native_state_data,
+    positions_from_native,
 )
 
 
@@ -54,10 +61,27 @@ class DetailedInferenceResponse:
 class InferenceConfig:
     precision: str = "fp32"
     score_utility_weight: float = 0.0
+    # The previous lineage's models (feature schema v3) evaluate through the
+    # frozen Python encoder so cross-schema arenas can measure a transfer.
+    feature_schema_version: int = FEATURE_SCHEMA_VERSION
 
     def __post_init__(self) -> None:
         if self.precision not in ("fp32", "bf16", "auto"):
             raise ValueError("inference precision must be fp32, bf16, or auto")
+        if not 0 <= self.score_utility_weight <= 1:
+            raise ValueError("score_utility_weight must be in [0, 1]")
+        if self.feature_schema_version not in (
+            FEATURE_SCHEMA_VERSION,
+            LEGACY_FEATURE_SCHEMA_VERSION,
+        ):
+            raise ValueError(
+                "inference feature_schema_version must be "
+                f"{FEATURE_SCHEMA_VERSION} or {LEGACY_FEATURE_SCHEMA_VERSION}"
+            )
+
+    @property
+    def legacy_features(self) -> bool:
+        return self.feature_schema_version == LEGACY_FEATURE_SCHEMA_VERSION
         if not 0 <= self.score_utility_weight <= 1:
             raise ValueError("score_utility_weight must be in [0, 1]")
 
@@ -109,7 +133,7 @@ class GraphInferenceAdapter:
         self.model_step = int(model_step)
         self.model_identity = model_identity or model_version
         self.last_feature_path: str | None = None
-        self.feature_path_counts = {"rust": 0, "python": 0}
+        self.feature_path_counts = {"rust": 0, "python": 0, "python-legacy": 0}
         self._evaluator_calls = 0
         self._evaluator_rows = 0
         self._topology_cache: dict[
@@ -254,7 +278,12 @@ class GraphInferenceAdapter:
         ):
             raise ValueError("legal action CSR offsets are invalid")
 
-        if native_features is not None:
+        if self.config.legacy_features:
+            # Search always packs the production schema; the previous lineage
+            # re-encodes the semantic states with its frozen v3 encoder.
+            host_encoded = encode_legacy_batch(positions_from_native(requests.states))
+            feature_path = "python-legacy"
+        elif native_features is not None:
             host_encoded = encode_native_feature_data(
                 native_features, source="native_request"
             )

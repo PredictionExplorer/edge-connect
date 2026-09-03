@@ -24,6 +24,10 @@ from .contracts import (
     ACTION_LAYOUT_VERSION,
     FEATURE_SCHEMA_HASH,
     FEATURE_SCHEMA_VERSION,
+    LEGACY_FEATURE_SCHEMA_HASH,
+    LEGACY_RULES_HASH,
+    LEGACY_RULES_HASH_WIRE,
+    LEGACY_RULES_SCHEMA_ID,
     MAX_HANDICAP,
     MODES,
     RULES_HASH,
@@ -36,6 +40,8 @@ from .runtime import append_jsonl, atomic_json, validate_identifier
 CHECKPOINT_FORMAT = "startrain.checkpoint"
 CHECKPOINT_VERSION = 3
 EMA_VERSION = 1
+# Checkpoints of the previous lineage (rules v2, feature schema v3).
+LEGACY_MODEL_SCHEMA_VERSION = 2
 MODEL_MANIFEST_FORMAT = "startrain.model-manifest"
 MODEL_POINTER_FORMAT = "startrain.model-pointer"
 MODEL_MANIFEST_VERSION = 3
@@ -505,6 +511,110 @@ def load_ema_checkpoint(
         expected_sha256=expected_sha256,
         expected_bytes=expected_bytes,
     )
+
+
+def legacy_model_config(config: Mapping[str, Any]) -> ModelConfig:
+    """Rebuild a previous-lineage ``ModelConfig`` from its checkpoint mapping.
+
+    The old lineage never stored the schema/bias/conditioning fields, so the
+    legacy defaults apply; a mapping that already carries them must agree.
+    """
+
+    values = dict(config)
+    legacy_defaults = asdict(ModelConfig.legacy())
+    for name in ("feature_schema_version", "relational_bias", "adaln_hidden"):
+        if name in values and values[name] != legacy_defaults[name]:
+            raise ValueError(f"legacy checkpoint model configuration {name} is invalid")
+        values[name] = legacy_defaults[name]
+    for name in ("node_feature_dim", "global_feature_dim"):
+        if name in values and values[name] != legacy_defaults[name]:
+            raise ValueError(f"legacy checkpoint model configuration {name} is invalid")
+        values[name] = legacy_defaults[name]
+    normalized = normalize_model_config(values)
+    return ModelConfig(**normalized)  # type: ignore[arg-type]
+
+
+def load_legacy_ema_checkpoint(
+    source: str | Path,
+    *,
+    model: nn.Module,
+    expected_model_config: ModelConfig,
+    map_location: torch.device | str = "cpu",
+    expected_sha256: str | None = None,
+    expected_bytes: int | None = None,
+) -> dict[str, Any]:
+    """Load the EMA weights of a previous-lineage checkpoint for lineage transfer.
+
+    The payload must carry the rules-v2 / feature-v3 / model-v2 contract; the
+    current contract is deliberately rejected so a new-lineage checkpoint can
+    never masquerade as a teacher.
+    """
+
+    checkpoint_path = Path(source)
+    if expected_sha256 is not None or expected_bytes is not None:
+        verify_file(
+            checkpoint_path,
+            expected_sha256=expected_sha256,
+            expected_bytes=expected_bytes,
+        )
+    payload = torch.load(checkpoint_path, map_location=map_location, weights_only=True)
+    if not isinstance(payload, dict) or payload.get("format") != CHECKPOINT_FORMAT:
+        raise ValueError("not a startrain checkpoint")
+    if payload.get("version") != CHECKPOINT_VERSION:
+        raise ValueError("unsupported checkpoint version")
+    if payload.get("rules_schema") != LEGACY_RULES_SCHEMA_ID:
+        raise ValueError("legacy checkpoint rules schema is not the previous lineage")
+    if payload.get("rules_hash") != LEGACY_RULES_HASH:
+        raise ValueError("legacy checkpoint rules hash is not the previous lineage")
+    if payload.get("rules_hash_wire") != LEGACY_RULES_HASH_WIRE:
+        raise ValueError("legacy checkpoint rules hash identifier is invalid")
+    if payload.get("feature_schema_hash") != LEGACY_FEATURE_SCHEMA_HASH:
+        raise ValueError("legacy checkpoint feature schema is not the previous lineage")
+    if payload.get("action_layout_schema", ACTION_LAYOUT_SCHEMA_ID) != (
+        ACTION_LAYOUT_SCHEMA_ID
+    ) or payload.get("action_layout_version", ACTION_LAYOUT_VERSION) != (
+        ACTION_LAYOUT_VERSION
+    ):
+        raise ValueError("legacy checkpoint action layout is incompatible")
+    if payload.get("model_schema_version") != LEGACY_MODEL_SCHEMA_VERSION:
+        raise ValueError("legacy checkpoint model schema is not the previous lineage")
+    for name in ("model", "ema", "step", "config", "extra"):
+        if name not in payload:
+            raise ValueError("legacy checkpoint payload is incomplete")
+    config = payload["config"]
+    if not isinstance(config, Mapping) or not isinstance(config.get("model"), Mapping):
+        raise ValueError("legacy checkpoint configuration is missing")
+    if not expected_model_config.is_legacy:
+        raise ValueError("legacy teacher must use the previous feature schema")
+    if legacy_model_config(config["model"]) != expected_model_config:
+        raise ValueError("legacy checkpoint model configuration is incompatible")
+    ema_payload = payload["ema"]
+    if (
+        not isinstance(ema_payload, Mapping)
+        or ema_payload.get("version") != EMA_VERSION
+        or not isinstance(ema_payload.get("shadow"), Mapping)
+    ):
+        raise ValueError("legacy checkpoint has no EMA weights")
+    if not isinstance(payload["model"], Mapping):
+        raise ValueError("legacy checkpoint model state is invalid")
+    step = payload["step"]
+    if isinstance(step, bool) or not isinstance(step, int) or step < 0:
+        raise ValueError("legacy checkpoint step is invalid")
+    evaluation_ema = ExponentialMovingAverage(model)
+    evaluation_ema.load_state_dict(ema_payload)
+    _validate_strict_model_state(model, payload["model"])
+    model.load_state_dict(payload["model"], strict=True)
+    evaluation_ema.copy_to(model)
+    extra = payload["extra"] if isinstance(payload["extra"], Mapping) else {}
+    return {
+        "step": int(step),
+        "config": dict(config),
+        "extra": dict(extra),
+        "rules_schema": LEGACY_RULES_SCHEMA_ID,
+        "rules_hash": LEGACY_RULES_HASH_WIRE,
+        "feature_schema_hash": f"{LEGACY_FEATURE_SCHEMA_HASH:016x}",
+        "model_schema_version": LEGACY_MODEL_SCHEMA_VERSION,
+    }
 
 
 def load_ema_weights_for_warm_start(
