@@ -416,8 +416,18 @@ Result: first stage fired 14 seconds after startup (19:37:57 UTC,
   publication) stood at 0.0 Elo after 500 games against -19.1 and -22.6 for
   the two candidates before it, still under evaluation. Side effect found: the
   recovery's new resume cutover broke the disaster snapshot (see the decision
-  log entry "Keep disaster snapshots through plateau recovery")
-Decision: pending
+  log entry "Keep disaster snapshots through plateau recovery").
+  Incomplete: a third lag path survived this release. The learner's window
+  budget (`_plateau_step_budget`) still capped training at
+  champion + max_replay_lag_steps unless the in-place recovery token matched
+  the current candidate, so at 04:10 UTC Sep 3 the learner reached exactly
+  802,979 and waited in `replay_wait` (`invalid_window_capacity`) until the
+  fix (6a23234, main-6a23234-lag-budget) went live at 07:03 UTC: 2 h 53 min of
+  learner idle while actors and the arena kept running. The 04:10 status check
+  recorded "lag exactly 60,000" without recognizing the stall; the monitor now
+  needs a stalled-learner-step error (follow-up)
+Decision: keep the policy; every remaining champion-lag use in the learner is
+  now either the replay-window filter or scoped to reset_from_champion
 ```
 
 ```text
@@ -552,6 +562,16 @@ example candidate-publication treatment. The completed optimizer, EMA,
 freshness, and clinch screen had no promoted frontier gain, so those arms are
 excluded. Backlog relief is necessary but insufficient: the treatment must also
 pass the standard pair-valid Elo/hour gates.
+
+### 2026-09-03 — Scope the window budget to the rewinding policy
+
+Decision: the keep-weights learner stalled at champion + 60,000 for almost
+three hours because the replay-window step budget still enforced the
+`reset_from_champion` lag cap. Remove the cap for `reduce_lr_keep_weights` (the
+rewind it protects never happens), ship immediately as a runtime-only release
+with targeted tests, and add a monitor error for a learner heartbeat whose step
+stops advancing while actors keep committing samples, so a stall is never again
+read as "lag exactly at the limit".
 
 ### 2026-09-03 — Let budget exhaustion advance the anneal
 

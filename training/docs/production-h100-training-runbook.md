@@ -451,13 +451,17 @@ learner records next to the reference in every checkpoint
   the gate cannot conclude in 1,200 games and, under the default rule, neither
   a promotion nor a stage. With the floor and restore-on-promotion in place an
   extra stage is a bounded, reversible cost.
-- Under `reduce_lr_keep_weights` the champion lag never gates or pauses the
-  learner: weights are never rewound, so idling while the arena works would only
-  waste learner time, and the lag grows without bound between promotions. The
-  streak alone triggers a stage, at any lag, and a multiplier already at the
-  floor leaves nothing to do. `max_learner_champion_lag_steps` and the pause
-  semantics still apply to `reset_from_champion`, whose rewinds keep the lag
-  bounded.
+- Under `reduce_lr_keep_weights` the champion lag never gates, pauses, or
+  budgets the learner: weights are never rewound, so idling while the arena
+  works would only waste learner time, and the lag grows without bound between
+  promotions. The streak alone triggers a stage, at any lag, and a multiplier
+  already at the floor leaves nothing to do. `max_learner_champion_lag_steps`,
+  the pause semantics, and the `champion + max_replay_lag_steps` window budget
+  still apply to `reset_from_champion`, whose rewinds keep the lag bounded. The
+  production run hit the window budget at exactly champion + 60,000 on
+  2026-09-03 and sat in `replay_wait` (`invalid_window_capacity`) for almost
+  three hours before the budget was scoped to the rewinding policy; a learner
+  heartbeat that stops advancing at a round lag is this failure.
 - Actors keep the replay window in mind: once the learner is
   `learner.max_replay_lag_steps` past the champion, champion self-play games
   would only be excluded from training, so a batch drawn for the champion plays
