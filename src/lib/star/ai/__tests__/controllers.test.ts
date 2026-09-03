@@ -20,15 +20,27 @@ describe('AI controller validation', () => {
     expect(normalizeControllers(double, controllers)).toEqual(controllers);
   });
 
-  it('forces persisted AI controllers back to human for unsupported variants', () => {
+  it('keeps AI controllers for every rules-v3 variant', () => {
     expect(normalizeControllers({ ...double, mode: 'classic' }, ['server', 'local'])).toEqual([
-      'human',
-      'human',
+      'server',
+      'local',
     ]);
     expect(normalizeControllers({ ...double, pieRule: true }, ['server', 'local'])).toEqual([
-      'human',
-      'human',
+      'server',
+      'local',
     ]);
+    expect(
+      normalizeControllers({ ...double, handicap: 9 }, ['server', 'local']),
+    ).toEqual(['server', 'local']);
+  });
+
+  it('forces persisted AI controllers back to human outside the rules family', () => {
+    expect(
+      normalizeControllers({ ...double, handicap: 10 }, ['server', 'local']),
+    ).toEqual(['human', 'human']);
+    expect(
+      normalizeControllers({ ...double, pieRule: true, handicap: 2 }, ['server', 'local']),
+    ).toEqual(['human', 'human']);
   });
 
   it('sanitizes malformed persisted controller tuples per player', () => {

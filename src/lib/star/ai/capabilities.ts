@@ -257,7 +257,7 @@ export async function checkServerAiCapability(
     }
     if (
       !isRecord(payload) ||
-      payload.api_schema_version !== 2 ||
+      payload.api_schema_version !== 3 ||
       (payload.status !== 'ok' && payload.status !== 'degraded') ||
       !isRecord(payload.rules) ||
       payload.rules.schema_id !== STAR_RULES_SCHEMA_ID ||

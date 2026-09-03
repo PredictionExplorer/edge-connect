@@ -9,6 +9,7 @@ import {
   codeToAction,
   makeAiResponse,
   semanticStateHash,
+  type AtomicGameAction,
   type StarAiRequest,
   type StarAiResponse,
 } from './protocol';
@@ -23,8 +24,10 @@ export const MAX_SERVER_AI_MAX_CONSIDERED = 128;
 
 export type ServerSearchBudget = StarAiSearchBudget;
 
-export interface AnalyzeRequestV2 {
-  schema_version: 2;
+export const STARSERVE_API_SCHEMA_VERSION = 3 as const;
+
+export interface AnalyzeRequestV3 {
+  schema_version: typeof STARSERVE_API_SCHEMA_VERSION;
   rules_hash: StarAiRequest['rulesHash'];
   rings: number;
   stones: number[];
@@ -32,12 +35,28 @@ export interface AnalyzeRequestV2 {
   moves_left: number;
   opening: boolean;
   terminal: false;
+  mode: 'classic' | 'double';
+  handicap: number;
+  pie: boolean;
+  swap_available: boolean;
+  swapped: boolean;
+  history: {
+    current_turn: number[];
+    previous_turn: number[];
+    own_previous_turn: number[];
+    handicap_stones: number[];
+  };
+  /** Browser games are symmetric: neither side holds a playout advantage. */
+  pda: 0;
   search: {
     simulations: number;
     max_considered: number;
     seed: number;
   };
 }
+
+/** @deprecated Retained name for callers that imported the v2 alias. */
+export type AnalyzeRequestV2 = AnalyzeRequestV3;
 
 export interface ServerAiRequestOptions {
   signal?: AbortSignal;
@@ -127,7 +146,7 @@ export function deterministicServerSeed(stateHash: string): number {
 export function toAnalyzeRequest(
   request: StarAiRequest,
   search: ServerSearchBudget = resolveServerSearchBudget(),
-): AnalyzeRequestV2 {
+): AnalyzeRequestV3 {
   const simulations = strictBudgetInteger(
     'Server AI simulations',
     search.simulations,
@@ -145,7 +164,7 @@ export function toAnalyzeRequest(
     throw new StarAiError('protocol', 'Internal AI state hash is inconsistent.');
   }
   return {
-    schema_version: 2,
+    schema_version: STARSERVE_API_SCHEMA_VERSION,
     rules_hash: request.rulesHash,
     rings: request.state.rings,
     stones: [...request.state.stones],
@@ -153,6 +172,18 @@ export function toAnalyzeRequest(
     moves_left: request.state.movesLeft,
     opening: request.state.opening,
     terminal: false,
+    mode: request.state.mode,
+    handicap: request.state.handicap,
+    pie: request.state.pie,
+    swap_available: request.state.swapAvailable,
+    swapped: request.state.swapped,
+    history: {
+      current_turn: [...request.state.history.currentTurn],
+      previous_turn: [...request.state.history.previousTurn],
+      own_previous_turn: [...request.state.history.ownPreviousTurn],
+      handicap_stones: [...request.state.history.handicapStones],
+    },
+    pda: 0,
     search: {
       simulations,
       max_considered: maxConsidered,
@@ -300,12 +331,21 @@ export function parseAnalyzeResponse(
     'outcome',
     'value',
     'search_value',
+    'root_value',
     'score_belief',
+    'variant',
+    'swap_available',
+    'swap_recommended',
+    'history_known',
     'model_version',
     'model_step',
     'timing_ms',
   ] as const;
-  if (!isRecord(payload) || !hasExactKeys(payload, responseKeys) || payload.schema_version !== 2) {
+  if (
+    !isRecord(payload) ||
+    !hasExactKeys(payload, responseKeys) ||
+    payload.schema_version !== STARSERVE_API_SCHEMA_VERSION
+  ) {
     throw new StarAiError('protocol', 'Starserve response schema is incompatible.');
   }
   if (
@@ -379,10 +419,28 @@ export function parseAnalyzeResponse(
     ) > 1e-5 ||
     !finiteNumber(payload.search_value) ||
     payload.search_value < -1 ||
-    payload.search_value > 1
+    payload.search_value > 1 ||
+    !finiteNumber(payload.root_value) ||
+    payload.root_value < -1 ||
+    payload.root_value > 1
   ) {
     throw new StarAiError('protocol', 'Starserve value belief is invalid.');
   }
+
+  if (
+    !isRecord(payload.variant) ||
+    !hasExactKeys(payload.variant, ['mode', 'handicap', 'pie']) ||
+    payload.variant.mode !== request.state.mode ||
+    payload.variant.handicap !== request.state.handicap ||
+    payload.variant.pie !== request.state.pie ||
+    payload.swap_available !== request.state.swapAvailable ||
+    typeof payload.swap_recommended !== 'boolean' ||
+    (payload.swap_recommended && !request.state.swapAvailable) ||
+    payload.history_known !== true
+  ) {
+    throw new StarAiError('protocol', 'Starserve variant metadata is incompatible.');
+  }
+  const swapRecommended = payload.swap_recommended;
 
   if (
     !isRecord(payload.score_belief) ||
@@ -449,7 +507,11 @@ export function parseAnalyzeResponse(
     effectiveSearch.maxConsidered,
     MAX_SERVER_AI_MAX_CONSIDERED,
   );
-  const response = makeAiResponse(request, codeToAction(action.code));
+  const nodeCount = request.state.stones.length;
+  const chosen: AtomicGameAction = swapRecommended
+    ? { type: 'swap' }
+    : codeToAction(action.code, nodeCount);
+  const response = makeAiResponse(request, chosen);
   return parseStarAiDecision(request, {
     response,
     analysis: {
@@ -461,8 +523,12 @@ export function parseAnalyzeResponse(
       },
       modelValue: payload.value,
       searchValue: payload.search_value,
+      rootValue: payload.root_value,
+      swapRecommended,
       expectedMargin: payload.score_belief.expected_margin,
-      rootActions: rootActions.map((rootAction) => codeToAction(rootAction.code)),
+      rootActions: rootActions.map((rootAction) =>
+        codeToAction(rootAction.code, nodeCount),
+      ),
       rootPolicy,
       rootQ,
       rootVisits,

@@ -80,10 +80,11 @@ function makeDecision(
   action: AtomicGameAction = { type: 'place', node: 0 },
   overrides: Partial<StarAiAnalysis> = {},
 ): StarAiDecision {
+  const anchor = action.type === 'place' ? action.node : 0;
   const rootActions = overrides.rootActions ?? [
-    action,
-    { type: 'place', node: action.node + 1 },
-    { type: 'place', node: action.node + 2 },
+    { type: 'place', node: anchor },
+    { type: 'place', node: anchor + 1 },
+    { type: 'place', node: anchor + 2 },
   ];
   const rootVisits = overrides.rootVisits ?? [6, 3, 1];
   const simulations =
@@ -97,6 +98,8 @@ function makeDecision(
       outcome: { loss: 0.25, win: 0.75 },
       modelValue: 0.5,
       searchValue: 0.4,
+      rootValue: 0.4,
+      swapRecommended: action.type === 'swap',
       expectedMargin: 2.5,
       rootActions,
       rootPolicy: rootActions.map((_, index) => (index === 0 ? 0.6 : 0.2)),

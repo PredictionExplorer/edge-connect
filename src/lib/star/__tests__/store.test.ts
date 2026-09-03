@@ -484,15 +484,22 @@ describe('gameplay store actions', () => {
     expect(useAppStore.getState().phase).toBe('setup');
   });
 
-  it('normalizes unsupported AI controllers and ignores invalid controller slots', () => {
+  it('keeps AI controllers for classic games and ignores invalid controller slots', () => {
     const classic: GameConfig = { ...double, mode: 'classic' };
     useAppStore.getState().startGame(classic, ['server', 'local']);
-    expect(useAppStore.getState().controllers).toEqual(['human', 'human']);
+    expect(useAppStore.getState().controllers).toEqual(['server', 'local']);
     const before = useAppStore.getState();
     before.setPlayerController(2 as 0, 'server');
-    expect(useAppStore.getState().controllers).toEqual(['human', 'human']);
+    expect(useAppStore.getState().controllers).toEqual(['server', 'local']);
     useAppStore.getState().resumeAi();
     expect(useAppStore.getState().aiPaused).toBe(false);
+  });
+
+  it('refuses configurations outside the rules family', () => {
+    const oversized: GameConfig = { ...double, handicap: 12 };
+    expect(() =>
+      useAppStore.getState().startGame(oversized, ['server', 'local']),
+    ).toThrow(/unsupported configuration/);
   });
 
   it('acknowledges, ends, and resets a clinched game without changing its log', () => {

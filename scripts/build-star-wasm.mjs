@@ -10,7 +10,7 @@ import { fileURLToPath } from 'node:url';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const crate = resolve(root, 'training/crates/star-wasm');
-const wasmDirectory = 'wasm-2da3783519381453';
+const wasmDirectory = 'wasm-a5d932b0ef8354e8';
 const output = resolve(root, `public/models/star/${wasmDirectory}`);
 const outputFromCrate = relative(crate, output);
 
@@ -62,9 +62,9 @@ writeFileSync(
   resolve(output, 'contract.json'),
   `${JSON.stringify(
     {
-      schema: 'edgeconnect.star.browser-wasm-build.v2',
-      rulesSchema: 'edgeconnect.star.rules.v2',
-      rulesHash: 'fnv1a64:2da3783519381453',
+      schema: 'edgeconnect.star.browser-wasm-build.v3',
+      rulesSchema: 'edgeconnect.star.rules.v3',
+      rulesHash: 'fnv1a64:a5d932b0ef8354e8',
       moduleUrl: `/models/star/${wasmDirectory}/star_wasm.js`,
       binaryUrl: `/models/star/${wasmDirectory}/star_wasm_bg.wasm`,
       modelManifestUrl: '/models/star/manifest.json',

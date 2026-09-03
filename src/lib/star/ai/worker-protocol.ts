@@ -1,6 +1,7 @@
 import {
   STAR_ACTION_LAYOUT_SCHEMA_ID,
   STAR_FEATURE_SCHEMA_ID,
+  STAR_MAX_HANDICAP,
   STAR_RULES_HASH,
   STAR_RULES_SCHEMA_ID,
 } from '../rules';
@@ -35,8 +36,10 @@ export type StarAiWorkerCommand =
     }
   | { type: 'cancel'; taskId: string };
 
+export const STAR_AI_WORKER_PROTOCOL_VERSION = 3 as const;
+
 export type StarAiWorkerEvent =
-  | { type: 'ready'; protocolVersion: 2 }
+  | { type: 'ready'; protocolVersion: typeof STAR_AI_WORKER_PROTOCOL_VERSION }
   | { type: 'result'; taskId: string; decision: StarAiDecision }
   | {
       type: 'error';
@@ -95,6 +98,17 @@ export function parseBrowserSearchBudget(value: unknown): StarAiSearchBudget {
   };
 }
 
+function parseNodeList(value: unknown, nodeCount: number): number[] {
+  if (
+    !isIntegerArray(value, 0) ||
+    value.some((node) => node >= nodeCount) ||
+    new Set(value).size !== value.length
+  ) {
+    throw new StarAiError('protocol', 'Worker received an invalid placement history.');
+  }
+  return [...value];
+}
+
 function parseSemanticState(value: unknown): StarAiSemanticState {
   if (
     !isRecord(value) ||
@@ -105,6 +119,12 @@ function parseSemanticState(value: unknown): StarAiSemanticState {
       'movesLeft',
       'opening',
       'terminal',
+      'mode',
+      'handicap',
+      'pie',
+      'swapAvailable',
+      'swapped',
+      'history',
     ]) ||
     !isSupportedRings(value.rings) ||
     !isIntegerArray(value.stones, -1) ||
@@ -114,12 +134,30 @@ function parseSemanticState(value: unknown): StarAiSemanticState {
     typeof value.movesLeft !== 'number' ||
     !Number.isInteger(value.movesLeft) ||
     value.movesLeft < 0 ||
-    value.movesLeft > 2 ||
+    value.movesLeft > STAR_MAX_HANDICAP ||
     typeof value.opening !== 'boolean' ||
-    typeof value.terminal !== 'boolean'
+    typeof value.terminal !== 'boolean' ||
+    (value.mode !== 'classic' && value.mode !== 'double') ||
+    typeof value.handicap !== 'number' ||
+    !Number.isInteger(value.handicap) ||
+    value.handicap < 1 ||
+    value.handicap > STAR_MAX_HANDICAP ||
+    typeof value.pie !== 'boolean' ||
+    (value.pie && value.handicap !== 1) ||
+    typeof value.swapAvailable !== 'boolean' ||
+    typeof value.swapped !== 'boolean' ||
+    (value.swapAvailable && (!value.pie || value.toMove !== 1)) ||
+    !isRecord(value.history) ||
+    !hasExactKeys(value.history, [
+      'currentTurn',
+      'previousTurn',
+      'ownPreviousTurn',
+      'handicapStones',
+    ])
   ) {
     throw new StarAiError('protocol', 'Worker received an invalid semantic state.');
   }
+  const nodeCount = value.stones.length;
   return {
     rings: value.rings,
     stones: [...value.stones],
@@ -127,6 +165,17 @@ function parseSemanticState(value: unknown): StarAiSemanticState {
     movesLeft: value.movesLeft,
     opening: value.opening,
     terminal: value.terminal,
+    mode: value.mode,
+    handicap: value.handicap,
+    pie: value.pie,
+    swapAvailable: value.swapAvailable,
+    swapped: value.swapped,
+    history: {
+      currentTurn: parseNodeList(value.history.currentTurn, nodeCount),
+      previousTurn: parseNodeList(value.history.previousTurn, nodeCount),
+      ownPreviousTurn: parseNodeList(value.history.ownPreviousTurn, nodeCount),
+      handicapStones: parseNodeList(value.history.handicapStones, nodeCount),
+    },
   };
 }
 
@@ -175,7 +224,8 @@ function parseRequest(value: unknown): StarAiRequest {
   if (
     state.terminal ||
     legalActions.length === 0 ||
-    actionLog.some((action) => action >= nodeCount) ||
+    // Placements are dense node ids; the pie swap is coded as the node count.
+    actionLog.some((action) => action > nodeCount) ||
     legalActions.some(
       (action, index) =>
         action >= nodeCount ||
@@ -237,10 +287,10 @@ export function parseWorkerEvent(value: unknown): StarAiWorkerEvent {
   }
   if (
     value.type === 'ready' &&
-    value.protocolVersion === 2 &&
+    value.protocolVersion === STAR_AI_WORKER_PROTOCOL_VERSION &&
     hasExactKeys(value, ['type', 'protocolVersion'])
   ) {
-    return { type: 'ready', protocolVersion: 2 };
+    return { type: 'ready', protocolVersion: STAR_AI_WORKER_PROTOCOL_VERSION };
   }
   if (!isTaskId(value.taskId)) {
     throw new StarAiError('protocol', 'Local AI worker returned an invalid message.');

@@ -105,6 +105,15 @@ export function EngineEstimatePanel({
           </div>
           <div className="rounded-lg border border-white/10 bg-black/10 px-3 py-2">
             <p className="text-xs uppercase tracking-[0.12em] text-muted">
+              Root value
+            </p>
+            <p className="mt-1 font-mono text-ink">
+              {formatValue(analysis.rootValue)}
+              {analysis.swapRecommended ? ' · swapped sides' : ''}
+            </p>
+          </div>
+          <div className="rounded-lg border border-white/10 bg-black/10 px-3 py-2">
+            <p className="text-xs uppercase tracking-[0.12em] text-muted">
               Simulations
             </p>
             <p className="mt-1 text-ink">

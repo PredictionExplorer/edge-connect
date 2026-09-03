@@ -1,6 +1,10 @@
 import type * as Ort from 'onnxruntime-web';
 import { getBoard } from '@/lib/star/board';
-import { STAR_RULES_HASH, STAR_RULES_SCHEMA_ID } from '@/lib/star/rules';
+import {
+  STAR_MAX_HANDICAP,
+  STAR_RULES_HASH,
+  STAR_RULES_SCHEMA_ID,
+} from '@/lib/star/rules';
 import { StarAiError, asStarAiError } from '@/lib/star/ai/errors';
 import {
   STAR_SCORE_MARGIN_MIN,
@@ -31,6 +35,7 @@ import {
   type StarAiSemanticState,
 } from '@/lib/star/ai/protocol';
 import {
+  STAR_AI_WORKER_PROTOCOL_VERSION,
   parseWorkerCommand,
   workerErrorEvent,
   type StarAiWorkerCommand,
@@ -45,24 +50,38 @@ interface WorkerScope {
 export interface WasmState {
   readonly to_move: number;
   readonly moves_left: number;
+  readonly opening: boolean;
   readonly terminal: boolean;
+  readonly mode: string;
+  readonly handicap: number;
+  readonly pie: boolean;
+  readonly swap_available: boolean;
+  readonly swapped: boolean;
   apply(action: number): void;
+  swap(): void;
   zero_bits(): BigUint64Array;
   one_bits(): BigUint64Array;
+  current_turn_bits(): BigUint64Array;
+  previous_turn_bits(): BigUint64Array;
+  own_previous_turn_bits(): BigUint64Array;
+  handicap_bits(): BigUint64Array;
   legal_actions(): Int32Array;
   hash64(): bigint;
   free?(): void;
 }
 
 interface WasmStateConstructor {
-  new (rings: number): WasmState;
+  new (rings: number, mode: string, handicap: number, pie: boolean): WasmState;
   rules_hash_tag(): string;
   rules_schema(): string;
+  max_handicap(): number;
 }
 
 interface WasmSearchTree {
   root_actions(): Int32Array;
   root_token(): bigint;
+  pie_root_transform(): boolean;
+  root_value(): number | undefined;
   initialize_root(token: bigint, value: number, policyLogits: Float32Array): void;
   start(rootAction: number): boolean;
   pending_state(): WasmState;
@@ -122,9 +141,11 @@ interface Evaluation {
 
 interface LocalSearchResult {
   actionCode: number;
+  swapRecommended: boolean;
   outcome: StarAiOutcomeBelief;
   modelValue: number;
   searchValue: number;
+  rootValue: number;
   expectedMargin: number;
   rootActions: number[];
   rootPolicy: number[];
@@ -237,7 +258,8 @@ async function importWasm(
     typeof wasmModule.WasmSearchTree !== 'function' ||
     typeof wasmModule.WasmGumbel !== 'function' ||
     wasmModule.WasmState.rules_hash_tag() !== STAR_RULES_HASH ||
-    wasmModule.WasmState.rules_schema() !== STAR_RULES_SCHEMA_ID
+    wasmModule.WasmState.rules_schema() !== STAR_RULES_SCHEMA_ID ||
+    wasmModule.WasmState.max_handicap() !== STAR_MAX_HANDICAP
   ) {
     throw new StarAiError('unavailable', 'Local AI WASM rules are incompatible.');
   }
@@ -274,6 +296,7 @@ export function hasExpectedOnnxSchema(session: Ort.InferenceSession): boolean {
     ['int64', 3],
     ['bool', 2],
     ['bool', 2],
+    ['int64', 1],
   ] as const;
   const outputSchema = [
     ['float16', 2],
@@ -364,27 +387,31 @@ function getRuntime(signal: AbortSignal): Promise<LocalRuntime> {
   return runtimePromise;
 }
 
+export function nodesFromBits(words: BigUint64Array, nodeCount: number, label: string): number[] {
+  const nodes: number[] = [];
+  for (let wordIndex = 0; wordIndex < words.length; wordIndex++) {
+    const word = words[wordIndex];
+    const first = wordIndex * 64;
+    const valid = Math.min(64, Math.max(0, nodeCount - first));
+    for (let bit = 0; bit < valid; bit++) {
+      if ((word & (BigInt(1) << BigInt(bit))) !== BigInt(0)) nodes.push(first + bit);
+    }
+    if (valid < 64 && (word >> BigInt(valid)) !== BigInt(0)) {
+      throw new StarAiError('protocol', `WASM ${label} contains off-board nodes.`);
+    }
+  }
+  return nodes;
+}
+
 export function stonesFromWasm(state: WasmState, nodeCount: number): number[] {
   const stones = new Array<number>(nodeCount).fill(-1);
   const players = [state.zero_bits(), state.one_bits()];
   for (let player = 0; player < 2; player++) {
-    const words = players[player];
-    for (let wordIndex = 0; wordIndex < words.length; wordIndex++) {
-      const word = words[wordIndex];
-      const first = wordIndex * 64;
-      const valid = Math.min(64, Math.max(0, nodeCount - first));
-      for (let bit = 0; bit < valid; bit++) {
-        if ((word & (BigInt(1) << BigInt(bit))) !== BigInt(0)) {
-          const node = first + bit;
-          if (stones[node] !== -1) {
-            throw new StarAiError('protocol', 'WASM state contains overlapping stones.');
-          }
-          stones[node] = player;
-        }
+    for (const node of nodesFromBits(players[player], nodeCount, 'state')) {
+      if (stones[node] !== -1) {
+        throw new StarAiError('protocol', 'WASM state contains overlapping stones.');
       }
-      if (valid < 64 && (word >> BigInt(valid)) !== BigInt(0)) {
-        throw new StarAiError('protocol', 'WASM state contains off-board stones.');
-      }
+      stones[node] = player;
     }
   }
   return stones;
@@ -393,32 +420,65 @@ export function stonesFromWasm(state: WasmState, nodeCount: number): number[] {
 export function semanticFromWasm(rings: number, state: WasmState): StarAiSemanticState {
   const nodeCount = getBoard(rings).n;
   const stones = stonesFromWasm(state, nodeCount);
-  const occupied = stones.reduce((count, stone) => count + Number(stone !== -1), 0);
+  if (state.mode !== 'classic' && state.mode !== 'double') {
+    throw new StarAiError('protocol', 'WASM state reports an unknown mode.');
+  }
   return {
     rings,
     stones,
     toMove: state.to_move as 0 | 1,
     movesLeft: state.moves_left,
-    opening:
-      occupied === 0 &&
-      state.to_move === 0 &&
-      state.moves_left === 1 &&
-      !state.terminal,
+    opening: state.opening,
     terminal: state.terminal,
+    mode: state.mode,
+    handicap: state.handicap,
+    pie: state.pie,
+    swapAvailable: state.swap_available,
+    swapped: state.swapped,
+    history: {
+      currentTurn: nodesFromBits(state.current_turn_bits(), nodeCount, 'current turn'),
+      previousTurn: nodesFromBits(state.previous_turn_bits(), nodeCount, 'previous turn'),
+      ownPreviousTurn: nodesFromBits(
+        state.own_previous_turn_bits(),
+        nodeCount,
+        'own previous turn',
+      ),
+      handicapStones: nodesFromBits(state.handicap_bits(), nodeCount, 'handicap stones'),
+    },
   };
 }
 
+function sameSemanticState(left: StarAiSemanticState, right: StarAiSemanticState): boolean {
+  return (
+    left.toMove === right.toMove &&
+    left.movesLeft === right.movesLeft &&
+    left.opening === right.opening &&
+    left.terminal === right.terminal &&
+    left.mode === right.mode &&
+    left.handicap === right.handicap &&
+    left.pie === right.pie &&
+    left.swapAvailable === right.swapAvailable &&
+    left.swapped === right.swapped &&
+    arraysEqual(left.stones, right.stones) &&
+    arraysEqual(left.history.currentTurn, right.history.currentTurn) &&
+    arraysEqual(left.history.previousTurn, right.history.previousTurn) &&
+    arraysEqual(left.history.ownPreviousTurn, right.history.ownPreviousTurn) &&
+    arraysEqual(left.history.handicapStones, right.history.handicapStones)
+  );
+}
+
 export function replayAndVerify(request: StarAiRequest, wasm: StarWasmModule): WasmState {
-  const state = new wasm.WasmState(request.state.rings);
+  const { rings, mode, handicap, pie } = request.state;
+  const nodeCount = request.state.stones.length;
+  const state = new wasm.WasmState(rings, mode, handicap, pie);
   try {
-    for (const action of request.actionLog) state.apply(action);
-    const semantic = semanticFromWasm(request.state.rings, state);
+    for (const action of request.actionLog) {
+      if (action === nodeCount) state.swap();
+      else state.apply(action);
+    }
+    const semantic = semanticFromWasm(rings, state);
     if (
-      semantic.toMove !== request.state.toMove ||
-      semantic.movesLeft !== request.state.movesLeft ||
-      semantic.opening !== request.state.opening ||
-      semantic.terminal !== request.state.terminal ||
-      !arraysEqual(semantic.stones, request.state.stones) ||
+      !sameSemanticState(semantic, request.state) ||
       !arraysEqual(state.legal_actions(), request.legalActions) ||
       `zobrist64:${state.hash64().toString(16).padStart(16, '0')}` !== request.stateHash
     ) {
@@ -466,6 +526,7 @@ function tensorFeeds(runtime: LocalRuntime, semantic: StarAiSemanticState) {
       encoded.legalActionMask,
       [1, encoded.nodeCount],
     ),
+    rings: new Tensor('int64', encoded.rings, [1]),
   };
 }
 
@@ -680,11 +741,26 @@ async function chooseAction(
     if (selected < 0 || selected >= actions.length) {
       throw new StarAiError('protocol', 'WASM search selected an invalid edge.');
     }
+    const rawRootValue = tree.root_value();
+    const rootValue = Math.max(
+      -1,
+      Math.min(1, rawRootValue === undefined ? rootEvaluation.value : rawRootValue),
+    );
+    if (!Number.isFinite(rootValue)) {
+      throw new StarAiError('protocol', 'WASM search root value is not finite.');
+    }
+    // The responder of a pie game swaps when keeping the position searches
+    // worse than the dead zone: the opener's position is then worth -rootValue.
+    const swapRecommended =
+      request.state.swapAvailable &&
+      rootValue < -runtime.manifest.search.swapDeadZone;
     return {
       actionCode: actions[selected],
+      swapRecommended,
       outcome: rootEvaluation.outcome,
       modelValue: rootEvaluation.value,
       searchValue: rootEvaluation.value,
+      rootValue,
       expectedMargin: rootEvaluation.expectedMargin,
       rootActions: Array.from(actions),
       rootPolicy: Array.from(tree.policy_target()),
@@ -720,9 +796,12 @@ async function runChoose(
       taskController.signal,
     );
     ensureNotCancelled(command.taskId);
+    const nodeCount = command.request.state.stones.length;
     const response = makeAiResponse(
       command.request,
-      codeToAction(result.actionCode),
+      result.swapRecommended
+        ? { type: 'swap' }
+        : codeToAction(result.actionCode, nodeCount),
     );
     const decision = parseStarAiDecision(command.request, {
       response,
@@ -732,8 +811,10 @@ async function runChoose(
         outcome: result.outcome,
         modelValue: result.modelValue,
         searchValue: result.searchValue,
+        rootValue: result.rootValue,
+        swapRecommended: result.swapRecommended,
         expectedMargin: result.expectedMargin,
-        rootActions: result.rootActions.map(codeToAction),
+        rootActions: result.rootActions.map((code) => codeToAction(code, nodeCount)),
         rootPolicy: result.rootPolicy,
         rootQ: result.rootQ,
         rootVisits: result.rootVisits,
@@ -808,4 +889,4 @@ scope.addEventListener('message', (event) => {
   });
 });
 
-scope.postMessage({ type: 'ready', protocolVersion: 2 });
+scope.postMessage({ type: 'ready', protocolVersion: STAR_AI_WORKER_PROTOCOL_VERSION });

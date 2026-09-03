@@ -133,14 +133,16 @@ describe('SetupScreen', () => {
     });
   });
 
-  it('shows controllers only for a supported mode and resets them for the pie rule', async () => {
+  it('shows controllers for every variant and keeps them across the pie rule', async () => {
     const user = userEvent.setup();
     render(<SetupScreen />);
 
     const classic = screen.getByRole('button', { name: '*Star, 1 stone per turn' });
     const double = screen.getByRole('button', { name: /Double \*Star, 2 stones per turn/i });
     expect(classic).toHaveAttribute('aria-pressed', 'true');
-    expect(screen.queryByRole('combobox')).not.toBeInTheDocument();
+    expect(
+      screen.getByRole('combobox', { name: 'Player 1 controller' }),
+    ).toBeInTheDocument();
 
     await user.click(double);
     const playerOneController = await screen.findByRole('combobox', {
@@ -161,12 +163,14 @@ describe('SetupScreen', () => {
 
     const pieRule = screen.getByRole('checkbox', { name: /pie rule/i });
     await user.click(pieRule);
-    expect(screen.queryByRole('combobox')).not.toBeInTheDocument();
+    expect(
+      screen.getByRole('combobox', { name: 'Player 1 controller' }),
+    ).toHaveValue('server');
 
     await user.click(pieRule);
     expect(
       screen.getByRole('combobox', { name: 'Player 1 controller' }),
-    ).toHaveValue('human');
+    ).toHaveValue('server');
   });
 
   it('blocks setup until a selected controller is ready and supports rechecking', async () => {

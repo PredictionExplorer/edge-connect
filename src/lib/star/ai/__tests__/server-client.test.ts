@@ -24,12 +24,21 @@ const config: GameConfig = {
 };
 const request = buildAiRequest(config, [], 'starserve-test');
 
-function representativeAnalyzeResponse() {
+function representativeAnalyzeResponse(
+  target = request,
+  variant: { mode: 'classic' | 'double'; handicap: number; pie: boolean } = {
+    mode: 'double',
+    handicap: 1,
+    pie: false,
+  },
+  swapAvailable = false,
+  swapRecommended = false,
+) {
   const score = new Array<number>(303).fill(0);
   score[151] = 1;
   return {
-    schema_version: 2,
-    request_id: request.requestId,
+    schema_version: 3,
+    request_id: target.requestId,
     action: { code: 0, kind: 'place', node: 0 },
     root_actions: [
       { code: 0, kind: 'place', node: 0 },
@@ -41,6 +50,11 @@ function representativeAnalyzeResponse() {
     outcome: { loss: 0.2, win: 0.8 },
     value: 0.6,
     search_value: 0.3,
+    root_value: swapRecommended ? -0.4 : 0.25,
+    variant,
+    swap_available: swapAvailable,
+    swap_recommended: swapRecommended,
+    history_known: true,
     score_belief: {
       support_min: -151,
       support_max: 151,
@@ -63,21 +77,33 @@ afterEach(() => {
   vi.unstubAllEnvs();
 });
 
-describe('starserve v2 adapter', () => {
-  it('converts semantic state to strict placement-only snake_case', () => {
+describe('starserve v3 adapter', () => {
+  it('converts semantic state to strict snake_case with the variant and history', () => {
     const wire = toAnalyzeRequest(request, {
       simulations: 4,
       maxConsidered: 2,
     });
     expect(wire).toEqual({
-      schema_version: 2,
-      rules_hash: 'fnv1a64:2da3783519381453',
+      schema_version: 3,
+      rules_hash: 'fnv1a64:a5d932b0ef8354e8',
       rings: 4,
       stones: new Array(50).fill(-1),
       to_move: 0,
       moves_left: 1,
       opening: true,
       terminal: false,
+      mode: 'double',
+      handicap: 1,
+      pie: false,
+      swap_available: false,
+      swapped: false,
+      history: {
+        current_turn: [],
+        previous_turn: [],
+        own_previous_turn: [],
+        handicap_stones: [],
+      },
+      pda: 0,
       search: {
         simulations: 4,
         max_considered: 2,
@@ -86,6 +112,64 @@ describe('starserve v2 adapter', () => {
     });
     expect(Number.isSafeInteger(wire.search.seed)).toBe(true);
     expect(JSON.parse(JSON.stringify(wire))).toEqual(wire);
+
+    const pieRequest = buildAiRequest(
+      { ...config, pieRule: true },
+      [{ type: 'place', node: 7 }],
+      'starserve-pie',
+    );
+    expect(toAnalyzeRequest(pieRequest, { simulations: 4, maxConsidered: 2 })).toMatchObject({
+      pie: true,
+      swap_available: true,
+      to_move: 1,
+      history: { previous_turn: [7], handicap_stones: [7] },
+    });
+  });
+
+  it('dispatches a recommended swap and rejects variant drift', () => {
+    const pieRequest = buildAiRequest(
+      { ...config, pieRule: true },
+      [{ type: 'place', node: 7 }],
+      'starserve-swap',
+    );
+    const pieVariant = { mode: 'double' as const, handicap: 1, pie: true };
+    const swapped = parseAnalyzeResponse(
+      pieRequest,
+      representativeAnalyzeResponse(pieRequest, pieVariant, true, true),
+      pieRequest.requestId,
+      { simulations: 4, maxConsidered: 2 },
+    );
+    expect(swapped.response.action).toEqual({ type: 'swap' });
+    expect(swapped.analysis).toMatchObject({ swapRecommended: true, rootValue: -0.4 });
+    const kept = parseAnalyzeResponse(
+      pieRequest,
+      representativeAnalyzeResponse(pieRequest, pieVariant, true, false),
+      pieRequest.requestId,
+      { simulations: 4, maxConsidered: 2 },
+    );
+    expect(kept.response.action).toEqual({ type: 'place', node: 0 });
+    expect(kept.analysis.swapRecommended).toBe(false);
+    expect(() =>
+      parseAnalyzeResponse(request, {
+        ...representativeAnalyzeResponse(),
+        variant: { mode: 'classic', handicap: 1, pie: false },
+      }),
+    ).toThrow(/variant metadata/i);
+    expect(() =>
+      parseAnalyzeResponse(request, {
+        ...representativeAnalyzeResponse(),
+        swap_recommended: true,
+      }),
+    ).toThrow(/variant metadata/i);
+    expect(() =>
+      parseAnalyzeResponse(request, {
+        ...representativeAnalyzeResponse(),
+        history_known: false,
+      }),
+    ).toThrow(/variant metadata/i);
+    expect(() =>
+      parseAnalyzeResponse(request, { ...representativeAnalyzeResponse(), schema_version: 2 }),
+    ).toThrow(/schema is incompatible/i);
   });
 
   it('validates binary outcomes and maps a placement response', () => {
@@ -104,6 +188,8 @@ describe('starserve v2 adapter', () => {
       outcome: { loss: 0.2, win: 0.8 },
       modelValue: 0.6,
       searchValue: 0.3,
+      rootValue: 0.25,
+      swapRecommended: false,
       expectedMargin: 0,
       rootActions: [
         { type: 'place', node: 0 },
@@ -251,7 +337,7 @@ describe('starserve v2 adapter', () => {
     expect(configuredServerHealthUrl()).toBe('/v2/health');
   });
 
-  it('posts schema v2 with request identity and no browser bearer secret', async () => {
+  it('posts schema v3 with request identity and no browser bearer secret', async () => {
     const fetchMock = vi.fn(
       async (url: string | URL | Request, init?: RequestInit) => {
         expect(String(url)).toBe('https://ai.example/v2/move');
@@ -260,8 +346,12 @@ describe('starserve v2 adapter', () => {
         expect(headers.has('Authorization')).toBe(false);
         const body = JSON.parse(String(init?.body));
         expect(body).toMatchObject({
-          schema_version: 2,
+          schema_version: 3,
           to_move: 0,
+          mode: 'double',
+          handicap: 1,
+          pie: false,
+          pda: 0,
           search: { simulations: 4, max_considered: 2 },
         });
         expect(body.pass_streak).toBeUndefined();

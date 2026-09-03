@@ -3,6 +3,7 @@ import { StarAiError } from './errors';
 import {
   STAR_AI_PROTOCOL_SCHEMA_ID,
   STAR_AI_PROTOCOL_VERSION,
+  isRequestLegalAction,
   parseAiResponse,
   type AtomicGameAction,
   type StarAiRequest,
@@ -39,8 +40,13 @@ export interface StarAiAnalysis {
   outcome: StarAiOutcomeBelief;
   modelValue: number;
   searchValue: number;
+  /** Visit-weighted search value of the root (optimal-swap payoff while pie is pending). */
+  rootValue: number;
+  /** True when the responder took the pie swap instead of a placement. */
+  swapRecommended: boolean;
   expectedMargin: number;
-  rootActions: AtomicGameAction[];
+  /** Root placements in one stable order (a swap decision is not a root action). */
+  rootActions: Extract<AtomicGameAction, { type: 'place' }>[];
   rootPolicy: number[];
   rootQ: number[];
   rootVisits: number[];
@@ -78,7 +84,10 @@ function approximatelyEqual(left: number, right: number, tolerance: number): boo
   return Math.abs(left - right) <= tolerance;
 }
 
-function parseAtomicAction(value: unknown, label: string): AtomicGameAction {
+function parsePlacement(
+  value: unknown,
+  label: string,
+): Extract<AtomicGameAction, { type: 'place' }> {
   if (
     !isRecord(value) ||
     !hasExactKeys(value, ['type', 'node']) ||
@@ -90,6 +99,13 @@ function parseAtomicAction(value: unknown, label: string): AtomicGameAction {
     throw new StarAiError('protocol', `${label} is not a valid atomic action.`);
   }
   return { type: 'place', node: value.node };
+}
+
+function parseAtomicAction(value: unknown, label: string): AtomicGameAction {
+  if (isRecord(value) && value.type === 'swap' && hasExactKeys(value, ['type'])) {
+    return { type: 'swap' };
+  }
+  return parsePlacement(value, label);
 }
 
 function parseUnboundResponse(value: unknown): StarAiResponse {
@@ -174,6 +190,8 @@ function parseAnalysis(value: unknown, response: StarAiResponse): StarAiAnalysis
       'outcome',
       'modelValue',
       'searchValue',
+      'rootValue',
+      'swapRecommended',
       'expectedMargin',
       'rootActions',
       'rootPolicy',
@@ -190,6 +208,12 @@ function parseAnalysis(value: unknown, response: StarAiResponse): StarAiAnalysis
     value.stateHash !== response.stateHash
   ) {
     throw new StarAiError('protocol', 'AI decision analysis identity is invalid.');
+  }
+  if (
+    typeof value.swapRecommended !== 'boolean' ||
+    value.swapRecommended !== (response.action.type === 'swap')
+  ) {
+    throw new StarAiError('protocol', 'AI decision swap metadata disagrees with its action.');
   }
 
   if (
@@ -215,6 +239,9 @@ function parseAnalysis(value: unknown, response: StarAiResponse): StarAiAnalysis
     !finiteNumber(value.searchValue) ||
     value.searchValue < -1 ||
     value.searchValue > 1 ||
+    !finiteNumber(value.rootValue) ||
+    value.rootValue < -1 ||
+    value.rootValue > 1 ||
     !finiteNumber(value.expectedMargin) ||
     value.expectedMargin < STAR_SCORE_MARGIN_MIN ||
     value.expectedMargin > STAR_SCORE_MARGIN_MAX
@@ -226,12 +253,12 @@ function parseAnalysis(value: unknown, response: StarAiResponse): StarAiAnalysis
     throw new StarAiError('protocol', 'AI decision root actions are invalid.');
   }
   const rootActions = value.rootActions.map((action, index) =>
-    parseAtomicAction(action, `AI decision root action ${index}`),
+    parsePlacement(action, `AI decision root action ${index}`),
   );
   const rootNodes = rootActions.map((action) => action.node);
   if (
     new Set(rootNodes).size !== rootNodes.length ||
-    !rootNodes.includes(response.action.node)
+    (response.action.type === 'place' && !rootNodes.includes(response.action.node))
   ) {
     throw new StarAiError('protocol', 'AI decision root action identity is invalid.');
   }
@@ -308,6 +335,8 @@ function parseAnalysis(value: unknown, response: StarAiResponse): StarAiAnalysis
     outcome,
     modelValue: value.modelValue,
     searchValue: value.searchValue,
+    rootValue: value.rootValue,
+    swapRecommended: value.swapRecommended,
     expectedMargin: value.expectedMargin,
     rootActions,
     rootPolicy,
@@ -353,7 +382,7 @@ export function parseStarAiDecision(
   }
   if (
     decision.analysis.rootActions.some(
-      (action) => !request.legalActions.includes(action.node),
+      (action) => !isRequestLegalAction(request, action),
     )
   ) {
     throw new StarAiError('protocol', 'AI decision contains an illegal root action.');

@@ -4,20 +4,21 @@ import { fillFourRingGame, reachFourRingClinch } from './helpers';
 const health = {
   status: 'ok',
   service_version: '2.0.0',
-  api_schema_version: 2,
+  api_schema_version: 3,
   model: { ready: true, model_version: 'layout-model', model_step: 11 },
   rules: {
-    schema_id: 'edgeconnect.star.rules.v2',
-    version: 2,
-    hash: 'fnv1a64:2da3783519381453',
+    schema_id: 'edgeconnect.star.rules.v3',
+    version: 3,
+    hash: 'fnv1a64:a5d932b0ef8354e8',
   },
   features: {
-    schema_id: 'edgeconnect.star.model-features.external.v2',
-    version: 3,
-    hash: '6b5b00f638e9c16b',
+    schema_id: 'edgeconnect.star.model-features.external.v3',
+    version: 4,
+    hash: 'cb0e1e89a6ce3540',
   },
   actions: {
     schema_id: 'edgeconnect.star.action-layout.nodes-only.v1',
+    types: ['place', 'swap'],
   },
 };
 
@@ -68,6 +69,10 @@ async function mockServerAi(page: Page) {
     moveCalls += 1;
     const body = route.request().postDataJSON() as {
       stones: number[];
+      mode: 'classic' | 'double';
+      handicap: number;
+      pie: boolean;
+      swap_available: boolean;
       search?: { simulations?: number };
     };
     const action = body.stones.findIndex((stone) => stone === -1);
@@ -82,7 +87,7 @@ async function mockServerAi(page: Page) {
       contentType: 'application/json',
       headers: { 'X-Request-ID': requestId },
       body: JSON.stringify({
-        schema_version: 2,
+        schema_version: 3,
         request_id: requestId,
         action: { code: action, kind: 'place', node: action },
         root_actions: [
@@ -95,6 +100,11 @@ async function mockServerAi(page: Page) {
         outcome: { loss: 0.25, win: 0.75 },
         value: 0.5,
         search_value: 0.25,
+        root_value: 0.2,
+        variant: { mode: body.mode, handicap: body.handicap, pie: body.pie },
+        swap_available: body.swap_available,
+        swap_recommended: false,
+        history_known: true,
         score_belief: {
           support_min: -151,
           support_max: 151,

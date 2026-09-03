@@ -36,6 +36,8 @@ function workerDecision() {
       outcome: { loss: 0.4, win: 0.6 },
       modelValue: 0.2,
       searchValue: 0.2,
+      rootValue: 0.15,
+      swapRecommended: false,
       expectedMargin: 1.5,
       rootActions: [
         { type: 'place' as const, node: 0 },
@@ -61,37 +63,48 @@ function workerDecision() {
 
 const manifest = {
   format: STAR_BROWSER_MODEL_MANIFEST_SCHEMA_ID,
-  schema_version: 2,
-  model_version: 'browser-smoke-v2',
+  schema_version: 3,
+  model_version: 'browser-smoke-v3',
   created_ns: 1_700_000_000_000_000_000,
   weights: 'ema',
   rules: {
-    schema_id: 'edgeconnect.star.rules.v2',
-    hash: 'fnv1a64:2da3783519381453',
+    schema_id: 'edgeconnect.star.rules.v3',
+    hash: 'fnv1a64:a5d932b0ef8354e8',
     mode: 'double',
     pie_rule: false,
+    handicap: 1,
     rings: [4, 6, 8, 10],
+    variants: {
+      modes: ['classic', 'double'],
+      handicap_min: 1,
+      handicap_max: 9,
+      pie_allowed: true,
+    },
   },
   features: {
-    schema_id: 'edgeconnect.star.model-features.external.v2',
-    version: 3,
+    schema_id: 'edgeconnect.star.model-features.external.v3',
+    version: 4,
     hash: STAR_FEATURE_SCHEMA_HASH,
-    node_feature_count: 15,
-    global_feature_count: 17,
+    node_feature_count: 19,
+    global_feature_count: 25,
   },
-  actions: { schema_id: 'edgeconnect.star.action-layout.nodes-only.v1' },
+  actions: {
+    schema_id: 'edgeconnect.star.action-layout.nodes-only.v1',
+    types: ['place', 'swap'],
+  },
   outcome: {
     classes: ['loss', 'win'],
     value: 'P(win)-P(loss)',
   },
   architecture: {
     name: 'GraphResTNet',
-    schema_version: 2,
+    schema_version: 3,
     all_size: true,
     parameter_count: 12_345,
     config: {
-      node_feature_dim: 15,
-      global_feature_dim: 17,
+      node_feature_dim: 19,
+      global_feature_dim: 25,
+      feature_schema_version: 4,
       width: 64,
       rrt_groups: 5,
       attention_heads: 8,
@@ -103,31 +116,36 @@ const manifest = {
       score_margin_min: -151,
       score_margin_max: 151,
       soft_policy_temperature: 4,
+      local_operator: 'mean',
+      local_blocks_per_group: 2,
+      relational_bias: true,
+      adaln_hidden: 32,
     },
   },
   precision: 'float16',
   artifacts: {
     onnx: {
-      file: 'browser-smoke-v2.fp16.onnx',
+      file: 'browser-smoke-v3.fp16.onnx',
       sha256: 'a'.repeat(64),
       bytes: 123_456,
       opset: 18,
     },
     checkpoint: {
-      file: 'browser-smoke-v2.pt',
+      file: 'browser-smoke-v3.pt',
       sha256: 'b'.repeat(64),
       bytes: 234_567,
     },
   },
   tensors: {
     inputs: {
-      node_features: { dtype: 'float16', shape: ['batch', 'nodes', 15] },
-      global_features: { dtype: 'float16', shape: ['batch', 17] },
+      node_features: { dtype: 'float16', shape: ['batch', 'nodes', 19] },
+      global_features: { dtype: 'float16', shape: ['batch', 25] },
       neighbor_index: { dtype: 'int64', shape: ['batch', 'nodes', 'degree'] },
       neighbor_mask: { dtype: 'bool', shape: ['batch', 'nodes', 'degree'] },
       neighbor_edge_type: { dtype: 'int64', shape: ['batch', 'nodes', 'degree'] },
       node_mask: { dtype: 'bool', shape: ['batch', 'nodes'] },
       legal_action_mask: { dtype: 'bool', shape: ['batch', 'nodes'] },
+      rings: { dtype: 'int64', shape: ['batch'] },
     },
     outputs: {
       policy_logits: { dtype: 'float16', shape: ['batch', 'nodes'] },
@@ -143,6 +161,7 @@ const manifest = {
     max_considered: 16,
     c_visit: 50,
     c_scale: 1,
+    swap_dead_zone: 0.02,
   },
   training: {
     steps: 10_000,
@@ -224,10 +243,13 @@ describe('local worker protocol', () => {
   });
 
   it('parses structured worker errors without trusting arbitrary codes', () => {
-    expect(parseWorkerEvent({ type: 'ready', protocolVersion: 2 })).toEqual({
+    expect(parseWorkerEvent({ type: 'ready', protocolVersion: 3 })).toEqual({
       type: 'ready',
-      protocolVersion: 2,
+      protocolVersion: 3,
     });
+    expect(() => parseWorkerEvent({ type: 'ready', protocolVersion: 2 })).toThrow(
+      /invalid message/,
+    );
     expect(
       parseWorkerEvent({
         type: 'error',
@@ -279,7 +301,7 @@ describe('local worker protocol', () => {
 
   it('accepts only fully pinned browser model manifests', () => {
     expect(parseStarBrowserModelManifest(manifest)).toMatchObject({
-      rulesHash: 'fnv1a64:2da3783519381453',
+      rulesHash: 'fnv1a64:a5d932b0ef8354e8',
       featureSchemaHash: STAR_FEATURE_SCHEMA_HASH,
       weights: 'ema',
       wasm: {
@@ -288,7 +310,7 @@ describe('local worker protocol', () => {
       },
       model: {
         precision: 'float16',
-        url: '/models/star/browser-smoke-v2.fp16.onnx',
+        url: '/models/star/browser-smoke-v3.fp16.onnx',
         sha256: `sha256:${'a'.repeat(64)}`,
         inputs: STAR_MODEL_INPUT_NAMES,
         outputs: STAR_MODEL_OUTPUT_NAMES,
@@ -298,6 +320,7 @@ describe('local worker protocol', () => {
         maxConsidered: 16,
         maximumSimulations: 1_024,
         maximumMaxConsidered: 128,
+        swapDeadZone: 0.02,
       },
     });
     expect(() =>

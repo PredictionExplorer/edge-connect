@@ -31,7 +31,7 @@ beforeAll(async () => {
 describe('local worker runtime contract', () => {
   it('registers exactly one message handler and announces readiness', () => {
     expect(registeredHandler).toEqual(expect.any(Function));
-    expect(readyEvent).toEqual({ type: 'ready', protocolVersion: 2 });
+    expect(readyEvent).toEqual({ type: 'ready', protocolVersion: 3 });
   });
 
   it('decodes bitboards while rejecting overlap and off-board bits', () => {
@@ -52,7 +52,14 @@ describe('local worker runtime contract', () => {
       zero_bits: () => new BigUint64Array([BigInt(1) << BigInt(50), ...Array(6).fill(BigInt(0))]),
       one_bits: () => new BigUint64Array(7),
     } as WasmState;
-    expect(() => runtime.stonesFromWasm(offBoard, 50)).toThrow(/off-board stones/i);
+    expect(() => runtime.stonesFromWasm(offBoard, 50)).toThrow(/off-board nodes/i);
+    expect(
+      runtime.nodesFromBits(
+        new BigUint64Array([BigInt(5), BigInt(1), ...Array(5).fill(BigInt(0))]),
+        275,
+        'history',
+      ),
+    ).toEqual([0, 2, 64]);
   });
 
   it('validates ONNX names, tensor types, ranks, and fixed head dimensions', () => {
@@ -72,6 +79,7 @@ describe('local worker runtime contract', () => {
         metadata('int64', [1, 50, 6]),
         metadata('bool', [1, 50]),
         metadata('bool', [1, 50]),
+        metadata('int64', [1]),
       ],
       outputMetadata: [
         metadata('float16', [1, 50]),
@@ -126,30 +134,59 @@ describe('local worker runtime contract', () => {
       {
         rings: 4,
         mode: 'double',
-        pieRule: false,
+        pieRule: true,
         playerNames: ['A', 'B'],
       },
-      [],
+      [{ type: 'place', node: 7 }, { type: 'swap' }],
     );
     const hash = BigInt(`0x${request.stateHash.slice('zobrist64:'.length)}`);
+    const applied: Array<number | 'swap'> = [];
+    const stoneWords = new BigUint64Array(7);
+    stoneWords[0] = BigInt(1) << BigInt(7);
     class FakeState {
       readonly to_move = request.state.toMove;
       readonly moves_left = request.state.movesLeft;
+      readonly opening = request.state.opening;
       readonly terminal = request.state.terminal;
-      apply = vi.fn();
+      readonly mode = request.state.mode;
+      readonly handicap = request.state.handicap;
+      readonly pie = request.state.pie;
+      readonly swap_available = request.state.swapAvailable;
+      readonly swapped = request.state.swapped;
+      constructor(rings: number, mode: string, handicap: number, pie: boolean) {
+        expect([rings, mode, handicap, pie]).toEqual([4, 'double', 1, true]);
+      }
+      apply = (node: number) => {
+        applied.push(node);
+      };
+      swap = () => {
+        applied.push('swap');
+      };
       zero_bits = () => new BigUint64Array(7);
-      one_bits = () => new BigUint64Array(7);
+      one_bits = () => stoneWords;
+      current_turn_bits = () => new BigUint64Array(7);
+      previous_turn_bits = () => stoneWords;
+      own_previous_turn_bits = () => new BigUint64Array(7);
+      handicap_bits = () => stoneWords;
       legal_actions = () => Int32Array.from(request.legalActions);
       hash64 = () => hash;
     }
     const wasm = { WasmState: FakeState };
     expect(runtime.replayAndVerify(request, wasm as never)).toBeInstanceOf(FakeState);
+    expect(applied).toEqual([7, 'swap']);
+    expect(request.state.stones[7]).toBe(1);
 
     class BadState extends FakeState {
       legal_actions = () => Int32Array.from([-1]);
     }
     expect(() =>
       runtime.replayAndVerify(request, { WasmState: BadState } as never),
+    ).toThrow(/disagrees with the AI request/i);
+    class DriftedState extends FakeState {
+      readonly swapped = false;
+    }
+    expect(() =>
+      runtime.replayAndVerify(request, { WasmState: DriftedState } as never),
     ).toThrow(/disagrees with the AI request/i);
   });
 });

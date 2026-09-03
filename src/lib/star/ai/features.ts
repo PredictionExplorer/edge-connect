@@ -1,6 +1,10 @@
 import { getBoard, MAX_RINGS, type Board } from '../board';
+import { STAR_MAX_HANDICAP } from '../rules';
 import { EMPTY, scorePosition } from '../scoring';
-import type { StarAiSemanticState } from './protocol';
+import { isPiePending, type StarAiSemanticState } from './protocol';
+
+/** Playout-doubling advantage input range; browser games are symmetric (0). */
+export const STAR_MAX_PLAYOUT_DOUBLING_ADVANTAGE = 3;
 
 export const STAR_NODE_FEATURE_NAMES = [
   'empty',
@@ -18,6 +22,10 @@ export const STAR_NODE_FEATURE_NAMES = [
   'degree_fraction',
   'is_bridge',
   'legal',
+  'placed_this_turn',
+  'own_previous_turn',
+  'opponent_previous_turn',
+  'handicap_stone',
 ] as const;
 
 export const STAR_GLOBAL_FEATURE_NAMES = [
@@ -38,6 +46,14 @@ export const STAR_GLOBAL_FEATURE_NAMES = [
   'current_stars_fraction',
   'opponent_stars_fraction',
   'contested_peries_fraction',
+  'turn_size_fraction',
+  'handicap_fraction',
+  'handicap_phase',
+  'handicap_remaining_fraction',
+  'pie_pending',
+  'swap_available',
+  'history_known',
+  'playout_doubling_advantage_fraction',
 ] as const;
 
 export const STAR_MODEL_INPUT_NAMES = [
@@ -48,6 +64,7 @@ export const STAR_MODEL_INPUT_NAMES = [
   'neighbor_edge_type',
   'node_mask',
   'legal_action_mask',
+  'rings',
 ] as const;
 
 export const STAR_MODEL_OUTPUT_NAMES = [
@@ -75,10 +92,32 @@ export interface EncodedStarFeatures {
   neighborEdgeType: BigInt64Array;
   nodeMask: Uint8Array;
   legalActionMask: Uint8Array;
+  /** Per-sample ring count selecting the D5-invariant relation table. */
+  rings: BigInt64Array;
 }
 
 function bool(value: boolean): number {
   return value ? 1 : 0;
+}
+
+function turnSize(state: StarAiSemanticState): number {
+  return state.mode === 'classic' ? 1 : 2;
+}
+
+/** Placements of the turn in progress: the handicap during the opening. */
+function currentTurnTotal(state: StarAiSemanticState): number {
+  return state.opening ? state.handicap : turnSize(state);
+}
+
+function historyMask(nodes: readonly number[], nodeCount: number, label: string): Uint8Array {
+  const mask = new Uint8Array(nodeCount);
+  for (const node of nodes) {
+    if (!Number.isInteger(node) || node < 0 || node >= nodeCount || mask[node]) {
+      throw new Error(`${label} must contain unique dense node ids`);
+    }
+    mask[node] = 1;
+  }
+  return mask;
 }
 
 function validateSemanticState(state: StarAiSemanticState): Board {
@@ -92,7 +131,23 @@ function validateSemanticState(state: StarAiSemanticState): Board {
     throw new Error(`stones must contain ${board.n} values from -1, 0, or 1`);
   }
   if (state.toMove !== 0 && state.toMove !== 1) throw new Error('toMove must be 0 or 1');
-  if (![0, 1, 2].includes(state.movesLeft)) throw new Error('movesLeft must be in 0..2');
+  if (state.mode !== 'classic' && state.mode !== 'double') {
+    throw new Error('mode must be classic or double');
+  }
+  if (
+    !Number.isInteger(state.handicap) ||
+    state.handicap < 1 ||
+    state.handicap > STAR_MAX_HANDICAP
+  ) {
+    throw new Error(`handicap must be in 1..${STAR_MAX_HANDICAP}`);
+  }
+  if (state.pie && state.handicap !== 1) {
+    throw new Error('handicap games cannot use the pie rule');
+  }
+  const turnTotal = currentTurnTotal(state);
+  if (!Number.isInteger(state.movesLeft) || state.movesLeft < 0 || state.movesLeft > turnTotal) {
+    throw new Error(`movesLeft must be in 0..${turnTotal}`);
+  }
 
   const occupied = state.stones.filter((stone) => stone !== EMPTY).length;
   const boardFull = occupied === board.n;
@@ -102,18 +157,16 @@ function validateSemanticState(state: StarAiSemanticState): Board {
   if (state.movesLeft === 0 && !boardFull) {
     throw new Error('movesLeft == 0 is valid only on a full board');
   }
-  if (boardFull && state.movesLeft > 1) {
-    throw new Error('a full board may retain at most one placement');
+  if (state.opening && (state.toMove !== 0 || occupied >= state.handicap || state.terminal)) {
+    throw new Error('invalid opening metadata');
   }
-  if (
-    state.opening &&
-    (state.toMove !== 0 ||
-      state.movesLeft !== 1 ||
-      occupied !== 0 ||
-      state.terminal)
-  ) {
-    throw new Error('invalid one-stone opening metadata');
+  if (state.opening && state.movesLeft !== state.handicap - occupied) {
+    throw new Error('opening movesLeft must equal the remaining handicap stones');
   }
+  if (state.swapAvailable && (!state.pie || state.toMove !== 1 || state.swapped)) {
+    throw new Error('the swap is available only to the responder of a pie game');
+  }
+  if (state.swapped && !state.pie) throw new Error('only pie games record a swap');
   return board;
 }
 
@@ -187,13 +240,33 @@ export function float16ToFloat32Array(values: ArrayLike<number>): Float32Array {
   return Float32Array.from(values, float16BitsToNumber);
 }
 
-/** Exact browser port of training/startrain/features.py schema v3. */
+/**
+ * Exact browser port of training/startrain/features.py schema v4 with the
+ * browser's fixed context: history is always known and no side holds a
+ * playout-doubling advantage.
+ */
 export function encodeStarFeatures(state: StarAiSemanticState): EncodedStarFeatures {
   const board = validateSemanticState(state);
   const score = scorePosition(board, state.stones);
   const current = state.toMove;
   const opponent = 1 - current;
   const maxDegree = maximumDegree(board);
+  const placedThisTurn = historyMask(state.history.currentTurn, board.n, 'currentTurn');
+  const ownPreviousTurn = historyMask(
+    state.history.ownPreviousTurn,
+    board.n,
+    'ownPreviousTurn',
+  );
+  const opponentPreviousTurn = historyMask(
+    state.history.previousTurn,
+    board.n,
+    'previousTurn',
+  );
+  const handicapStones = historyMask(
+    state.history.handicapStones,
+    board.n,
+    'handicapStones',
+  );
   const nodeFeatures = new Float32Array(board.n * STAR_NODE_FEATURE_DIM);
   const neighborIndex = new BigInt64Array(board.n * maxDegree);
   const neighborMask = new Uint8Array(board.n * maxDegree);
@@ -231,6 +304,10 @@ export function encodeStarFeatures(state: StarAiSemanticState): EncodedStarFeatu
       degree / maxDegree,
       bool(ring === 1),
       bool(empty && !state.terminal),
+      placedThisTurn[node],
+      ownPreviousTurn[node],
+      opponentPreviousTurn[node],
+      handicapStones[node],
     ];
     nodeFeatures.set(values, base);
     legalActionMask[node] = bool(empty && !state.terminal);
@@ -249,12 +326,13 @@ export function encodeStarFeatures(state: StarAiSemanticState): EncodedStarFeatu
   const opponentScore = score.players[opponent];
   const scoreScale = 151;
   const starScale = Math.max(1, board.periCount / 2);
+  const turnTotal = Math.max(1, currentTurnTotal(state));
   const globalFeatures = new Float32Array([
     state.rings / MAX_RINGS,
     occupied / board.n,
     currentCount / board.n,
     opponentCount / board.n,
-    state.movesLeft / 2,
+    state.movesLeft / turnTotal,
     bool(state.opening),
     bool(state.terminal),
     currentScore.total / scoreScale,
@@ -267,6 +345,14 @@ export function encodeStarFeatures(state: StarAiSemanticState): EncodedStarFeatu
     currentScore.stars / starScale,
     opponentScore.stars / starScale,
     score.contestedPeries / board.periCount,
+    turnSize(state) / 2,
+    state.handicap / STAR_MAX_HANDICAP,
+    bool(state.opening && state.handicap >= 2),
+    state.opening ? state.movesLeft / STAR_MAX_HANDICAP : 0,
+    bool(isPiePending(state)),
+    bool(state.swapAvailable),
+    1,
+    0 / STAR_MAX_PLAYOUT_DOUBLING_ADVANTAGE,
   ]);
 
   return {
@@ -279,5 +365,6 @@ export function encodeStarFeatures(state: StarAiSemanticState): EncodedStarFeatu
     neighborEdgeType,
     nodeMask,
     legalActionMask,
+    rings: BigInt64Array.from([BigInt(state.rings)]),
   };
 }

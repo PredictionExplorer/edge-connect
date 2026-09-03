@@ -20,17 +20,19 @@ import { StarAiError } from './errors';
 
 export const STAR_BROWSER_MODEL_MANIFEST_SCHEMA_ID =
   'startrain.browser-model' as const;
-export const STAR_BROWSER_MODEL_MANIFEST_VERSION = 2 as const;
+export const STAR_BROWSER_MODEL_MANIFEST_VERSION = 3 as const;
+export const STAR_BROWSER_MODEL_ARCHITECTURE_VERSION = 3 as const;
 export const STAR_BROWSER_MODEL_PRECISION = 'float16' as const;
 export const MAX_BROWSER_AI_SIMULATIONS = 1_024;
 export const MAX_BROWSER_AI_MAX_CONSIDERED = 128;
 
 /** Deployment convention; intentionally absent until a trained model is published. */
 export const STAR_BROWSER_MODEL_MANIFEST_PATH = '/models/star/manifest.json' as const;
+/** The WASM package directory is keyed by the rules hash it was built from. */
 export const STAR_WASM_MODULE_PATH =
-  '/models/star/wasm-2da3783519381453/star_wasm.js' as const;
+  '/models/star/wasm-a5d932b0ef8354e8/star_wasm.js' as const;
 export const STAR_WASM_BINARY_PATH =
-  '/models/star/wasm-2da3783519381453/star_wasm_bg.wasm' as const;
+  '/models/star/wasm-a5d932b0ef8354e8/star_wasm_bg.wasm' as const;
 
 export interface StarBrowserModelManifest {
   format: typeof STAR_BROWSER_MODEL_MANIFEST_SCHEMA_ID;
@@ -69,6 +71,8 @@ export interface StarBrowserModelManifest {
     maximumMaxConsidered: typeof MAX_BROWSER_AI_MAX_CONSIDERED;
     cVisit: number;
     cScale: number;
+    /** A pie responder swaps when the keep-search root value is below -deadZone. */
+    swapDeadZone: number;
   };
 }
 
@@ -206,11 +210,26 @@ export function parseStarBrowserModelManifest(payload: unknown): StarBrowserMode
     !Number.isFinite(payload.created_ns) ||
     payload.created_ns <= 0 ||
     !isRecord(rules) ||
-    !hasExactKeys(rules, ['schema_id', 'hash', 'mode', 'pie_rule', 'rings']) ||
+    !hasExactKeys(rules, [
+      'schema_id',
+      'hash',
+      'mode',
+      'pie_rule',
+      'handicap',
+      'rings',
+      'variants',
+    ]) ||
     rules.schema_id !== STAR_RULES_SCHEMA_ID ||
     rules.hash !== STAR_RULES_HASH ||
     rules.mode !== 'double' ||
     rules.pie_rule !== false ||
+    rules.handicap !== 1 ||
+    !isRecord(rules.variants) ||
+    !hasExactKeys(rules.variants, ['modes', 'handicap_min', 'handicap_max', 'pie_allowed']) ||
+    !sameShape(rules.variants.modes, ['classic', 'double']) ||
+    rules.variants.handicap_min !== 1 ||
+    rules.variants.handicap_max !== 9 ||
+    rules.variants.pie_allowed !== true ||
     !Array.isArray(rules.rings) ||
     rules.rings.length !== SUPPORTED_RINGS.length ||
     !rules.rings.every(
@@ -230,8 +249,9 @@ export function parseStarBrowserModelManifest(payload: unknown): StarBrowserMode
     features.node_feature_count !== STAR_NODE_FEATURE_DIM ||
     features.global_feature_count !== STAR_GLOBAL_FEATURE_DIM ||
     !isRecord(actions) ||
-    !hasExactKeys(actions, ['schema_id']) ||
+    !hasExactKeys(actions, ['schema_id', 'types']) ||
     actions.schema_id !== STAR_ACTION_LAYOUT_SCHEMA_ID ||
+    !sameShape(actions.types, ['place', 'swap']) ||
     !isRecord(outcome) ||
     !hasExactKeys(outcome, ['classes', 'value']) ||
     !sameShape(outcome.classes, ['loss', 'win']) ||
@@ -259,12 +279,13 @@ export function parseStarBrowserModelManifest(payload: unknown): StarBrowserMode
       'config',
     ]) ||
     architecture.name !== 'GraphResTNet' ||
-    architecture.schema_version !== 2 ||
+    architecture.schema_version !== STAR_BROWSER_MODEL_ARCHITECTURE_VERSION ||
     architecture.all_size !== true ||
     !positiveInteger(architecture.parameter_count, Number.MAX_SAFE_INTEGER) ||
     !isRecord(architecture.config) ||
     architecture.config.node_feature_dim !== STAR_NODE_FEATURE_DIM ||
     architecture.config.global_feature_dim !== STAR_GLOBAL_FEATURE_DIM ||
+    architecture.config.feature_schema_version !== STAR_FEATURE_SCHEMA_VERSION ||
     !isRecord(artifacts) ||
     !hasExactKeys(artifacts, ['onnx', 'checkpoint']) ||
     !validateArtifact(artifacts.onnx, 'onnx', true) ||
@@ -279,6 +300,7 @@ export function parseStarBrowserModelManifest(payload: unknown): StarBrowserMode
       ['neighbor_edge_type', 'int64', ['batch', 'nodes', 'degree']],
       ['node_mask', 'bool', ['batch', 'nodes']],
       ['legal_action_mask', 'bool', ['batch', 'nodes']],
+      ['rings', 'int64', ['batch']],
     ]) ||
     !validateTensorMap(tensors.outputs, [
       ['policy_logits', 'float16', ['batch', 'nodes']],
@@ -289,11 +311,21 @@ export function parseStarBrowserModelManifest(payload: unknown): StarBrowserMode
       ['soft_policy_logits', 'float16', ['batch', 'nodes']],
     ]) ||
     !isRecord(search) ||
-    !hasExactKeys(search, ['simulations', 'max_considered', 'c_visit', 'c_scale']) ||
+    !hasExactKeys(search, [
+      'simulations',
+      'max_considered',
+      'c_visit',
+      'c_scale',
+      'swap_dead_zone',
+    ]) ||
     !positiveInteger(search.simulations, MAX_BROWSER_AI_SIMULATIONS) ||
     !positiveInteger(search.max_considered, MAX_BROWSER_AI_MAX_CONSIDERED) ||
     !positiveFinite(search.c_visit) ||
     !positiveFinite(search.c_scale) ||
+    typeof search.swap_dead_zone !== 'number' ||
+    !Number.isFinite(search.swap_dead_zone) ||
+    search.swap_dead_zone < 0 ||
+    search.swap_dead_zone >= 1 ||
     !isRecord(payload.training)
   ) {
     throw new StarAiError('unavailable', 'Local AI model manifest fields are invalid.');
@@ -337,6 +369,7 @@ export function parseStarBrowserModelManifest(payload: unknown): StarBrowserMode
       maximumMaxConsidered: MAX_BROWSER_AI_MAX_CONSIDERED,
       cVisit: search.c_visit,
       cScale: search.c_scale,
+      swapDeadZone: search.swap_dead_zone,
     },
   };
 }

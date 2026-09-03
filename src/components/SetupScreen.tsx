@@ -16,7 +16,6 @@ import {
 } from '@/lib/star/ai/capabilities';
 import {
   CONTROLLER_TYPES,
-  HUMAN_CONTROLLERS,
   controllerLabel,
   normalizeControllers,
   supportsAiControllers,
@@ -63,7 +62,11 @@ export function SetupScreen() {
 
   const board = useMemo(() => getBoard(rings), [rings]);
   const emptyStones = useMemo(() => new Int8Array(board.n).fill(EMPTY), [board]);
-  const aiAllowed = supportsAiControllers({ mode, pieRule });
+  const aiAllowed = supportsAiControllers({
+    mode,
+    pieRule,
+    handicap: pieRule ? 1 : handicap,
+  });
   const selectedCapabilities = controllers.map((controller) =>
     capabilityForController(capabilities, controller),
   );
@@ -98,10 +101,6 @@ export function SetupScreen() {
 
   const chooseMode = (nextMode: Mode) => {
     setMode(nextMode);
-    if (nextMode !== 'double') {
-      setControllers([...HUMAN_CONTROLLERS]);
-      setEngineDraftValidity({});
-    }
   };
 
   const chooseController = (player: number, controller: ControllerType) => {
@@ -359,11 +358,7 @@ export function SetupScreen() {
                 aria-label="Pie rule"
                 onChange={(e) => {
                   setPieRule(e.target.checked);
-                  if (e.target.checked) {
-                    setHandicap(1);
-                    setControllers([...HUMAN_CONTROLLERS]);
-                    setEngineDraftValidity({});
-                  }
+                  if (e.target.checked) setHandicap(1);
                 }}
                 className="h-4 w-4 accent-[#e8c48b]"
               />
@@ -412,7 +407,8 @@ export function SetupScreen() {
             <div className="mt-2 min-h-6 px-1 text-xs" aria-live="polite">
               {!aiAllowed && (
                 <p className="text-muted">
-                  AI controllers require Double *Star with the pie rule off.
+                  AI controllers support classic and Double *Star, handicaps up to
+                  nine stones, and the pie rule (without a handicap).
                 </p>
               )}
               {aiAllowed &&

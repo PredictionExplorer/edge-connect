@@ -26,6 +26,8 @@ function decisionFor(
       outcome: { loss: 0.5, win: 0.5 },
       modelValue: 0,
       searchValue: 0,
+      rootValue: 0,
+      swapRecommended: false,
       expectedMargin: 0,
       rootActions: [{ type: 'place' as const, node: 0 }],
       rootPolicy: [1],
@@ -77,7 +79,7 @@ describe('local worker construction lifecycle', () => {
 
     const result = client.request(request);
     expect(worker.messages).toEqual([]);
-    worker.emit({ type: 'ready', protocolVersion: 2 });
+    worker.emit({ type: 'ready', protocolVersion: 3 });
     await Promise.resolve();
     expect(worker.messages).toEqual([
       { type: 'choose', taskId: request.requestId, request, search: null },
@@ -104,7 +106,7 @@ describe('local worker construction lifecycle', () => {
     const firstRequest = buildAiRequest(config, [], 'local-cancel');
     const first = client.request(firstRequest, { signal: abort.signal });
     const active = workers[0];
-    active.emit({ type: 'ready', protocolVersion: 2 });
+    active.emit({ type: 'ready', protocolVersion: 3 });
     await Promise.resolve();
     abort.abort();
     await expect(first).rejects.toMatchObject({ code: 'cancelled' });
@@ -114,7 +116,7 @@ describe('local worker construction lifecycle', () => {
     const second = client.request(secondRequest);
     const replacement = workers[1];
     expect(replacement).not.toBe(active);
-    replacement.emit({ type: 'ready', protocolVersion: 2 });
+    replacement.emit({ type: 'ready', protocolVersion: 3 });
     await Promise.resolve();
     replacement.emit({
       type: 'result',
@@ -132,7 +134,7 @@ describe('local worker construction lifecycle', () => {
     const client = new LocalStarAiClient(() => worker as unknown as Worker);
     const request = buildAiRequest(config, [], 'local-timeout');
     const result = client.request(request, { timeoutMs: 100 });
-    worker.emit({ type: 'ready', protocolVersion: 2 });
+    worker.emit({ type: 'ready', protocolVersion: 3 });
     await Promise.resolve();
 
     const rejection = expect(result).rejects.toMatchObject({
@@ -151,7 +153,7 @@ describe('local worker construction lifecycle', () => {
     const request = buildAiRequest(config, [], 'local-budget');
     const search = { simulations: 32, maxConsidered: 8 };
     const result = client.request(request, { search });
-    worker.emit({ type: 'ready', protocolVersion: 2 });
+    worker.emit({ type: 'ready', protocolVersion: 3 });
     await Promise.resolve();
     expect(worker.messages).toEqual([
       { type: 'choose', taskId: request.requestId, request, search },
@@ -182,7 +184,7 @@ describe('local worker construction lifecycle', () => {
     const client = new LocalStarAiClient(() => worker as unknown as Worker);
     const request = buildAiRequest(config, [], 'local-stale');
     const result = client.request(request);
-    worker.emit({ type: 'ready', protocolVersion: 2 });
+    worker.emit({ type: 'ready', protocolVersion: 3 });
     await Promise.resolve();
     const stale = decisionFor(request);
     stale.response.stateHash = 'zobrist64:0000000000000000';

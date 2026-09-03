@@ -17,16 +17,16 @@ describe('AI capability preflight', () => {
       return Response.json({
         status: 'ok',
         service_version: '1.0.0',
-        api_schema_version: 2,
+        api_schema_version: 3,
         model: { ready: true, model_version: 'test', model_step: 1 },
         rules: {
-          schema_id: 'edgeconnect.star.rules.v2',
-          version: 2,
-          hash: 'fnv1a64:2da3783519381453',
+          schema_id: 'edgeconnect.star.rules.v3',
+          version: 3,
+          hash: 'fnv1a64:a5d932b0ef8354e8',
         },
         features: {
-          schema_id: 'edgeconnect.star.model-features.external.v2',
-          version: 3,
+          schema_id: 'edgeconnect.star.model-features.external.v3',
+          version: 4,
           hash: STAR_FEATURE_SCHEMA_HASH,
         },
         actions: {
@@ -47,10 +47,10 @@ describe('AI capability preflight', () => {
       vi.fn(async () =>
         Response.json({
           status: 'ok',
-          api_schema_version: 2,
+          api_schema_version: 3,
           model: { ready: true },
           rules: {
-            schema_id: 'edgeconnect.star.rules.v2',
+            schema_id: 'edgeconnect.star.rules.v3',
             hash: 'fnv1a64:wrong',
           },
           features: {},
@@ -71,7 +71,7 @@ describe('AI capability preflight', () => {
       vi.fn(async () =>
         Response.json({
           status: 'ok',
-          api_schema_version: 2,
+          api_schema_version: 3,
           device: 'mps',
           model: {
             ready: true,
@@ -90,12 +90,12 @@ describe('AI capability preflight', () => {
             },
           },
           rules: {
-            schema_id: 'edgeconnect.star.rules.v2',
-            hash: 'fnv1a64:2da3783519381453',
+            schema_id: 'edgeconnect.star.rules.v3',
+            hash: 'fnv1a64:a5d932b0ef8354e8',
           },
           features: {
-            schema_id: 'edgeconnect.star.model-features.external.v2',
-            version: 3,
+            schema_id: 'edgeconnect.star.model-features.external.v3',
+            version: 4,
             hash: STAR_FEATURE_SCHEMA_HASH,
           },
           actions: {
@@ -132,7 +132,7 @@ describe('AI capability preflight', () => {
       vi.fn(async () =>
         Response.json({
           status: 'ok',
-          api_schema_version: 2,
+          api_schema_version: 3,
           device: 'mps',
           model: { ready: true },
           search: {
@@ -143,12 +143,12 @@ describe('AI capability preflight', () => {
             },
           },
           rules: {
-            schema_id: 'edgeconnect.star.rules.v2',
-            hash: 'fnv1a64:2da3783519381453',
+            schema_id: 'edgeconnect.star.rules.v3',
+            hash: 'fnv1a64:a5d932b0ef8354e8',
           },
           features: {
-            schema_id: 'edgeconnect.star.model-features.external.v2',
-            version: 3,
+            schema_id: 'edgeconnect.star.model-features.external.v3',
+            version: 4,
             hash: STAR_FEATURE_SCHEMA_HASH,
           },
           actions: {
