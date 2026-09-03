@@ -476,9 +476,15 @@ Result: system gates pass at the two-hour check (04:10 UTC): learner 4,181
   segment ratio 1.495, mean total loss 3.363 versus 3.393 (policy 1.305 versus
   1.331, gradient norm 9.0 versus 8.6), candidate cadence 1.5-2.0 hours,
   actors ~315 samples per second, nine verified snapshots in two hours, no
-  failed units. Candidate evidence pending: 793,770 (trained before the
-  change) at +15.6 after 800 games; the first UTD-1.5 candidate is 799,630
-Decision: pending
+  failed units. The first UTD-1.5 candidate, 799,630 (published 03:00 UTC
+  after 1.5e-4 training since 19:38 and UTD 1.5 since 02:03), was PROMOTED at
+  08:18 UTC: conclusive +33.1 Elo at 256 simulations over 1,200 games (score
+  0.5475) against champion 742,979, the first promotion since 2026-08-30. The
+  three candidates before it under UTD 1.0 ended +13.3, +18.5, and +18.0
+  (inconclusive). One candidate cannot separate the UTD effect from the
+  anneal's continued progress, but the direction is right and the steady
+  state costs nothing
+Decision: keep UTD 1.5
 ```
 
 ```text
@@ -520,8 +526,17 @@ Statistical gate: candidates trained under 7.5e-5 (published from about two
   with the +13/+18/+15 hover; success is the first promotion; abort back to
   the conclusive-only rule if two consecutive 7.5e-5 candidates conclude
   below the 1.5e-4 candidates
-Result: pending
-Decision: pending
+Result: the second stage never had to fire. 793,770 ended reject_max_pairs at
+  +18.0 (terminal streak 3), then 799,630 was promoted at 08:18 UTC (+33.1,
+  conclusive) before its verdict could count; the promotion reset the streak
+  and restored the multiplier to 1.0 (Muon 2.97e-4 on the cosine). The flag
+  stays enabled for the next hover; the promotion itself is credited to the
+  1.5e-4 anneal plus UTD 1.5 (R10-UTD-04)
+Decision: keep the flag; watch the post-promotion cycle at 3.0e-4 against the
+  new champion 799,630. The 3.0e-4 phase after the warm start cost fifteen
+  hours of below-champion candidates; if the dip recurs (candidates
+  conclusively below 799,630 within the first stage), cap the restore at the
+  first stage multiplier instead of returning to the reference
 ```
 
 ## Compute ledger
