@@ -470,8 +470,13 @@ Decision: pending
 ```text
 ID: R10-ANNEAL-HOVER-05
 Phase: 1 — training dynamics / plateau policy
-Status: implemented and tested; in-place migration scheduled for the arena
-  boundary after candidate 793,770's terminal verdict
+Status: live since 2026-09-03 04:32 UTC (in-place migration at learner step
+  ~805,000; two minutes of GPU idle). A first attempt at 04:22 was refused by
+  the migrator with "source profile does not match the migration chain head"
+  because the new defaulted field changed the canonical config hash; nothing
+  was written, the unchanged R10-UTD-04 runtime restarted within two minutes,
+  and the migrator was fixed (b53bb2e) to accept every legacy hash variant of
+  additive defaulted fields before the second attempt
 Hypothesis: the annealed learner produces candidates that are really about
   +15 Elo above champion 742,979 at 256 simulations (782,049 +13.3, 785,956
   +18.5, 793,770 +15.6 at 800 games) but the gate cannot conclude a +15 effect
@@ -481,8 +486,10 @@ Hypothesis: the annealed learner produces candidates that are really about
   1.5e-4 indefinitely. Counting terminal non-promotions toward the stage
   streak lets the anneal reach 7.5e-5, where the deeper anneal is expected to
   lift candidates toward the +35 the gate can conclude
-Commit: recorded at migration
-Release: recorded at migration
+Commit: b53bb2e (policy flag 1f450a8 plus the migrator fix; migration chain
+  496ad19 -> b53bb2e)
+Release: main-b53bb2e-anneal-hover (release-manifest sha256 59df27dc...;
+  profile profile-anneal-hover.yaml)
 Control: R10-UTD-04 runtime (conclusive-only streak)
 Treatment: orchestration.plateau.count_inconclusive_rejections true; the
   arena's all-terminal streak already stands at 2 since the 19:37 recovery,
