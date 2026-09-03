@@ -232,27 +232,46 @@ profile and cannot wait for absent rings. Use `h100-4gpu.yaml` or
 
 `GET /healthz` and `GET /v2/health` report service, configured device, champion
 role/identity, search defaults/maximums/named presets, model, rules, feature,
-action, and binary-outcome schemas. `POST /v2/analyze` is the documented
-endpoint; `POST /v2/move` exposes the same v2 schema. Health is intentionally
-unauthenticated for container orchestration.
+action, variant-family, and binary-outcome schemas. `POST /v2/analyze` is the
+documented endpoint; `POST /v2/move` exposes the same schema. The `/v2` path is
+the stable endpoint namespace; the in-band `api_schema_version` is 3 since the
+variant-capable network, and v2 request bodies are rejected with 422. Health is
+intentionally unauthenticated for container orchestration.
 
-The v2 request is strict: unknown fields, coercions, terminal states, incompatible
-hashes, malformed semantic states, and over-budget searches are rejected.
+The v3 request is strict: unknown fields, coercions, terminal states, incompatible
+hashes, malformed semantic states, variants outside the rules family, and over-budget
+searches are rejected. It carries the rule variant (`mode`, `handicap`, `pie`), the
+swap state, the retained placement history the network was trained on (`history` may
+be `null` for an imported position; the network then sees `history_known = 0`), and a
+playout-doubling advantage `pda` in `-3..3` for the side to move (browser clients send
+0).
 
 ```json
 {
-  "schema_version": 2,
-  "rules_hash": "fnv1a64:2da3783519381453",
+  "schema_version": 3,
+  "rules_hash": "fnv1a64:a5d932b0ef8354e8",
   "rings": 4,
-  "stones": [-1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+  "stones": [-1, -1, -1, -1, -1, -1, -1, 0, -1, -1,
              -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
              -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
              -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
              -1, -1, -1, -1, -1, -1, -1, -1, -1, -1],
-  "to_move": 0,
-  "moves_left": 1,
-  "opening": true,
+  "to_move": 1,
+  "moves_left": 2,
+  "opening": false,
   "terminal": false,
+  "mode": "double",
+  "handicap": 1,
+  "pie": true,
+  "swap_available": true,
+  "swapped": false,
+  "history": {
+    "current_turn": [],
+    "previous_turn": [7],
+    "own_previous_turn": [],
+    "handicap_stones": [7]
+  },
+  "pda": 0,
   "search": {
     "simulations": 4096,
     "max_considered": 32,
@@ -264,8 +283,13 @@ hashes, malformed semantic states, and over-budget searches are rejected.
 The state is imported through `star_native.StateBatch.from_semantic`; Python
 does not replay or reinterpret moves. The response contains one atomic
 placement, completed-Q root policy, root Q and visits, `{loss, win}` probabilities,
-`P(win) - P(loss)`, the 303-bin `[-151, 151]` score belief, EMA model identity,
-and timing.
+`P(win) - P(loss)`, the visit-weighted `root_value` (the opener's optimal-swap payoff
+`-|q|` while the pie decision is pending), the 303-bin `[-151, 151]` score belief, the
+echoed `variant`, `swap_available`, `swap_recommended`, `history_known`, EMA model
+identity, and timing. `swap_recommended` is true when the responder of a pie game should
+swap instead of playing `action`: the keep-search root value is below
+`search.swap_dead_zone` (server config, default 0.02). A `pda` other than zero gives the
+side to move `2^pda` times the opponent's leaf budget inside the search.
 
 If `security.bearer_token_env` is configured, send
 `Authorization: Bearer <token>`. The token is read only from that environment
@@ -320,9 +344,17 @@ The command emits:
 
 - a regular atomic startrain checkpoint containing raw and EMA state;
 - an EMA-weight FP16 ONNX model with dynamic batch, node, degree, and action axes;
-- a browser manifest with SHA-256 and byte length for both artifacts, exact
-  tensor names/dtypes/shapes, finalized rules/feature/action identifiers,
-  architecture, training provenance, and recommended local search settings.
+- a browser manifest (schema 3) with SHA-256 and byte length for both artifacts,
+  exact tensor names/dtypes/shapes (including the per-sample `rings` input that
+  selects the D5-invariant relation table), finalized rules/feature/action
+  identifiers, the supported variant family, architecture, training provenance,
+  and recommended local search settings including the pie `swap_dead_zone`.
+
+The browser worker builds a variant-aware WASM state from the request (mode,
+handicap, pie), replays placements and the swap, encodes the schema-v4 features with
+history always known and `pda = 0`, and swaps when the responder's root value is
+below the manifest dead zone. `src/lib/star/ai/features.ts` is pinned to the Python
+encoder through `testdata/star/features-v4.json`.
 
 Artifact versions are immutable: the command refuses to overwrite an existing
 checkpoint, ONNX model, or manifest. Choose a new `model_version` for each run.
@@ -334,9 +366,9 @@ cd ..
 RUSTUP_TOOLCHAIN=1.93.0 npm run build:star-wasm
 cd training
 startrain-publish-browser \
-  --manifest runs/browser/star-browser-v2.browser.json \
+  --manifest runs/browser/star-browser-v3.browser.json \
   --target ../public/models/star \
-  --wasm-source ../public/models/star/wasm-2da3783519381453
+  --wasm-source ../public/models/star/wasm-a5d932b0ef8354e8
 ```
 
 The release command verifies SHA-256 and byte length for both the Python
@@ -346,10 +378,10 @@ run as the same verified release step:
 
 ```bash
 startrain-publish-browser \
-  --manifest runs/browser/star-browser-v2.browser.json \
+  --manifest runs/browser/star-browser-v3.browser.json \
   --target ../public/models/star \
   --wasm-cwd .. \
-  --wasm-source ../public/models/star/wasm-2da3783519381453 \
+  --wasm-source ../public/models/star/wasm-a5d932b0ef8354e8 \
   --wasm-build npm run build:star-wasm
 ```
 

@@ -1,4 +1,4 @@
-schema_version: 2
+schema_version: 3
 
 replay:
   sources:
@@ -10,8 +10,11 @@ teacher:
   model_manifest: ../runs/h100-8gpu/learner/champion.json
 
 student:
-  node_feature_dim: 15
-  global_feature_dim: 17
+  node_feature_dim: 19
+  global_feature_dim: 25
+  feature_schema_version: 4
+  relational_bias: true
+  adaln_hidden: 32
   width: 96
   rrt_groups: 3
   attention_heads: 6
@@ -51,10 +54,11 @@ loss:
 
 export:
   output_directory: ../runs/browser
-  model_version: star-browser-v2
+  model_version: star-browser-v3
   onnx_opset: 18
   recommended_search:
     simulations: 64
     max_considered: 16
     c_visit: 50.0
     c_scale: 1.0
+    swap_dead_zone: 0.02

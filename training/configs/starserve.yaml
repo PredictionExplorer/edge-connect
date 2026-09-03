@@ -4,10 +4,10 @@ model_manifest: ../runs/h100-8gpu/learner/champion.json
 device: cuda:0
 host: 0.0.0.0
 port: 8080
-rules_schema_id: edgeconnect.star.rules.v2
-rules_hash: fnv1a64:2da3783519381453
-feature_schema_id: edgeconnect.star.model-features.external.v2
-feature_schema_hash: 6b5b00f638e9c16b
+rules_schema_id: edgeconnect.star.rules.v3
+rules_hash: fnv1a64:a5d932b0ef8354e8
+feature_schema_id: edgeconnect.star.model-features.external.v3
+feature_schema_hash: cb0e1e89a6ce3540
 action_schema_id: edgeconnect.star.action-layout.nodes-only.v1
 
 search:
@@ -17,6 +17,7 @@ search:
   maximum_max_considered: 64
   c_visit: 50.0
   c_scale: 1.0
+  swap_dead_zone: 0.02
 
 limits:
   max_concurrency: 2

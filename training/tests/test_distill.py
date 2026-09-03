@@ -105,7 +105,21 @@ def test_distillation_smoke_emits_checksum_verified_browser_manifest(
     assert artifacts.onnx.is_file()
     assert artifacts.checkpoint_sha256 == sha256_file(artifacts.checkpoint)
     assert artifacts.onnx_sha256 == sha256_file(artifacts.onnx)
-    assert manifest["schema_version"] == 2
+    assert manifest["schema_version"] == 3
+    assert manifest["rules"]["variants"] == {
+        "modes": ["classic", "double"],
+        "handicap_min": 1,
+        "handicap_max": 9,
+        "pie_allowed": True,
+    }
+    assert manifest["actions"]["types"] == ["place", "swap"]
+    assert manifest["architecture"]["schema_version"] == 3
+    assert manifest["architecture"]["config"]["feature_schema_version"] == 4
+    assert manifest["tensors"]["inputs"]["rings"] == {
+        "dtype": "int64",
+        "shape": ["batch"],
+    }
+    assert manifest["recommended_local_search"]["swap_dead_zone"] == 0.02
     assert manifest["artifacts"]["onnx"]["sha256"] == artifacts.onnx_sha256
     assert manifest["artifacts"]["checkpoint"]["sha256"] == artifacts.checkpoint_sha256
     assert manifest["precision"] == "float16"
@@ -117,7 +131,7 @@ def test_distillation_smoke_emits_checksum_verified_browser_manifest(
     assert manifest["tensors"]["inputs"]["node_features"]["shape"] == [
         "batch",
         "nodes",
-        15,
+        19,
     ]
     assert manifest["tensors"]["inputs"]["legal_action_mask"]["shape"] == [
         "batch",

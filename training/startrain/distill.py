@@ -36,6 +36,8 @@ from .contracts import (
     EXTERNAL_FEATURE_SCHEMA_ID,
     FEATURE_SCHEMA_HASH,
     FEATURE_SCHEMA_VERSION,
+    MAX_HANDICAP,
+    MODES,
     RULES_HASH_WIRE,
     RULES_SCHEMA_ID,
 )
@@ -59,8 +61,8 @@ from .runtime import atomic_json
 from .symmetry import deterministic_transform
 from .topology import SUPPORTED_RINGS, get_topology
 
-DISTILL_CONFIG_SCHEMA_VERSION = 2
-BROWSER_MANIFEST_SCHEMA_VERSION = 2
+DISTILL_CONFIG_SCHEMA_VERSION = 3
+BROWSER_MANIFEST_SCHEMA_VERSION = 3
 BROWSER_MANIFEST_FORMAT = "startrain.browser-model"
 _MODEL_VERSION = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _T = TypeVar("_T")
@@ -203,6 +205,8 @@ class BrowserSearchConfig:
     max_considered: int = 16
     c_visit: float = 50.0
     c_scale: float = 1.0
+    # The browser's pie responder swaps below -swap_dead_zone of root value.
+    swap_dead_zone: float = 0.02
 
     def __post_init__(self) -> None:
         if (
@@ -214,6 +218,12 @@ class BrowserSearchConfig:
             or self.c_scale <= 0
         ):
             raise DistillationConfigError("recommended browser search is invalid")
+        if (
+            isinstance(self.swap_dead_zone, bool)
+            or not isinstance(self.swap_dead_zone, int | float)
+            or not 0 <= float(self.swap_dead_zone) < 1
+        ):
+            raise DistillationConfigError("browser swap_dead_zone must be in [0, 1)")
 
 
 @dataclass(frozen=True, slots=True)
@@ -244,10 +254,13 @@ class DistillationConfig:
 
     def __post_init__(self) -> None:
         if self.schema_version != DISTILL_CONFIG_SCHEMA_VERSION:
-            raise DistillationConfigError("distillation schema_version must be 2")
+            raise DistillationConfigError(
+                f"distillation schema_version must be {DISTILL_CONFIG_SCHEMA_VERSION}"
+            )
         if (
             self.student.node_feature_dim != NODE_FEATURE_DIM
             or self.student.global_feature_dim != GLOBAL_FEATURE_DIM
+            or self.student.is_legacy
         ):
             raise DistillationConfigError(
                 "student feature dimensions must match the finalized feature schema"
@@ -616,7 +629,14 @@ class DistillationRunner:
                 "hash": RULES_HASH_WIRE,
                 "mode": "double",
                 "pie_rule": False,
+                "handicap": 1,
                 "rings": list(SUPPORTED_RINGS),
+                "variants": {
+                    "modes": list(MODES),
+                    "handicap_min": 1,
+                    "handicap_max": MAX_HANDICAP,
+                    "pie_allowed": True,
+                },
             },
             "features": {
                 "schema_id": EXTERNAL_FEATURE_SCHEMA_ID,
@@ -625,7 +645,10 @@ class DistillationRunner:
                 "node_feature_count": NODE_FEATURE_DIM,
                 "global_feature_count": GLOBAL_FEATURE_DIM,
             },
-            "actions": {"schema_id": ACTION_LAYOUT_SCHEMA_ID},
+            "actions": {
+                "schema_id": ACTION_LAYOUT_SCHEMA_ID,
+                "types": ["place", "swap"],
+            },
             "outcome": {
                 "classes": ["loss", "win"],
                 "value": "P(win)-P(loss)",
@@ -828,6 +851,7 @@ def _browser_tensor_schema(model: ModelConfig) -> dict[str, object]:
         ONNX_INPUT_NAMES[4]: {"dtype": "int64", "shape": ["batch", "nodes", "degree"]},
         ONNX_INPUT_NAMES[5]: {"dtype": "bool", "shape": ["batch", "nodes"]},
         ONNX_INPUT_NAMES[6]: {"dtype": "bool", "shape": ["batch", "nodes"]},
+        ONNX_INPUT_NAMES[7]: {"dtype": "int64", "shape": ["batch"]},
     }
     outputs = {
         ONNX_OUTPUT_NAMES[0]: {"dtype": "float16", "shape": ["batch", "nodes"]},

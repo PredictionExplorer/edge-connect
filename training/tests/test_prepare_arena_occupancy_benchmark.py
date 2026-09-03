@@ -55,7 +55,7 @@ def _patch_selection_plan(
             "path": "/test/star_native.so",
             "bytes": 1,
             "sha256": "d" * 64,
-            "rules_hash": "fnv1a64:2da3783519381453",
+            "rules_hash": "fnv1a64:a5d932b0ef8354e8",
         },
     )
 

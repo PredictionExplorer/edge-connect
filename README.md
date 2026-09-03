@@ -15,13 +15,15 @@ Double *Star only.
   after every stone with a union-find + flood-fill engine over a CSR adjacency (microseconds
   per evaluation, so the score panel is always current).
 - **Complete games**: placement is mandatory until the board is full, with undo/redo,
-  optional web-only pie rule, influence overlays, and a final score reveal.
+  the optional pie rule, handicap openings of up to nine stones, influence overlays, and a
+  final score reveal.
 - Games persist in `localStorage`, so a refresh resumes play.
 
 ## Double *Star AI
 
-The repository includes a self-play training and inference stack for no-pie Double *Star
-on 4-, 6-, 8-, and 10-ring boards:
+The repository includes a self-play training and inference stack for every rule variant
+(classic *Star, Double *Star, handicap openings, and the pie rule with the swap) on 4-,
+6-, 8-, and 10-ring boards, played by one variant-capable network:
 
 - Rust rules, scoring, symmetry and Gumbel tree search, exposed to Python as
   `star_native`;
@@ -51,7 +53,8 @@ npm run typecheck        # strict TypeScript
 npm run build            # production Next.js build
 npm run start            # serve the production build
 npm run build:star-wasm  # optional local-AI Rust/WASM artifacts
-node scripts/export-star-conformance.mjs # regenerate conformance-v2.json
+node scripts/export-star-conformance.mjs # regenerate conformance-v3.json
+python training/scripts/export_feature_fixture.py # regenerate features-v4.json
 ```
 
 CI also builds the native Python extension, runs pytest with per-module coverage
@@ -63,7 +66,8 @@ The rules engine lives in `src/lib/star/`:
 
 - `board.ts` — pentagonal mesh generation, official Nxy notation, CSR adjacency, layout
 - `scoring.ts` — the scoring engine (see the file header for the exact rule semantics)
-- `game.ts` — placement-only turn protocol, web pie rule, replayable action log
+- `game.ts` — turn protocol for both modes, handicap openings, the pie swap, and the
+  replayable action log with retained placement history
 
 Scoring is cross-validated against an independent reference implementation. Full supported
 boards have no contested peries, totals sum to `5 × rings + 1`, and the odd nonzero margin

@@ -91,6 +91,8 @@ _ALLOWED_PROFILE_PATHS = {
         ("selfplay", "variants", "score_utility_weight_by_segment", segment)
         for segment in ("standard", "classic", "handicap", "pie")
     ),
+    # ``None`` -> mapping when the quotas are first introduced, then per segment.
+    ("learner", "segment_quotas"),
     *(
         ("learner", "segment_quotas", segment)
         for segment in ("standard", "classic", "handicap", "pie")

@@ -20,6 +20,7 @@ transferred shards out of the replay window.
 from __future__ import annotations
 
 import hashlib
+import json
 import sqlite3
 import time
 from collections.abc import Callable, Iterator, Sequence
@@ -31,9 +32,11 @@ import numpy as np
 import torch
 
 from .checkpoint import (
+    LEGACY_MODEL_SCHEMA_VERSION,
     legacy_model_config,
     load_legacy_ema_checkpoint,
     sha256_file,
+    verify_file,
 )
 from .contracts import (
     LEGACY_FEATURE_SCHEMA_HASH,
@@ -81,6 +84,85 @@ class LegacyTeacher:
     checkpoint_bytes: int
     step: int
     device: torch.device
+
+
+def _read_json(path: Path, name: str) -> dict[str, Any]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise LineageTransferError(f"cannot read {name} {path}: {error}") from error
+    if not isinstance(payload, dict):
+        raise LineageTransferError(f"{name} must be a JSON object")
+    return payload
+
+
+def resolve_legacy_champion(pointer: str | Path) -> Path:
+    """Resolve a previous-lineage ``champion.json`` pointer to its EMA checkpoint.
+
+    The current manifest parser rejects rules-v2 manifests by design; this
+    walks the pointer and immutable manifest with the legacy contract instead
+    and verifies the checkpoint digest and size before returning its path.
+    """
+
+    source = Path(pointer).resolve()
+    payload = _read_json(source, "legacy model pointer")
+    if payload.get("format") != "startrain.model-pointer":
+        raise LineageTransferError("legacy champion must be a startrain model pointer")
+    if payload.get("role") != "champion":
+        raise LineageTransferError("lineage transfer requires the champion pointer")
+    manifest_value = payload.get("manifest")
+    if not isinstance(manifest_value, str) or not manifest_value:
+        raise LineageTransferError("legacy pointer manifest path is invalid")
+    artifact = Path(manifest_value)
+    if not artifact.is_absolute():
+        artifact = source.parent / artifact
+    artifact = artifact.resolve()
+    manifest_sha256 = payload.get("manifest_sha256")
+    manifest_bytes = payload.get("manifest_bytes")
+    if not isinstance(manifest_sha256, str) or not isinstance(manifest_bytes, int):
+        raise LineageTransferError("legacy pointer manifest pin is invalid")
+    try:
+        verify_file(
+            artifact, expected_sha256=manifest_sha256, expected_bytes=manifest_bytes
+        )
+    except ValueError as error:
+        raise LineageTransferError(str(error)) from error
+    manifest = _read_json(artifact, "legacy model manifest")
+    if (
+        manifest.get("format") != "startrain.model-manifest"
+        or manifest.get("rules_hash") != LEGACY_RULES_HASH_WIRE
+        or manifest.get("feature_schema_hash") != f"{LEGACY_FEATURE_SCHEMA_HASH:016x}"
+        or manifest.get("model_schema_version") != LEGACY_MODEL_SCHEMA_VERSION
+        or manifest.get("weights") != "ema"
+    ):
+        raise LineageTransferError(
+            "legacy champion manifest is not a previous-lineage EMA publication"
+        )
+    checkpoint_value = manifest.get("checkpoint")
+    checkpoint_sha256 = manifest.get("checkpoint_sha256")
+    checkpoint_bytes = manifest.get("checkpoint_bytes")
+    if (
+        not isinstance(checkpoint_value, str)
+        or not checkpoint_value
+        or not isinstance(checkpoint_sha256, str)
+        or not isinstance(checkpoint_bytes, int)
+        or manifest.get("model_identity") != f"sha256-{checkpoint_sha256}"
+        or payload.get("model_identity") != manifest.get("model_identity")
+    ):
+        raise LineageTransferError("legacy champion checkpoint pin is invalid")
+    checkpoint = Path(checkpoint_value)
+    if not checkpoint.is_absolute():
+        checkpoint = artifact.parent / checkpoint
+    checkpoint = checkpoint.resolve()
+    try:
+        verify_file(
+            checkpoint,
+            expected_sha256=checkpoint_sha256,
+            expected_bytes=checkpoint_bytes,
+        )
+    except ValueError as error:
+        raise LineageTransferError(str(error)) from error
+    return checkpoint
 
 
 def load_legacy_teacher(

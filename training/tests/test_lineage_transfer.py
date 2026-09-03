@@ -515,3 +515,76 @@ def test_lineage_arena_pits_the_candidate_against_the_legacy_teacher(
     )
     assert code == 1
     assert "lineage arena failed" in capsys.readouterr().err
+
+
+def write_legacy_publication(root: Path) -> Path:
+    """A previous-lineage learner directory: champion pointer -> manifest -> checkpoint."""
+
+    from startrain.checkpoint import sha256_file
+
+    learner = root / "learner"
+    (learner / "checkpoints").mkdir(parents=True)
+    (learner / "manifests").mkdir(parents=True)
+    staged = write_legacy_checkpoint(root / "staged.pt")
+    digest = sha256_file(staged)
+    checkpoint = learner / "checkpoints" / f"sha256-{digest}.pt"
+    staged.rename(checkpoint)
+    manifest_payload = {
+        "format": "startrain.model-manifest",
+        "schema_version": 3,
+        "rules_hash": LEGACY_RULES_HASH_WIRE,
+        "feature_schema_hash": f"{LEGACY_FEATURE_SCHEMA_HASH:016x}",
+        "model_schema_version": LEGACY_MODEL_SCHEMA_VERSION,
+        "weights": "ema",
+        "model_identity": f"sha256-{digest}",
+        "model_version": f"sha256-{digest}",
+        "model_step": 1234,
+        "created_ns": 1,
+        "run_id": "legacy-run",
+        "generation_family": "legacy-family",
+        "checkpoint": f"../checkpoints/sha256-{digest}.pt",
+        "checkpoint_sha256": digest,
+        "checkpoint_bytes": checkpoint.stat().st_size,
+    }
+    manifest_text = json.dumps(manifest_payload, sort_keys=True)
+    manifest_digest = hashlib.sha256(manifest_text.encode("utf-8")).hexdigest()
+    manifest = learner / "manifests" / f"manifest-{manifest_digest}.json"
+    manifest.write_text(manifest_text, encoding="utf-8")
+    pointer = learner / "champion.json"
+    pointer.write_text(
+        json.dumps(
+            {
+                "format": "startrain.model-pointer",
+                "schema_version": 2,
+                "role": "champion",
+                "manifest": f"manifests/{manifest.name}",
+                "manifest_sha256": manifest_digest,
+                "manifest_bytes": manifest.stat().st_size,
+                "model_identity": f"sha256-{digest}",
+                "model_step": 1234,
+                "run_id": "legacy-run",
+                "generation_family": "legacy-family",
+            }
+        ),
+        encoding="utf-8",
+    )
+    return pointer
+
+
+def test_legacy_champion_pointer_resolves_to_a_verified_checkpoint(tmp_path) -> None:
+    from startrain.lineage import resolve_legacy_champion
+
+    pointer = write_legacy_publication(tmp_path / "legacy")
+    checkpoint = resolve_legacy_champion(pointer)
+    assert checkpoint.is_file() and checkpoint.name.startswith("sha256-")
+    teacher = load_legacy_teacher(checkpoint)
+    assert teacher.step == 1234
+    # Tampering with the checkpoint or pointing at a candidate is refused.
+    checkpoint.write_bytes(checkpoint.read_bytes() + b"\0")
+    with pytest.raises(LineageTransferError):
+        resolve_legacy_champion(pointer)
+    payload = json.loads(pointer.read_text(encoding="utf-8"))
+    payload["role"] = "candidate"
+    pointer.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(LineageTransferError, match="champion pointer"):
+        resolve_legacy_champion(pointer)

@@ -148,16 +148,22 @@ do not infer progress from loss, throughput, or promotion counts alone.
   Current local-heavy profile is 10,476,953 parameters, exactly 30 below the
   10,476,983 reference; it is near-matched, not exactly matched.
 - [-] Run `ring10-relational` control/local-heavy/gated-local screen.
-- [ ] Only if local gating fails, implement D5-invariant graph-relative bias.
-- [ ] Verify all-ring D5 equivariance, native parity, padding, compile, ONNX,
-  distillation, HBM, and actor/arena throughput.
+- [x] Implement D5-invariant graph-relative bias (architecture v3 relational
+  attention bias, `variant-capable-network-plan.md`); it ships together with
+  adaLN-Zero rule conditioning in the variant-capable lineage rather than as a
+  one-factor treatment of this lineage.
+- [x] Verify all-ring D5 equivariance, native parity, padding, compile, ONNX,
+  distillation locally for architecture v3 (`tests/test_model.py`,
+  `tests/test_topology_features.py`, `tests/test_training.py`,
+  `tests/test_distill.py`); HBM and actor/arena throughput remain to be
+  benchmarked on the H100 host.
 
 ## Phase 4: capacity scaling
 
 - [ ] Carry forward the winning training dynamics and relational design.
-- [x] Baseline 384x5: 10,476,983 parameters.
-- [x] Depth treatment 384x7: 14,614,199 parameters.
-- [x] Width treatment 512x5: 18,556,727 parameters.
+- [x] Baseline 384x5: 10,476,983 parameters (architecture v3: 10,929,399).
+- [x] Depth treatment 384x7: 14,614,199 parameters (architecture v3: 15,244,983).
+- [x] Width treatment 512x5: 18,556,727 parameters (architecture v3: 19,159,319).
 - [x] Preserve 32-wide heads for width 512.
 - [ ] Benchmark learner batch, actor leaves/s, arena service time, and HBM.
 - [ ] Match samples, search leaves, seeds, and provisioned H100-hours.
@@ -560,6 +566,20 @@ Cumulative roadmap H100-hours: not tracked before this entry
 ```
 
 ## Decision log
+
+### 2026-09-03 — Start the variant-capable lineage by transfer, not by scratch
+
+Decision: the next lineage plays classic, handicap, and pie games with one
+network (rules v3, feature schema v4, architecture v3). It cannot warm-start
+from this lineage's weights, so it starts from random weights and distils the
+current champion through teacher-labelled replay
+(`scripts/prepare_lineage_transfer.py`, Stage A profile), then turns on the
+rule mixture by profile migration (Stage B). The architecture counts of the
+ring-10 ablation suites were re-pinned to v3 (10,929,399 baseline; the
+previous 10,476,983 lineage stays in the registry as history). Stage A must
+clear the cross-schema arena against the current champion before Stage B,
+and Stage B promotions are vetoed by any proven regression in a variant
+segment.
 
 ### 2026-08-17 — Preserve seed 17
 

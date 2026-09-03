@@ -32,12 +32,32 @@ The measured 8-H100 host evidence, accepted treatments and current forecast are 
 `GraphResTNet` alternates local edge-aware residual blocks with global grouped-query
 attention. It predicts node policy, binary loss/win outcome, score margin, ownership,
 alive stones, and a node-only KataGo-style soft-policy auxiliary. Value is
-`P(win) - P(loss)`. Self-play searches placements only.
+`P(win) - P(loss)`. Architecture v3 adds a D5-invariant relational attention bias
+(ring difference, angular offset, shortest path, peri pair) and adaLN-Zero rule
+conditioning so one network plays every rule variant: classic (one stone per turn) and
+Double *Star, handicap openings of 1..9 stones, and the pie rule with the swap. The
+network sees the retained placement history (current turn, both previous turns, the
+handicap stones), whether that history is known, and a playout-doubling advantage input
+that self-play uses to keep lopsided handicap games informative. Self-play searches
+placements; the pie responder swaps when the keep-search root value is below a dead
+zone, and the opener searches the optimal-swap payoff `-|q|`.
 
-The canonical gameplay contract is `edgeconnect.star.rules.v2` with fingerprint
-`fnv1a64:2da3783519381453`. Training uses feature schema v3, replay/data schema v4,
-config/checkpoint/model-manifest schema v3, browser manifest v2, and starserve API/config
-schema v2. Older artifacts are rejected; start fresh roots instead of converting them.
+The canonical gameplay contract is `edgeconnect.star.rules.v3` with fingerprint
+`fnv1a64:a5d932b0ef8354e8`. Training uses feature schema v4, replay/data schema v5,
+config schema v4, model schema v3, browser manifest v3, arena result schema v4, and
+starserve API schema v3 (server config schema 2). Previous-lineage artifacts
+(rules v2 / feature schema v3) are rejected by every runtime path except the explicit
+lineage transfer: `scripts/prepare_lineage_transfer.py` re-labels the old replay with
+the legacy champion's soft targets so a fresh rules-v3 run distils it (see
+`docs/variant-capable-network-plan.md`).
+
+The self-play mixture is configured under `selfplay.variants` (default off, i.e.
+standard Double *Star only). The shipped Stage B profile draws standard 0.45 /
+classic 0.25 / handicap 0.20 / pie 0.10 batches; handicap games give the second player
+a playout-doubling advantage, the learner stratifies every ring's replay window by
+segment (`learner.segment_quotas`), and the arena plays extra classic, handicap, and
+pie pairs that veto a promotion only when the candidate provably regressed below the
+segment floor (`arena.segment_pairs_per_ring`, `arena.segment_regression_floor_elo`).
 
 Shipped self-play profiles set `clinch_finalization: loser-fill`. Before each search
 wave, the actor applies the same extremal-completion proof used by the web client. A
@@ -378,6 +398,56 @@ experiment:
 startrain-orchestrate --config configs/h100-8gpu-learner-shared.yaml
 ```
 
+### Variant-capable network (lineage transfer, then the mixture)
+
+The variant-capable lineage does not warm-start from previous-lineage weights: the
+input planes, the relational bias, and the rule conditioning have no counterpart in
+them. It transfers the old lineage's *knowledge* instead, in two stages that share
+one run root and one run identity (`variant-network`).
+
+Stage A seeds the root from the previous champion and its replay. The legacy EMA
+champion becomes a frozen teacher; every position of the legacy replay store is
+upgraded to replay schema v5 (standard variant, `history_known = 0`) and labelled
+with the teacher's soft policy, outcome, and score-margin distributions:
+
+```bash
+python scripts/prepare_lineage_transfer.py \
+  --legacy-champion runs/h100-8gpu-throughput/learner/champion.json \
+  --legacy-replay-root runs/h100-8gpu-throughput/replay \
+  --output-root runs/variant-network \
+  --run-id variant-network --generation-family variant-network-a \
+  --max-samples 20000000 --device cuda:0
+startrain-orchestrate --config configs/h100-8gpu-variant-stage-a.yaml
+```
+
+The Stage A profile trains the v3 architecture from random weights with
+`loss.teacher_*` distilling the transferred targets while the actors generate standard
+Double *Star games with real history planes. The transferred shards carry
+`model_step 0`, so they leave the replay window once the learner passes
+`learner.max_replay_lag_steps`. Measure how much of the old strength the new lineage
+recovered with the cross-schema arena, which evaluates the legacy champion through its
+frozen v3 encoder:
+
+```bash
+python scripts/run_lineage_arena.py \
+  --candidate-checkpoint runs/variant-network/learner/checkpoints/sha256-<identity>.pt \
+  --legacy-champion runs/h100-8gpu-throughput/learner/champion.json \
+  --output runs/variant-network/arena/lineage-crossplay.json
+```
+
+Stage B turns on the rule mixture on the same root through the ordinary
+continuous-profile migration (`scripts/migrate_continuous_profile.py` with
+`configs/h100-8gpu-variant-stage-b.yaml`; the mixture, quota, and arena-segment paths
+are on its allowlist). Self-play then draws standard 0.45 / classic 0.25 / handicap 0.20
+/ pie 0.10 batches, handicap games hand the second player a playout-doubling advantage
+(`selfplay.variants.handicap_pda`), a fifth of the other games give one random seat an
+advantage so the network learns the input everywhere, the learner keeps every ring's
+window at the same segment shares, and the arena adds classic, handicap, and pie pairs
+that veto a promotion only on a proven regression below the segment floor. Actor
+metrics report `variant`, `segment`, `pie_swaps`, and `asymmetric_games`; learner
+metrics report `replay_samples_by_segment`; arena results report `per_segment` and
+`promotion.segment_floors`.
+
 It preserves the throughput profile's training and search settings, runs two
 actor lanes on every GPU 1–7, and moves promotion to GPU 0. Each arena lease is
 limited to one wave; the learner checkpoints, suspends its replay prefetcher,
@@ -694,13 +764,17 @@ RUSTUP_TOOLCHAIN=1.93.0 npm run build:star-wasm
 
 cd training
 startrain-publish-browser \
-  --manifest runs/browser/star-browser-v2.browser.json \
+  --manifest runs/browser/star-browser-v3.browser.json \
   --target ../public/models/star \
-  --wasm-source ../public/models/star/wasm-2da3783519381453
+  --wasm-source ../public/models/star/wasm-a5d932b0ef8354e8
 ```
 
-The sample config emits `star-browser-v2.pt`, `star-browser-v2.fp16.onnx` and
-`star-browser-v2.browser.json`. Publication verifies checkpoint, ONNX and WASM
+The sample config emits `star-browser-v3.pt`, `star-browser-v3.fp16.onnx` and
+`star-browser-v3.browser.json`. The ONNX graph takes the eight schema-v4 inputs
+(including the per-sample `rings` tensor that selects the relation table); the browser
+encoder in `src/lib/star/ai/features.ts` is pinned to the Python encoder through
+`testdata/star/features-v4.json` (regenerate with
+`python scripts/export_feature_fixture.py`). Publication verifies checkpoint, ONNX and WASM
 integrity, copies the immutable ONNX artifact, and replaces
 `public/models/star/manifest.json` last. The web app reports local AI unavailable until
 that canonical manifest and all referenced artifacts exist.

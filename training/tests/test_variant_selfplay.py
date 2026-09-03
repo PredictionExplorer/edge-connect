@@ -294,3 +294,71 @@ def test_yaml_variant_mixture_flows_into_selfplay_and_learner_quotas(tmp_path) -
     )
     with pytest.raises(ConfigError, match="unknown replay segment"):
         load_config(bogus)
+
+
+def test_variant_stage_profiles_validate_and_migrate(tmp_path) -> None:
+    import sys
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from scripts.migrate_continuous_profile import (
+        _ALLOWED_PROFILE_PATHS,
+        _profile_diffs,
+    )
+    from scripts.validate_continuous_profile import validate_continuous_config
+    from startrain.config import load_config
+
+    configs = Path(__file__).resolve().parents[1] / "configs"
+    stage_a = load_config(configs / "h100-8gpu-variant-stage-a.yaml")
+    stage_b = load_config(configs / "h100-8gpu-variant-stage-b.yaml")
+    assert stage_a.model.relational_bias and stage_a.model.adaln_hidden == 32
+    assert stage_a.model.feature_schema_version == 4
+    assert stage_a.loss.uses_teacher
+    assert not stage_a.selfplay.variants.enabled
+    assert stage_a.learner.segment_quotas is None
+    assert not stage_a.orchestration.autonomous.enabled
+    assert stage_a.orchestration.run_id == "variant-network"
+    validate_continuous_config(stage_a)
+
+    assert stage_b.selfplay.variants.enabled
+    assert stage_b.selfplay.variants.segment_fractions == {
+        "standard": 0.45,
+        "classic": 0.25,
+        "handicap": 0.2,
+        "pie": 0.1,
+    }
+    assert stage_b.learner.segment_quotas == stage_b.selfplay.variants.segment_fractions
+    assert set(stage_b.arena.segment_pairs_per_ring) == {"classic", "handicap", "pie"}
+    assert stage_b.arena.segment_handicap_pda == stage_b.selfplay.variants.handicap_pda
+    validate_continuous_config(stage_b)
+
+    # Stage A -> Stage B is a legal mid-run migration: only mixture, quota,
+    # and arena-segment paths differ.
+    differences = list(_profile_diffs(stage_a.as_dict(), stage_b.as_dict()))
+    assert differences
+    assert [
+        ".".join(path)
+        for path, _, _ in differences
+        if path not in _ALLOWED_PROFILE_PATHS
+    ] == []
+
+    # The validator refuses a mixture whose learner quotas or arena guards drift.
+    from dataclasses import replace
+
+    with pytest.raises(ValueError, match="segment_quotas"):
+        validate_continuous_config(
+            replace(
+                stage_b,
+                learner=replace(stage_b.learner, segment_quotas={"standard": 1.0}),
+            )
+        )
+    with pytest.raises(ValueError, match="arena segment pairs"):
+        validate_continuous_config(
+            replace(
+                stage_b,
+                arena=replace(
+                    stage_b.arena,
+                    segment_pairs_per_ring={"classic": 5},
+                    segment_regression_floor_elo={},
+                ),
+            )
+        )

@@ -37,7 +37,11 @@ from startrain.contracts import (  # noqa: E402
     RULES_HASH_WIRE,
 )
 from startrain.inference import GraphInferenceAdapter, InferenceConfig  # noqa: E402
-from startrain.lineage import LineageTransferError, load_legacy_teacher  # noqa: E402
+from startrain.lineage import (  # noqa: E402
+    LineageTransferError,
+    load_legacy_teacher,
+    resolve_legacy_champion,
+)
 from startrain.model import GraphResTNet, ModelConfig  # noqa: E402
 from startrain.native import validate_native_module  # noqa: E402
 from startrain.runtime import atomic_json  # noqa: E402
@@ -172,7 +176,13 @@ def run_lineage_arena(
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--candidate-checkpoint", type=Path, required=True)
-    parser.add_argument("--legacy-checkpoint", type=Path, required=True)
+    teacher = parser.add_mutually_exclusive_group(required=True)
+    teacher.add_argument("--legacy-checkpoint", type=Path)
+    teacher.add_argument(
+        "--legacy-champion",
+        type=Path,
+        help="previous lineage learner/champion.json pointer",
+    )
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--rings", default="4,6,8,10")
     parser.add_argument("--pairs-per-ring", type=int, default=20)
@@ -189,10 +199,15 @@ def main(argv: list[str] | None = None) -> int:
         import star_native
 
         validate_native_module(star_native)
+        legacy_checkpoint = (
+            args.legacy_checkpoint
+            if args.legacy_checkpoint is not None
+            else resolve_legacy_champion(args.legacy_champion)
+        )
         result = run_lineage_arena(
             native_module=star_native,
             candidate_checkpoint=args.candidate_checkpoint,
-            legacy_checkpoint=args.legacy_checkpoint,
+            legacy_checkpoint=legacy_checkpoint,
             rings=tuple(int(value) for value in str(args.rings).split(",")),
             pairs_per_ring=args.pairs_per_ring,
             simulations=args.simulations,

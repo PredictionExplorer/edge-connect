@@ -26,9 +26,58 @@ def _validate_learner_shared_promotion(config: ExperimentConfig) -> None:
         )
 
 
-def _validate_autonomous_config(config: ExperimentConfig) -> None:
+def _is_variant_lineage_profile(config: ExperimentConfig) -> bool:
+    """A rules-v3 run seeded by lineage transfer or playing the variant mixture."""
+
+    return (
+        not config.orchestration.autonomous.enabled
+        and not config.model.is_legacy
+        and (config.loss.uses_teacher or config.selfplay.variants.enabled)
+    )
+
+
+def _validate_variant_lineage_config(config: ExperimentConfig) -> None:
+    mixture = config.selfplay.variants
+    if mixture.enabled:
+        quotas = config.learner.segment_quotas
+        if quotas is None or any(
+            abs(quotas.get(segment, 0.0) - fraction) > 1e-9
+            for segment, fraction in mixture.segment_fractions.items()
+        ):
+            raise ValueError(
+                "variant mixture requires learner.segment_quotas equal to the "
+                "self-play segment fractions"
+            )
+        arena = config.arena
+        guarded = set(arena.segment_pairs_per_ring)
+        trained = {
+            segment
+            for segment, fraction in mixture.segment_fractions.items()
+            if fraction > 0 and segment != "standard"
+        }
+        if not trained <= guarded:
+            missing = ", ".join(sorted(trained - guarded))
+            raise ValueError(
+                f"variant mixture requires arena segment pairs for {missing}"
+            )
+        if arena.segment_handicap_pda != mixture.handicap_pda:
+            raise ValueError(
+                "arena segment_handicap_pda must equal selfplay.variants.handicap_pda"
+            )
+        if not any(
+            mixture.handicap_min <= handicap <= mixture.handicap_max
+            for handicap in arena.segment_handicaps
+        ):
+            raise ValueError("arena segment_handicaps fall outside the trained range")
+    if config.loss.uses_teacher and config.orchestration.autonomous.enabled:
+        raise ValueError("teacher distillation cannot run inside a scratch profile")
+
+
+def _validate_autonomous_config(
+    config: ExperimentConfig, *, require_scratch: bool = True
+) -> None:
     autonomous = config.orchestration.autonomous
-    if not autonomous.enabled:
+    if require_scratch and not autonomous.enabled:
         raise ValueError(
             "autonomous validator requires orchestration.autonomous.enabled"
         )
@@ -257,6 +306,9 @@ def validate_continuous_config(config: ExperimentConfig) -> None:
         _validate_ring10_only_config(config)
     elif config.orchestration.autonomous.enabled:
         _validate_autonomous_config(config)
+    elif _is_variant_lineage_profile(config):
+        _validate_autonomous_config(config, require_scratch=False)
+        _validate_variant_lineage_config(config)
     elif objective == "generalist":
         _validate_throughput_config(config)
     else:

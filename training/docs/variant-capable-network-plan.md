@@ -3,10 +3,56 @@
 Handicap openings, the classic one-stone variant, the pie rule, and architecture v3
 for a single GraphResTNet lineage.
 
-Status: planning document, 2026-09-03. Nothing in this document is implemented.
-Each phase becomes a roadmap registry entry with pre-registered gates before it
-starts (`model-improvement-roadmap.md`), in the same form as
-R10-LR-RECOVERY-01 through R10-ANNEAL-HOVER-05.
+Status: implemented locally on branch `variant-capable-network`, 2026-09-03. Every
+phase below is code-complete and tested (Rust, Python, TypeScript); nothing has been
+deployed or trained on an H100 host yet. The live gates of Section 11 become roadmap
+registry entries with pre-registered thresholds before the first Stage A run
+(`model-improvement-roadmap.md`), in the same form as R10-LR-RECOVERY-01 through
+R10-ANNEAL-HOVER-05.
+
+Implementation summary:
+
+- Phase 0 — rules v3 (`fnv1a64:a5d932b0ef8354e8`): `Variant`, `Action::Swap`, retained
+  placement history in `GameState`/`StateKey`, regenerated `conformance-v3.json`
+  consumed by Rust, Python, and TypeScript; `star_native`/`star_wasm` variant APIs;
+  web `game.ts` handicap and the setup handicap selector.
+- Phase 1 — feature schema v4 (19 node planes, 25 scalars, `fnv1a64:cb0e1e89a6ce3540`),
+  frozen `features_v3.py` for the previous lineage, D5-invariant pairwise relations in
+  `topology.py`, `GraphResTNet` v3 (relational attention bias, adaLN-Zero rule
+  conditioning, `rings` forward input, ONNX export), `ModelConfig.legacy`.
+- Phase 2 — pie root transform `-|q|` and `root_value`, per-root simulation budgets,
+  `VariantMixtureConfig` (standard 0.45 / classic 0.25 / handicap 0.20 / pie 0.10),
+  handicap↔pda pairing, swap decision by root value, replay schema v5 with variant
+  provenance and teacher targets, segment-stratified replay windows
+  (`learner.segment_quotas`), arena mixture segments with veto-on-regress floors
+  (result schema v4), monitor/migrator/validator support.
+- Phase 3 — `scripts/prepare_lineage_transfer.py` (legacy champion as frozen teacher,
+  v4→v5 replay upgrade with soft targets, new run identity) and
+  `scripts/run_lineage_arena.py` (cross-schema arena against the legacy champion).
+- Phase 4 — starserve API schema v3 (`swap_recommended`, `root_value`, variant,
+  optional history, `pda`), web protocol v3 with swap dispatch in both AI controllers,
+  browser features v4 pinned to Python via `testdata/star/features-v4.json`, browser
+  manifest v3 with the `rings` input, `configs/h100-8gpu-variant-stage-a.yaml` and
+  `-stage-b.yaml`, `configs/distill-browser.yaml` v3.
+
+Design decisions taken during implementation that refine the text below:
+
+- Both server and browser AI received full variant support at once; the browser
+  always sends `pda = 0` and real history.
+- The pda input is signed per seat: the advantaged seat sees `+d`, the other `-d`,
+  and the search gives the advantaged seat `2^d` times the leaf budget clamped to the
+  fast/full caps. Handicap games advantage the second player with
+  `handicap_pda[k - 2] = (1, 1, 2, 2, 2, 3, 3, 3)`.
+- Arena segments never promote: the standard pairs alone drive the sequential test;
+  each extra segment aggregates its pairs across rings under the same one-sided
+  paired e-process and vetoes (`reject_ring_regression` with
+  `regression_source = "segment"`) only once the candidate is provably below the
+  segment floor.
+- The starserve endpoint namespace stays `/v2/*`; the wire schema and
+  `api_schema_version` are 3, and v2 bodies are rejected.
+- The lineage transfer keeps `model_step = 0` on transferred shards so they age out
+  through `learner.max_replay_lag_steps` without a special retention rule, and the
+  Stage A → Stage B profile change is an ordinary continuous-profile migration.
 
 ## 1. Requirements
 

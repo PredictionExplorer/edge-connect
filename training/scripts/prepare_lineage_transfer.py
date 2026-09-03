@@ -27,6 +27,7 @@ from startrain.lineage import (  # noqa: E402
     list_legacy_shards,
     load_legacy_teacher,
     new_run_identity,
+    resolve_legacy_champion,
     select_recent_legacy_shards,
     transfer_lineage,
     write_transfer_report,
@@ -35,11 +36,16 @@ from startrain.lineage import (  # noqa: E402
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
+    teacher = parser.add_mutually_exclusive_group(required=True)
+    teacher.add_argument(
         "--legacy-checkpoint",
         type=Path,
-        required=True,
         help="EMA checkpoint of the previous lineage's champion (the teacher)",
+    )
+    teacher.add_argument(
+        "--legacy-champion",
+        type=Path,
+        help="previous lineage learner/champion.json pointer resolving to the teacher",
     )
     parser.add_argument(
         "--legacy-replay-root",
@@ -84,9 +90,12 @@ def main(argv: list[str] | None = None) -> int:
             if args.rings
             else None
         )
-        teacher = load_legacy_teacher(
-            args.legacy_checkpoint, device=torch.device(args.device)
+        checkpoint = (
+            args.legacy_checkpoint
+            if args.legacy_checkpoint is not None
+            else resolve_legacy_champion(args.legacy_champion)
         )
+        teacher = load_legacy_teacher(checkpoint, device=torch.device(args.device))
         shards = select_recent_legacy_shards(
             list_legacy_shards(args.legacy_replay_root, rings=rings),
             max_samples=args.max_samples,

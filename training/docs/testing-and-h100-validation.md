@@ -61,7 +61,7 @@ The Python mirror must match the canonical v2 bytes and fingerprint in
 
 ```bash
 uv run pytest tests/test_conformance_fixture.py
-# expected fingerprint: fnv1a64:2da3783519381453
+# expected fingerprint: fnv1a64:a5d932b0ef8354e8
 ```
 
 ## Tier 3: one-GPU CUDA validation
