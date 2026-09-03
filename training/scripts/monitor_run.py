@@ -958,6 +958,12 @@ def _replay_status(
     }, None
 
 
+def _string_list(value: object) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [str(item) for item in value]
+
+
 def _arena_history(
     run_root: Path,
     *,
@@ -1043,7 +1049,7 @@ def _arena_history(
                     str(segment): _mapping(metrics).get("elo_difference")
                     for segment, metrics in _mapping(result.get("per_segment")).items()
                 },
-                "segment_vetoes": list(promotion.get("segment_vetoes") or []),
+                "segment_vetoes": _string_list(promotion.get("segment_vetoes")),
                 "regression_source": promotion.get("regression_source"),
                 "weighted_aggregate": (
                     dict(weighted_aggregate) if weighted_aggregate else None
