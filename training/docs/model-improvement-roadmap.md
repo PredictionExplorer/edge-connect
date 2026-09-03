@@ -423,20 +423,23 @@ Decision: pending
 ```text
 ID: R10-UTD-04
 Phase: 1 — learner utilization
-Status: implemented and tested; in-place migration scheduled for the arena
-  boundary right after the first fully annealed candidate (785,956) has its
-  terminal verdict, so the anneal has one attributable data point at UTD 1.0
-  before the learner budget changes
+Status: live since 2026-09-03 02:03 UTC (in-place migration at learner step
+  796,464, 2.5 minutes of GPU idle, applied right after candidate 785,956's
+  terminal verdict while the arena had no pairs persisted for 793,770)
 Hypothesis: the learner GPU is idle 86% of the time because update-to-data 1.0
   allows one 512-example update per 512 newly generated samples (2,560 steps
   per hour against a 0.19-second step; 19,000 steps per hour unthrottled).
   Raising the target to 1.5 adds 50% more optimizer steps per generated sample
   at zero hardware cost and raises frontier Elo per hour, because data
   generation, not optimization, bounds progress
-Commit: recorded at migration
-Release: recorded at migration
-Control: R10-PLATEAU-LAG-03 runtime at UTD 1.0 (candidates 782,049 onward
-  under the 1.5e-4 anneal)
+Commit: 496ad19 (migration chain 2ccd895 -> 496ad19; the R3/R4 runtime
+  releases did not change the root's source authority)
+Release: main-496ad19-utd-1p5 (release-manifest sha256 de5301c9...; profile
+  profile-utd-1.5.yaml sha256 32e2958a...); prospective segment baselined at
+  examples_consumed 407,789,568 and committed replay samples 592,021,716
+Control: R10-PLATEAU-LAG-03 runtime at UTD 1.0 (candidates 782,049 and
+  785,956 under the 1.5e-4 anneal: +13.3 and +18.5 at 1,200 games, both
+  reject_max_pairs)
 Treatment: learner.target_updates_per_new_sample 1.0 -> 1.5 with the
   publication cadence held constant per new replay sample
   (candidate_interval_examples 2M -> 3M, selfplay_snapshot_interval_examples
@@ -454,7 +457,11 @@ Statistical gate: judged over the next four to six candidates at 256
   1.5e-4/UTD-1.0 candidates; abort back to UTD 1.0 by migration if training
   loss diverges from the 1.5e-4 trend (mean total loss above 3.55 for two
   consecutive hours) or two consecutive candidates conclude below -30 Elo
-Result: pending
+Result: first minutes: learner heartbeat target 1.5, segment ratio 1.42 and
+  rising toward 1.5 after a twelve-minute wait for samples past the new
+  baseline, then 7,900 steps per hour spending the accumulated allowance;
+  first disaster snapshot after cutover (02:12 UTC) verified with the new
+  segment; steady-state rate and candidate evidence pending
 Decision: pending
 ```
 
