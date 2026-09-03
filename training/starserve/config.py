@@ -34,6 +34,8 @@ class SearchConfig:
     maximum_max_considered: int = 64
     c_visit: float = 50.0
     c_scale: float = 1.0
+    # A pie responder swaps when the keep-search root value is below -dead_zone.
+    swap_dead_zone: float = 0.02
 
     def __post_init__(self) -> None:
         integers = (
@@ -44,6 +46,12 @@ class SearchConfig:
         )
         if any(type(value) is not int or value <= 0 for value in integers):
             raise ServerConfigError("search budgets must be positive integers")
+        if (
+            isinstance(self.swap_dead_zone, bool)
+            or not isinstance(self.swap_dead_zone, int | float)
+            or not 0 <= float(self.swap_dead_zone) < 1
+        ):
+            raise ServerConfigError("swap_dead_zone must be in [0, 1)")
         if self.default_simulations > self.maximum_simulations:
             raise ServerConfigError("default simulations exceed the configured maximum")
         if self.default_max_considered > self.maximum_max_considered:

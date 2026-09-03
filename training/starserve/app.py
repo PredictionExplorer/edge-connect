@@ -20,6 +20,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from startrain.contracts import (
+    MAX_HANDICAP,
+    MAX_PLAYOUT_DOUBLING_ADVANTAGE,
+    MODES,
     ACTION_LAYOUT_SCHEMA_ID,
     EXTERNAL_FEATURE_SCHEMA_ID,
     FEATURE_SCHEMA_HASH,
@@ -32,7 +35,7 @@ from startrain.model import MODEL_SCHEMA_VERSION
 
 from .config import SERVER_CONFIG_SCHEMA_VERSION, ServerConfig, load_server_config
 from .runtime import AnalysisError, NativeAnalysisService
-from .schemas import AnalyzeRequest, AnalyzeResponse
+from .schemas import API_SCHEMA_VERSION, AnalyzeRequest, AnalyzeResponse
 
 SERVICE_VERSION = "2.0.0"
 _LOGGER = logging.getLogger("starserve")
@@ -285,7 +288,7 @@ def create_app(
             request,
             status_code=422,
             code="invalid_request",
-            message="request does not match the v2 analysis schema",
+            message=f"request does not match the v{API_SCHEMA_VERSION} analysis schema",
             details=details,
         )
 
@@ -313,7 +316,7 @@ def create_app(
         payload = {
             "status": "degraded" if degraded else ("ok" if ready else "starting"),
             "service_version": SERVICE_VERSION,
-            "api_schema_version": 2,
+            "api_schema_version": API_SCHEMA_VERSION,
             "server_config_schema_version": SERVER_CONFIG_SCHEMA_VERSION,
             "model_schema_version": MODEL_SCHEMA_VERSION,
             "device": settings.device,
@@ -341,7 +344,18 @@ def create_app(
             },
             "actions": {
                 "schema_id": ACTION_LAYOUT_SCHEMA_ID,
-                "types": ["place"],
+                "types": ["place", "swap"],
+            },
+            "variants": {
+                "modes": list(MODES),
+                "handicap": {"min": 1, "max": MAX_HANDICAP},
+                "pie": True,
+                "history": "optional",
+                "playout_doubling_advantage": {
+                    "min": -MAX_PLAYOUT_DOUBLING_ADVANTAGE,
+                    "max": MAX_PLAYOUT_DOUBLING_ADVANTAGE,
+                },
+                "swap_dead_zone": settings.search.swap_dead_zone,
             },
             "outcomes": {
                 "classes": ["loss", "win"],

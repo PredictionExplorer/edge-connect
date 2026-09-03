@@ -72,7 +72,7 @@ def server_config(tmp_path, **changes: object) -> ServerConfig:
 
 def request_payload() -> dict[str, object]:
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "rules_hash": RULES_HASH_WIRE,
         "rings": 4,
         "stones": [-1] * get_topology(4).n,
@@ -80,6 +80,18 @@ def request_payload() -> dict[str, object]:
         "moves_left": 1,
         "opening": True,
         "terminal": False,
+        "mode": "double",
+        "handicap": 1,
+        "pie": False,
+        "swap_available": False,
+        "swapped": False,
+        "history": {
+            "current_turn": [],
+            "previous_turn": [],
+            "own_previous_turn": [],
+            "handicap_stones": [],
+        },
+        "pda": 0,
         "search": {"simulations": 4, "max_considered": 2, "seed": 7},
     }
 
@@ -88,7 +100,7 @@ def response_payload() -> dict[str, object]:
     score = [0.0] * (SCORE_MARGIN_MAX - SCORE_MARGIN_MIN + 1)
     score[-SCORE_MARGIN_MIN] = 1.0
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "action": {"code": 0, "kind": "place", "node": 0},
         "root_actions": [
             {"code": 0, "kind": "place", "node": 0},
@@ -100,6 +112,11 @@ def response_payload() -> dict[str, object]:
         "outcome": {"loss": 0.2, "win": 0.8},
         "value": 0.6,
         "search_value": 0.3,
+        "root_value": 0.25,
+        "variant": {"mode": "double", "handicap": 1, "pie": False},
+        "swap_available": False,
+        "swap_recommended": False,
+        "history_known": True,
         "score_belief": {
             "support_min": SCORE_MARGIN_MIN,
             "support_max": SCORE_MARGIN_MAX,
@@ -141,7 +158,7 @@ class FakeService:
         return response_payload()
 
 
-def test_v2_api_health_auth_and_binary_response(tmp_path, monkeypatch) -> None:
+def test_v3_api_health_auth_and_binary_response(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("TEST_STARSERVE_TOKEN", "correct-secret")
     config = server_config(
         tmp_path,
@@ -153,13 +170,23 @@ def test_v2_api_health_auth_and_binary_response(tmp_path, monkeypatch) -> None:
     with TestClient(create_app(config, service=FakeService())) as client:
         health = client.get("/v2/health")
         assert health.status_code == 200
-        assert health.json()["api_schema_version"] == 2
+        assert health.json()["api_schema_version"] == 3
         assert health.json()["server_config_schema_version"] == 2
-        assert health.json()["model_schema_version"] == 2
+        assert health.json()["model_schema_version"] == 3
         assert health.json()["actions"] == {
             "schema_id": ACTION_LAYOUT_SCHEMA_ID,
-            "types": ["place"],
+            "types": ["place", "swap"],
         }
+        assert health.json()["variants"] == {
+            "modes": ["classic", "double"],
+            "handicap": {"min": 1, "max": 9},
+            "pie": True,
+            "history": "optional",
+            "playout_doubling_advantage": {"min": -3, "max": 3},
+            "swap_dead_zone": 0.02,
+        }
+        assert health.json()["rules"]["hash"] == RULES_HASH_WIRE
+        assert health.json()["features"]["version"] == 4
         assert health.json()["outcomes"]["classes"] == ["loss", "win"]
         assert health.json()["device"] == "cpu"
         assert health.json()["model"]["role"] == "champion"
@@ -179,18 +206,21 @@ def test_v2_api_health_auth_and_binary_response(tmp_path, monkeypatch) -> None:
         response = client.post("/v2/analyze", json=request_payload(), headers=headers)
         assert response.status_code == 200
         body = response.json()
-        assert body["schema_version"] == 2
+        assert body["schema_version"] == 3
         assert body["outcome"] == {"loss": 0.2, "win": 0.8}
+        assert body["swap_recommended"] is False
+        assert body["variant"] == {"mode": "double", "handicap": 1, "pie": False}
         assert body["value"] == pytest.approx(0.6)
         assert all(action["kind"] == "place" for action in body["root_actions"])
         assert client.post("/v1/analyze", json=request_payload()).status_code == 404
 
 
 def test_request_rejects_old_schema_pass_fields_and_unsupported_rings() -> None:
-    old = request_payload()
-    old["schema_version"] = 1
-    with pytest.raises(ValidationError):
-        AnalyzeRequest.model_validate(old)
+    for old_version in (1, 2):
+        old = request_payload()
+        old["schema_version"] = old_version
+        with pytest.raises(ValidationError):
+            AnalyzeRequest.model_validate(old)
 
     legacy_action = request_payload()
     legacy_action["pass_streak"] = 0
@@ -558,6 +588,16 @@ class FakeStateBatch:
         to_move,
         moves_left,
         opening,
+        *,
+        mode=None,
+        handicap=None,
+        pie=None,
+        swap_available=None,
+        swapped=None,
+        current_turn_bits=None,
+        previous_turn_bits=None,
+        own_previous_turn_bits=None,
+        handicap_bits=None,
     ):
         nodes = get_topology(rings).n
         occupied = sum(word.bit_count() for word in zero_bits + one_bits)
@@ -568,6 +608,7 @@ class FakeStateBatch:
                 or one_bits[node // 64] & (1 << (node % 64))
             ):
                 legal_words[node // 64] |= 1 << (node % 64)
+        empty_words = [0] * BITBOARD_WORDS
         data = SimpleNamespace(
             rings=rings,
             node_count=nodes,
@@ -582,6 +623,23 @@ class FakeStateBatch:
             opening=opening,
             mid_turn=[not opening[0] and moves_left[0] == 1],
             terminal=[False],
+            mode=mode if mode is not None else [1],
+            handicap=handicap if handicap is not None else [1],
+            pie=pie if pie is not None else [False],
+            swap_available=(swap_available if swap_available is not None else [False]),
+            swapped=swapped if swapped is not None else [False],
+            current_turn_bits=(
+                current_turn_bits if current_turn_bits is not None else empty_words
+            ),
+            previous_turn_bits=(
+                previous_turn_bits if previous_turn_bits is not None else empty_words
+            ),
+            own_previous_turn_bits=(
+                own_previous_turn_bits
+                if own_previous_turn_bits is not None
+                else empty_words
+            ),
+            handicap_bits=(handicap_bits if handicap_bits is not None else empty_words),
         )
         return FakeStateBatch(data)
 
@@ -630,6 +688,7 @@ class FakeSearchBatch:
             visits=[3, 1],
             selected_actions=[0],
             terminal=[False],
+            root_values=[0.05],
         )
 
 
@@ -678,7 +737,7 @@ class FakeManager:
         yield ModelLease(LoadedModel(manifest, FakeEvaluator()), 0.0)
 
 
-def test_native_analysis_imports_v2_state_and_returns_node_only_root(tmp_path) -> None:
+def test_native_analysis_imports_v3_state_and_returns_node_only_root(tmp_path) -> None:
     native = SimpleNamespace(StateBatch=FakeStateBatch, SearchBatch=FakeSearchBatch)
     service = NativeAnalysisService(
         server_config(tmp_path),
@@ -689,7 +748,12 @@ def test_native_analysis_imports_v2_state_and_returns_node_only_root(tmp_path) -
         AnalyzeRequest.model_validate(request_payload()),
         threading.Event(),
     )
-    assert result["schema_version"] == 2
+    assert result["schema_version"] == 3
+    assert result["root_value"] == pytest.approx(0.05)
+    assert result["variant"] == {"mode": "double", "handicap": 1, "pie": False}
+    assert result["swap_available"] is False
+    assert result["swap_recommended"] is False
+    assert result["history_known"] is True
     assert result["action"] == {"code": 0, "kind": "place", "node": 0}
     assert result["root_actions"] == [
         {"code": 0, "kind": "place", "node": 0},
@@ -780,9 +844,90 @@ def test_true_native_server_search_when_available(tmp_path) -> None:
     assert 0 <= result["action"]["code"] < get_topology(4).n
     assert sum(result["root_policy"]) == pytest.approx(1.0)
     assert result["model_version"] == "native-server-v2"
+    assert result["history_known"] is True
+    assert result["swap_available"] is False
+
+    # A pie responder's position: player 1 may swap right after the opening.
+    nodes = get_topology(4).n
+    stones = [-1] * nodes
+    stones[7] = 0
+    pie = {
+        **request_payload(),
+        "stones": stones,
+        "to_move": 1,
+        "moves_left": 2,
+        "opening": False,
+        "pie": True,
+        "swap_available": True,
+        "history": {
+            "current_turn": [],
+            "previous_turn": [7],
+            "own_previous_turn": [],
+            "handicap_stones": [7],
+        },
+        "search": {"simulations": 2, "max_considered": 2, "seed": 5},
+    }
+    result = service.analyze(AnalyzeRequest.model_validate(pie), threading.Event())
+    assert result["variant"] == {"mode": "double", "handicap": 1, "pie": True}
+    assert result["swap_available"] is True
+    assert result["swap_recommended"] == (result["root_value"] < -0.02)
+    assert result["action"]["code"] != 7
+
+    # A handicap opening with an advantage for the side to move and no history.
+    handicap = {
+        **request_payload(),
+        "moves_left": 3,
+        "mode": "classic",
+        "handicap": 3,
+        "history": None,
+        "pda": 2,
+        "search": {"simulations": 2, "max_considered": 2, "seed": 3},
+    }
+    result = service.analyze(AnalyzeRequest.model_validate(handicap), threading.Event())
+    assert result["variant"] == {"mode": "classic", "handicap": 3, "pie": False}
+    assert result["history_known"] is False
+    assert result["swap_available"] is False
+    validated = AnalyzeResponse.model_validate({**result, "request_id": "r"})
+    assert validated.variant.handicap == 3
 
 
-def test_v2_schema_cross_field_validation_is_strict() -> None:
+def test_v3_request_variant_validation_is_strict() -> None:
+    base = request_payload()
+    with pytest.raises(ValidationError, match="pie"):
+        AnalyzeRequest.model_validate({**base, "pie": True, "handicap": 2})
+    with pytest.raises(ValidationError):
+        AnalyzeRequest.model_validate({**base, "mode": "triple"})
+    with pytest.raises(ValidationError):
+        AnalyzeRequest.model_validate({**base, "handicap": 10})
+    with pytest.raises(ValidationError):
+        AnalyzeRequest.model_validate({**base, "pda": 4})
+    with pytest.raises(ValidationError, match="history"):
+        AnalyzeRequest.model_validate(
+            {
+                **base,
+                "history": {
+                    "current_turn": [999],
+                    "previous_turn": [],
+                    "own_previous_turn": [],
+                    "handicap_stones": [],
+                },
+            }
+        )
+    # A swap is available only to player 1 in a pie game after the opening.
+    with pytest.raises(ValidationError):
+        AnalyzeRequest.model_validate({**base, "swap_available": True})
+    response = response_payload()
+    with pytest.raises(ValidationError, match="only be recommended"):
+        AnalyzeResponse.model_validate(
+            {**response, "request_id": "r", "swap_recommended": True}
+        )
+    with pytest.raises(ValidationError, match="pie games"):
+        AnalyzeResponse.model_validate(
+            {**response, "request_id": "r", "swap_available": True}
+        )
+
+
+def test_v3_schema_cross_field_validation_is_strict() -> None:
     request = request_payload()
     request["stones"] = [0] * get_topology(4).n
     with pytest.raises(ValidationError, match="terminal must equal board-full"):

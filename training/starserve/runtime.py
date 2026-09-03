@@ -19,11 +19,12 @@ from startrain.contracts import SCORE_MARGIN_MAX, SCORE_MARGIN_MIN
 from startrain.features import GLOBAL_FEATURE_DIM, NODE_FEATURE_DIM
 from startrain.inference import GraphInferenceAdapter, InferenceConfig
 from startrain.model import GraphResTNet
+from startrain.contracts import MODE_INDEX
 from startrain.native import BITBOARD_WORDS, load_star_native, positions_from_native
 from startrain.training import maybe_compile_model
 
 from .config import ServerConfig
-from .schemas import AnalyzeRequest
+from .schemas import API_SCHEMA_VERSION, AnalyzeRequest
 
 
 class AnalysisError(RuntimeError):
@@ -296,6 +297,13 @@ class NativeAnalysisService:
                 raise SearchCancelled()
             search_started = time.perf_counter()
             evaluator = lease.model.evaluator
+            # The requested advantage belongs to the side to move; the search
+            # feeds the negated value to the opponent's leaves.
+            pda_seats = (
+                (request.pda, -request.pda)
+                if request.to_move == 0
+                else (-request.pda, request.pda)
+            )
             search = self.native.SearchBatch(
                 states,
                 simulations=request.search.simulations,
@@ -303,6 +311,7 @@ class NativeAnalysisService:
                 c_visit=self.config.search.c_visit,
                 c_scale=self.config.search.c_scale,
                 deterministic_seed=request.search.seed,
+                pda_by_seat=[pda_seats],
             )
             roots = search.root_requests()
             if len(roots) != 1:
@@ -344,6 +353,8 @@ class NativeAnalysisService:
                 search_ms=search_ms,
                 total_ms=(time.perf_counter() - started) * 1_000.0,
                 node_count=len(request.stones),
+                request=request,
+                swap_dead_zone=self.config.search.swap_dead_zone,
             )
         return payload
 
@@ -357,6 +368,18 @@ class NativeAnalysisService:
                 "native_incompatible",
                 "star_native lacks StateBatch.from_semantic",
             )
+        node_count = len(request.stones)
+        history = request.history
+        if history is not None:
+            current, previous, own_previous, handicap = history.node_sets()
+            history_words = {
+                "current_turn_bits": _pack_nodes(current, node_count),
+                "previous_turn_bits": _pack_nodes(previous, node_count),
+                "own_previous_turn_bits": _pack_nodes(own_previous, node_count),
+                "handicap_bits": _pack_nodes(handicap, node_count),
+            }
+        else:
+            history_words = {}
         try:
             states: Any = importer(
                 request.rings,
@@ -365,8 +388,18 @@ class NativeAnalysisService:
                 [request.to_move],
                 [request.moves_left],
                 [request.opening],
+                mode=[MODE_INDEX[request.mode]],
+                handicap=[request.handicap],
+                pie=[request.pie],
+                swap_available=[request.swap_available],
+                swapped=[request.swapped],
+                **history_words,
             )
-            imported = positions_from_native(states.data())
+            imported = positions_from_native(
+                states.data(),
+                history_known=history is not None,
+                pda=[request.pda],
+            )
         except (TypeError, ValueError) as exc:
             raise AnalysisError(
                 "invalid_semantic_state",
@@ -381,12 +414,22 @@ class NativeAnalysisService:
                 status_code=422,
             )
         position = imported[0]
+        expected = request.position()
         if (
             position.rings != request.rings
             or position.stones.tolist() != request.stones
             or position.to_move != request.to_move
             or position.moves_left != request.moves_left
             or position.opening != request.opening
+            or position.mode != request.mode
+            or position.handicap != request.handicap
+            or position.pie != request.pie
+            or position.swap_available != request.swap_available
+            or position.swapped != request.swapped
+            or (
+                history is not None
+                and not torch.equal(position.history_flags(), expected.history_flags())
+            )
         ):
             raise AnalysisError(
                 "native_incompatible",
@@ -404,6 +447,8 @@ class NativeAnalysisService:
         search_ms: float,
         total_ms: float,
         node_count: int,
+        request: AnalyzeRequest | None = None,
+        swap_dead_zone: float = 0.02,
     ) -> dict[str, object]:
         offsets = [int(value) for value in results.action_offsets]
         actions = [int(value) for value in results.actions]
@@ -459,6 +504,18 @@ class NativeAnalysisService:
                 "model_output_error",
                 "root belief support has an invalid shape",
             )
+        raw_root_values = getattr(results, "root_values", None)
+        root_values = (
+            [float(value) for value in raw_root_values]
+            if raw_root_values is not None
+            else [detailed.response.values[0]]
+        )
+        if len(root_values) != 1 or not math.isfinite(root_values[0]):
+            raise AnalysisError(
+                "native_search_error",
+                "native root value is malformed",
+            )
+        root_value = max(-1.0, min(1.0, root_values[0]))
         beliefs = [*outcome, *scores]
         values = [
             detailed.outcome_values[0],
@@ -477,8 +534,9 @@ class NativeAnalysisService:
                 "model_output_error",
                 "root model beliefs contain invalid probabilities or values",
             )
+        swap_available = bool(request.swap_available) if request is not None else False
         return {
-            "schema_version": 2,
+            "schema_version": API_SCHEMA_VERSION,
             "action": _action_payload(selected[0]),
             "root_actions": [_action_payload(action) for action in actions],
             "root_policy": policy,
@@ -487,6 +545,17 @@ class NativeAnalysisService:
             "outcome": {"loss": outcome[0], "win": outcome[1]},
             "value": detailed.outcome_values[0],
             "search_value": detailed.response.values[0],
+            "root_value": root_value,
+            "variant": {
+                "mode": request.mode if request is not None else "double",
+                "handicap": request.handicap if request is not None else 1,
+                "pie": bool(request.pie) if request is not None else False,
+            },
+            "swap_available": swap_available,
+            "swap_recommended": swap_available and root_value < -swap_dead_zone,
+            "history_known": request.history is not None
+            if request is not None
+            else False,
             "score_belief": {
                 "support_min": SCORE_MARGIN_MIN,
                 "support_max": SCORE_MARGIN_MAX,
@@ -509,6 +578,15 @@ def _pack_stones(stones: Sequence[int], *, player: int) -> list[int]:
     for node, stone in enumerate(stones):
         if stone == player:
             words[node // 64] |= 1 << (node % 64)
+    return words
+
+
+def _pack_nodes(nodes: Sequence[int], node_count: int) -> list[int]:
+    words = [0] * BITBOARD_WORDS
+    for node in nodes:
+        if not 0 <= node < node_count:
+            raise ValueError("history node is off the board")
+        words[node // 64] |= 1 << (node % 64)
     return words
 
 
