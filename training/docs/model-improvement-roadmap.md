@@ -457,11 +457,49 @@ Statistical gate: judged over the next four to six candidates at 256
   1.5e-4/UTD-1.0 candidates; abort back to UTD 1.0 by migration if training
   loss diverges from the 1.5e-4 trend (mean total loss above 3.55 for two
   consecutive hours) or two consecutive candidates conclude below -30 Elo
-Result: first minutes: learner heartbeat target 1.5, segment ratio 1.42 and
-  rising toward 1.5 after a twelve-minute wait for samples past the new
-  baseline, then 7,900 steps per hour spending the accumulated allowance;
-  first disaster snapshot after cutover (02:12 UTC) verified with the new
-  segment; steady-state rate and candidate evidence pending
+Result: system gates pass at the two-hour check (04:10 UTC): learner 4,181
+  steps per hour (02:40-04:10) versus 2,601 under UTD 1.0 at the same rate,
+  segment ratio 1.495, mean total loss 3.363 versus 3.393 (policy 1.305 versus
+  1.331, gradient norm 9.0 versus 8.6), candidate cadence 1.5-2.0 hours,
+  actors ~315 samples per second, nine verified snapshots in two hours, no
+  failed units. Candidate evidence pending: 793,770 (trained before the
+  change) at +15.6 after 800 games; the first UTD-1.5 candidate is 799,630
+Decision: pending
+```
+
+```text
+ID: R10-ANNEAL-HOVER-05
+Phase: 1 — training dynamics / plateau policy
+Status: implemented and tested; in-place migration scheduled for the arena
+  boundary after candidate 793,770's terminal verdict
+Hypothesis: the annealed learner produces candidates that are really about
+  +15 Elo above champion 742,979 at 256 simulations (782,049 +13.3, 785,956
+  +18.5, 793,770 +15.6 at 800 games) but the gate cannot conclude a +15 effect
+  in 1,200 games (about 4,000 games would be needed at this error level), so
+  every verdict is reject_max_pairs, which neither promotes nor, under the
+  conclusive-only rule, advances the anneal; the learning rate would sit at
+  1.5e-4 indefinitely. Counting terminal non-promotions toward the stage
+  streak lets the anneal reach 7.5e-5, where the deeper anneal is expected to
+  lift candidates toward the +35 the gate can conclude
+Commit: recorded at migration
+Release: recorded at migration
+Control: R10-UTD-04 runtime (conclusive-only streak)
+Treatment: orchestration.plateau.count_inconclusive_rejections true; the
+  arena's all-terminal streak already stands at 2 since the 19:37 recovery,
+  so the second stage (multiplier 0.25, Muon 7.5e-5) fires on the first
+  terminal non-promotion after cutover
+Anchor/replay cutoff: none; in place with migrate_continuous_profile.py
+Seeds: 17 (production continuation)
+Budget: continuous
+System gates: plateau_recovery event with multiplier 0.25 within minutes of
+  cutover; learner keeps training; training loss falls further below 3.36
+  within two hours; disaster snapshots keep verifying
+Statistical gate: candidates trained under 7.5e-5 (published from about two
+  hours after the stage) versus champion 742,979 at 256 simulations compared
+  with the +13/+18/+15 hover; success is the first promotion; abort back to
+  the conclusive-only rule if two consecutive 7.5e-5 candidates conclude
+  below the 1.5e-4 candidates
+Result: pending
 Decision: pending
 ```
 
@@ -507,6 +545,21 @@ example candidate-publication treatment. The completed optimizer, EMA,
 freshness, and clinch screen had no promoted frontier gain, so those arms are
 excluded. Backlog relief is necessary but insufficient: the treatment must also
 pass the standard pair-valid Elo/hour gates.
+
+### 2026-09-03 — Let budget exhaustion advance the anneal
+
+Decision: three consecutive annealed candidates ended `reject_max_pairs` at
++13, +18, and +15 Elo. That is real progress the 1,200-game gate cannot
+conclude against a +35 alternative (detecting +15 needs roughly 4,000 games),
+and under the conclusive-only rule from R10-LR-RECOVERY-01 it advances nothing:
+no promotion, no stage, rate frozen at 1.5e-4. The conclusive-only rule was
+written to stop inconclusive verdicts from triggering weight resets and
+compounding cuts; with keep-weights, the floor, and restore-on-promotion, an
+extra stage is bounded and reversible, so add
+`plateau.count_inconclusive_rejections` (default off) and enable it for this run.
+Do not lower `arena.alternative_elo` instead: the information in 1,200 games
+cannot conclude a +15 effect at any alternative, so that would only weaken the
+gate without ending the hover.
 
 ### 2026-09-02 — Use the idle learner: update-to-data 1.5
 

@@ -437,12 +437,20 @@ learner records next to the reference in every checkpoint
   and floor 0.25: reference, half, quarter) and then rests at the floor. The
   multiplier is always applied to the reference, never to rates saved inside a
   checkpoint, so nothing carries across champions.
-- Only *conclusive* rejections (`reject`, `reject_ring_regression`) count toward
-  `consecutive_terminal_rejections`. A candidate that merely exhausts its pair
-  budget (`reject_max_pairs`) is terminal but inconclusive and never lowers the
-  rate or clears optimizer moments. The arena writes `conclusive` and
-  `consecutive_conclusive_rejections` into `promotion-status.json`; each applied
-  stage resets the counter, so the next stage needs a fresh streak.
+- By default only *conclusive* rejections (`reject`, `reject_ring_regression`)
+  count toward `consecutive_terminal_rejections`. A candidate that merely
+  exhausts its pair budget (`reject_max_pairs`) is terminal but inconclusive and
+  then never lowers the rate or clears optimizer moments. The arena writes
+  `conclusive`, `consecutive_conclusive_rejections`, and the all-terminal
+  `consecutive_terminal_rejections` into `promotion-status.json`; each applied
+  stage resets the counters, so the next stage needs a fresh streak.
+- `count_inconclusive_rejections: true` lets budget exhaustion advance the
+  streak as well. Use it when candidates hover below the promotion bar: on the
+  production run three consecutive annealed candidates ended `reject_max_pairs`
+  at +13, +18, and +15 Elo against a +35 alternative, which is real progress
+  the gate cannot conclude in 1,200 games and, under the default rule, neither
+  a promotion nor a stage. With the floor and restore-on-promotion in place an
+  extra stage is a bounded, reversible cost.
 - Under `reduce_lr_keep_weights` the champion lag never gates or pauses the
   learner: weights are never rewound, so idling while the arena works would only
   waste learner time, and the lag grows without bound between promotions. The

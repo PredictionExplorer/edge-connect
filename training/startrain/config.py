@@ -790,6 +790,11 @@ class PlateauConfig:
     # Restore the reference rates once a recovery segment produces a promotion.
     restore_scale_on_promotion: bool = True
     clear_optimizer_state_on_recovery: bool = True
+    # Let terminal non-promotions that merely exhausted the arena budget
+    # (reject_max_pairs) advance the recovery streak too. With rates floored and
+    # restored on promotion this cannot compound, and it keeps a candidate that
+    # hovers below the promotion bar from freezing the anneal indefinitely.
+    count_inconclusive_rejections: bool = False
     poll_seconds: float = 10.0
 
     def __post_init__(self) -> None:
@@ -797,6 +802,7 @@ class PlateauConfig:
             type(self.enabled) is not bool
             or type(self.clear_optimizer_state_on_recovery) is not bool
             or type(self.restore_scale_on_promotion) is not bool
+            or type(self.count_inconclusive_rejections) is not bool
         ):
             raise ConfigError("plateau booleans must be boolean")
         if (

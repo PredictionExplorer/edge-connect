@@ -582,6 +582,15 @@ def test_continuous_validator_requires_non_compounding_plateau_recovery() -> Non
         PlateauConfig(minimum_learning_rate_scale=0.0)
     with pytest.raises(ConfigError, match="plateau booleans"):
         PlateauConfig(restore_scale_on_promotion="yes")  # type: ignore[arg-type]
+    with pytest.raises(ConfigError, match="plateau booleans"):
+        PlateauConfig(count_inconclusive_rejections=1)  # type: ignore[arg-type]
+    assert PlateauConfig().count_inconclusive_rejections is False
+    validate_continuous_config(
+        with_plateau(
+            action="reduce_lr_keep_weights",
+            count_inconclusive_rejections=True,
+        )
+    )
 
 
 def test_plateau_candidate_cadence_fits_replay_lag() -> None:

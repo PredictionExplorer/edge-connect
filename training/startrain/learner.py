@@ -4082,14 +4082,19 @@ class LearnerLoop:
     @staticmethod
     def _promotion_status_rejection(
         status: Mapping[str, object],
+        *,
+        count_inconclusive: bool = False,
     ) -> tuple[bool, int]:
-        """Return (terminal rejection, conclusive rejection streak).
+        """Return (terminal rejection, rejection streak).
 
         ``reject_max_pairs`` is a terminal but inconclusive outcome: the arena
         exhausted its budget without evidence either way. It still releases the
-        replay-lag cap, but only conclusive rejections accumulate toward the
-        learning-rate reduction streak. Status files written before the arena
-        recorded conclusiveness fall back to the legacy terminal streak.
+        replay-lag cap, but by default only conclusive rejections accumulate
+        toward the learning-rate reduction streak. With ``count_inconclusive``
+        every terminal non-promotion counts, so a candidate that keeps ending
+        below the promotion bar still advances the anneal. Status files written
+        before the arena recorded conclusiveness fall back to the terminal
+        streak.
         """
 
         decision = status.get("decision")
@@ -4098,10 +4103,13 @@ class LearnerLoop:
             "reject_ring_regression",
             "reject_max_pairs",
         )
-        raw_streak = status.get(
-            "consecutive_conclusive_rejections",
-            status.get("consecutive_terminal_rejections", 0),
-        )
+        if count_inconclusive:
+            raw_streak = status.get("consecutive_terminal_rejections", 0)
+        else:
+            raw_streak = status.get(
+                "consecutive_conclusive_rejections",
+                status.get("consecutive_terminal_rejections", 0),
+            )
         streak = (
             raw_streak
             if isinstance(raw_streak, int) and not isinstance(raw_streak, bool)
@@ -4147,7 +4155,10 @@ class LearnerLoop:
             candidate is not None
             and status.get("candidate_identity") == candidate.model_identity
         )
-        terminal_rejection, streak = self._promotion_status_rejection(status)
+        terminal_rejection, streak = self._promotion_status_rejection(
+            status,
+            count_inconclusive=configured.count_inconclusive_rejections,
+        )
         reset_token = (
             champion.model_identity,
             candidate.model_identity if candidate is not None else "",

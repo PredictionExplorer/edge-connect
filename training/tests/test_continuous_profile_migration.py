@@ -817,6 +817,22 @@ def test_removing_update_to_data_control_is_rejected(tmp_path: Path) -> None:
         migration.migrate_continuous_profile(fixture.request)
 
 
+def test_plateau_inconclusive_counting_is_migratable(tmp_path: Path) -> None:
+    fixture = _fixture(tmp_path)
+    target = yaml.safe_load(fixture.candidate_profile.read_text(encoding="utf-8"))
+    target["orchestration"]["plateau"]["count_inconclusive_rejections"] = True
+    fixture.candidate_profile.write_text(
+        yaml.safe_dump(target, sort_keys=False),
+        encoding="utf-8",
+    )
+
+    result = migration.migrate_continuous_profile(fixture.request)
+
+    assert "orchestration.plateau.count_inconclusive_rejections" in {
+        change["path"] for change in result["changes"]
+    }
+
+
 def test_incomplete_replay_history_is_rejected(tmp_path: Path) -> None:
     fixture = _fixture(tmp_path)
     with sqlite3.connect(fixture.root / "replay" / "manifest.sqlite3") as connection:

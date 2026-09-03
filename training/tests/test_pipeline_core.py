@@ -3525,6 +3525,24 @@ def test_keep_weights_plateau_policy_ignores_champion_lag(
     )
     assert learner._rank_zero_plateau_action(configured)["kind"] == "recover"
 
+    # Opting in lets budget exhaustion advance the streak: a candidate that
+    # keeps ending below the promotion bar no longer freezes the anneal.
+    counting = replace(configured, count_inconclusive_rejections=True)
+    status(consecutive_terminal_rejections=1, consecutive_conclusive_rejections=0)
+    assert learner._rank_zero_plateau_action(counting) == {"kind": "proceed"}
+    status(consecutive_terminal_rejections=2, consecutive_conclusive_rejections=0)
+    action = learner._rank_zero_plateau_action(counting)
+    assert action["kind"] == "recover"
+    assert action["reset_reason"] == "terminal_rejection_streak"
+    assert learner._rank_zero_plateau_action(configured) == {"kind": "proceed"}
+    status(
+        decision="continue",
+        terminal=False,
+        consecutive_terminal_rejections=2,
+        consecutive_conclusive_rejections=0,
+    )
+    assert learner._rank_zero_plateau_action(counting) == {"kind": "proceed"}
+
 
 def test_reset_from_champion_plateau_policy_keeps_lag_gating(
     tmp_path, monkeypatch

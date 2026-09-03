@@ -56,6 +56,7 @@ _ALLOWED_PROFILE_PATHS = {
     ("learner", "selfplay_snapshot_interval_examples"),
     ("learner", "selfplay_snapshot_warmup_interval_examples"),
     ("orchestration", "plateau", "max_learner_champion_lag_steps"),
+    ("orchestration", "plateau", "count_inconclusive_rejections"),
     ("orchestration", "promotion", "finish_inflight_candidate"),
     ("arena", "continuation_pairs_per_ring"),
     # Promotion-gate budget and the measurement crossplay that keeps the Elo
