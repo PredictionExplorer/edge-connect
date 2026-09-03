@@ -14,11 +14,11 @@ from .device import (
     generate_auto_topology,
     resolve_device_string,
 )
-from .contracts import MAX_HANDICAP, MODES
+from .contracts import MAX_HANDICAP, MODES, SEGMENTS
 from .losses import LossWeights
 from .model import ModelConfig
 from .optim import OptimizerConfig
-from .selfplay import SelfPlayConfig
+from .selfplay import SelfPlayConfig, VariantMixtureConfig
 from .topology import SUPPORTED_RINGS
 
 CONFIG_SCHEMA_VERSION = 4
@@ -252,12 +252,39 @@ class LearnerConfig:
     replay_wait_timeout_seconds: float = 0.0
     resume_latest: bool = True
     device: str = "cpu"
+    # Target share of each mixture segment inside every ring's replay window.
+    # ``None`` selects the most recent samples regardless of variant; the
+    # loader fills it from ``selfplay.variants`` when the mixture is enabled.
+    segment_quotas: dict[str, float] | None = None
 
     def __post_init__(self) -> None:
         if type(self.unlimited) is not bool:
             raise ConfigError("unlimited must be boolean")
         if type(self.use_ring_mixture_curriculum) is not bool:
             raise ConfigError("use_ring_mixture_curriculum must be boolean")
+        if self.segment_quotas is not None:
+            if not isinstance(self.segment_quotas, dict) or not self.segment_quotas:
+                raise ConfigError("segment_quotas must be a non-empty mapping")
+            for segment, fraction in self.segment_quotas.items():
+                if segment not in SEGMENTS:
+                    raise ConfigError(f"unknown replay segment {segment!r}")
+                if (
+                    isinstance(fraction, bool)
+                    or not isinstance(fraction, int | float)
+                    or not math.isfinite(float(fraction))
+                    or float(fraction) < 0
+                ):
+                    raise ConfigError("segment_quotas fractions must be non-negative")
+            if sum(float(value) for value in self.segment_quotas.values()) <= 0:
+                raise ConfigError("segment_quotas must contain a positive fraction")
+            object.__setattr__(
+                self,
+                "segment_quotas",
+                {
+                    segment: float(fraction)
+                    for segment, fraction in self.segment_quotas.items()
+                },
+            )
         if type(self.resume_latest) is not bool:
             raise ConfigError("resume_latest must be boolean")
         values = (
@@ -1263,6 +1290,7 @@ class ExperimentConfig:
             raise ConfigError("experiment profile is invalid")
         if self.profile == "continuous" and not self.orchestration.enabled:
             raise ConfigError("continuous profile requires orchestration")
+        self._validate_variant_family()
         if self.orchestration.training_objective == "ring10_only":
             stages = tuple(
                 (stage.from_step, tuple(float(weight) for weight in stage.weights))
@@ -1329,6 +1357,46 @@ class ExperimentConfig:
                     "plateau lag must allow every reset-triggering candidate"
                 )
 
+    def _validate_variant_family(self) -> None:
+        """Self-play may only draw variants the game family admits."""
+
+        family = self.game.variants
+        mixture = self.selfplay.variants
+        default_variant = (
+            self.selfplay.mode,
+            self.selfplay.handicap,
+            self.selfplay.pie,
+        )
+        if default_variant != (self.game.mode, self.game.handicap, self.game.pie_rule):
+            raise ConfigError(
+                "selfplay mode/handicap/pie must equal the game's standard variant"
+            )
+        if not mixture.enabled:
+            return
+        if mixture.classic > 0 and "classic" not in family.modes:
+            raise ConfigError(
+                "selfplay.variants draws classic games the family excludes"
+            )
+        if mixture.standard > 0 and "double" not in family.modes:
+            raise ConfigError(
+                "selfplay.variants draws double games the family excludes"
+            )
+        if mixture.pie > 0 and not family.pie_allowed:
+            raise ConfigError("selfplay.variants draws pie games the family excludes")
+        if mixture.pie > 0 and (
+            (mixture.pie_classic_share > 0 and "classic" not in family.modes)
+            or (mixture.pie_classic_share < 1 and "double" not in family.modes)
+        ):
+            raise ConfigError("selfplay.variants pie modes fall outside the family")
+        if mixture.handicap > 0 and (
+            mixture.handicap_min < family.handicap_min
+            or mixture.handicap_max > family.handicap_max
+            or "double" not in family.modes
+        ):
+            raise ConfigError(
+                "selfplay.variants handicap range falls outside the game family"
+            )
+
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
 
@@ -1350,6 +1418,28 @@ def _mapping(name: str, values: object) -> dict[str, Any]:
     if not isinstance(values, dict):
         raise ConfigError(f"{name} must be a mapping")
     return dict(values)
+
+
+def _normalize_selfplay(values: object) -> dict[str, Any]:
+    """Build the nested variant mixture from its YAML mapping."""
+
+    output = _mapping("selfplay", values)
+    raw_variants = output.get("variants")
+    if raw_variants is None:
+        return output
+    variants = _mapping("selfplay.variants", raw_variants)
+    for name in ("handicap_pda", "pda_magnitudes"):
+        if name in variants:
+            if not isinstance(variants[name], list | tuple):
+                raise ConfigError(f"selfplay.variants.{name} must be a list")
+            variants[name] = tuple(variants[name])
+    if "score_utility_weight_by_segment" in variants:
+        variants["score_utility_weight_by_segment"] = _mapping(
+            "selfplay.variants.score_utility_weight_by_segment",
+            variants["score_utility_weight_by_segment"],
+        )
+    output["variants"] = _construct(VariantMixtureConfig, variants)
+    return output
 
 
 def _curriculum_values(values: object) -> dict[str, Any]:
@@ -1504,6 +1594,14 @@ def load_config(path: str | Path) -> ExperimentConfig:
     learner_values = _mapping("learner", raw["learner"])
     if learner_values.get("device") == "auto":
         learner_values["device"] = host.resolve("auto")
+    selfplay_values = _normalize_selfplay(raw["selfplay"])
+    mixture = selfplay_values.get("variants")
+    if (
+        learner_values.get("segment_quotas") is None
+        and isinstance(mixture, VariantMixtureConfig)
+        and mixture.enabled
+    ):
+        learner_values["segment_quotas"] = dict(mixture.segment_fractions)
     arena_values = _mapping("arena", raw.get("arena", {}))
     arena_values["rings"] = tuple(arena_values.get("rings", SUPPORTED_RINGS))
     arena_values["per_ring_regression_floor_elo"] = {
@@ -1536,7 +1634,7 @@ def load_config(path: str | Path) -> ExperimentConfig:
         optimizer=_construct(OptimizerConfig, optimizer_values),
         train=_construct(TrainConfig, train_values),
         data=_construct(DataConfig, raw["data"]),
-        selfplay=_construct(SelfPlayConfig, raw["selfplay"]),
+        selfplay=_construct(SelfPlayConfig, selfplay_values),
         learner=_construct(LearnerConfig, learner_values),
         orchestration=_construct(OrchestrationConfig, orchestration_values),
         arena=_construct(ArenaConfig, arena_values),

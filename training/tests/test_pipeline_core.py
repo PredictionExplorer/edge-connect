@@ -7,7 +7,7 @@ import pickle
 import subprocess
 import sys
 import textwrap
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -108,6 +108,11 @@ class FakeStateData:
     opening: list[bool]
     mid_turn: list[bool]
     terminal: list[bool]
+    swap_available: list[bool] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        if not self.swap_available:
+            self.swap_available = [False] * self.batch_size
 
 
 def state_data(positions: list[DoubleStarPosition]) -> FakeStateData:
@@ -3746,9 +3751,19 @@ def test_ddp_replay_selection_metadata_is_broadcast_from_rank_zero(
 
 
 class OneMoveStateBatch:
-    def __init__(self, rings: int, batch_size: int) -> None:
+    def __init__(
+        self,
+        rings: int,
+        batch_size: int,
+        *,
+        mode: str = "double",
+        handicap: int = 1,
+        pie: bool = False,
+    ) -> None:
         assert rings == 4 and batch_size == 1
+        assert (mode, handicap, pie) == ("double", 1, False)
         topology = get_topology(rings)
+        self.node_count = topology.n
         stones = torch.zeros(topology.n, dtype=torch.int8)
         stones[-1] = -1
         self.position = DoubleStarPosition(
@@ -3854,6 +3869,7 @@ class OneMoveSearchBatch:
             q_values=[1.0],
             priors=[1.0],
             policy_target=[1.0],
+            root_values=[1.0],
         )
 
 

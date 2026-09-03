@@ -10,14 +10,20 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator, Sequence
+from typing import Iterator, Mapping, Sequence
 
-from .contracts import FEATURE_SCHEMA_HASH, RULES_HASH, RULES_HASH_WIRE
+from .contracts import (
+    FEATURE_SCHEMA_HASH,
+    RULES_HASH,
+    RULES_HASH_WIRE,
+    SEGMENT_STANDARD,
+    SEGMENTS,
+)
 from .replay import ReplaySample, read_replay_shard, write_replay_shard
 from .runtime import RunIdentity, atomic_json, validate_identifier
 from .topology import SUPPORTED_RINGS, get_topology
 
-MANIFEST_SCHEMA_VERSION = 4
+MANIFEST_SCHEMA_VERSION = 5
 
 
 def _validated_rings(rings: Sequence[int]) -> tuple[int, ...]:
@@ -30,6 +36,21 @@ def _validated_rings(rings: Sequence[int]) -> tuple[int, ...]:
         raise ValueError("rings must be a non-empty unique sequence of integers")
     for ring in requested:
         get_topology(ring)
+    return requested
+
+
+def _validated_segments(segments: Sequence[str]) -> tuple[str, ...]:
+    requested = tuple(segments)
+    if (
+        not requested
+        or any(
+            type(segment) is not str or segment not in SEGMENTS for segment in requested
+        )
+        or len(set(requested)) != len(requested)
+    ):
+        raise ValueError(
+            "segments must be a non-empty unique subset of " + ", ".join(SEGMENTS)
+        )
     return requested
 
 
@@ -65,6 +86,9 @@ class ShardRecord:
     checksum_sha256: str
     state: str
     quarantine_reason: str | None
+    # Rules-v3 variant of every sample in the shard and its mixture segment.
+    variant: str = "double"
+    segment: str = SEGMENT_STANDARD
 
 
 @dataclass(frozen=True, slots=True)
@@ -80,6 +104,7 @@ class ReplaySelection:
     samples_by_ring: dict[int, int]
     max_shard_id: int
     minimum_shard_id_exclusive: int | None = None
+    samples_by_segment: dict[str, int] | None = None
 
     def __post_init__(self) -> None:
         _validated_optional_shard_id(
@@ -303,10 +328,14 @@ class ReplayStore:
                 quarantine_reason TEXT,
                 rules_hash TEXT NOT NULL,
                 feature_schema_hash TEXT NOT NULL,
-                checksum_sha256 TEXT NOT NULL
+                checksum_sha256 TEXT NOT NULL,
+                variant TEXT NOT NULL DEFAULT 'double',
+                segment TEXT NOT NULL DEFAULT 'standard'
             );
             CREATE INDEX IF NOT EXISTS shards_ring_created
                 ON shards(ring, created_ns DESC);
+            CREATE INDEX IF NOT EXISTS shards_ring_segment_created
+                ON shards(ring, segment, created_ns DESC);
             CREATE INDEX IF NOT EXISTS shards_model_step
                 ON shards(model_step DESC);
             CREATE INDEX IF NOT EXISTS shards_eligibility
@@ -725,6 +754,11 @@ class ReplayStore:
         rings = {sample.rings for sample in samples}
         if len(rings) != 1:
             raise ValueError("replay shards must be ring-homogeneous")
+        variants = {sample.variant_label for sample in samples}
+        if len(variants) != 1:
+            raise ValueError("replay shards must be variant-homogeneous")
+        variant = next(iter(variants))
+        segment = samples[0].segment
         if phase_min < 0 or phase_max < phase_min:
             raise ValueError("invalid phase range")
         if not model_version:
@@ -811,8 +845,9 @@ class ReplayStore:
                     phase_min, phase_max, model_version, model_step,
                     model_identity, run_id, generation_family, actor_id,
                     generation, game_count,
-                    rules_hash, feature_schema_hash, checksum_sha256
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    rules_hash, feature_schema_hash, checksum_sha256,
+                    variant, segment
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     str(destination.relative_to(self.root)),
@@ -832,6 +867,8 @@ class ReplayStore:
                     f"{RULES_HASH:016x}",
                     f"{FEATURE_SCHEMA_HASH:016x}",
                     checksum,
+                    variant,
+                    segment,
                 ),
             )
             if cursor.lastrowid is None:
@@ -899,6 +936,8 @@ class ReplayStore:
             checksum_sha256=checksum,
             state="ready",
             quarantine_reason=None,
+            variant=variant,
+            segment=segment,
         )
 
     def recent_shards(
@@ -908,6 +947,7 @@ class ReplayStore:
         run_id: str,
         generation_family: str,
         rings: Sequence[int] | None = None,
+        segments: Sequence[str] | None = None,
         current_model_step: int | None = None,
         max_model_lag_steps: int | None = None,
         minimum_shard_id_exclusive: int | None = None,
@@ -937,6 +977,11 @@ class ReplayStore:
             placeholders = ",".join("?" for _ in requested)
             clauses.append(f"ring IN ({placeholders})")
             parameters.extend(requested)
+        if segments is not None:
+            requested_segments = _validated_segments(segments)
+            placeholders = ",".join("?" for _ in requested_segments)
+            clauses.append(f"segment IN ({placeholders})")
+            parameters.extend(requested_segments)
         if max_model_lag_steps is not None:
             if current_model_step is None or max_model_lag_steps < 0:
                 raise ValueError(
@@ -1246,6 +1291,61 @@ class ReplayStore:
             counts[int(row["ring"])] = int(row["samples"])
         return counts
 
+    def eligible_sample_counts_by_segment(
+        self,
+        rings: Sequence[int],
+        *,
+        run_id: str,
+        generation_family: str,
+        current_model_step: int,
+        max_model_lag_steps: int,
+        minimum_shard_id_exclusive: int | None = None,
+    ) -> dict[tuple[int, str], int]:
+        """Eligible samples per (ring, segment); absent pairs report zero."""
+
+        requested = _validated_rings(rings)
+        minimum_shard_id_exclusive = _validated_optional_shard_id(
+            "minimum_shard_id_exclusive",
+            minimum_shard_id_exclusive,
+        )
+        lower = max(0, current_model_step - max_model_lag_steps)
+        placeholders = ",".join("?" for _ in requested)
+        cutoff_clause = "AND id > ?" if minimum_shard_id_exclusive is not None else ""
+        cutoff_parameters = (
+            (minimum_shard_id_exclusive,)
+            if minimum_shard_id_exclusive is not None
+            else ()
+        )
+        rows = self.connection.execute(
+            f"""
+            SELECT ring, segment, COALESCE(SUM(sample_count), 0) AS samples
+            FROM shards
+            WHERE rules_hash = ?
+              AND feature_schema_hash = ?
+              AND state = 'ready'
+              AND run_id = ?
+              AND generation_family = ?
+              AND model_step BETWEEN ? AND ?
+              {cutoff_clause}
+              AND ring IN ({placeholders})
+            GROUP BY ring, segment
+            """,
+            (
+                f"{RULES_HASH:016x}",
+                f"{FEATURE_SCHEMA_HASH:016x}",
+                validate_identifier("run_id", run_id),
+                validate_identifier("generation_family", generation_family),
+                lower,
+                current_model_step,
+                *cutoff_parameters,
+                *requested,
+            ),
+        )
+        counts = {(ring, segment): 0 for ring in requested for segment in SEGMENTS}
+        for row in rows:
+            counts[(int(row["ring"]), str(row["segment"]))] = int(row["samples"])
+        return counts
+
     def select_recent_spans(
         self,
         *,
@@ -1256,7 +1356,17 @@ class ReplayStore:
         current_model_step: int,
         max_model_lag_steps: int,
         minimum_shard_id_exclusive: int | None = None,
+        segment_quotas: Mapping[str, float] | None = None,
     ) -> ReplaySelection:
+        """Select the most recent samples per ring, optionally stratified by segment.
+
+        ``segment_quotas`` maps mixture segments to target fractions of each
+        ring's quota. A segment with fewer eligible samples than its share
+        yields what it has and the shortfall is redistributed to the other
+        segments in proportion to their targets, so the window always fills
+        when any segment has enough data.
+        """
+
         if per_ring_quota <= 0:
             raise ValueError("per_ring_quota must be positive")
         requested = _validated_rings(rings)
@@ -1264,6 +1374,18 @@ class ReplayStore:
             "minimum_shard_id_exclusive",
             minimum_shard_id_exclusive,
         )
+        fractions: dict[str, float] | None = None
+        if segment_quotas is not None:
+            fractions = {
+                segment: float(fraction)
+                for segment, fraction in segment_quotas.items()
+                if float(fraction) > 0
+            }
+            _validated_segments(tuple(fractions))
+            total = sum(fractions.values())
+            if total <= 0:
+                raise ValueError("segment quotas must contain a positive fraction")
+            fractions = {segment: value / total for segment, value in fractions.items()}
         cutoff_clause = "AND id > ?" if minimum_shard_id_exclusive is not None else ""
         cutoff_parameters = (
             (minimum_shard_id_exclusive,)
@@ -1290,18 +1412,25 @@ class ReplayStore:
         maximum_shard_id = int(row["max_id"])
         spans: list[ReplaySpan] = []
         counts: dict[int, int] = {}
-        for ring in requested:
+        segment_counts: dict[str, int] = {segment: 0 for segment in SEGMENTS}
+
+        def take_recent(
+            ring: int, quota: int, segments: tuple[str, ...] | None
+        ) -> list[ReplaySpan]:
+            if quota <= 0:
+                return []
             records = self.recent_shards(
-                sample_window=per_ring_quota,
+                sample_window=quota,
                 run_id=run_id,
                 generation_family=generation_family,
                 rings=(ring,),
+                segments=segments,
                 current_model_step=current_model_step,
                 max_model_lag_steps=max_model_lag_steps,
                 minimum_shard_id_exclusive=minimum_shard_id_exclusive,
                 maximum_shard_id=maximum_shard_id,
             )
-            remaining = per_ring_quota
+            remaining = quota
             selected: list[ReplaySpan] = []
             for record in reversed(records):
                 take = min(record.sample_count, remaining)
@@ -1316,14 +1445,65 @@ class ReplayStore:
                 )
                 remaining -= take
             selected.reverse()
+            return selected
+
+        for ring in requested:
+            if fractions is None:
+                selected = take_recent(ring, per_ring_quota, None)
+            else:
+                # First pass: each segment takes its share. Second pass: the
+                # shortfall is offered to the segments that still have data.
+                targets = {
+                    segment: int(round(per_ring_quota * fraction))
+                    for segment, fraction in fractions.items()
+                }
+                drift = per_ring_quota - sum(targets.values())
+                if drift and targets:
+                    largest = max(targets, key=lambda segment: fractions[segment])
+                    targets[largest] += drift
+                selected = []
+                taken: dict[str, int] = {}
+                for segment, target in targets.items():
+                    chosen = take_recent(ring, target, (segment,))
+                    taken[segment] = sum(span.sample_count for span in chosen)
+                    selected.extend(chosen)
+                shortfall = per_ring_quota - sum(taken.values())
+                if shortfall > 0:
+                    saturated = {
+                        segment
+                        for segment, target in targets.items()
+                        if taken[segment] >= target
+                    }
+                    for segment in sorted(
+                        saturated, key=lambda name: fractions[name], reverse=True
+                    ):
+                        if shortfall <= 0:
+                            break
+                        extra = take_recent(
+                            ring, taken[segment] + shortfall, (segment,)
+                        )
+                        gained = (
+                            sum(span.sample_count for span in extra) - taken[segment]
+                        )
+                        if gained <= 0:
+                            continue
+                        selected = [
+                            span for span in selected if span.record.segment != segment
+                        ]
+                        selected.extend(extra)
+                        taken[segment] += gained
+                        shortfall -= gained
             spans.extend(selected)
             counts[int(ring)] = sum(span.sample_count for span in selected)
+            for span in selected:
+                segment_counts[span.record.segment] += span.sample_count
         spans.sort(key=lambda span: span.record.shard_id)
         return ReplaySelection(
             tuple(spans),
             counts,
             maximum_shard_id,
             minimum_shard_id_exclusive,
+            samples_by_segment=segment_counts,
         )
 
     def load_recent_samples(
@@ -1422,6 +1602,8 @@ class ReplayStore:
                 if row["quarantine_reason"] is not None
                 else None
             ),
+            variant=str(row["variant"]),
+            segment=str(row["segment"]),
         )
 
 

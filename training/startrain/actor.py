@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import random
 import statistics
@@ -528,17 +529,29 @@ class ActorSupervisor:
                     generation = store.lease_generation(
                         self.run_identity, self.actor_id
                     )
+                    variant = self.experiment.selfplay.variants.draw(
+                        self._variant_seed(batches, generation)
+                    )
                     batch_config = replace(
                         self.experiment.selfplay,
                         rings=ring,
                         batch_size=self.gpu.actor_batch_size,
                         games=self.experiment.orchestration.actor_games_per_batch,
+                    ).with_variant(variant)
+                    set_score_utility_weight = getattr(
+                        evaluator, "set_score_utility_weight", None
                     )
+                    if callable(set_score_utility_weight):
+                        set_score_utility_weight(
+                            batch_config.effective_score_utility_weight()
+                        )
                     self.heartbeat.advance(
                         phase="selfplay",
                         batch=batches,
                         generation=generation,
                         ring=ring,
+                        variant=variant.label,
+                        segment=variant.segment,
                         model_role=model_role,
                         model_version=evaluator.model_version,
                         model_step=evaluator.model_step,
@@ -666,6 +679,21 @@ class ActorSupervisor:
                             "record_sequence": batches,
                             "process_started_ns": process_started_ns,
                             "ring": ring,
+                            "variant": variant.label,
+                            "segment": variant.segment,
+                            "mode": variant.mode,
+                            "handicap": variant.handicap,
+                            "pie": variant.pie,
+                            "score_utility_weight": (
+                                batch_config.effective_score_utility_weight()
+                            ),
+                            "swapped_games": sum(
+                                bool(getattr(summary, "swapped", False))
+                                for summary in summaries
+                            ),
+                            "pie_decisions": selfplay_metrics.pie_decisions,
+                            "pie_swaps": selfplay_metrics.pie_swaps,
+                            "asymmetric_games": selfplay_metrics.asymmetric_games,
                             "scheduling_step": scheduling_step,
                             "scheduling_step_source": scheduling_step_source,
                             "active_ring_weights": active_ring_weights,
@@ -808,6 +836,22 @@ class ActorSupervisor:
 
     def _peak_cuda_memory(self) -> tuple[int | None, int | None]:
         return peak_memory_stats(self.device)
+
+    def _variant_seed(self, batch: int, generation: int) -> int:
+        """Deterministic per-batch draw for the variant mixture."""
+
+        encoded = "\0".join(
+            (
+                str(self.experiment.selfplay.seed),
+                self.run_identity.run_id,
+                self.run_identity.generation_family,
+                self.actor_id,
+                str(generation),
+                "variant",
+                str(batch),
+            )
+        ).encode("utf-8")
+        return int.from_bytes(hashlib.sha256(encoded).digest()[:8], "big")
 
     def _select_model_provider(
         self,

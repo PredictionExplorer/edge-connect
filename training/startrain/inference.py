@@ -187,6 +187,11 @@ class GraphInferenceAdapter:
             rings=encoded.rings.to(self.device, non_blocking=True),
         )
 
+    def set_score_utility_weight(self, weight: float) -> None:
+        """Retarget the search utility between batches, never mid-cohort."""
+
+        self.config = dataclasses.replace(self.config, score_utility_weight=weight)
+
     def evaluate(self, requests: NativeEvalBatchProtocol) -> InferenceResponse:
         response, _ = self._evaluate(requests, include_details=False)
         return response

@@ -312,6 +312,8 @@ def _record_from_row(root: Path, row: sqlite3.Row) -> ShardRecord:
             if row["quarantine_reason"] is not None
             else None
         ),
+        variant=str(row["variant"]),
+        segment=str(row["segment"]),
     )
 
 
@@ -331,7 +333,7 @@ def _recent_records_for_ring(
             phase_min, phase_max, model_version, model_step,
             model_identity, run_id, generation_family, actor_id,
             generation, game_count, checksum_sha256, state,
-            quarantine_reason
+            quarantine_reason, variant, segment
         FROM shards
         WHERE state = 'ready'
           AND rules_hash = ?

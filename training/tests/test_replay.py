@@ -635,3 +635,146 @@ def test_variant_samples_round_trip(tmp_path) -> None:
     with pytest.raises(ReplaySchemaError, match="variant-homogeneous"):
         write_replay_shard(tmp_path / "mixed.npz", [sample, sample_for()])
         read_replay_shard(tmp_path / "mixed.npz")
+
+
+def classic_sample_for(rings: int = 4) -> ReplaySample:
+    topology = get_topology(rings)
+    stones = torch.full((topology.n,), -1, dtype=torch.int8)
+    stones[0] = 0
+    previous = torch.zeros(topology.n, dtype=torch.bool)
+    previous[0] = True
+    position = DoubleStarPosition(
+        rings=rings,
+        stones=stones,
+        to_move=1,
+        moves_left=1,
+        opening=False,
+        terminal=False,
+        mode="classic",
+        previous_turn=previous,
+        handicap_stones=previous,
+    )
+    return ReplaySample.from_position(
+        position,
+        policy=normalized_policy(position),
+        final_score=decisive_score(position),
+        search_provenance="gumbel-completed-q:test",
+        policy_provenance="completed-q",
+    )
+
+
+def test_store_records_variants_and_stratifies_windows_by_segment(tmp_path) -> None:
+    identity = RunIdentity(tmp_path / "run.json", "run-segments", "family-segments", 1)
+    model_identity = "sha256-" + "b" * 64
+    with ReplayStore(tmp_path / "replay") as store:
+        generation = store.lease_generation(identity, "actor-segments")
+
+        def commit(samples: list[ReplaySample], step: int, prefix: str):
+            rows = [
+                replace(
+                    sample,
+                    run_id=identity.run_id,
+                    generation_family=identity.generation_family,
+                    actor_id="actor-segments",
+                    generation=generation,
+                    game_id=f"{prefix}-{step}-{index}",
+                    model_identity=model_identity,
+                )
+                for index, sample in enumerate(samples)
+            ]
+            return store.append(
+                rows,
+                phase_min=0,
+                phase_max=0,
+                model_version=model_identity,
+                model_step=step,
+                model_identity=model_identity,
+                run_id=identity.run_id,
+                generation_family=identity.generation_family,
+                actor_id="actor-segments",
+                generation=generation,
+            )
+
+        with pytest.raises(ValueError, match="variant-homogeneous"):
+            commit([sample_for(), classic_sample_for()], 0, "mixed")
+        # Six standard shards of four samples, two classic shards of four.
+        standard = [commit([sample_for()] * 4, step, "standard") for step in range(6)]
+        classic = [
+            commit([classic_sample_for()] * 4, step, "classic") for step in range(2)
+        ]
+        assert all(
+            record.variant == "double" and record.segment == "standard"
+            for record in standard
+        )
+        assert all(
+            record.variant == "classic" and record.segment == "classic"
+            for record in classic
+        )
+        counts = store.eligible_sample_counts_by_segment(
+            (4,),
+            run_id=identity.run_id,
+            generation_family=identity.generation_family,
+            current_model_step=10,
+            max_model_lag_steps=100,
+        )
+        assert counts[(4, "standard")] == 24
+        assert counts[(4, "classic")] == 8
+        assert counts[(4, "pie")] == 0
+
+        # A 16-sample window at 50/50 wants 8 classic, gets all 8.
+        selection = store.select_recent_spans(
+            rings=(4,),
+            per_ring_quota=16,
+            run_id=identity.run_id,
+            generation_family=identity.generation_family,
+            current_model_step=10,
+            max_model_lag_steps=100,
+            segment_quotas={"standard": 0.5, "classic": 0.5},
+        )
+        assert selection.sample_count == 16
+        assert selection.samples_by_segment is not None
+        assert selection.samples_by_segment["standard"] == 8
+        assert selection.samples_by_segment["classic"] == 8
+
+        # A 24-sample window at 25/75 wants 18 classic; only 8 exist, so the
+        # shortfall is redistributed to the standard segment.
+        selection = store.select_recent_spans(
+            rings=(4,),
+            per_ring_quota=24,
+            run_id=identity.run_id,
+            generation_family=identity.generation_family,
+            current_model_step=10,
+            max_model_lag_steps=100,
+            segment_quotas={"standard": 0.25, "classic": 0.75},
+        )
+        assert selection.sample_count == 24
+        assert selection.samples_by_segment is not None
+        assert selection.samples_by_segment["classic"] == 8
+        assert selection.samples_by_segment["standard"] == 16
+
+        # Segments with no data at all fall back entirely to the others, and a
+        # zero-weight segment is never selected.
+        selection = store.select_recent_spans(
+            rings=(4,),
+            per_ring_quota=12,
+            run_id=identity.run_id,
+            generation_family=identity.generation_family,
+            current_model_step=10,
+            max_model_lag_steps=100,
+            segment_quotas={"standard": 0.5, "classic": 0.0, "pie": 0.5},
+        )
+        assert selection.sample_count == 12
+        assert selection.samples_by_segment is not None
+        assert selection.samples_by_segment == {
+            "standard": 12,
+            "classic": 0,
+            "handicap": 0,
+            "pie": 0,
+        }
+        with pytest.raises(ValueError, match="segments"):
+            store.recent_shards(
+                sample_window=1,
+                run_id=identity.run_id,
+                generation_family=identity.generation_family,
+                segments=("bogus",),
+            )

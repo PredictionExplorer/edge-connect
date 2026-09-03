@@ -1997,6 +1997,12 @@ class LearnerLoop:
                                 "replay_samples_by_ring": (
                                     spin_window.selection.samples_by_ring
                                 ),
+                                "replay_samples_by_segment": (
+                                    spin_window.selection.samples_by_segment
+                                ),
+                                "replay_segment_quotas": (
+                                    self.learner_config.segment_quotas
+                                ),
                                 "ring_batch_weights": (self._active_ring_weights()),
                                 "replay_max_shard_id": (
                                     spin_window.selection.max_shard_id
@@ -3020,6 +3026,7 @@ class LearnerLoop:
                 minimum_shard_id_exclusive=(
                     self.learner_config.minimum_replay_shard_id_exclusive
                 ),
+                segment_quotas=self.learner_config.segment_quotas,
             )
             if self.rank == 0
             else None

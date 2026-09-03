@@ -165,7 +165,9 @@ def _write_manifest(replay_root: Path, shard: Path) -> Path:
                 quarantine_reason TEXT,
                 rules_hash TEXT NOT NULL,
                 feature_schema_hash TEXT NOT NULL,
-                checksum_sha256 TEXT NOT NULL
+                checksum_sha256 TEXT NOT NULL,
+                variant TEXT NOT NULL DEFAULT 'double',
+                segment TEXT NOT NULL DEFAULT 'standard'
             );
             """
         )
