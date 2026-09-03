@@ -468,8 +468,14 @@ learner records next to the reference in every checkpoint
   the candidate instead and the actor heartbeat records
   `champion_selfplay_stale`.
 - When `restore_scale_on_promotion` is true and the champion changes after a
-  reduction, the learner returns to the reference schedule and records a
-  `plateau_scale_restored` metric event.
+  reduction, the learner returns to `restore_learning_rate_scale` (default 1.0,
+  the reference schedule) and records a `plateau_scale_restored` metric event.
+  A restore scale below 1.0 is also a cap: a governor above it is brought down
+  at once (`plateau_scale_capped`), so a converged run can cycle between, for
+  example, half the reference and the floor without ever returning to a
+  full-rate phase that only produces a dip. The reference rates stay the
+  schedule authority; the cap is a migratable plateau field rather than an
+  optimizer change.
 - Checkpoints written before the governor existed carry only scaled scheduler
   rates. Resuming them adopts those rates as the reference (metric event
   `learning_rate_governor_legacy`) so a resume never jumps the effective rate;

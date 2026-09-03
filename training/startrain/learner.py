@@ -2845,8 +2845,15 @@ class LearnerLoop:
         apply_governor(self.optimizer, self.scheduler, self._lr_governor)
         return multiplier
 
-    def _restore_learning_rates(self) -> None:
-        self._lr_governor = self._lr_governor.restored()
+    def _restore_learning_rates(self, multiplier: float = 1.0) -> None:
+        """Return to ``multiplier`` of the reference with no champion attached."""
+
+        if multiplier >= 1.0:
+            self._lr_governor = self._lr_governor.restored()
+        else:
+            self._lr_governor = self._lr_governor.with_multiplier(
+                multiplier, scaled_champion_identity=None
+            )
         apply_governor(self.optimizer, self.scheduler, self._lr_governor)
 
     def _carry_governor_across_rewind(
@@ -4041,33 +4048,43 @@ class LearnerLoop:
             )
 
     def _maybe_restore_learning_rates_after_promotion(self, configured) -> None:
-        """Return to the reference schedule once a reduced segment promotes."""
+        """Return to the restore multiplier once a reduced segment promotes.
 
-        restore = False
+        The restore multiplier is also a cap: a governor above it (a profile
+        that lowered the cap while the run sat at the reference, or a legacy
+        checkpoint) is brought down to it without waiting for a promotion.
+        """
+
+        cap = float(configured.restore_learning_rate_scale)
+        action = None
         if self.rank == 0:
             governor = self._lr_governor
-            if (
+            if governor.multiplier > cap + 1e-9:
+                action = "capped"
+            elif (
                 configured.restore_scale_on_promotion
-                and governor.multiplier < 1.0
+                and governor.multiplier < cap - 1e-9
                 and governor.scaled_champion_identity is not None
                 and self.publisher.champion_path.is_file()
             ):
                 champion = load_model_manifest(self.publisher.champion_path)
-                restore = champion.model_identity != governor.scaled_champion_identity
-        restore = self._collective_any(restore)
-        if not restore:
+                if champion.model_identity != governor.scaled_champion_identity:
+                    action = "restored"
+        action = self._broadcast_object(action)
+        if action is None:
             return
         previous = self._lr_governor.multiplier
-        self._restore_learning_rates()
+        self._restore_learning_rates(cap)
         if self.rank == 0:
             self.metrics.append(
                 {
                     "schema_version": 1,
                     "timestamp_ns": time.time_ns(),
                     "worker": "learner",
-                    "event": "plateau_scale_restored",
+                    "event": f"plateau_scale_{action}",
                     "step": self.step,
                     "previous_learning_rate_multiplier": previous,
+                    "restore_learning_rate_scale": cap,
                     **self._learning_rate_metrics(),
                     "learning_rates": [
                         float(group["lr"]) for group in self.optimizer.param_groups

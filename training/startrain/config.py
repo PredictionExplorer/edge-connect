@@ -789,6 +789,11 @@ class PlateauConfig:
     minimum_learning_rate_scale: float = 0.25
     # Restore the reference rates once a recovery segment produces a promotion.
     restore_scale_on_promotion: bool = True
+    # The multiplier a promotion restores to, and the highest multiplier the
+    # governor ever applies. Below 1.0 the profile's reference rates remain the
+    # schedule authority while the run cycles between this cap and the floor,
+    # for a converged model whose full-rate phase only produces a dip.
+    restore_learning_rate_scale: float = 1.0
     clear_optimizer_state_on_recovery: bool = True
     # Let terminal non-promotions that merely exhausted the arena budget
     # (reject_max_pairs) advance the recovery streak too. With rates floored and
@@ -810,6 +815,9 @@ class PlateauConfig:
             or self.consecutive_terminal_rejections <= 0
             or not 0 < self.reset_learning_rate_scale <= 1
             or not 0 < self.minimum_learning_rate_scale <= 1
+            or isinstance(self.restore_learning_rate_scale, bool)
+            or not isinstance(self.restore_learning_rate_scale, int | float)
+            or not 0 < self.restore_learning_rate_scale <= 1
             or self.poll_seconds <= 0
             or self.action
             not in ("pause", "reset_from_champion", "reduce_lr_keep_weights")
@@ -818,6 +826,11 @@ class PlateauConfig:
         if self.reset_learning_rate_scale < self.minimum_learning_rate_scale:
             raise ConfigError(
                 "plateau reset_learning_rate_scale cannot be below "
+                "minimum_learning_rate_scale"
+            )
+        if self.restore_learning_rate_scale < self.minimum_learning_rate_scale:
+            raise ConfigError(
+                "plateau restore_learning_rate_scale cannot be below "
                 "minimum_learning_rate_scale"
             )
 

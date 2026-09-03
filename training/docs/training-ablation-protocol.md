@@ -71,11 +71,12 @@ The following switches are deliberately first-class and recorded in metrics:
   smaller-ring regression guards.
 - `orchestration.plateau.action: reduce_lr_keep_weights`, which clears stale
   optimizer moments and lowers rates without discarding the learner branch.
-- `orchestration.plateau.minimum_learning_rate_scale` and
-  `restore_scale_on_promotion`, which bound plateau recovery to a staged,
-  floored multiplier of the profile's reference rates (each stage multiplies
-  the active multiplier by `reset_learning_rate_scale`, never below the floor)
-  and return to the reference after the next promotion. Stages are triggered
+- `orchestration.plateau.minimum_learning_rate_scale`,
+  `restore_scale_on_promotion`, and `restore_learning_rate_scale`, which bound
+  plateau recovery to a staged, floored multiplier of the profile's reference
+  rates (each stage multiplies the active multiplier by
+  `reset_learning_rate_scale`, never below the floor) and return to the restore
+  scale (the reference by default, or a lower cap) after the next promotion. Stages are triggered
   by streaks of conclusive rejections, at any champion lag; budget exhaustion
   (`reject_max_pairs`) counts only with
   `orchestration.plateau.count_inconclusive_rejections: true`, and the

@@ -57,6 +57,7 @@ _ALLOWED_PROFILE_PATHS = {
     ("learner", "selfplay_snapshot_warmup_interval_examples"),
     ("orchestration", "plateau", "max_learner_champion_lag_steps"),
     ("orchestration", "plateau", "count_inconclusive_rejections"),
+    ("orchestration", "plateau", "restore_learning_rate_scale"),
     ("orchestration", "promotion", "finish_inflight_candidate"),
     ("arena", "continuation_pairs_per_ring"),
     # Promotion-gate budget and the measurement crossplay that keeps the Elo
@@ -251,6 +252,7 @@ def _canonical_config_bytes(config: Mapping[str, object]) -> bytes:
 _ADDITIVE_DEFAULT_FIELDS: tuple[tuple[tuple[str, ...], object], ...] = (
     (("orchestration", "promotion", "finish_inflight_candidate"), False),
     (("orchestration", "plateau", "count_inconclusive_rejections"), False),
+    (("orchestration", "plateau", "restore_learning_rate_scale"), 1.0),
 )
 
 
@@ -290,7 +292,7 @@ def _compatible_source_config_sha256s(config: ExperimentConfig) -> set[str]:
         for key in path:
             child = current.get(key) if isinstance(current, Mapping) else None
             current = child if isinstance(child, Mapping) else child
-        if current is not default:
+        if type(current) is not type(default) or current != default:
             continue
         # Every combination of absent additive fields is a hash some earlier
         # release may have recorded.

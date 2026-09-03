@@ -381,23 +381,28 @@ def test_additive_default_field_accepts_legacy_chain_hash(tmp_path: Path) -> Non
 
     finish = ("orchestration", "promotion", "finish_inflight_candidate")
     count = ("orchestration", "plateau", "count_inconclusive_rejections")
-    assert compatible == {
-        materialized,
-        hash_without(finish),
-        hash_without(count),
-        hash_without(finish, count),
-    }
-    # A profile that opts into the new field no longer matches releases that
-    # never had it, but keeps the other legacy variant.
+    restore = ("orchestration", "plateau", "restore_learning_rate_scale")
+    additive = [finish, count, restore]
+    expected = {materialized}
+    for mask in range(1, 2 ** len(additive)):
+        expected.add(
+            hash_without(
+                *(path for bit, path in enumerate(additive) if mask >> bit & 1)
+            )
+        )
+    assert compatible == expected
+    # A profile that opts into a new field no longer matches releases that
+    # never had it, but keeps the variants for the other additive fields.
     opted = yaml.safe_load(fixture.old_profile.read_text(encoding="utf-8"))
     opted["orchestration"]["plateau"]["count_inconclusive_rejections"] = True
+    opted["orchestration"]["plateau"]["restore_learning_rate_scale"] = 0.5
     opted_path = tmp_path / "opted.yaml"
     opted_path.write_text(yaml.safe_dump(opted, sort_keys=False), encoding="utf-8")
     opted_config = load_config(opted_path)
     assert len(migration._compatible_source_config_sha256s(opted_config)) == 2
 
-    # The head a release without count_inconclusive_rejections recorded.
-    legacy_hash = hash_without(count)
+    # The head a release without the plateau additions recorded.
+    legacy_hash = hash_without(count, restore)
     source_profile_sha256 = hashlib.sha256(fixture.old_profile_bytes).hexdigest()
     record = {
         "schema_version": 1,

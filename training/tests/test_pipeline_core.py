@@ -3701,6 +3701,33 @@ def test_plateau_scale_restores_after_promotion(tmp_path, monkeypatch) -> None:
     assert events[-1]["event"] == "plateau_scale_restored"
     assert events[-1]["previous_learning_rate_multiplier"] == pytest.approx(0.5)
 
+    # A restore cap below the reference is applied at once to a governor above
+    # it, and later promotions return to the cap rather than to the reference.
+    learner.serialized_config["orchestration"]["plateau"][
+        "restore_learning_rate_scale"
+    ] = 0.5
+    capped = learner._plateau_config()
+    learner._maybe_restore_learning_rates_after_promotion(capped)
+    assert learner._lr_governor.multiplier == pytest.approx(0.5)
+    assert learner._lr_governor.scaled_champion_identity is None
+    assert optimizer.param_groups[0]["lr"] == pytest.approx(0.5)
+    assert events[-1]["event"] == "plateau_scale_capped"
+    assert events[-1]["restore_learning_rate_scale"] == 0.5
+    learner._maybe_restore_learning_rates_after_promotion(capped)
+    assert events[-1]["event"] == "plateau_scale_capped"
+    assert len([e for e in events if e["event"] == "plateau_scale_capped"]) == 1
+
+    # A stage below the cap still restores, but only up to the cap.
+    assert learner._scale_learning_rates(0.5, champion_identity="sha256-new") == 0.25
+    learner._maybe_restore_learning_rates_after_promotion(capped)
+    assert learner._lr_governor.multiplier == pytest.approx(0.25)
+    write_champion("sha256-newer")
+    learner._maybe_restore_learning_rates_after_promotion(capped)
+    assert learner._lr_governor.multiplier == pytest.approx(0.5)
+    assert optimizer.param_groups[0]["lr"] == pytest.approx(0.5)
+    assert events[-1]["event"] == "plateau_scale_restored"
+    assert events[-1]["previous_learning_rate_multiplier"] == pytest.approx(0.25)
+
 
 def test_ddp_replay_selection_metadata_is_broadcast_from_rank_zero(
     monkeypatch,
