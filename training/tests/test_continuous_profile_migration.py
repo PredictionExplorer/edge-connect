@@ -358,13 +358,46 @@ def test_apply_writes_immutable_profile_record_and_complete_backup(
 
 
 def test_additive_default_field_accepts_legacy_chain_hash(tmp_path: Path) -> None:
+    """Every combination of absent defaulted fields is an acceptable chain head.
+
+    A release that predates an additive field recorded the canonical hash
+    without it; the migration chain must still accept that head when the
+    source profile materializes the field's default.
+    """
+
     fixture = _fixture(tmp_path)
     config = load_config(fixture.old_profile)
     materialized = migration.canonical_config_sha256(config)
     compatible = migration._compatible_source_config_sha256s(config)
-    legacy_hashes = compatible - {materialized}
-    assert len(legacy_hashes) == 1
-    legacy_hash = legacy_hashes.pop()
+
+    def hash_without(*paths: tuple[str, ...]) -> str:
+        payload = deepcopy(config.as_dict())
+        for path in paths:
+            parent = payload
+            for key in path[:-1]:
+                parent = parent[key]
+            del parent[path[-1]]
+        return hashlib.sha256(migration._canonical_config_bytes(payload)).hexdigest()
+
+    finish = ("orchestration", "promotion", "finish_inflight_candidate")
+    count = ("orchestration", "plateau", "count_inconclusive_rejections")
+    assert compatible == {
+        materialized,
+        hash_without(finish),
+        hash_without(count),
+        hash_without(finish, count),
+    }
+    # A profile that opts into the new field no longer matches releases that
+    # never had it, but keeps the other legacy variant.
+    opted = yaml.safe_load(fixture.old_profile.read_text(encoding="utf-8"))
+    opted["orchestration"]["plateau"]["count_inconclusive_rejections"] = True
+    opted_path = tmp_path / "opted.yaml"
+    opted_path.write_text(yaml.safe_dump(opted, sort_keys=False), encoding="utf-8")
+    opted_config = load_config(opted_path)
+    assert len(migration._compatible_source_config_sha256s(opted_config)) == 2
+
+    # The head a release without count_inconclusive_rejections recorded.
+    legacy_hash = hash_without(count)
     source_profile_sha256 = hashlib.sha256(fixture.old_profile_bytes).hexdigest()
     record = {
         "schema_version": 1,

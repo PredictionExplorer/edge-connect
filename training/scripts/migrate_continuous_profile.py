@@ -244,26 +244,65 @@ def _canonical_config_bytes(config: Mapping[str, object]) -> bytes:
     ).encode("utf-8")
 
 
+# Fields added to the configuration with a default after runs were already
+# recording canonical hashes. A source profile that materializes the default
+# value must also match the hash a release without the field would have
+# recorded, otherwise every additive field would break every migration chain.
+_ADDITIVE_DEFAULT_FIELDS: tuple[tuple[tuple[str, ...], object], ...] = (
+    (("orchestration", "promotion", "finish_inflight_candidate"), False),
+    (("orchestration", "plateau", "count_inconclusive_rejections"), False),
+)
+
+
+def _without_field(
+    materialized: Mapping[str, object], path: tuple[str, ...]
+) -> dict[str, object] | None:
+    """Return a copy without ``path``, or None when the path is absent."""
+
+    parent = materialized
+    for key in path[:-1]:
+        child = parent.get(key)
+        if not isinstance(child, Mapping):
+            return None
+        parent = child
+    if path[-1] not in parent:
+        return None
+
+    def rebuild(node: Mapping[str, object], depth: int) -> dict[str, object]:
+        copied = dict(node)
+        key = path[depth]
+        if depth == len(path) - 1:
+            copied.pop(key)
+        else:
+            child = node[key]
+            assert isinstance(child, Mapping)
+            copied[key] = rebuild(child, depth + 1)
+        return copied
+
+    return rebuild(materialized, 0)
+
+
 def _compatible_source_config_sha256s(config: ExperimentConfig) -> set[str]:
     materialized = config.as_dict()
-    compatible = {hashlib.sha256(_canonical_config_bytes(materialized)).hexdigest()}
-    orchestration = materialized.get("orchestration")
-    promotion = (
-        orchestration.get("promotion") if isinstance(orchestration, dict) else None
-    )
-    if (
-        isinstance(orchestration, dict)
-        and isinstance(promotion, dict)
-        and promotion.get("finish_inflight_candidate") is False
-    ):
-        legacy: dict[str, object] = dict(materialized)
-        legacy_orchestration: dict[str, object] = dict(orchestration)
-        legacy_promotion: dict[str, object] = dict(promotion)
-        legacy_promotion.pop("finish_inflight_candidate")
-        legacy_orchestration["promotion"] = legacy_promotion
-        legacy["orchestration"] = legacy_orchestration
-        compatible.add(hashlib.sha256(_canonical_config_bytes(legacy)).hexdigest())
-    return compatible
+    variants: list[dict[str, object]] = [dict(materialized)]
+    for path, default in _ADDITIVE_DEFAULT_FIELDS:
+        current = materialized
+        for key in path:
+            child = current.get(key) if isinstance(current, Mapping) else None
+            current = child if isinstance(child, Mapping) else child
+        if current is not default:
+            continue
+        # Every combination of absent additive fields is a hash some earlier
+        # release may have recorded.
+        variants.extend(
+            stripped
+            for variant in list(variants)
+            if (stripped := _without_field(variant, path)) is not None
+        )
+    return {
+        hashlib.sha256(_canonical_config_bytes(variant)).hexdigest()
+        for variant in variants
+    }
 
 
 def _json_bytes(payload: Mapping[str, object]) -> bytes:
