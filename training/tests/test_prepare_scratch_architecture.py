@@ -48,7 +48,7 @@ def test_prepare_scratch_architecture_root_is_empty_and_pinned(
         "external_checkpoint": False,
         "partial_model_load": False,
     }
-    assert evidence["model_parameters"] == 10_476_983
+    assert evidence["model_parameters"] == 10_929_399
     assert load_config(profile).orchestration.run_id == evidence["run_id"]
     assert (root / "scratch-initialization.json").is_file()
     assert not (root / "run.json").exists()

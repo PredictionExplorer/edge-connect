@@ -313,5 +313,5 @@ fn scoring_is_d5_invariant_and_full_board_identity_holds() {
     }
 
     assert_eq!(rules_hash(), RULES_HASH_VALUE);
-    assert_eq!(rules_hash(), 0x2da3_7835_1938_1453);
+    assert_eq!(rules_hash(), 0xa5d9_32b0_ef83_54e8);
 }

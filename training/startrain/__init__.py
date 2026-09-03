@@ -1,4 +1,4 @@
-"""Training and inference foundations for no-pie Double *Star."""
+"""Training and inference foundations for the *Star variant family."""
 
 from .actions import extract_sample_actions, relocate_sample_actions
 from .actor import ActorSupervisor, ManifestModelProvider, RingMixtureScheduler
@@ -49,6 +49,7 @@ from .config import (
     SchedulerConfig,
     ShutdownConfig,
     TrainConfig,
+    VariantRulesConfig,
     load_config,
     parse_cpu_affinity,
 )
@@ -106,6 +107,14 @@ from .features import (
     EncodedBatch,
     encode_batch,
     encode_position,
+    variant_label,
+    variant_segment,
+)
+from .features_v3 import (
+    LEGACY_GLOBAL_FEATURE_DIM,
+    LEGACY_NODE_FEATURE_DIM,
+    encode_legacy_batch,
+    encode_legacy_position,
 )
 from .losses import LossWeights, TrainingTargets, compute_losses
 from .inference import (
@@ -342,6 +351,13 @@ __all__ = [
     "TeacherConfig",
     "TrainConfig",
     "TrainStepResult",
+    "VariantRulesConfig",
+    "LEGACY_GLOBAL_FEATURE_DIM",
+    "LEGACY_NODE_FEATURE_DIM",
+    "encode_legacy_batch",
+    "encode_legacy_position",
+    "variant_label",
+    "variant_segment",
     "WorkerSpec",
     "AtomicModelPublisher",
     "AugmentedReplayDataset",

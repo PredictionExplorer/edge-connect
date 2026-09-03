@@ -24,7 +24,8 @@ import {
   type PlayerControllers,
 } from '@/lib/star/ai/controllers';
 import { EMPTY } from '@/lib/star/scoring';
-import type { GameConfig, Mode } from '@/lib/star/game';
+import { configHandicap, type GameConfig, type Mode } from '@/lib/star/game';
+import { STAR_MAX_HANDICAP } from '@/lib/star/rules';
 import { useAppStore, type AiRuntime } from '@/lib/store';
 import {
   EngineDeveloperSettings,
@@ -47,6 +48,7 @@ export function SetupScreen() {
   const [mode, setMode] = useState<Mode>(lastConfig.mode);
   const [rings, setRings] = useState(lastConfig.rings);
   const [pieRule, setPieRule] = useState(lastConfig.pieRule);
+  const [handicap, setHandicap] = useState(configHandicap(lastConfig));
   const [names, setNames] = useState<[string, string]>([...lastConfig.playerNames]);
   const [controllers, setControllers] = useState<PlayerControllers>(() =>
     normalizeControllers(lastConfig, lastControllers),
@@ -127,6 +129,7 @@ export function SetupScreen() {
       rings,
       mode,
       pieRule,
+      handicap: pieRule ? 1 : handicap,
       playerNames: [names[0].trim() || 'Player 1', names[1].trim() || 'Player 2'],
     };
     const validControllers = normalizeControllers(config, controllers);
@@ -357,6 +360,7 @@ export function SetupScreen() {
                 onChange={(e) => {
                   setPieRule(e.target.checked);
                   if (e.target.checked) {
+                    setHandicap(1);
                     setControllers([...HUMAN_CONTROLLERS]);
                     setEngineDraftValidity({});
                   }
@@ -364,6 +368,47 @@ export function SetupScreen() {
                 className="h-4 w-4 accent-[#e8c48b]"
               />
             </label>
+            <div className="control-surface mt-3 rounded-xl px-4 py-2.5">
+              <div className="flex items-center justify-between gap-4">
+                <span>
+                  <span className="block text-sm text-ink">Handicap</span>
+                  <span className="block text-xs text-muted">
+                    {handicap === 1
+                      ? 'Standard opening: one stone'
+                      : `${names[0].trim() || 'Player 1'} opens with ${handicap} stones`}
+                  </span>
+                </span>
+                <span className="text-xs uppercase tracking-[0.12em] text-muted">
+                  {pieRule ? 'off with pie' : `${handicap} stone${handicap === 1 ? '' : 's'}`}
+                </span>
+              </div>
+              <div
+                role="radiogroup"
+                aria-label="Handicap stones"
+                className="mt-2 grid grid-cols-9 gap-1"
+              >
+                {Array.from({ length: STAR_MAX_HANDICAP }, (_, index) => index + 1).map(
+                  (stones) => (
+                    <button
+                      key={stones}
+                      type="button"
+                      role="radio"
+                      aria-checked={handicap === stones}
+                      aria-label={`${stones} handicap stone${stones === 1 ? '' : 's'}`}
+                      disabled={pieRule}
+                      onClick={() => setHandicap(stones)}
+                      className={`min-h-8 rounded-lg border text-xs transition-[border-color,background-color] duration-200 disabled:cursor-not-allowed disabled:opacity-40 ${
+                        handicap === stones
+                          ? 'border-gold/70 bg-gold-faint text-ink'
+                          : 'border-white/10 bg-white/[0.03] text-muted hover:border-gold/35'
+                      }`}
+                    >
+                      {stones}
+                    </button>
+                  ),
+                )}
+              </div>
+            </div>
             <div className="mt-2 min-h-6 px-1 text-xs" aria-live="polite">
               {!aiAllowed && (
                 <p className="text-muted">

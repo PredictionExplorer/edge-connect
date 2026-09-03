@@ -16,6 +16,11 @@ import torch
 from .contracts import (
     FEATURE_SCHEMA_HASH,
     FEATURE_SCHEMA_VERSION,
+    LEGACY_FEATURE_SCHEMA_HASH,
+    LEGACY_FEATURE_SCHEMA_VERSION,
+    MAX_HANDICAP,
+    MODE_INDEX,
+    MODES,
     RULES_HASH,
     RULES_HASH_WIRE,
     RULES_SCHEMA_ID,
@@ -27,11 +32,26 @@ from .features import (
     EncodedBatch,
     encode_batch,
 )
+from .features_v3 import (
+    LEGACY_GLOBAL_FEATURE_DIM,
+    LEGACY_NODE_FEATURE_DIM,
+    encode_legacy_batch,
+)
 from .scoring import PlayerScore, ScoreResult
 from .topology import MAX_NODES, get_topology
 
 BITBOARD_WORDS = (MAX_NODES + 63) // 64
 _NATIVE_FEATURE_PATH_COUNTS: Counter[str] = Counter()
+_FEATURE_DIMENSIONS: dict[int, tuple[int, int, int]] = {
+    FEATURE_SCHEMA_VERSION: (NODE_FEATURE_DIM, GLOBAL_FEATURE_DIM, FEATURE_SCHEMA_HASH),
+    LEGACY_FEATURE_SCHEMA_VERSION: (
+        LEGACY_NODE_FEATURE_DIM,
+        LEGACY_GLOBAL_FEATURE_DIM,
+        LEGACY_FEATURE_SCHEMA_HASH,
+    ),
+}
+_SEMANTIC_METADATA_COLUMNS = 11
+_LEGACY_SEMANTIC_METADATA_COLUMNS = 4
 
 
 class NativeCompatibilityError(ValueError):
@@ -55,6 +75,25 @@ class NativeStateDataProtocol(Protocol):
     opening: Sequence[bool]
     mid_turn: Sequence[bool]
     terminal: Sequence[bool]
+
+
+@runtime_checkable
+class NativeVariantStateDataProtocol(NativeStateDataProtocol, Protocol):
+    """Rules-v3 fields exposed by ``star_native.StateData``."""
+
+    current_turn_bits: Sequence[int]
+    previous_turn_bits: Sequence[int]
+    own_previous_turn_bits: Sequence[int]
+    handicap_bits: Sequence[int]
+    mode: Sequence[int]
+    handicap: Sequence[int]
+    pie: Sequence[bool]
+    pie_pending: Sequence[bool]
+    swap_available: Sequence[bool]
+    swapped: Sequence[bool]
+    turn_size: Sequence[int]
+    current_turn_total: Sequence[int]
+    turn_count: Sequence[int]
 
 
 @runtime_checkable
@@ -167,6 +206,16 @@ def validate_native_module(module: object) -> None:
     schema = getattr(module, "native_rules_schema", None)
     if callable(schema) and schema() != RULES_SCHEMA_ID:
         raise NativeCompatibilityError("star_native rules schema is incompatible")
+    feature_hash = getattr(module, "native_feature_schema_hash", None)
+    if (
+        callable(feature_hash)
+        and _integer("native_feature_schema_hash", feature_hash())
+        != FEATURE_SCHEMA_HASH
+    ):
+        raise NativeCompatibilityError(
+            "star_native feature schema does not match startrain/features/v4; "
+            "rebuild the native extension"
+        )
     state_batch = getattr(module, "StateBatch", None)
     complete_clinches = getattr(state_batch, "complete_clinches", None)
     if not callable(complete_clinches):
@@ -218,12 +267,66 @@ def _unpack_row(words: Sequence[int], *, row: int, nodes: int) -> torch.Tensor:
     return output
 
 
+@dataclass(frozen=True, slots=True)
+class _VariantColumns:
+    modes: list[int]
+    handicaps: list[int]
+    pies: list[bool]
+    swap_available: list[bool]
+    swapped: list[bool]
+    current_words: list[int]
+    previous_words: list[int]
+    own_previous_words: list[int]
+    handicap_words: list[int]
+
+
+def _decode_variant_columns(
+    data: NativeStateDataProtocol, *, batch_size: int, word_count: int
+) -> _VariantColumns | None:
+    """Validate the rules-v3 columns; ``None`` for a pre-variant export."""
+
+    if not isinstance(data, NativeVariantStateDataProtocol):
+        return None
+    modes = _integers("mode", data.mode, batch_size)
+    handicaps = _integers("handicap", data.handicap, batch_size)
+    for row in range(batch_size):
+        if modes[row] not in MODE_INDEX.values():
+            raise NativeCompatibilityError(f"row {row} has invalid mode {modes[row]}")
+        if not 1 <= handicaps[row] <= MAX_HANDICAP:
+            raise NativeCompatibilityError(f"row {row} has invalid handicap")
+    return _VariantColumns(
+        modes=modes,
+        handicaps=handicaps,
+        pies=_booleans("pie", data.pie, batch_size),
+        swap_available=_booleans("swap_available", data.swap_available, batch_size),
+        swapped=_booleans("swapped", data.swapped, batch_size),
+        current_words=_integers(
+            "current_turn_bits", data.current_turn_bits, word_count
+        ),
+        previous_words=_integers(
+            "previous_turn_bits", data.previous_turn_bits, word_count
+        ),
+        own_previous_words=_integers(
+            "own_previous_turn_bits", data.own_previous_turn_bits, word_count
+        ),
+        handicap_words=_integers("handicap_bits", data.handicap_bits, word_count),
+    )
+
+
 def positions_from_native(
     data: NativeStateDataProtocol,
     *,
     verify_legal_buffers: bool = True,
+    pda: Sequence[int] | None = None,
+    history_known: bool = True,
 ) -> list[DoubleStarPosition]:
-    """Convert one homogeneous native batch into schema-v3 semantic keys."""
+    """Convert one homogeneous native batch into schema-v4 semantic keys.
+
+    ``pda`` supplies one playout-doubling advantage per row for the side to
+    move; ``history_known`` marks whether the native history sets are real.
+    Batches exported by an extension without variant fields decode as the
+    standard game with unknown history.
+    """
 
     rings = _integer("rings", data.rings)
     topology = get_topology(rings)
@@ -243,6 +346,13 @@ def positions_from_native(
     opening = _booleans("opening", data.opening, batch_size)
     mid_turn = _booleans("mid_turn", data.mid_turn, batch_size)
     terminal = _booleans("terminal", data.terminal, batch_size)
+    pda_values = (
+        _integers("pda", pda, batch_size) if pda is not None else [0] * batch_size
+    )
+
+    variants = _decode_variant_columns(
+        data, batch_size=batch_size, word_count=word_count
+    )
 
     positions: list[DoubleStarPosition] = []
     for row in range(batch_size):
@@ -255,16 +365,54 @@ def positions_from_native(
         stones[one] = 1
         if stones_placed[row] != int((stones >= 0).sum()):
             raise NativeCompatibilityError("native stones_placed is inconsistent")
-        if mid_turn[row] != (not opening[row] and moves_left[row] == 1):
-            raise NativeCompatibilityError("native mid_turn is inconsistent")
-        position = DoubleStarPosition(
-            rings=rings,
-            stones=stones,
-            to_move=to_move[row],
-            moves_left=moves_left[row],
-            opening=opening[row],
-            terminal=terminal[row],
-        )
+        if variants is not None:
+            current_turn = _unpack_row(
+                variants.current_words, row=row, nodes=topology.n
+            )
+            previous_turn = _unpack_row(
+                variants.previous_words, row=row, nodes=topology.n
+            )
+            own_previous = _unpack_row(
+                variants.own_previous_words, row=row, nodes=topology.n
+            )
+            handicap_stones = _unpack_row(
+                variants.handicap_words, row=row, nodes=topology.n
+            )
+            expected_mid_turn = bool(current_turn.any()) and moves_left[row] > 0
+            if mid_turn[row] != expected_mid_turn:
+                raise NativeCompatibilityError("native mid_turn is inconsistent")
+            position = DoubleStarPosition(
+                rings=rings,
+                stones=stones,
+                to_move=to_move[row],
+                moves_left=moves_left[row],
+                opening=opening[row],
+                terminal=terminal[row],
+                mode=MODES[variants.modes[row]],
+                handicap=variants.handicaps[row],
+                pie=variants.pies[row],
+                swap_available=variants.swap_available[row],
+                swapped=variants.swapped[row],
+                current_turn=current_turn,
+                previous_turn=previous_turn,
+                own_previous_turn=own_previous,
+                handicap_stones=handicap_stones,
+                history_known=history_known,
+                pda=pda_values[row],
+            )
+        else:
+            if mid_turn[row] != (not opening[row] and moves_left[row] == 1):
+                raise NativeCompatibilityError("native mid_turn is inconsistent")
+            position = DoubleStarPosition(
+                rings=rings,
+                stones=stones,
+                to_move=to_move[row],
+                moves_left=moves_left[row],
+                opening=opening[row],
+                terminal=terminal[row],
+                history_known=False,
+                pda=pda_values[row],
+            )
         if verify_legal_buffers:
             native_legal = _unpack_row(legal_words, row=row, nodes=topology.n)
             expected_legal = (stones == -1) & (not terminal[row])
@@ -307,16 +455,22 @@ def encode_native_feature_data(
     dtype: torch.dtype = torch.float32,
     device: torch.device | str | None = None,
     source: str = "native_feature",
+    schema_version: int = FEATURE_SCHEMA_VERSION,
 ) -> EncodedBatch:
     """Wrap one Rust feature export and add cached graph topology tensors."""
 
+    if schema_version not in _FEATURE_DIMENSIONS:
+        raise NativeCompatibilityError(
+            f"unknown feature schema version {schema_version}"
+        )
+    node_dim, global_dim, schema_hash = _FEATURE_DIMENSIONS[schema_version]
     batch_size = _integer("batch_size", data.batch_size)
     max_nodes = _integer("max_nodes", data.max_nodes)
     if batch_size <= 0 or max_nodes <= 0:
         raise NativeCompatibilityError("native feature dimensions must be positive")
-    if _integer("node_feature_dim", data.node_feature_dim) != NODE_FEATURE_DIM:
+    if _integer("node_feature_dim", data.node_feature_dim) != node_dim:
         raise NativeCompatibilityError("native node feature dimension is incompatible")
-    if _integer("global_feature_dim", data.global_feature_dim) != GLOBAL_FEATURE_DIM:
+    if _integer("global_feature_dim", data.global_feature_dim) != global_dim:
         raise NativeCompatibilityError(
             "native global feature dimension is incompatible"
         )
@@ -326,9 +480,8 @@ def encode_native_feature_data(
         )
     if (
         _integer("feature_schema_version", data.feature_schema_version)
-        != FEATURE_SCHEMA_VERSION
-        or _integer("feature_schema_hash", data.feature_schema_hash)
-        != FEATURE_SCHEMA_HASH
+        != schema_version
+        or _integer("feature_schema_hash", data.feature_schema_hash) != schema_hash
     ):
         raise NativeCompatibilityError("native feature schema is incompatible")
 
@@ -342,13 +495,13 @@ def encode_native_feature_data(
         "node_features",
         data.node_features,
         dtype=np.float32,
-        shape=(batch_size, max_nodes, NODE_FEATURE_DIM),
+        shape=(batch_size, max_nodes, node_dim),
     )
     global_features = _buffer_tensor(
         "global_features",
         data.global_features,
         dtype=np.float32,
-        shape=(batch_size, GLOBAL_FEATURE_DIM),
+        shape=(batch_size, global_dim),
     )
     node_mask = _buffer_tensor(
         "node_mask",
@@ -450,48 +603,74 @@ def encode_native_state_data(
     dtype: torch.dtype = torch.float32,
     device: torch.device | str | None = None,
     verify_legal_buffers: bool = True,
+    pda: Sequence[int] | None = None,
+    schema_version: int = FEATURE_SCHEMA_VERSION,
 ) -> EncodedBatch:
     feature_export = getattr(data, "feature_data", None)
     if callable(feature_export):
+        kwargs: dict[str, object] = {"schema_version": schema_version}
+        if pda is not None:
+            kwargs["pda"] = [int(value) for value in pda]
         return encode_native_feature_data(
-            cast(NativeFeatureDataProtocol, feature_export()),
+            cast(NativeFeatureDataProtocol, feature_export(**kwargs)),
             dtype=dtype,
             device=device,
             source="native_state",
+            schema_version=schema_version,
         )
     _record_feature_path("python_state", _integer("batch_size", data.batch_size))
-    return encode_batch(
-        positions_from_native(data, verify_legal_buffers=verify_legal_buffers),
-        dtype=dtype,
-        device=device,
+    positions = positions_from_native(
+        data, verify_legal_buffers=verify_legal_buffers, pda=pda
     )
+    if schema_version == LEGACY_FEATURE_SCHEMA_VERSION:
+        return encode_legacy_batch(positions, dtype=dtype, device=device)
+    return encode_batch(positions, dtype=dtype, device=device)
+
+
+def semantic_metadata(
+    positions: Sequence[DoubleStarPosition],
+    *,
+    schema_version: int = FEATURE_SCHEMA_VERSION,
+) -> np.ndarray:
+    """Pack the per-row metadata columns of ``encode_semantic_features``."""
+
+    rows = len(positions)
+    if schema_version == LEGACY_FEATURE_SCHEMA_VERSION:
+        metadata = np.empty((rows, _LEGACY_SEMANTIC_METADATA_COLUMNS), dtype=np.uint8)
+    else:
+        metadata = np.empty((rows, _SEMANTIC_METADATA_COLUMNS), dtype=np.uint8)
+    for row, position in enumerate(positions):
+        metadata[row, 0] = position.to_move
+        metadata[row, 1] = position.moves_left
+        metadata[row, 2] = position.opening
+        metadata[row, 3] = position.terminal
+        if schema_version != LEGACY_FEATURE_SCHEMA_VERSION:
+            metadata[row, 4] = MODE_INDEX[position.mode]
+            metadata[row, 5] = position.handicap
+            metadata[row, 6] = position.pie
+            metadata[row, 7] = position.swap_available
+            metadata[row, 8] = position.swapped
+            metadata[row, 9] = position.history_known
+            metadata[row, 10] = np.int8(position.pda).view(np.uint8)
+    return metadata
 
 
 def encode_native_semantic_batch(
+    positions: Sequence[DoubleStarPosition],
     *,
-    rings: Sequence[int],
-    stones: Sequence[np.ndarray],
-    to_move: Sequence[int],
-    moves_left: Sequence[int],
-    opening: Sequence[bool],
-    terminal: Sequence[bool],
     dtype: torch.dtype = torch.float32,
     device: torch.device | str | None = None,
+    schema_version: int = FEATURE_SCHEMA_VERSION,
 ) -> EncodedBatch | None:
     """Encode heterogeneous semantic keys through Rust when the export exists."""
 
-    rows = len(rings)
+    rows = len(positions)
     if rows == 0:
         raise NativeCompatibilityError("semantic feature batch cannot be empty")
-    if not (
-        len(stones)
-        == len(to_move)
-        == len(moves_left)
-        == len(opening)
-        == len(terminal)
-        == rows
-    ):
-        raise NativeCompatibilityError("semantic feature fields disagree on row count")
+    if schema_version not in _FEATURE_DIMENSIONS:
+        raise NativeCompatibilityError(
+            f"unknown feature schema version {schema_version}"
+        )
     try:
         module = load_star_native()
     except NativeCompatibilityError:
@@ -502,44 +681,30 @@ def encode_native_semantic_batch(
         _record_feature_path("python_semantic", rows)
         return None
 
-    ring_values = _integers("rings", rings, rows)
-    to_move_values = _integers("to_move", to_move, rows)
-    moves_left_values = _integers("moves_left", moves_left, rows)
-    opening_values = _booleans("opening", opening, rows)
-    terminal_values = _booleans("terminal", terminal, rows)
-    topologies = [get_topology(ring_count) for ring_count in ring_values]
-    for row in range(rows):
-        if to_move_values[row] not in (0, 1):
-            raise NativeCompatibilityError(f"row {row} has invalid to_move")
-        if moves_left_values[row] not in (0, 1, 2):
-            raise NativeCompatibilityError(f"row {row} has invalid moves_left")
-    ring_array = np.asarray(ring_values, dtype=np.uint8)
-    metadata = np.empty((rows, 4), dtype=np.uint8)
-    metadata[:, 0] = to_move_values
-    metadata[:, 1] = moves_left_values
-    metadata[:, 2] = opening_values
-    metadata[:, 3] = terminal_values
-    stone_arrays: list[np.ndarray] = []
-    for row, (topology, values) in enumerate(zip(topologies, stones, strict=True)):
-        array = np.asarray(values)
-        if not np.issubdtype(array.dtype, np.integer):
-            raise NativeCompatibilityError(f"stones row {row} must contain integers")
-        if array.shape != (topology.n,):
-            raise NativeCompatibilityError(
-                f"stones row {row} must have shape ({topology.n},)"
-            )
-        if not np.isin(array, (-1, 0, 1)).all():
-            raise NativeCompatibilityError(
-                f"stones row {row} must contain only -1, 0, or 1"
-            )
-        stone_arrays.append(np.ascontiguousarray(array, dtype=np.int8))
-    stone_array = np.concatenate(stone_arrays)
+    ring_array = np.asarray([position.rings for position in positions], dtype=np.uint8)
+    metadata = semantic_metadata(positions, schema_version=schema_version)
+    stone_array = np.concatenate(
+        [
+            np.ascontiguousarray(position.stones.numpy(), dtype=np.int8)
+            for position in positions
+        ]
+    )
+    history_flags: bytes | None = None
+    if schema_version != LEGACY_FEATURE_SCHEMA_VERSION:
+        history_flags = np.concatenate(
+            [
+                np.ascontiguousarray(position.history_flags().numpy(), dtype=np.uint8)
+                for position in positions
+            ]
+        ).tobytes()
     feature_data = cast(
         NativeFeatureDataProtocol,
         encoder(
             ring_array.tobytes(),
             metadata.tobytes(),
             stone_array.tobytes(),
+            history_flags,
+            schema_version,
         ),
     )
     return encode_native_feature_data(
@@ -547,6 +712,7 @@ def encode_native_semantic_batch(
         dtype=dtype,
         device=device,
         source="native_semantic",
+        schema_version=schema_version,
     )
 
 

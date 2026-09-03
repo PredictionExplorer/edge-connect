@@ -1,4 +1,4 @@
-schema_version: 3
+schema_version: 4
 profile: standalone-smoke
 game:
   mode: double
@@ -46,7 +46,7 @@ train:
     min_lr_ratio: 0.1
 
 data:
-  schema_version: 4
+  schema_version: 5
   ring_stratified: false
   d5_augmentation: true
   workers: 0

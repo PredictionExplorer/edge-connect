@@ -84,7 +84,12 @@ impl From<GameError> for SearchError {
 }
 
 /// Outcome of starting one simulation.
+///
+/// The evaluation request carries a full state clone (with its retained
+/// placement history); boxing it would add an allocation per simulation on the
+/// hot path, so the size difference between the variants is accepted.
 #[derive(Clone, Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum SimulationStart {
     /// The path reached a terminal state and was backed up immediately.
     Terminal {
@@ -155,12 +160,19 @@ struct PendingSimulation {
 }
 
 /// Arena-backed, exact-transposition MCTS DAG for one root.
+///
+/// When the root is the empty board of a pie game, every root child value `q`
+/// is reported as `-|q|`: the responder will swap exactly when the opening
+/// favors the opener, so the opener's exact payoff under an optimal swap is
+/// `-|q|` and the best opening is the most balanced one. Deeper nodes are
+/// never transformed.
 #[derive(Clone, Debug)]
 pub struct SearchTree {
     nodes: Vec<Node>,
     transpositions: HashMap<StateKey, usize>,
     pending: Option<PendingSimulation>,
     root_token: u64,
+    pie_root_transform: bool,
 }
 
 impl SearchTree {
@@ -168,6 +180,7 @@ impl SearchTree {
     #[must_use]
     pub fn new(root: GameState) -> Self {
         let key = root.key();
+        let pie_root_transform = root.is_pie_pending();
         let mut transpositions = HashMap::new();
         transpositions.insert(key, 0);
         Self {
@@ -175,6 +188,7 @@ impl SearchTree {
             transpositions,
             pending: None,
             root_token: fresh_evaluation_token(),
+            pie_root_transform,
         }
     }
 
@@ -182,6 +196,41 @@ impl SearchTree {
     #[must_use]
     pub fn root_state(&self) -> &GameState {
         &self.nodes[0].state
+    }
+
+    /// Whether root child values are reported under the optimal-swap payoff.
+    #[must_use]
+    pub const fn uses_pie_root_transform(&self) -> bool {
+        self.pie_root_transform
+    }
+
+    /// Visit-weighted mean root value in the root player's perspective.
+    ///
+    /// Only backed-up child values contribute (the root's own network value is
+    /// excluded), so this is the search's estimate rather than the prior. A
+    /// pie-pending root reports the optimal-swap payoff. Returns `None` before
+    /// any simulation completes.
+    #[must_use]
+    pub fn root_value(&self) -> Option<f32> {
+        let node = &self.nodes[0];
+        let total_visits: u32 = node.edges.iter().map(|edge| edge.visits).sum();
+        if total_visits == 0 {
+            return None;
+        }
+        let weighted: f64 = node
+            .edges
+            .iter()
+            .filter(|edge| edge.visits > 0)
+            .map(|edge| {
+                let mean = edge.value_sum / f64::from(edge.visits);
+                f64::from(edge.visits) * self.transform_root_q(mean)
+            })
+            .sum();
+        Some((weighted / f64::from(total_visits)) as f32)
+    }
+
+    fn transform_root_q(&self, q: f64) -> f64 {
+        if self.pie_root_transform { -q.abs() } else { q }
     }
 
     /// Exact cached terminal value for a terminal root.
@@ -469,17 +518,25 @@ impl SearchTree {
     }
 
     /// Appendix D mixed-value completion.
+    ///
+    /// At a pie-pending root the visited child means enter as `-|q|`; the
+    /// root's own network value already estimates the optimal-swap payoff, so
+    /// the mixed estimate for unvisited children needs no further transform.
     fn completed_q(&self, node_id: usize) -> Vec<f32> {
         let node = &self.nodes[node_id];
+        let transform = node_id == 0 && self.pie_root_transform;
+        let edge_q = |edge: &Edge| {
+            let mean = edge.value_sum / f64::from(edge.visits);
+            if transform { -mean.abs() } else { mean }
+        };
         let total_visits: u32 = node.edges.iter().map(|edge| edge.visits).sum();
         let (prior_weighted_q, visited_prior) = node
             .edges
             .iter()
             .filter(|edge| edge.visits > 0)
             .fold((0.0_f64, 0.0_f64), |(weighted_q, prior_sum), edge| {
-                let q = edge.value_sum / f64::from(edge.visits);
                 (
-                    weighted_q + f64::from(edge.prior) * q,
+                    weighted_q + f64::from(edge.prior) * edge_q(edge),
                     prior_sum + f64::from(edge.prior),
                 )
             });
@@ -497,7 +554,7 @@ impl SearchTree {
                 if edge.visits == 0 {
                     mixed
                 } else {
-                    (edge.value_sum / f64::from(edge.visits)) as f32
+                    edge_q(edge) as f32
                 }
             })
             .collect()
@@ -609,7 +666,7 @@ fn softmax(values: &[f32]) -> Vec<f32> {
 mod tests {
     use std::sync::Arc;
 
-    use star_engine::{Board, Player};
+    use star_engine::{Board, Mode, Player, Variant};
 
     use super::*;
 
@@ -742,6 +799,106 @@ mod tests {
             .finish_simulation(evaluation(&request, 0.75))
             .unwrap();
         assert_eq!(boundary_tree.root_stats()[second].q, -0.75);
+    }
+
+    #[test]
+    fn handicap_and_classic_backups_flip_only_at_turn_boundaries() {
+        let board = Arc::new(Board::new(4).unwrap());
+        // Handicap 3: the root is mid-opening with two placements left, so a
+        // child evaluated for player 0 backs up with its sign preserved.
+        let handicap = Variant::new(Mode::Double, 3, false).unwrap();
+        let mut opening = GameState::with_variant(Arc::clone(&board), handicap);
+        opening.apply(Action::Place(0)).unwrap();
+        let mut tree = SearchTree::new(opening);
+        initialize_uniform(&mut tree, 0.0);
+        let edge = tree.root_edge(Action::Place(1)).unwrap();
+        let request = match tree
+            .start_simulation(Some(edge), GumbelParameters::PAPER)
+            .unwrap()
+        {
+            SimulationStart::NeedsEvaluation(request) => request,
+            SimulationStart::Terminal { .. } => panic!("unexpected terminal"),
+        };
+        assert_eq!(request.state.to_move(), Player::Zero);
+        assert!(request.state.is_opening());
+        tree.finish_simulation(evaluation(&request, 0.5)).unwrap();
+        assert_eq!(tree.root_stats()[edge].q, 0.5);
+        assert!(!tree.uses_pie_root_transform());
+
+        // Classic: every placement ends the turn, so every child flips.
+        let classic = Variant::new(Mode::Classic, 1, false).unwrap();
+        let mut state = GameState::with_variant(board, classic);
+        state.apply(Action::Place(0)).unwrap();
+        let mut tree = SearchTree::new(state);
+        initialize_uniform(&mut tree, 0.0);
+        let edge = tree.root_edge(Action::Place(1)).unwrap();
+        let request = match tree
+            .start_simulation(Some(edge), GumbelParameters::PAPER)
+            .unwrap()
+        {
+            SimulationStart::NeedsEvaluation(request) => request,
+            SimulationStart::Terminal { .. } => panic!("unexpected terminal"),
+        };
+        assert_eq!(request.state.to_move(), Player::Zero);
+        tree.finish_simulation(evaluation(&request, 0.5)).unwrap();
+        assert_eq!(tree.root_stats()[edge].q, -0.5);
+        assert_eq!(tree.root_value(), Some(-0.5));
+    }
+
+    #[test]
+    fn pie_pending_root_reports_the_optimal_swap_payoff() {
+        let board = Arc::new(Board::new(4).unwrap());
+        let pie = Variant::new(Mode::Double, 1, true).unwrap();
+        let root = GameState::with_variant(Arc::clone(&board), pie);
+        assert!(root.is_pie_pending());
+        let mut tree = SearchTree::new(root);
+        assert!(tree.uses_pie_root_transform());
+        assert_eq!(tree.root_value(), None);
+        initialize_uniform(&mut tree, -0.1);
+
+        // Opening 0 looks great for the opener (+0.8 for the responder means
+        // -0.8 for the opener before the swap); opening 1 is balanced.
+        for (node, responder_value) in [(0_u16, -0.8_f32), (1, 0.05)] {
+            let edge = tree.root_edge(Action::Place(node)).unwrap();
+            let request = match tree
+                .start_simulation(Some(edge), GumbelParameters::PAPER)
+                .unwrap()
+            {
+                SimulationStart::NeedsEvaluation(request) => request,
+                SimulationStart::Terminal { .. } => panic!("unexpected terminal"),
+            };
+            assert_eq!(request.state.to_move(), Player::One);
+            assert!(request.state.swap_available());
+            tree.finish_simulation(evaluation(&request, responder_value))
+                .unwrap();
+        }
+        let stats = tree.root_stats();
+        let strong = tree.root_edge(Action::Place(0)).unwrap();
+        let balanced = tree.root_edge(Action::Place(1)).unwrap();
+        // Raw backup would give +0.8; the responder swaps, so the opener gets -0.8.
+        assert!((stats[strong].q + 0.8).abs() < 1.0e-6);
+        assert!((stats[balanced].q + 0.05).abs() < 1.0e-6);
+        assert!(stats[balanced].q > stats[strong].q);
+        assert_eq!(tree.root_value(), Some(-0.425));
+        let target = tree.completed_q_target(GumbelParameters::PAPER);
+        assert!(target[balanced].1 > target[strong].1);
+
+        // Unvisited edges receive the mixed estimate built from transformed
+        // values and the root's own (already optimal-swap) network value.
+        let completed = tree.completed_q(0);
+        let unvisited = (0..completed.len())
+            .find(|edge| tree.nodes[0].edges[*edge].visits == 0)
+            .unwrap();
+        let prior = tree.nodes[0].edges[strong].prior;
+        let visited_prior_q = (prior * -0.8 + prior * -0.05) / (2.0 * prior);
+        let expected_mixed = (-0.1 + 2.0 * visited_prior_q) / 3.0;
+        assert!((completed[unvisited] - expected_mixed).abs() < 1.0e-5);
+
+        // Deeper nodes are untouched: the responder's root is a normal root.
+        let mut responder = tree.root_state().clone();
+        responder.apply(Action::Place(0)).unwrap();
+        let responder_tree = SearchTree::new(responder);
+        assert!(!responder_tree.uses_pie_root_transform());
     }
 
     #[test]

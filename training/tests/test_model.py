@@ -22,7 +22,12 @@ from startrain.symmetry import (
     permute_nodes,
     transform_position,
 )
-from startrain.topology import EDGE_CLASS_COUNT, SUPPORTED_RINGS, get_topology
+from startrain.topology import (
+    EDGE_CLASS_COUNT,
+    SUPPORTED_RINGS,
+    get_topology,
+    relation_count,
+)
 
 
 def position(rings: int) -> DoubleStarPosition:
@@ -71,6 +76,32 @@ def production_config(**changes: object) -> ModelConfig:
         ),
         **changes,
     )
+
+
+def legacy_production_config(**changes: object) -> ModelConfig:
+    """The previous lineage's 384x5 trunk: feature schema v3, no v3 additions."""
+
+    return replace(
+        ModelConfig.legacy(
+            width=384,
+            rrt_groups=5,
+            attention_heads=12,
+            kv_heads=3,
+            bottleneck_ratio=0.5,
+            ff_multiplier=2.5,
+        ),
+        **changes,
+    )
+
+
+def randomize_v3_parameters(model: GraphResTNet) -> None:
+    """Give the zero-initialized v3 additions real values so tests exercise them."""
+
+    generator = torch.Generator().manual_seed(23)
+    for name, parameter in model.named_parameters():
+        if "relation_bias" in name or "modulation" in name:
+            with torch.no_grad():
+                parameter.copy_(torch.randn(parameter.shape, generator=generator) * 0.5)
 
 
 def assert_global_outputs_close(
@@ -141,7 +172,7 @@ def test_default_mean_preserves_v2_state_and_output_parity() -> None:
         local_operator="mean",
         local_blocks_per_group=2,
     )
-    assert MODEL_SCHEMA_VERSION == 2
+    assert MODEL_SCHEMA_VERSION == 3
     assert legacy_config == explicit_config
 
     torch.manual_seed(19)
@@ -175,6 +206,7 @@ def test_model_equivariance_and_invariance_for_all_rings_and_d5_transforms(
 ) -> None:
     torch.manual_seed(7)
     model = tiny_model(local_operator=local_operator, rrt_groups=1).eval()
+    randomize_v3_parameters(model)
     sources = [position(rings) for rings in SUPPORTED_RINGS]
     source_batch = encode_batch(sources)
     with torch.no_grad():
@@ -381,21 +413,21 @@ def test_configured_local_block_count_and_checkpoint_shape_gate() -> None:
 
 
 def test_exact_production_parameter_counts() -> None:
-    variants = {
+    legacy_variants = {
         "current-384x5-kv3-ff2.5": (
-            production_config(),
+            legacy_production_config(),
             10_476_983,
         ),
         "matched-attention-384x5-kv12-ff2.0": (
-            production_config(kv_heads=12, ff_multiplier=2.0),
+            legacy_production_config(kv_heads=12, ff_multiplier=2.0),
             10_476_983,
         ),
         "depth-384x7-kv3-ff2.5": (
-            production_config(rrt_groups=7),
+            legacy_production_config(rrt_groups=7),
             14_614_199,
         ),
         "width-512x5-kv4-ff2.5": (
-            production_config(
+            legacy_production_config(
                 width=512,
                 attention_heads=16,
                 kv_heads=4,
@@ -403,7 +435,7 @@ def test_exact_production_parameter_counts() -> None:
             18_556_727,
         ),
         "width-512x5-kv16-ff2.0": (
-            production_config(
+            legacy_production_config(
                 width=512,
                 attention_heads=16,
                 kv_heads=16,
@@ -412,16 +444,90 @@ def test_exact_production_parameter_counts() -> None:
             18_556_727,
         ),
     }
-    for config, expected in variants.values():
+    for config, expected in legacy_variants.values():
         counts = model_parameter_counts(config)
         assert counts.total == expected
-        assert sum(counts[:3]) == counts.total
+        assert counts.relational_bias == 0 and counts.rule_conditioning == 0
+        assert sum(counts[:5]) == counts.total
         assert model_parameter_count(config) == expected
         assert GraphResTNet(config).parameter_count() == expected
 
+    # Architecture v3: Stage A keeps the 384x5 trunk and adds the relational
+    # bias and adaLN-Zero conditioning; Stage B is the 512x6 GQA 16/4 trunk.
+    stage_a = production_config()
+    stage_a_counts = model_parameter_counts(stage_a)
+    assert stage_a_counts.local_blocks == 2_962_560
+    assert stage_a_counts.global_blocks == 7_380_480
+    assert stage_a_counts.relational_bias == 5 * relation_count() * 12
+    assert stage_a_counts.rule_conditioning == (26 * 32 + 33 * 32 + 10 * 33 * 2 * 384)
+    assert stage_a_counts.total == 10_929_399
+    assert GraphResTNet(stage_a).parameter_count() == stage_a_counts.total
+    stage_b = production_config(width=512, rrt_groups=6, attention_heads=16, kv_heads=4)
+    stage_b_counts = model_parameter_counts(stage_b)
+    assert stage_b_counts.total == 22_953_879
+    assert GraphResTNet(stage_b).parameter_count() == stage_b_counts.total
+
+
+def test_legacy_config_rebuilds_the_previous_lineage_module_tree() -> None:
+    legacy = GraphResTNet(legacy_production_config())
+    assert legacy.config.is_legacy
+    assert legacy.rule_conditioner is None
+    assert legacy.relation_tables is None
+    keys = list(legacy.state_dict())
+    assert all(
+        "relation" not in key and "modulation" not in key and "conditioner" not in key
+        for key in keys
+    )
+    assert legacy.node_projection.in_features == 15
+    assert legacy.global_projection.in_features == 25 - 8
+    with pytest.raises(ValueError, match="legacy feature schema"):
+        ModelConfig.legacy(relational_bias=True)
+    with pytest.raises(ValueError, match="legacy feature schema"):
+        ModelConfig.legacy(adaln_hidden=16)
+    with pytest.raises(ValueError, match="feature dimensions"):
+        ModelConfig(node_feature_dim=15, global_feature_dim=17)
+    with pytest.raises(ValueError, match="feature_schema_version"):
+        ModelConfig(feature_schema_version=2)
+
+    # A v3 network without the additions is the legacy trunk with wider inputs.
+    plain = GraphResTNet(production_config(relational_bias=False, adaln_hidden=0))
+    plain_keys = [key for key in plain.state_dict()]
+    assert plain_keys == keys
+    assert plain.parameter_count() - legacy.parameter_count() == (4 + 8) * 384
+
+
+def test_relational_bias_and_conditioning_start_as_the_identity() -> None:
+    torch.manual_seed(5)
+    with_additions = tiny_model(rrt_groups=2).eval()
+    without = GraphResTNet(
+        replace(with_additions.config, relational_bias=False, adaln_hidden=0)
+    ).eval()
+    shared = {
+        key: value
+        for key, value in with_additions.state_dict().items()
+        if "relation" not in key
+        and "modulation" not in key
+        and "conditioner" not in key
+    }
+    without.load_state_dict(shared, strict=True)
+    batch = encode_batch([position(4), position(10)])
+    with torch.no_grad():
+        first = with_additions(*batch.model_args())
+        second = without(*batch.model_args())
+    for left, right in zip(first, second, strict=True):
+        torch.testing.assert_close(left, right, atol=0.0, rtol=0.0)
+
+    # Once the bias table has values, attention depends on the relation index.
+    randomize_v3_parameters(with_additions)
+    with torch.no_grad():
+        third = with_additions(*batch.model_args())
+    assert not torch.allclose(third.policy_logits, first.policy_logits)
+    with pytest.raises(ValueError, match="rings"):
+        with_additions(*batch.model_args()[:-1])
+
 
 def test_parameter_matched_relational_variants_report_exact_deltas() -> None:
-    phase_two = production_config(kv_heads=12, ff_multiplier=2.0)
+    phase_two = legacy_production_config(kv_heads=12, ff_multiplier=2.0)
     local_heavy = replace(
         phase_two,
         bottleneck_ratio=35 / 64,

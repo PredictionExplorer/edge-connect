@@ -11,8 +11,8 @@ mod bindings {
     use std::sync::Arc;
 
     use star_engine::{
-        Action, Board, D5Maps, GameState, RULES_HASH, RULES_SCHEMA, ScoringScratch, Symmetry,
-        rules_hash,
+        Action, Board, D5Maps, GameState, MAX_HANDICAP, Mode, RULES_HASH, RULES_SCHEMA,
+        ScoringScratch, Symmetry, Variant, rules_hash,
     };
     use star_search::{
         Evaluation, EvaluationRequest, GumbelParameters, GumbelSequentialHalving, SearchTree,
@@ -20,7 +20,7 @@ mod bindings {
     };
     use wasm_bindgen::prelude::*;
 
-    /// Browser-owned Double *Star state.
+    /// Browser-owned *Star state for any rule variant.
     #[wasm_bindgen]
     pub struct WasmState {
         inner: GameState,
@@ -28,18 +28,33 @@ mod bindings {
 
     #[wasm_bindgen]
     impl WasmState {
-        /// Creates an empty Double *Star state.
+        /// Creates an empty state. `mode` is `"classic"` or `"double"`,
+        /// `handicap` is `1..=9`, and `pie` enables the swap after the opening.
         #[wasm_bindgen(constructor)]
-        pub fn new(rings: u8) -> Result<WasmState, JsValue> {
+        pub fn new(rings: u8, mode: &str, handicap: u8, pie: bool) -> Result<WasmState, JsValue> {
             let board = Arc::new(Board::new(rings).map_err(js_error)?);
+            let mode = Mode::parse(mode)
+                .ok_or_else(|| JsValue::from_str("mode must be 'classic' or 'double'"))?;
+            let variant = Variant::new(mode, handicap, pie).map_err(js_error)?;
             Ok(Self {
-                inner: GameState::new(board),
+                inner: GameState::with_variant(board, variant),
             })
+        }
+
+        /// Creates an empty standard Double *Star state.
+        pub fn standard(rings: u8) -> Result<WasmState, JsValue> {
+            Self::new(rings, "double", 1, false)
         }
 
         /// Applies one dense node id.
         pub fn apply(&mut self, node: u16) -> Result<(), JsValue> {
             self.inner.apply(Action::Place(node)).map_err(js_error)?;
+            Ok(())
+        }
+
+        /// Applies the pie swap; legal only right after the opening turn.
+        pub fn swap(&mut self) -> Result<(), JsValue> {
+            self.inner.apply(Action::Swap).map_err(js_error)?;
             Ok(())
         }
 
@@ -65,10 +80,58 @@ mod bindings {
             self.inner.moves_left()
         }
 
+        /// Placements of the turn in progress: handicap during the opening.
+        #[wasm_bindgen(getter)]
+        pub fn current_turn_total(&self) -> u8 {
+            self.inner.current_turn_total()
+        }
+
+        /// Whether the opening turn is active.
+        #[wasm_bindgen(getter)]
+        pub fn opening(&self) -> bool {
+            self.inner.is_opening()
+        }
+
         /// Terminal marker.
         #[wasm_bindgen(getter)]
         pub fn terminal(&self) -> bool {
             self.inner.is_terminal()
+        }
+
+        /// Turn protocol name: `"classic"` or `"double"`.
+        #[wasm_bindgen(getter)]
+        pub fn mode(&self) -> String {
+            self.inner.mode().name().to_owned()
+        }
+
+        /// Consecutive opening placements by player 0.
+        #[wasm_bindgen(getter)]
+        pub fn handicap(&self) -> u8 {
+            self.inner.handicap()
+        }
+
+        /// Whether the pie rule is in effect.
+        #[wasm_bindgen(getter)]
+        pub fn pie(&self) -> bool {
+            self.inner.pie()
+        }
+
+        /// Empty board of a pie game.
+        #[wasm_bindgen(getter)]
+        pub fn pie_pending(&self) -> bool {
+            self.inner.is_pie_pending()
+        }
+
+        /// Whether player 1 may swap right now.
+        #[wasm_bindgen(getter)]
+        pub fn swap_available(&self) -> bool {
+            self.inner.swap_available()
+        }
+
+        /// Whether the swap was taken earlier in this game.
+        #[wasm_bindgen(getter)]
+        pub fn swapped(&self) -> bool {
+            self.inner.swapped()
         }
 
         /// Player-zero fixed bitboard words.
@@ -84,6 +147,26 @@ mod bindings {
         /// Legal placement bitboard words.
         pub fn legal_bits(&self) -> Vec<u64> {
             self.inner.legal_actions().placements.words().to_vec()
+        }
+
+        /// Placements of the unfinished current turn.
+        pub fn current_turn_bits(&self) -> Vec<u64> {
+            self.inner.current_turn_set().words().to_vec()
+        }
+
+        /// The most recently completed turn (the opponent's).
+        pub fn previous_turn_bits(&self) -> Vec<u64> {
+            self.inner.previous_turn_set().words().to_vec()
+        }
+
+        /// The completed turn before that (the mover's).
+        pub fn own_previous_turn_bits(&self) -> Vec<u64> {
+            self.inner.own_previous_turn_set().words().to_vec()
+        }
+
+        /// Stones placed during the opening phase.
+        pub fn handicap_bits(&self) -> Vec<u64> {
+            self.inner.handicap_stones().words().to_vec()
         }
 
         /// Legal node ids in ascending order.
@@ -114,8 +197,7 @@ mod bindings {
             components.push(if self.inner.is_terminal() {
                 score
                     .leader
-                    .expect("a full Double *Star board must have a decisive winner")
-                    as i32
+                    .expect("a full *Star board must have a decisive winner") as i32
             } else {
                 score.leader.map_or(-1, |player| player as i32)
             });
@@ -136,6 +218,18 @@ mod bindings {
         pub fn rules_schema() -> String {
             RULES_SCHEMA.to_owned()
         }
+
+        /// Largest supported handicap.
+        pub fn max_handicap() -> u8 {
+            MAX_HANDICAP
+        }
+    }
+
+    fn placement_nodes(actions: impl IntoIterator<Item = Action>) -> Vec<u16> {
+        actions
+            .into_iter()
+            .map(|action| action.node().expect("search expands placements only"))
+            .collect()
     }
 
     /// Ask/tell atomic-action search tree for browser inference.
@@ -169,22 +263,19 @@ mod bindings {
 
         /// Stable root legal node ids required by `initialize_root`.
         pub fn root_actions(&self) -> Result<Vec<u16>, JsValue> {
-            Ok(self
-                .inner
-                .root_request()
-                .map_err(js_error)?
-                .legal_actions
-                .into_iter()
-                .map(|action| {
-                    let Action::Place(node) = action;
-                    node
-                })
-                .collect())
+            Ok(placement_nodes(
+                self.inner.root_request().map_err(js_error)?.legal_actions,
+            ))
         }
 
         /// Token that must accompany the root evaluation response.
         pub fn root_token(&self) -> Result<u64, JsValue> {
             Ok(self.inner.root_request().map_err(js_error)?.token)
+        }
+
+        /// Whether root values are reported as the opener's optimal-swap payoff.
+        pub fn pie_root_transform(&self) -> bool {
+            self.inner.uses_pie_root_transform()
         }
 
         /// Supplies initial root inference.
@@ -243,18 +334,14 @@ mod bindings {
 
         /// Stable pending legal actions required by `finish`.
         pub fn pending_actions(&self) -> Result<Vec<u16>, JsValue> {
-            Ok(self
-                .pending
-                .as_ref()
-                .ok_or_else(|| JsValue::from_str("no leaf is pending"))?
-                .legal_actions
-                .iter()
-                .copied()
-                .map(|action| {
-                    let Action::Place(node) = action;
-                    node
-                })
-                .collect())
+            Ok(placement_nodes(
+                self.pending
+                    .as_ref()
+                    .ok_or_else(|| JsValue::from_str("no leaf is pending"))?
+                    .legal_actions
+                    .iter()
+                    .copied(),
+            ))
         }
 
         /// Token that must accompany the pending leaf response.
@@ -286,14 +373,12 @@ mod bindings {
 
         /// Root node ids in stable order.
         pub fn actions(&self) -> Vec<u16> {
-            self.inner
-                .root_stats()
-                .into_iter()
-                .map(|stats| {
-                    let Action::Place(node) = stats.action;
-                    node
-                })
-                .collect()
+            placement_nodes(
+                self.inner
+                    .root_stats()
+                    .into_iter()
+                    .map(|stats| stats.action),
+            )
         }
 
         /// Root edge visit counts in stable order.
@@ -308,6 +393,13 @@ mod bindings {
         /// Completed root Q values in stable order.
         pub fn completed_q(&self) -> Vec<f32> {
             self.inner.root_completed_q()
+        }
+
+        /// Visit-weighted root value for the player to move, once any
+        /// simulation has completed. The pie swap is recommended for the
+        /// responder exactly when this value is negative.
+        pub fn root_value(&self) -> Option<f32> {
+            self.inner.root_value()
         }
 
         /// Completed-Q policy target in stable order.

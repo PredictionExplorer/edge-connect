@@ -1,26 +1,31 @@
 /**
- * Versioned Double *Star contract shared by TypeScript and parity ports.
+ * Versioned *Star contract shared by TypeScript and parity ports.
  *
  * The hash covers STAR_RULES_CANONICAL, not implementation source. A
  * consumer can therefore reject fixtures or saved protocol data produced for
  * different semantics without depending on TypeScript formatting or builds.
- * Optional classic and pie-rule UI modes are outside this parity contract.
+ *
+ * Rules v3 covers the whole variant family: standard Double *Star, classic
+ * one-stone turns, handicap openings of one to nine stones, and the pie rule.
  */
 
-export const STAR_RULES_VERSION = 2 as const;
+export const STAR_RULES_VERSION = 3 as const;
 export const STAR_RULES_HASH_ALGORITHM = 'fnv1a64' as const;
-export const STAR_RULES_SCHEMA_ID = 'edgeconnect.star.rules.v2' as const;
+export const STAR_RULES_SCHEMA_ID = 'edgeconnect.star.rules.v3' as const;
 export const STAR_CONFORMANCE_SCHEMA_ID =
-  'edgeconnect.star.conformance.v2' as const;
+  'edgeconnect.star.conformance.v3' as const;
 /**
  * Model feature definitions live outside this TypeScript rules package.
  * Exported identifiers let training/inference artifacts pin their own schema
  * without folding model-only changes into the gameplay rules hash.
  */
 export const STAR_FEATURE_SCHEMA_ID =
-  'edgeconnect.star.model-features.external.v2' as const;
+  'edgeconnect.star.model-features.external.v3' as const;
 export const STAR_ACTION_LAYOUT_SCHEMA_ID =
   'edgeconnect.star.action-layout.nodes-only.v1' as const;
+
+/** Largest handicap: consecutive opening placements by the first player. */
+export const STAR_MAX_HANDICAP = 9 as const;
 
 export const STAR_RULES_CONTRACT = {
   schema: STAR_RULES_SCHEMA_ID,
@@ -75,18 +80,32 @@ export const STAR_RULES_CONTRACT = {
     scoreMargin: 'toMove total - opponent total',
   },
   game: {
-    openingPlacements: 1,
-    laterTurnPlacements: 2,
-    pieRule: false,
-    actionTypes: ['place'],
+    modes: {
+      classic: 'one placement every turn',
+      double: 'one opening placement, then two placements per turn',
+    },
+    handicap:
+      'the first player places k stones consecutively before the second player moves; k in 1..9; k = 1 is the standard game',
+    pieRule:
+      'optional; immediately after the first turn the second player may swap: the opening stone is recolored to player 1 and player 0 moves next with a full turn; unavailable after any placement',
+    handicapExcludesPie: true,
+    variantInSemanticKey: ['mode', 'handicap', 'pie'],
+    historyInSemanticKey: [
+      'currentTurn',
+      'previousTurn',
+      'ownPreviousTurn',
+      'handicapStones',
+    ],
+    actionTypes: ['place', 'swap'],
     actionWireEncoding: {
       place: 'dense node id 0..n-1',
+      swap: 'node count n, one past the last node',
     },
     legalActionOrder: 'legal placements by ascending node id',
-    nativeActionLayout: 'node u at slot u',
+    nativeActionLayout: 'node u at slot u; the swap has no slot',
     termination: 'board full',
     fullBoardResidual:
-      'the final placement decrements movesLeft and terminates before endTurn; actor and turnCount are retained; movesLeft is 0 or 1; midTurn is movesLeft > 0; lastMove is the final node; currentTurnMoves retains the final partial turn',
+      'the final placement decrements movesLeft and terminates before endTurn; actor and turnCount are retained; movesLeft is below the turn size; midTurn is movesLeft > 0; lastMove is the final node; currentTurnMoves retains the final partial turn',
     terminalLegalActions: 'none',
     placement: 'only an empty in-range node is legal',
     replay: 'apply the ordered action log to a fresh initial state',
@@ -99,7 +118,7 @@ export const STAR_RULES_CONTRACT = {
     ringCoordinate: 't = sector*ring + position modulo 5*ring',
     rotation: 'r(k): t -> t + k*ring for k in 0..4',
     reflection: 'f(k): t -> k*ring - t for k in 0..4',
-    action: 'place transforms by the node map',
+    action: 'place transforms by the node map; the swap is fixed',
   },
 } as const;
 
@@ -108,7 +127,7 @@ export const STAR_RULES_CONTRACT = {
  * bytes so every runtime derives the same unsigned 64-bit fingerprint.
  */
 export const STAR_RULES_CANONICAL = [
-  'double-star/rules-v2;',
+  'double-star/rules-v3;',
   'rings=even:{4,6,8,10};',
   'node-count=5*r*(r+1)/2;',
   'node-order=x:1..r,s:0..4,y:0..x-1;',
@@ -126,15 +145,18 @@ export const STAR_RULES_CANONICAL = [
   'diagonal=x>=2&&y>=1?(s,x,y)-(s,x-1,y-1);',
   'corner-cross=x>=2&&y==x-1?(s,x,y)-(s+1,x-1,0);',
   'bridge=K5((s,1,0),s=0..4);',
-  'opening-placements=1;',
-  'later-turn-placements=2;',
-  'pie=false;',
-  'actions=atomic-place;',
-  'action-wire=place(node)->node;',
+  'modes={classic:turn-size-1,double:opening-1-then-2};',
+  'handicap=k-consecutive-opening-placements-by-player0,k-in-1..9,k=1-is-standard;',
+  'pie=optional:after-first-turn-player1-may-swap,recolor-opening-stones-to-player1,player0-moves-next-with-full-turn,swap-unavailable-after-any-placement;',
+  'handicap-excludes-pie;',
+  'variant-in-semantic-key=mode,handicap,pie;',
+  'history-in-semantic-key=currentTurn,previousTurn,ownPreviousTurn,handicapStones;',
+  'actions=atomic-place|swap;',
+  'action-wire=place(node)->node,swap->node-count;',
   'legal-order=empty-node-id-ascending;',
   'native-action-layout=node-u-at-u;',
   'terminal=full;',
-  'full-terminal=decrement-movesLeft,retain-actor-and-turnCount,no-endTurn,movesLeft-in-{0,1},midTurn=(movesLeft>0),lastMove=final-node,currentTurnMoves=final-partial-turn;',
+  'full-terminal=decrement-movesLeft,retain-actor-and-turnCount,no-endTurn,movesLeft-below-turn-size,midTurn=(movesLeft>0),lastMove=final-node,currentTurnMoves=final-partial-turn;',
   'pair-semantic=AB==BA-excluding-lastMove;',
   'stones=empty:-1,players:0,1;',
   'star=same-color-connected-group-with-at-least-two-directly-occupied-peries;',
@@ -149,7 +171,7 @@ export const STAR_RULES_CANONICAL = [
   'd5-coordinate=t=s*x+y(mod5*x);',
   'd5-rk=t+k*x(mod5*x);',
   'd5-fk=k*x-t(mod5*x);',
-  'd5-action=map-place-node',
+  'd5-action=map-place-node,swap-fixed',
 ].join('');
 
 /** Compute the unsigned 64-bit FNV-1a hash used by the parity contract. */
@@ -165,4 +187,4 @@ export function fnv1a64(value: string): string {
 
 /** Stable wire fingerprint for the complete gameplay contract above. */
 export const STAR_RULES_HASH =
-  'fnv1a64:2da3783519381453' as const;
+  'fnv1a64:a5d932b0ef8354e8' as const;

@@ -1,4 +1,4 @@
-schema_version: 3
+schema_version: 4
 profile: continuous
 game:
   mode: double
@@ -47,7 +47,7 @@ train:
     total_steps: 1000000
     min_lr_ratio: 0.05
 data:
-  schema_version: 4
+  schema_version: 5
   ring_stratified: true
   d5_augmentation: true
   workers: 16

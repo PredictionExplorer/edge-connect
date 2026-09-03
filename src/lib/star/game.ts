@@ -6,11 +6,14 @@
  *   - double:   Double *Star — two stones per turn, except the very first
  *     turn of the game, when the first player places a single stone.
  *
- * The game ends only when the board is full.
+ * Handicap: the first player places `handicap` stones consecutively before
+ * the second player's first turn (1..9; 1 is the standard game).
  *
- * Optional pie rule: immediately after the game's first turn, the second
- * player may swap — the opening stone changes to their color and the first
- * player moves next.
+ * Optional pie rule (handicap 1 only): immediately after the game's first
+ * turn, the second player may swap — the opening stone changes to their color
+ * and the first player moves next with a full turn.
+ *
+ * The game ends only when the board is full.
  *
  * Keeping the log (rather than mutable state) as the source of truth makes
  * undo/redo and localStorage persistence trivial and bug-resistant: state is
@@ -18,6 +21,7 @@
  */
 
 import { getBoard, type Board } from './board';
+import { STAR_MAX_HANDICAP } from './rules';
 import { EMPTY } from './scoring';
 
 export type Mode = 'classic' | 'double';
@@ -26,6 +30,8 @@ export interface GameConfig {
   rings: number;
   mode: Mode;
   pieRule: boolean;
+  /** Consecutive opening placements by the first player; defaults to 1. */
+  handicap?: number;
   playerNames: [string, string];
 }
 
@@ -54,16 +60,47 @@ export interface GameState {
   lastMove: number;
   /** Nodes placed in the current (unfinished) turn. */
   currentTurnMoves: number[];
+  /** Nodes placed in the most recently completed turn (the opponent's). */
+  previousTurnMoves: number[];
+  /** Nodes placed in the completed turn before that (the current player's). */
+  ownPreviousTurnMoves: number[];
+  /** Nodes placed during the opening phase (all `handicap` opening stones). */
+  handicapStones: number[];
   turnCount: number;
 }
 
+/** Effective handicap of a config: an omitted value means the standard 1. */
+export function configHandicap(config: Pick<GameConfig, 'handicap'>): number {
+  return config.handicap ?? 1;
+}
+
+/** Placements per completed non-opening turn. */
+export function modeTurnSize(mode: Mode): number {
+  return mode === 'classic' ? 1 : 2;
+}
+
 function turnSize(config: GameConfig, turnIndex: number): number {
-  if (config.mode === 'classic') return 1;
-  return turnIndex === 0 ? 1 : 2;
+  if (turnIndex === 0) return configHandicap(config);
+  return modeTurnSize(config.mode);
+}
+
+function validateConfig(config: GameConfig): void {
+  const handicap = configHandicap(config);
+  if (
+    !Number.isInteger(handicap) ||
+    handicap < 1 ||
+    handicap > STAR_MAX_HANDICAP
+  ) {
+    throw new Error(`handicap must be an integer in 1..${STAR_MAX_HANDICAP}`);
+  }
+  if (config.pieRule && handicap !== 1) {
+    throw new Error('handicap games cannot use the pie rule');
+  }
 }
 
 export function initialState(config: GameConfig): GameState {
   const board = getBoard(config.rings);
+  validateConfig(config);
   return {
     config,
     board,
@@ -77,6 +114,9 @@ export function initialState(config: GameConfig): GameState {
     swapped: false,
     lastMove: -1,
     currentTurnMoves: [],
+    previousTurnMoves: [],
+    ownPreviousTurnMoves: [],
+    handicapStones: [],
     turnCount: 0,
   };
 }
@@ -90,6 +130,8 @@ function endTurn(state: GameState): void {
   state.turnCount++;
   state.movesLeft = turnSize(state.config, state.turnCount);
   state.midTurn = false;
+  state.ownPreviousTurnMoves = state.previousTurnMoves;
+  state.previousTurnMoves = state.currentTurnMoves;
   state.currentTurnMoves = [];
 }
 
@@ -118,6 +160,9 @@ export function applyAction(prev: GameState, action: GameAction): GameState {
     ...prev,
     stones: prev.stones.slice(),
     currentTurnMoves: prev.currentTurnMoves.slice(),
+    previousTurnMoves: prev.previousTurnMoves.slice(),
+    ownPreviousTurnMoves: prev.ownPreviousTurnMoves.slice(),
+    handicapStones: prev.handicapStones.slice(),
   };
 
   switch (action.type) {
@@ -126,6 +171,7 @@ export function applyAction(prev: GameState, action: GameAction): GameState {
       state.stonesPlaced++;
       state.lastMove = action.node;
       state.currentTurnMoves.push(action.node);
+      if (state.turnCount === 0) state.handicapStones.push(action.node);
       state.movesLeft--;
       state.midTurn = state.movesLeft > 0;
       if (boardFull(state)) {
@@ -144,7 +190,9 @@ export function applyAction(prev: GameState, action: GameAction): GameState {
     }
     case 'swap': {
       // Recolor the single opening stone; the swap consumes this player's
-      // turn, so the opener moves again next.
+      // turn, so the opener moves again next. The opening stone stays the most
+      // recently completed turn, so the position reads exactly like the
+      // unswapped position with colors exchanged.
       for (let u = 0; u < state.stones.length; u++) {
         if (state.stones[u] !== EMPTY) state.stones[u] = 1;
       }

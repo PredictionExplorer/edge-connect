@@ -111,6 +111,8 @@ pub struct SearchResult {
     pub selected_action: Option<Action>,
     /// Cached exact current-player value for a terminal input row.
     pub terminal_value: Option<f32>,
+    /// Visit-weighted search value for the root player, `None` for terminal rows.
+    pub root_value: Option<f32>,
     /// Visit and completed-Q diagnostics in stable legal order.
     pub root_stats: Vec<RootActionStats>,
     /// Improved completed-Q policy target in stable legal order.
@@ -158,9 +160,41 @@ impl<E: Error + 'static> Error for SearchRunError<E> {}
 /// Runs many roots together, crossing the evaluator boundary once per active batch round.
 ///
 /// Terminal rows are retained in output order but never sent to the evaluator.
+/// Every root receives `config.simulations`; use [`gumbel_search_batch_with_budgets`]
+/// for per-root budgets such as a playout-doubling advantage.
 pub fn gumbel_search_batch<E: BatchEvaluator>(
     roots: Vec<GameState>,
     config: RootSearchConfig,
+    evaluator: &mut E,
+) -> Result<Vec<SearchResult>, SearchRunError<E::Error>> {
+    gumbel_search_batch_with_budgets(roots, config, None, evaluator)
+}
+
+/// Resolves the exact simulation budget of one root.
+///
+/// `per_root` overrides `default` row by row; a zero entry is invalid because
+/// Sequential Halving needs at least one simulation.
+pub fn resolve_root_budget(
+    default: u32,
+    per_root: Option<&[u32]>,
+    index: usize,
+) -> Result<u32, GumbelError> {
+    let budget = per_root.map_or(default, |budgets| budgets[index]);
+    if budget == 0 {
+        Err(GumbelError::ZeroBudget)
+    } else {
+        Ok(budget)
+    }
+}
+
+/// [`gumbel_search_batch`] with an optional per-root simulation budget.
+///
+/// Trees with larger budgets simply take part in more batch rounds; the
+/// evaluator boundary is still crossed once per round.
+pub fn gumbel_search_batch_with_budgets<E: BatchEvaluator>(
+    roots: Vec<GameState>,
+    config: RootSearchConfig,
+    per_root_simulations: Option<&[u32]>,
     evaluator: &mut E,
 ) -> Result<Vec<SearchResult>, SearchRunError<E::Error>> {
     if config.simulations == 0 {
@@ -173,6 +207,14 @@ pub fn gumbel_search_batch<E: BatchEvaluator>(
         .parameters
         .validate()
         .map_err(SearchRunError::Gumbel)?;
+    if let Some(budgets) = per_root_simulations {
+        if budgets.len() != roots.len() {
+            return Err(SearchRunError::Gumbel(GumbelError::ZeroBudget));
+        }
+        if budgets.contains(&0) {
+            return Err(SearchRunError::Gumbel(GumbelError::ZeroBudget));
+        }
+    }
     let mut trees: Vec<_> = roots.into_iter().map(SearchTree::new).collect();
     if trees.is_empty() {
         return Ok(Vec::new());
@@ -226,7 +268,7 @@ pub fn gumbel_search_batch<E: BatchEvaluator>(
             } else {
                 GumbelSequentialHalving::new(
                     &tree.root_logits(),
-                    config.simulations,
+                    resolve_root_budget(config.simulations, per_root_simulations, index)?,
                     config.max_considered,
                     config.parameters,
                     derive_root_seed(config.nonce.value(), tree.root_state().hash64(), index),
@@ -314,6 +356,7 @@ pub fn gumbel_search_batch<E: BatchEvaluator>(
                 return Ok(SearchResult {
                     selected_action: None,
                     terminal_value: tree.root_terminal_value(),
+                    root_value: None,
                     root_stats: Vec::new(),
                     policy_target: Vec::new(),
                 });
@@ -327,6 +370,7 @@ pub fn gumbel_search_batch<E: BatchEvaluator>(
             Ok(SearchResult {
                 selected_action: Some(root_stats[selected].action),
                 terminal_value: None,
+                root_value: tree.root_value(),
                 root_stats,
                 policy_target: tree.completed_q_target(config.parameters),
             })
@@ -404,8 +448,8 @@ mod tests {
                         .legal_actions
                         .iter()
                         .map(|action| {
-                            let Action::Place(node) = action;
-                            -f32::from(*node) / 100.0
+                            let node = action.node().expect("search expands placements only");
+                            -f32::from(node) / 100.0
                         })
                         .collect();
                     Evaluation {
@@ -497,6 +541,61 @@ mod tests {
                 .sum();
             assert!((target_sum - 1.0).abs() < 1.0e-5);
         }
+    }
+
+    #[test]
+    fn per_root_budgets_are_exact_and_validated() {
+        let board = Arc::new(Board::new(4).unwrap());
+        let mut roots = Vec::new();
+        for opening in 0..3 {
+            let mut state = GameState::new(Arc::clone(&board));
+            state.apply(Action::Place(opening)).unwrap();
+            roots.push(state);
+        }
+        let mut evaluator = DeterministicEvaluator {
+            batch_sizes: Vec::new(),
+        };
+        let config = RootSearchConfig::deterministic(8, 4, GumbelParameters::PAPER, 11);
+        let budgets = [8_u32, 32, 4];
+        let results =
+            gumbel_search_batch_with_budgets(roots.clone(), config, Some(&budgets), &mut evaluator)
+                .unwrap();
+        for (result, budget) in results.iter().zip(budgets) {
+            assert_eq!(
+                result
+                    .root_stats
+                    .iter()
+                    .map(|stats| stats.visits)
+                    .sum::<u32>(),
+                budget
+            );
+            assert!(result.root_value.is_some());
+        }
+        // Later rounds shrink to the trees that still have budget.
+        assert_eq!(evaluator.batch_sizes[0], 3);
+        assert!(evaluator.batch_sizes.contains(&1));
+
+        let config = RootSearchConfig::deterministic(8, 4, GumbelParameters::PAPER, 11);
+        assert!(matches!(
+            gumbel_search_batch_with_budgets(
+                roots.clone(),
+                config,
+                Some(&[8, 0, 4]),
+                &mut evaluator
+            ),
+            Err(SearchRunError::Gumbel(GumbelError::ZeroBudget))
+        ));
+        let config = RootSearchConfig::deterministic(8, 4, GumbelParameters::PAPER, 11);
+        assert!(matches!(
+            gumbel_search_batch_with_budgets(roots, config, Some(&[8, 8]), &mut evaluator),
+            Err(SearchRunError::Gumbel(GumbelError::ZeroBudget))
+        ));
+        assert_eq!(resolve_root_budget(5, None, 2), Ok(5));
+        assert_eq!(resolve_root_budget(5, Some(&[1, 2, 3]), 2), Ok(3));
+        assert_eq!(
+            resolve_root_budget(5, Some(&[1, 0, 3]), 1),
+            Err(GumbelError::ZeroBudget)
+        );
     }
 
     #[test]

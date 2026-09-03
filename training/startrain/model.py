@@ -1,4 +1,12 @@
-"""Approved five-group D5-equivariant local/global graph RRT trunk."""
+"""D5-equivariant local/global graph RRT trunk with relational attention.
+
+Architecture v3 adds two structural elements to the approved five-group
+GraphResTNet: a D5-invariant relative attention bias in every global block
+(keyed by the pairwise relations of :mod:`startrain.topology`) and adaLN-Zero
+rule conditioning of every local block from the global scalars. Both are
+optional so the previous lineage's checkpoints (feature schema v3, no bias, no
+conditioning) still build the exact module tree they were trained with.
+"""
 
 from __future__ import annotations
 
@@ -10,16 +18,28 @@ import torch.nn.functional as functional
 from torch import Tensor, nn
 
 from .contracts import (
+    FEATURE_SCHEMA_VERSION,
+    LEGACY_FEATURE_SCHEMA_VERSION,
     SCORE_MARGIN_MAX,
     SCORE_MARGIN_MIN,
     SOFT_POLICY_TEMPERATURE,
 )
 from .features import GLOBAL_FEATURE_DIM, NODE_FEATURE_DIM
-from .topology import EDGE_CLASS_COUNT
+from .features_v3 import LEGACY_GLOBAL_FEATURE_DIM, LEGACY_NODE_FEATURE_DIM
+from .topology import (
+    EDGE_CLASS_COUNT,
+    relation_count,
+    relation_tables,
+    ring_slots,
+)
 
-MODEL_SCHEMA_VERSION = 2
+MODEL_SCHEMA_VERSION = 3
 LocalOperator = Literal["mean", "source_gated"]
 LOCAL_OPERATORS: tuple[LocalOperator, ...] = ("mean", "source_gated")
+FEATURE_DIMENSIONS: dict[int, tuple[int, int]] = {
+    FEATURE_SCHEMA_VERSION: (NODE_FEATURE_DIM, GLOBAL_FEATURE_DIM),
+    LEGACY_FEATURE_SCHEMA_VERSION: (LEGACY_NODE_FEATURE_DIM, LEGACY_GLOBAL_FEATURE_DIM),
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,13 +59,42 @@ class ModelConfig:
     soft_policy_temperature: float = SOFT_POLICY_TEMPERATURE
     local_operator: LocalOperator = "mean"
     local_blocks_per_group: int = 2
+    # Architecture v3. The legacy lineage is (3, False, 0).
+    feature_schema_version: int = FEATURE_SCHEMA_VERSION
+    relational_bias: bool = True
+    adaln_hidden: int = 32
 
     def __post_init__(self) -> None:
         if (
-            self.node_feature_dim != NODE_FEATURE_DIM
-            or self.global_feature_dim != GLOBAL_FEATURE_DIM
+            isinstance(self.feature_schema_version, bool)
+            or not isinstance(self.feature_schema_version, int)
+            or self.feature_schema_version not in FEATURE_DIMENSIONS
         ):
-            raise ValueError("model feature dimensions must match feature schema v3")
+            raise ValueError(
+                "feature_schema_version must be the production schema "
+                f"{FEATURE_SCHEMA_VERSION} or the legacy schema "
+                f"{LEGACY_FEATURE_SCHEMA_VERSION}"
+            )
+        node_dim, global_dim = FEATURE_DIMENSIONS[self.feature_schema_version]
+        if self.node_feature_dim != node_dim or self.global_feature_dim != global_dim:
+            raise ValueError(
+                "model feature dimensions must match feature schema "
+                f"v{self.feature_schema_version} ({node_dim}, {global_dim})"
+            )
+        if type(self.relational_bias) is not bool:
+            raise TypeError("relational_bias must be boolean")
+        if isinstance(self.adaln_hidden, bool) or not isinstance(
+            self.adaln_hidden, int
+        ):
+            raise TypeError("adaln_hidden must be an integer")
+        if self.adaln_hidden < 0:
+            raise ValueError("adaln_hidden must be non-negative")
+        if self.feature_schema_version == LEGACY_FEATURE_SCHEMA_VERSION and (
+            self.relational_bias or self.adaln_hidden
+        ):
+            raise ValueError(
+                "the legacy feature schema predates relational bias and rule conditioning"
+            )
         if self.width <= 0:
             raise ValueError("width must be positive")
         if self.rrt_groups <= 0:
@@ -77,6 +126,24 @@ class ModelConfig:
         if self.local_blocks_per_group <= 0:
             raise ValueError("local_blocks_per_group must be positive")
 
+    @classmethod
+    def legacy(cls, **overrides: object) -> "ModelConfig":
+        """Configuration of the previous lineage (feature schema v3)."""
+
+        values: dict[str, object] = {
+            "node_feature_dim": LEGACY_NODE_FEATURE_DIM,
+            "global_feature_dim": LEGACY_GLOBAL_FEATURE_DIM,
+            "feature_schema_version": LEGACY_FEATURE_SCHEMA_VERSION,
+            "relational_bias": False,
+            "adaln_hidden": 0,
+        }
+        values.update(overrides)
+        return cls(**values)  # type: ignore[arg-type]
+
+    @property
+    def is_legacy(self) -> bool:
+        return self.feature_schema_version == LEGACY_FEATURE_SCHEMA_VERSION
+
     @property
     def score_margin_bins(self) -> int:
         return self.score_margin_max - self.score_margin_min + 1
@@ -93,6 +160,10 @@ class ModelConfig:
     def ff_hidden_width(self) -> int:
         return max(self.width, int(self.width * self.ff_multiplier))
 
+    @property
+    def uses_rule_conditioning(self) -> bool:
+        return self.adaln_hidden > 0
+
 
 class StarModelOutput(NamedTuple):
     policy_logits: Tensor
@@ -107,6 +178,8 @@ class ModelParameterCounts(NamedTuple):
     input_and_output: int
     local_blocks: int
     global_blocks: int
+    relational_bias: int
+    rule_conditioning: int
     total: int
 
 
@@ -125,7 +198,8 @@ def model_parameter_counts(config: ModelConfig) -> ModelParameterCounts:
     )
     if config.local_operator == "source_gated":
         local_per_block += width * bottleneck
-    local_blocks = config.rrt_groups * config.local_blocks_per_group * local_per_block
+    local_block_count = config.rrt_groups * config.local_blocks_per_group
+    local_blocks = local_block_count * local_per_block
 
     kv_width = config.kv_heads * config.attention_head_width
     global_per_block = (
@@ -145,11 +219,31 @@ def model_parameter_counts(config: ModelConfig) -> ModelParameterCounts:
     head_outputs = 1 + 2 + config.score_margin_bins + 3 + 1 + 1
     head_parameters = (width + 1) * head_outputs
     input_and_output = projection_parameters + final_norm_parameters + head_parameters
+
+    relational_bias = (
+        config.rrt_groups * relation_count() * config.attention_heads
+        if config.relational_bias
+        else 0
+    )
+    rule_conditioning = 0
+    if config.uses_rule_conditioning:
+        hidden = config.adaln_hidden
+        rule_conditioning = (
+            (config.global_feature_dim + 1) * hidden
+            + (hidden + 1) * hidden
+            + local_block_count * (hidden + 1) * 2 * width
+        )
     return ModelParameterCounts(
         input_and_output=input_and_output,
         local_blocks=local_blocks,
         global_blocks=global_blocks,
-        total=input_and_output + local_blocks + global_blocks,
+        relational_bias=relational_bias,
+        rule_conditioning=rule_conditioning,
+        total=input_and_output
+        + local_blocks
+        + global_blocks
+        + relational_bias
+        + rule_conditioning,
     )
 
 
@@ -179,7 +273,13 @@ def _gather_neighbors(inputs: Tensor, neighbor_index: Tensor) -> Tensor:
 
 
 class LocalEdgeBlock(nn.Module):
-    """Bottleneck residual message passing over invariant edge classes."""
+    """Bottleneck residual message passing over invariant edge classes.
+
+    With ``adaln_hidden > 0`` the RMSNorm output is modulated by a zero-
+    initialized scale and shift computed from the shared rule-conditioning
+    vector (adaLN-Zero), so every block starts as the unconditioned block and
+    learns how the variant should change local message passing.
+    """
 
     def __init__(
         self,
@@ -188,6 +288,7 @@ class LocalEdgeBlock(nn.Module):
         dropout: float,
         norm_eps: float,
         local_operator: LocalOperator = "mean",
+        adaln_hidden: int = 0,
     ) -> None:
         super().__init__()
         bottleneck = max(8, int(width * bottleneck_ratio))
@@ -202,6 +303,11 @@ class LocalEdgeBlock(nn.Module):
         self.update = SwiGLU(bottleneck, bottleneck, width)
         self.dropout = nn.Dropout(dropout)
         self.layer_scale = nn.Parameter(torch.full((width,), 1e-2))
+        self.modulation: nn.Linear | None = None
+        if adaln_hidden > 0:
+            self.modulation = nn.Linear(adaln_hidden, 2 * width)
+            nn.init.zeros_(self.modulation.weight)
+            nn.init.zeros_(self.modulation.bias)
 
     def forward(
         self,
@@ -210,8 +316,12 @@ class LocalEdgeBlock(nn.Module):
         neighbor_mask: Tensor,
         neighbor_edge_type: Tensor,
         node_mask: Tensor,
+        condition: Tensor | None = None,
     ) -> Tensor:
         normalized = self.norm(inputs)
+        if self.modulation is not None and condition is not None:
+            scale, shift = self.modulation(condition).unsqueeze(1).chunk(2, dim=-1)
+            normalized = normalized * (1.0 + scale) + shift
         neighbors = _gather_neighbors(normalized, neighbor_index)
         messages = self.neighbor_projection(neighbors)
         messages = messages + self.edge_embedding(neighbor_edge_type)
@@ -229,7 +339,13 @@ class LocalEdgeBlock(nn.Module):
 
 
 class GlobalGQABlock(nn.Module):
-    """Masked global-token attention using fused scaled-dot-product attention."""
+    """Masked global-token attention using fused scaled-dot-product attention.
+
+    With ``relational_bias`` a learned per-head bias indexed by the D5-invariant
+    pairwise relation of every (query, key) pair is added through the additive
+    attention mask, so attention can attend by geometry (ring difference,
+    angular offset, shortest-path distance) rather than only by content.
+    """
 
     def __init__(
         self,
@@ -239,6 +355,7 @@ class GlobalGQABlock(nn.Module):
         ff_multiplier: float,
         dropout: float,
         norm_eps: float,
+        relational_bias: bool = False,
     ) -> None:
         super().__init__()
         self.query_heads = query_heads
@@ -255,12 +372,17 @@ class GlobalGQABlock(nn.Module):
         self.ff = SwiGLU(width, hidden, width)
         self.attention_scale = nn.Parameter(torch.full((width,), 1e-2))
         self.ff_scale = nn.Parameter(torch.full((width,), 1e-2))
+        self.relation_bias: nn.Embedding | None = None
+        if relational_bias:
+            self.relation_bias = nn.Embedding(relation_count(), query_heads)
+            nn.init.zeros_(self.relation_bias.weight)
 
     def forward(
         self,
         token: Tensor,
         nodes: Tensor,
         node_mask: Tensor,
+        relation_index: Tensor | None = None,
     ) -> tuple[Tensor, Tensor]:
         sequence = torch.cat((token, nodes), dim=1)
         token_mask = torch.ones(
@@ -281,16 +403,34 @@ class GlobalGQABlock(nn.Module):
         query = query.transpose(1, 2)
         key = key.transpose(1, 2)
         value = value.transpose(1, 2)
+        key_mask = sequence_mask[:, None, None, :]
+        attn_mask: Tensor
+        if self.relation_bias is not None and relation_index is not None:
+            bias = self.relation_bias(relation_index).permute(0, 3, 1, 2)
+            attn_mask = bias.to(dtype=query.dtype).masked_fill(
+                ~key_mask, torch.finfo(query.dtype).min
+            )
+        else:
+            attn_mask = key_mask
         attended = functional.scaled_dot_product_attention(
             query,
             key,
             value,
-            attn_mask=sequence_mask[:, None, None, :],
+            attn_mask=attn_mask,
             dropout_p=self.dropout if self.training else 0.0,
             is_causal=False,
             enable_gqa=self.query_heads != self.kv_heads,
         )
-        attended = attended.transpose(1, 2).reshape(batch, length, width)
+        attended = attended.transpose(1, 2)
+        if torch.compiler.is_exporting():
+            # With an additive mask the math kernel hands back a transposed
+            # layout that symbolic tracing cannot prove viewable; an explicit
+            # contiguous clone keeps the ONNX export well-defined. Eager and
+            # compiled runs keep the copy-free reshape.
+            attended = attended.clone(memory_format=torch.contiguous_format)
+            attended = attended.view(batch, length, width)
+        else:
+            attended = attended.reshape(batch, length, width)
         sequence = sequence + self.attention_output(attended) * self.attention_scale
         sequence = sequence * sequence_mask.unsqueeze(-1).to(sequence.dtype)
         sequence = sequence + self.ff(self.ff_norm(sequence)) * self.ff_scale
@@ -311,6 +451,7 @@ class RRTGroup(nn.Module):
                     config.dropout,
                     config.rms_norm_eps,
                     config.local_operator,
+                    config.adaln_hidden,
                 )
                 for _ in range(config.local_blocks_per_group)
             ]
@@ -322,6 +463,7 @@ class RRTGroup(nn.Module):
             config.ff_multiplier,
             config.dropout,
             config.rms_norm_eps,
+            config.relational_bias,
         )
 
     def forward(
@@ -332,6 +474,8 @@ class RRTGroup(nn.Module):
         neighbor_mask: Tensor,
         neighbor_edge_type: Tensor,
         node_mask: Tensor,
+        condition: Tensor | None = None,
+        relation_index: Tensor | None = None,
     ) -> tuple[Tensor, Tensor]:
         for block in self.local_blocks:
             nodes = block(
@@ -340,8 +484,9 @@ class RRTGroup(nn.Module):
                 neighbor_mask,
                 neighbor_edge_type,
                 node_mask,
+                condition,
             )
-        return self.global_block(token, nodes, node_mask)
+        return self.global_block(token, nodes, node_mask, relation_index)
 
 
 def _mask_logits(logits: Tensor, legal_mask: Tensor) -> Tensor:
@@ -349,7 +494,7 @@ def _mask_logits(logits: Tensor, legal_mask: Tensor) -> Tensor:
 
 
 class GraphResTNet(nn.Module):
-    """Shared model for rings 4, 6, 8, and 10."""
+    """Shared model for rings 4, 6, 8, and 10 and every rule variant."""
 
     def __init__(self, config: ModelConfig = ModelConfig()) -> None:
         super().__init__()
@@ -372,6 +517,40 @@ class GraphResTNet(nn.Module):
         self.alive_head = nn.Linear(width, 1)
         self.soft_node_policy = nn.Linear(width, 1)
 
+        self.rule_conditioner: nn.Sequential | None = None
+        if config.uses_rule_conditioning:
+            hidden = config.adaln_hidden
+            self.rule_conditioner = nn.Sequential(
+                nn.Linear(config.global_feature_dim, hidden),
+                nn.SiLU(),
+                nn.Linear(hidden, hidden),
+                nn.SiLU(),
+            )
+        # Non-persistent buffers: derived from the board, never checkpointed,
+        # and absent from legacy module trees.
+        self.relation_tables: Tensor | None
+        self.ring_slots: Tensor | None
+        if config.relational_bias:
+            self.register_buffer("relation_tables", relation_tables(), persistent=False)
+            self.register_buffer("ring_slots", ring_slots(), persistent=False)
+        else:
+            self.relation_tables = None
+            self.ring_slots = None
+
+    def relation_index_for(self, rings: Tensor, max_nodes: int) -> Tensor | None:
+        """Per-sample `(B, 1 + max_nodes, 1 + max_nodes)` relation ids."""
+
+        if self.relation_tables is None or self.ring_slots is None:
+            return None
+        slots = self.ring_slots[rings]
+        # index_select (rather than a slice) keeps the exported graph free of a
+        # specialization on whether the batch reaches the largest board.
+        positions = torch.arange(max_nodes + 1, device=rings.device)
+        tables = self.relation_tables.index_select(1, positions).index_select(
+            2, positions
+        )
+        return tables[slots]
+
     def forward(
         self,
         node_features: Tensor,
@@ -381,6 +560,7 @@ class GraphResTNet(nn.Module):
         neighbor_edge_type: Tensor,
         node_mask: Tensor,
         legal_action_mask: Tensor,
+        rings: Tensor | None = None,
     ) -> StarModelOutput:
         mask_values = node_mask.unsqueeze(-1).to(dtype=node_features.dtype)
         nodes = self.node_projection(node_features) * mask_values
@@ -388,6 +568,16 @@ class GraphResTNet(nn.Module):
             node_features.shape[0], -1, -1
         )
         token = token + self.global_projection(global_features).unsqueeze(1)
+        condition = (
+            self.rule_conditioner(global_features)
+            if self.rule_conditioner is not None
+            else None
+        )
+        relation_index: Tensor | None = None
+        if self.relation_tables is not None:
+            if rings is None:
+                raise ValueError("relational bias requires the per-sample rings tensor")
+            relation_index = self.relation_index_for(rings, node_features.shape[1])
 
         for group in self.rrt_groups:
             token, nodes = group(
@@ -397,6 +587,8 @@ class GraphResTNet(nn.Module):
                 neighbor_mask,
                 neighbor_edge_type,
                 node_mask,
+                condition,
+                relation_index,
             )
 
         nodes = self.final_node_norm(nodes) * mask_values

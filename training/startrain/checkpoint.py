@@ -23,6 +23,9 @@ from .contracts import (
     ACTION_LAYOUT_SCHEMA_ID,
     ACTION_LAYOUT_VERSION,
     FEATURE_SCHEMA_HASH,
+    FEATURE_SCHEMA_VERSION,
+    MAX_HANDICAP,
+    MODES,
     RULES_HASH,
     RULES_HASH_WIRE,
     RULES_SCHEMA_ID,
@@ -63,18 +66,27 @@ class ModelManifest:
 
 @dataclass(frozen=True, slots=True)
 class VerifiedModelConfig:
-    """Normalized architecture and immutable evaluation contracts."""
+    """Normalized architecture and immutable evaluation contracts.
+
+    The evaluation contract splits into the *game contract* (rules, action
+    layout, scoring: every model in one arena must share it) and the *input
+    contract* (feature schema and model schema: each model may differ, because
+    every side encodes the shared semantic position with its own encoder).
+    """
 
     model: ModelConfig
     game_mode: str
     pie_rule: bool
     rings: tuple[int, ...]
+    handicap: int = 1
+    variants: dict[str, object] | None = None
     checkpoint_format: str = CHECKPOINT_FORMAT
     checkpoint_version: int = CHECKPOINT_VERSION
     rules_schema: str = RULES_SCHEMA_ID
     rules_hash: int = RULES_HASH
     rules_hash_wire: str = RULES_HASH_WIRE
     feature_schema_hash: int = FEATURE_SCHEMA_HASH
+    feature_schema_version: int = FEATURE_SCHEMA_VERSION
     action_layout_schema: str = ACTION_LAYOUT_SCHEMA_ID
     action_layout_version: int = ACTION_LAYOUT_VERSION
     model_schema_version: int = MODEL_SCHEMA_VERSION
@@ -85,26 +97,52 @@ class VerifiedModelConfig:
 
     @property
     def game_config(self) -> dict[str, object]:
+        variants = (
+            dict(self.variants)
+            if self.variants is not None
+            else {
+                "modes": MODES,
+                "handicap_min": 1,
+                "handicap_max": MAX_HANDICAP,
+                "pie_allowed": True,
+            }
+        )
         return {
             "mode": self.game_mode,
             "pie_rule": self.pie_rule,
+            "handicap": self.handicap,
             "rings": self.rings,
+            "variants": variants,
         }
 
     @property
-    def evaluation_contract(self) -> dict[str, object]:
+    def game_contract(self) -> dict[str, object]:
+        """The part of the contract every model in one evaluation must share."""
+
         return {
             "checkpoint_format": self.checkpoint_format,
             "checkpoint_version": self.checkpoint_version,
             "rules_schema": self.rules_schema,
             "rules_hash": self.rules_hash,
             "rules_hash_wire": self.rules_hash_wire,
-            "feature_schema_hash": self.feature_schema_hash,
             "action_layout_schema": self.action_layout_schema,
             "action_layout_version": self.action_layout_version,
-            "model_schema_version": self.model_schema_version,
             "game": self.game_config,
         }
+
+    @property
+    def input_contract(self) -> dict[str, object]:
+        """The per-model encoder contract; sides of an arena may differ."""
+
+        return {
+            "feature_schema_version": self.feature_schema_version,
+            "feature_schema_hash": self.feature_schema_hash,
+            "model_schema_version": self.model_schema_version,
+        }
+
+    @property
+    def evaluation_contract(self) -> dict[str, object]:
+        return {**self.game_contract, **self.input_contract}
 
 
 @dataclass(frozen=True, slots=True)
@@ -556,7 +594,13 @@ def normalize_model_config(config: Mapping[str, Any]) -> dict[str, object]:
     normalized: dict[str, object] = {}
     for name, default in defaults.items():
         value = values.get(name, default)
-        if type(default) is int:
+        if type(default) is bool:
+            if type(value) is not bool:
+                raise ValueError(
+                    f"checkpoint model configuration {name} must be boolean"
+                )
+            normalized[name] = value
+        elif type(default) is int:
             if type(value) is not int:
                 raise ValueError(
                     f"checkpoint model configuration {name} must be integer"
@@ -624,6 +668,8 @@ def extract_verified_checkpoint_config(
         game_mode=str(game_config["mode"]),
         pie_rule=bool(game_config["pie_rule"]),
         rings=rings,
+        handicap=int(cast(int, game_config["handicap"])),
+        variants=cast(dict[str, object], game_config["variants"]),
     )
 
 
@@ -698,6 +744,8 @@ def extract_verified_manifest_config(
         game_mode=str(game_config["mode"]),
         pie_rule=bool(game_config["pie_rule"]),
         rings=rings,
+        handicap=int(cast(int, game_config["handicap"])),
+        variants=cast(dict[str, object], game_config["variants"]),
     )
 
 
@@ -1859,9 +1907,47 @@ def _mapping_value(config: Mapping[str, Any], name: str) -> Mapping[str, Any]:
     return value
 
 
-def _normalize_game_config(config: Mapping[str, Any]) -> dict[str, object]:
+def _normalize_variants(config: object) -> dict[str, object]:
+    if not isinstance(config, Mapping):
+        raise ValueError("checkpoint variant rules must be a mapping")
     values = dict(config)
-    unknown = set(values) - {"mode", "pie_rule", "rings"}
+    unknown = set(values) - {"modes", "handicap_min", "handicap_max", "pie_allowed"}
+    if unknown:
+        raise ValueError(
+            "checkpoint variant rules have unsupported keys: "
+            + ", ".join(sorted(str(key) for key in unknown))
+        )
+    modes = values.get("modes", MODES)
+    if (
+        not isinstance(modes, (list, tuple))
+        or not modes
+        or any(type(mode) is not str or mode not in MODES for mode in modes)
+        or len(set(modes)) != len(modes)
+    ):
+        raise ValueError("checkpoint variant modes are incompatible")
+    handicap_min = values.get("handicap_min", 1)
+    handicap_max = values.get("handicap_max", MAX_HANDICAP)
+    for name, value in (("handicap_min", handicap_min), ("handicap_max", handicap_max)):
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(f"checkpoint variant {name} is incompatible")
+    if not 1 <= handicap_min <= handicap_max <= MAX_HANDICAP:
+        raise ValueError("checkpoint variant handicap range is incompatible")
+    pie_allowed = values.get("pie_allowed", True)
+    if type(pie_allowed) is not bool:
+        raise ValueError("checkpoint variant pie_allowed is incompatible")
+    return {
+        "modes": tuple(modes),
+        "handicap_min": handicap_min,
+        "handicap_max": handicap_max,
+        "pie_allowed": pie_allowed,
+    }
+
+
+def _normalize_game_config(config: Mapping[str, Any]) -> dict[str, object]:
+    """Normalize a rules-v3 game configuration (default variant + family)."""
+
+    values = dict(config)
+    unknown = set(values) - {"mode", "pie_rule", "handicap", "rings", "variants"}
     if unknown:
         raise ValueError(
             "checkpoint game configuration has unsupported keys: "
@@ -1869,15 +1955,36 @@ def _normalize_game_config(config: Mapping[str, Any]) -> dict[str, object]:
         )
     mode = values.get("mode", "double")
     pie_rule = values.get("pie_rule", False)
+    handicap = values.get("handicap", 1)
     rings = values.get("rings", (4, 6, 8, 10))
-    if not isinstance(mode, str) or mode != "double":
+    if not isinstance(mode, str) or mode not in MODES:
         raise ValueError("checkpoint game mode is incompatible")
-    if type(pie_rule) is not bool or pie_rule:
+    if type(pie_rule) is not bool:
         raise ValueError("checkpoint pie-rule configuration is incompatible")
+    if isinstance(handicap, bool) or not isinstance(handicap, int):
+        raise ValueError("checkpoint game handicap is incompatible")
+    if not 1 <= handicap <= MAX_HANDICAP or (pie_rule and handicap != 1):
+        raise ValueError("checkpoint game handicap is incompatible")
     if (
         not isinstance(rings, (list, tuple))
         or any(type(ring) is not int for ring in rings)
         or tuple(rings) != (4, 6, 8, 10)
     ):
         raise ValueError("checkpoint game rings are incompatible")
-    return {"mode": mode, "pie_rule": pie_rule, "rings": tuple(rings)}
+    variants = _normalize_variants(values.get("variants", {}))
+    modes = cast(tuple[str, ...], variants["modes"])
+    if (
+        mode not in modes
+        or not cast(int, variants["handicap_min"])
+        <= handicap
+        <= cast(int, variants["handicap_max"])
+        or (pie_rule and not cast(bool, variants["pie_allowed"]))
+    ):
+        raise ValueError("checkpoint default variant is outside its variant rules")
+    return {
+        "mode": mode,
+        "pie_rule": pie_rule,
+        "handicap": handicap,
+        "rings": tuple(rings),
+        "variants": variants,
+    }

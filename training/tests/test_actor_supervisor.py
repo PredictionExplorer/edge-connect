@@ -468,7 +468,7 @@ def test_manifest_provider_reuses_compiled_evaluator_and_refreshes_weights(
 
         def forward(self, *arguments: torch.Tensor) -> StarModelOutput:
             node_features = arguments[0]
-            legal_actions = arguments[-1]
+            legal_actions = arguments[6]
             batch, nodes = node_features.shape[:2]
             value = self.weight.expand(batch)
             policy = self.weight.expand(batch, nodes).masked_fill(

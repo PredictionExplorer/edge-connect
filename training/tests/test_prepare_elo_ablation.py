@@ -1236,24 +1236,24 @@ def test_prepare_architecture_suite_parameter_contracts(tmp_path: Path) -> None:
     )
     attention_control = load_config(attention / "ring10-attention-control.yaml")
     attention_full = load_config(attention / "ring10-attention-full-kv.yaml")
-    assert model_parameter_count(attention_control.model) == 10_476_983
-    assert model_parameter_count(attention_full.model) == 10_476_983
+    assert model_parameter_count(attention_control.model) == 10_929_399
+    assert model_parameter_count(attention_full.model) == 10_929_399
 
     relational = prepare("ring10-relational", RING10_RELATIONAL_TREATMENTS)
     relational_control = load_config(relational / "ring10-relational-control.yaml")
     local_heavy = load_config(relational / "ring10-relational-local-heavy.yaml")
     source_gated = load_config(relational / "ring10-relational-source-gated.yaml")
-    assert model_parameter_count(relational_control.model) == 10_476_983
-    assert model_parameter_count(local_heavy.model) == 10_476_953
-    assert model_parameter_count(source_gated.model) == 10_476_983
+    assert model_parameter_count(relational_control.model) == 10_929_399
+    assert model_parameter_count(local_heavy.model) == 11_056_089
+    assert model_parameter_count(source_gated.model) == 10_929_399
 
     capacity = prepare("ring10-capacity", RING10_CAPACITY_TREATMENTS)
     capacity_control = load_config(capacity / "ring10-capacity-control.yaml")
     capacity_depth = load_config(capacity / "ring10-capacity-depth-7.yaml")
     capacity_width = load_config(capacity / "ring10-capacity-width-512.yaml")
-    assert model_parameter_count(capacity_control.model) == 10_476_983
-    assert model_parameter_count(capacity_depth.model) == 14_614_199
-    assert model_parameter_count(capacity_width.model) == 18_556_727
+    assert model_parameter_count(capacity_control.model) == 10_929_399
+    assert model_parameter_count(capacity_depth.model) == 15_244_983
+    assert model_parameter_count(capacity_width.model) == 19_159_319
 
 
 def test_prepare_canonicalizes_architecture_before_parameter_validation(
@@ -1285,7 +1285,7 @@ def test_prepare_canonicalizes_architecture_before_parameter_validation(
     )
     control = load_config(output / "ring10-attention-control.yaml")
     assert control.model.rrt_groups == 5
-    assert model_parameter_count(control.model) == 10_476_983
+    assert model_parameter_count(control.model) == 10_929_399
 
 
 def test_capacity_control_resets_equal_count_attention_drift(

@@ -61,7 +61,7 @@ def test_benchmark_reports_decode_and_selected_row_rates(tmp_path) -> None:
     assert result["benchmark"] == BENCHMARK_NAME
     assert result["sample_count"] == 8
     assert result["selected_rows"] == 3
-    assert result["npz_members_loaded_per_repeat"] == 30
+    assert result["npz_members_loaded_per_repeat"] == 41
     assert result["decode_seconds"]["count"] == 2
     assert result["selected_row_materialization_seconds"]["minimum"] >= 0
     assert result["selected_rows_per_second"] > 0

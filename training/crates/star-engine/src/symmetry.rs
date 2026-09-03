@@ -103,28 +103,19 @@ impl D5Maps {
         transformed
     }
 
-    /// Transforms one atomic action.
+    /// Transforms one atomic action. The swap is fixed by every symmetry.
     #[must_use]
     pub fn action(&self, symmetry: Symmetry, action: Action) -> Action {
         match action {
             Action::Place(node) => Action::Place(self.node(symmetry, node)),
+            Action::Swap => Action::Swap,
         }
     }
 
-    /// Transforms stones while preserving all turn semantics.
+    /// Transforms every spatial field while preserving all turn semantics.
     #[must_use]
     pub fn state(&self, symmetry: Symmetry, source: &GameState) -> GameState {
-        let stones = [
-            self.bitboard(symmetry, source.stones()[0]),
-            self.bitboard(symmetry, source.stones()[1]),
-        ];
-        let last_move = source.last_move().map(|node| self.node(symmetry, node));
-        let current_turn_moves: Vec<_> = source
-            .current_turn_moves()
-            .iter()
-            .map(|node| self.node(symmetry, *node))
-            .collect();
-        source.with_transformed_spatial(stones, last_move, &current_turn_moves)
+        source.map_nodes(|node| self.node(symmetry, node))
     }
 }
 

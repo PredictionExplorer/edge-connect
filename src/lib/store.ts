@@ -22,6 +22,7 @@ import {
 } from './star/ai/server-client';
 import { scoreCompletionBounds } from './star/completion-bounds';
 import { replay, type GameAction, type GameConfig } from './star/game';
+import { STAR_MAX_HANDICAP } from './star/rules';
 
 export type Phase = 'setup' | 'playing';
 export type AiRuntime = Exclude<ControllerType, 'human'>;
@@ -92,6 +93,7 @@ export const DEFAULT_CONFIG: GameConfig = {
   rings: 6,
   mode: 'classic',
   pieRule: false,
+  handicap: 1,
   playerNames: ['Player 1', 'Player 2'],
 };
 
@@ -123,16 +125,29 @@ function hasExactKeys(value: Record<string, unknown>, keys: readonly string[]): 
   return actual.length === expected.length && actual.every((key, index) => key === expected[index]);
 }
 
+function isHandicap(value: unknown): value is number {
+  return (
+    typeof value === 'number' &&
+    Number.isInteger(value) &&
+    value >= 1 &&
+    value <= STAR_MAX_HANDICAP
+  );
+}
+
 export function parseGameConfig(value: unknown): GameConfig | null {
-  if (!isRecord(value) || !hasExactKeys(value, ['rings', 'mode', 'pieRule', 'playerNames'])) {
-    return null;
-  }
+  if (!isRecord(value)) return null;
+  const withHandicap = 'handicap' in value;
+  const keys = withHandicap
+    ? ['rings', 'mode', 'pieRule', 'handicap', 'playerNames']
+    : ['rings', 'mode', 'pieRule', 'playerNames'];
+  if (!hasExactKeys(value, keys)) return null;
   const names = value.playerNames;
   if (
     typeof value.rings !== 'number' ||
     !isSupportedRings(value.rings) ||
     (value.mode !== 'classic' && value.mode !== 'double') ||
     typeof value.pieRule !== 'boolean' ||
+    (withHandicap && !isHandicap(value.handicap)) ||
     !Array.isArray(names) ||
     names.length !== 2 ||
     typeof names[0] !== 'string' ||
@@ -140,10 +155,13 @@ export function parseGameConfig(value: unknown): GameConfig | null {
   ) {
     return null;
   }
+  const handicap = withHandicap ? (value.handicap as number) : 1;
+  if (value.pieRule && handicap !== 1) return null;
   return {
     rings: value.rings,
     mode: value.mode,
     pieRule: value.pieRule,
+    handicap,
     playerNames: [names[0], names[1]],
   };
 }
@@ -151,14 +169,17 @@ export function parseGameConfig(value: unknown): GameConfig | null {
 export function normalizeGameConfig(value: unknown): GameConfig {
   const record = isRecord(value) ? value : {};
   const names = Array.isArray(record.playerNames) ? record.playerNames : [];
+  const pieRule =
+    typeof record.pieRule === 'boolean' ? record.pieRule : DEFAULT_CONFIG.pieRule;
+  const handicap = isHandicap(record.handicap) && !pieRule ? record.handicap : 1;
   return {
     rings: isSupportedRings(record.rings) ? record.rings : DEFAULT_CONFIG.rings,
     mode:
       record.mode === 'classic' || record.mode === 'double'
         ? record.mode
         : DEFAULT_CONFIG.mode,
-    pieRule:
-      typeof record.pieRule === 'boolean' ? record.pieRule : DEFAULT_CONFIG.pieRule,
+    pieRule,
+    handicap,
     playerNames: [
       typeof names[0] === 'string' ? names[0] : DEFAULT_CONFIG.playerNames[0],
       typeof names[1] === 'string' ? names[1] : DEFAULT_CONFIG.playerNames[1],

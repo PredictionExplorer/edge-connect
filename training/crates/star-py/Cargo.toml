@@ -1,6 +1,6 @@
 [package]
 name = "star-py"
-description = "Coarse batched PyO3 bindings for Double *Star training actors"
+description = "Coarse batched PyO3 bindings for *Star training actors"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

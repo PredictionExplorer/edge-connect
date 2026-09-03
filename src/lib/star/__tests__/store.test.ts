@@ -239,6 +239,7 @@ describe('persisted app-state validation', () => {
         rings: 8,
         mode: 'double',
         pieRule: false,
+        handicap: 1,
         playerNames: ['Ada', 'Grace'],
       },
       controllers: ['server', 'local'],
@@ -263,8 +264,37 @@ describe('persisted app-state validation', () => {
       rings: 6,
       mode: 'double',
       pieRule: true,
+      handicap: 1,
       playerNames: ['Ada', 'Player 2'],
     });
+    // A handicap survives normalization only without the pie rule.
+    expect(
+      normalizeGameConfig({
+        rings: 4,
+        mode: 'classic',
+        pieRule: false,
+        handicap: 5,
+        playerNames: ['Ada', 'Grace'],
+      }).handicap,
+    ).toBe(5);
+    expect(
+      normalizeGameConfig({
+        rings: 4,
+        mode: 'classic',
+        pieRule: true,
+        handicap: 5,
+        playerNames: ['Ada', 'Grace'],
+      }).handicap,
+    ).toBe(1);
+    expect(
+      normalizeGameConfig({
+        rings: 4,
+        mode: 'classic',
+        pieRule: false,
+        handicap: 12,
+        playerNames: ['Ada', 'Grace'],
+      }).handicap,
+    ).toBe(1);
   });
 
   it('validates each runtime search budget without clamping', () => {

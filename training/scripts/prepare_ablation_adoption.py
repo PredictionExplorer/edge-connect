@@ -17,6 +17,8 @@ from typing import Any
 
 import yaml
 
+from startrain.config import CONFIG_SCHEMA_VERSION
+
 if __package__:
     from .compare_elo_ablation_seeds import (
         REPORT_NAME as CROSS_SEED_REPORT,
@@ -525,7 +527,7 @@ def _targets(
                 )
             )
         if (
-            profile_document.get("schema_version") != 3
+            profile_document.get("schema_version") != CONFIG_SCHEMA_VERSION
             or orchestration.get("enabled") is not True
             or orchestration.get("training_objective") != "ring10_only"
             or learner.get("unlimited") is not True

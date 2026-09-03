@@ -153,7 +153,7 @@ def sample(rings: int = 4) -> ReplaySample:
 def test_yaml_configs_load_strictly() -> None:
     small = load_config(CONFIGS / "small.yaml")
     h100 = load_config(CONFIGS / "h100.yaml")
-    assert small.schema_version == h100.schema_version == 3
+    assert small.schema_version == h100.schema_version == 4
     assert small.model.rrt_groups == h100.model.rrt_groups == 5
     assert h100.model.kv_heads < h100.model.attention_heads
     assert small.train.precision == "fp32"
@@ -533,8 +533,8 @@ def test_yaml_parses_opt_in_learner_ring_mixture_curriculum(tmp_path) -> None:
 def test_old_config_schema_and_noncanonical_rings_are_rejected(tmp_path) -> None:
     source = (CONFIGS / "small.yaml").read_text(encoding="utf-8")
     old = tmp_path / "old.yaml"
-    old.write_text(source.replace("schema_version: 3", "schema_version: 2", 1))
-    with pytest.raises(ConfigError, match="schema_version must be 3"):
+    old.write_text(source.replace("schema_version: 4", "schema_version: 3", 1))
+    with pytest.raises(ConfigError, match="schema_version must be 4"):
         load_config(old)
 
     odd = tmp_path / "odd.yaml"

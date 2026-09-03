@@ -17,16 +17,16 @@ import {
   STAR_RULES_VERSION,
 } from '../rules';
 
-const EXPECTED_RULES_HASH = 'fnv1a64:2da3783519381453';
+const EXPECTED_RULES_HASH = 'fnv1a64:a5d932b0ef8354e8';
 
 function sha256(value: string): string {
   return `sha256:${createHash('sha256').update(value, 'utf8').digest('hex')}`;
 }
 
 describe('versioned rules contract', () => {
-  it('pins the complete v2 gameplay contract', () => {
-    expect(STAR_RULES_VERSION).toBe(2);
-    expect(STAR_RULES_SCHEMA_ID).toBe('edgeconnect.star.rules.v2');
+  it('pins the complete v3 gameplay contract', () => {
+    expect(STAR_RULES_VERSION).toBe(3);
+    expect(STAR_RULES_SCHEMA_ID).toBe('edgeconnect.star.rules.v3');
     expect(STAR_RULES_HASH_ALGORITHM).toBe('fnv1a64');
     expect(`${STAR_RULES_HASH_ALGORITHM}:${fnv1a64(STAR_RULES_CANONICAL)}`).toBe(
       STAR_RULES_HASH,
@@ -38,7 +38,12 @@ describe('versioned rules contract', () => {
       'node-order=x:1..r,s:0..4,y:0..x-1',
       'node-id=5*x*(x-1)/2+s*x+y',
       'csr-neighbor-order=edge-insertion-order',
-      'action-wire=place(node)->node',
+      'modes={classic:turn-size-1,double:opening-1-then-2}',
+      'handicap=k-consecutive-opening-placements-by-player0,k-in-1..9,k=1-is-standard',
+      'handicap-excludes-pie',
+      'variant-in-semantic-key=mode,handicap,pie',
+      'actions=atomic-place|swap',
+      'action-wire=place(node)->node,swap->node-count',
       'legal-order=empty-node-id-ascending',
       'native-action-layout=node-u-at-u',
       'terminal=full',
@@ -53,7 +58,7 @@ describe('versioned rules contract', () => {
 
   it('keeps model features and node-only layout separately versioned', () => {
     expect(STAR_FEATURE_SCHEMA_ID).toBe(
-      'edgeconnect.star.model-features.external.v2',
+      'edgeconnect.star.model-features.external.v3',
     );
     expect(STAR_ACTION_LAYOUT_SCHEMA_ID).toBe(
       'edgeconnect.star.action-layout.nodes-only.v1',
@@ -63,7 +68,7 @@ describe('versioned rules contract', () => {
   });
 });
 
-describe('v2 conformance export', () => {
+describe('v3 conformance export', () => {
   it('is deterministic and contains no legacy action or outcome fields', () => {
     const first = serializeStarConformance(createStarConformance());
     const second = serializeStarConformance(createStarConformance());
@@ -120,17 +125,37 @@ describe('v2 conformance export', () => {
 
   it('contains full-board traces with binary terminal outcomes', () => {
     const conformance = createStarConformance();
-    expect(conformance.games.map((game) => game.config.rings)).toEqual([
-      4, 6, 8, 10,
+    const standard = conformance.games.slice(0, 4);
+    expect(standard.map((game) => game.config.rings)).toEqual([4, 6, 8, 10]);
+    expect(conformance.games.slice(4).map((game) => game.id)).toEqual([
+      'rings-4-classic-board-full',
+      'rings-4-handicap-5-double-board-full',
+      'rings-6-handicap-9-classic-board-full',
+      'rings-4-pie-double-swap-board-full',
+      'rings-4-pie-double-keep-board-full',
+      'rings-6-pie-classic-swap-board-full',
     ]);
-    for (const game of conformance.games) {
+    for (const game of standard) {
       const final = game.states.at(-1)!;
-      expect(final.over).toBe(true);
-      expect(final.stonesPlaced).toBe(final.stones.length);
       expect(game.actions).toHaveLength(final.stones.length);
       expect(game.actionCodes).toEqual(
         Array.from({ length: final.stones.length }, (_, node) => node),
       );
+    }
+    for (const game of conformance.games) {
+      const final = game.states.at(-1)!;
+      expect(final.over).toBe(true);
+      expect(final.stonesPlaced).toBe(final.stones.length);
+      expect(final.canSwap).toBe(false);
+      const swaps = game.actions.filter((action) => action.type === 'swap');
+      expect(game.actions).toHaveLength(final.stones.length + swaps.length);
+      expect(final.swapped).toBe(swaps.length === 1);
+      for (const [index, action] of game.actions.entries()) {
+        expect(game.actionCodes[index]).toBe(
+          action.type === 'swap' ? final.stones.length : action.node,
+        );
+      }
+      expect(game.states[0].movesLeft).toBe(game.config.handicap);
       expect(game.terminal.reason).toBe('board-full');
       expect([0, 1]).toContain(game.terminal.winner);
       expect(game.terminal.score.contestedPeries).toBe(0);
@@ -153,6 +178,32 @@ describe('v2 conformance export', () => {
     )!.states.at(-1)!;
     expect(residualOne).toMatchObject({ movesLeft: 1, midTurn: true });
     expect(residualZero).toMatchObject({ movesLeft: 0, midTurn: false });
+
+    const swapGame = conformance.games.find(
+      (game) => game.id === 'rings-4-pie-double-swap-board-full',
+    )!;
+    const beforeSwap = swapGame.states[1];
+    const afterSwap = swapGame.states[2];
+    expect(beforeSwap).toMatchObject({ canSwap: true, toMove: 1, swapped: false });
+    expect(afterSwap).toMatchObject({ canSwap: false, toMove: 0, swapped: true });
+    expect(afterSwap.stones[7]).toBe(1);
+    expect(afterSwap.previousTurnMoves).toEqual([7]);
+    expect(afterSwap.handicapStones).toEqual([7]);
+
+    const handicapGame = conformance.games.find(
+      (game) => game.id === 'rings-4-handicap-5-double-board-full',
+    )!;
+    expect(handicapGame.states[5]).toMatchObject({ toMove: 1, movesLeft: 2 });
+    expect(handicapGame.states[5].handicapStones).toHaveLength(5);
+    expect(handicapGame.states[5].previousTurnMoves).toHaveLength(5);
+
+    const relabeling = conformance.swapEquivalences[0];
+    expect(relabeling.swapCode).toBe(50);
+    expect(relabeling.kept.toMove).toBe(1);
+    expect(relabeling.swapped.toMove).toBe(0);
+    expect(relabeling.swapped.stones).toEqual(
+      relabeling.kept.stones.map((stone) => (stone === -1 ? -1 : 1 - stone)),
+    );
   });
 
   it('exports AB/BA equivalence and nodes-only mixed layouts', () => {
@@ -176,9 +227,9 @@ describe('v2 conformance export', () => {
     }
   });
 
-  it('matches the checked-in deterministic v2 fixture', () => {
+  it('matches the checked-in deterministic v3 fixture', () => {
     const fixture = readFileSync(
-      new URL('../../../../testdata/star/conformance-v2.json', import.meta.url),
+      new URL('../../../../testdata/star/conformance-v3.json', import.meta.url),
       'utf8',
     );
     expect(fixture).toBe(serializeStarConformance(createStarConformance()));

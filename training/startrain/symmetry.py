@@ -79,13 +79,23 @@ def transform_position(
     position: DoubleStarPosition,
     transform: D5Transform,
 ) -> DoubleStarPosition:
+    """Permute every node-indexed field: stones and the four history sets."""
+
     topology = get_topology(position.rings)
     permutation = topology.d5_permutation(
         rotation=transform.rotation, reflected=transform.reflected
     )
+    assert position.current_turn is not None
+    assert position.previous_turn is not None
+    assert position.own_previous_turn is not None
+    assert position.handicap_stones is not None
     return replace(
         position,
         stones=permute_nodes(position.stones, permutation),
+        current_turn=permute_nodes(position.current_turn, permutation),
+        previous_turn=permute_nodes(position.previous_turn, permutation),
+        own_previous_turn=permute_nodes(position.own_previous_turn, permutation),
+        handicap_stones=permute_nodes(position.handicap_stones, permutation),
     )
 
 

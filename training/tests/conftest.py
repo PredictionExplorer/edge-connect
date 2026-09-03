@@ -7,7 +7,7 @@ import os
 import pytest
 import torch
 
-_RULES_HASH = 0x2DA3783519381453
+_RULES_HASH = 0xA5D932B0EF8354E8
 
 
 def _native_compatible() -> bool:
@@ -47,7 +47,7 @@ def pytest_addoption(parser: pytest.Parser) -> None:
 def pytest_configure(config: pytest.Config) -> None:
     if config.getoption("--require-native") and not _native_compatible():
         raise pytest.UsageError(
-            "--require-native was set but the rules-v2 star_native extension "
+            "--require-native was set but the rules-v3 star_native extension "
             "is not importable"
         )
 

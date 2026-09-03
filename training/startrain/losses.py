@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import torch
@@ -21,6 +22,12 @@ class LossWeights:
     ownership: float = 0.25
     alive: float = 0.1
     soft_policy: float = 0.25
+    # Per-head KL to stored teacher distributions (lineage transfer). Samples
+    # without teacher targets contribute nothing, so fresh self-play data
+    # trains on its search targets alone even when these weights are positive.
+    teacher_policy: float = 0.0
+    teacher_outcome: float = 0.0
+    teacher_score_margin: float = 0.0
 
     def __post_init__(self) -> None:
         values = (
@@ -30,11 +37,22 @@ class LossWeights:
             self.ownership,
             self.alive,
             self.soft_policy,
+            self.teacher_policy,
+            self.teacher_outcome,
+            self.teacher_score_margin,
         )
         if any(not math.isfinite(value) or value < 0 for value in values):
             raise ValueError("loss weights must be finite and non-negative")
-        if not any(value > 0 for value in values):
+        if not any(value > 0 for value in values[:6]):
             raise ValueError("at least one loss weight must be positive")
+
+    @property
+    def uses_teacher(self) -> bool:
+        return (
+            self.teacher_policy > 0
+            or self.teacher_outcome > 0
+            or self.teacher_score_margin > 0
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,6 +72,19 @@ class TrainingTargets:
     sample_weight: Tensor | None = None
     policy_weight: Tensor | None = None
     clinch_mask: Tensor | None = None
+    # Stored teacher distributions (probabilities) and their availability mask.
+    teacher_policy: Tensor | None = None
+    teacher_outcome: Tensor | None = None
+    teacher_score_margin: Tensor | None = None
+    teacher_mask: Tensor | None = None
+
+    def _optional(
+        self,
+        name: str,
+        transform: "Callable[[Tensor], Tensor]",
+    ) -> Tensor | None:
+        value = getattr(self, name)
+        return transform(value) if value is not None else None
 
     def to(
         self,
@@ -93,6 +124,19 @@ class TrainingTargets:
                 if self.clinch_mask is not None
                 else None
             ),
+            teacher_policy=self._optional(
+                "teacher_policy", lambda t: t.to(device, non_blocking=non_blocking)
+            ),
+            teacher_outcome=self._optional(
+                "teacher_outcome", lambda t: t.to(device, non_blocking=non_blocking)
+            ),
+            teacher_score_margin=self._optional(
+                "teacher_score_margin",
+                lambda t: t.to(device, non_blocking=non_blocking),
+            ),
+            teacher_mask=self._optional(
+                "teacher_mask", lambda t: t.to(device, non_blocking=non_blocking)
+            ),
         )
 
     def pin_memory(self) -> "TrainingTargets":
@@ -122,6 +166,12 @@ class TrainingTargets:
             clinch_mask=(
                 self.clinch_mask.pin_memory() if self.clinch_mask is not None else None
             ),
+            teacher_policy=self._optional("teacher_policy", lambda t: t.pin_memory()),
+            teacher_outcome=self._optional("teacher_outcome", lambda t: t.pin_memory()),
+            teacher_score_margin=self._optional(
+                "teacher_score_margin", lambda t: t.pin_memory()
+            ),
+            teacher_mask=self._optional("teacher_mask", lambda t: t.pin_memory()),
         )
 
     def record_stream(self, stream: torch.Stream) -> None:
@@ -147,6 +197,15 @@ class TrainingTargets:
             self.policy_weight.record_stream(stream)
         if self.clinch_mask is not None:
             self.clinch_mask.record_stream(stream)
+        for name in (
+            "teacher_policy",
+            "teacher_outcome",
+            "teacher_score_margin",
+            "teacher_mask",
+        ):
+            value = getattr(self, name)
+            if value is not None:
+                value.record_stream(stream)
 
 
 def _require_tensor(condition: Tensor, message: str) -> None:
@@ -171,6 +230,25 @@ def _per_sample_masked_mean(values: Tensor, valid: Tensor) -> tuple[Tensor, Tens
     counts = valid_float.sum(dim=1)
     per_sample = (values * valid_float).sum(dim=1) / counts.clamp_min(1.0)
     return per_sample, counts > 0
+
+
+def _kl_to_teacher(
+    logits: Tensor,
+    teacher: Tensor,
+    legal_mask: Tensor | None,
+) -> Tensor:
+    """Per-sample ``KL(teacher || student)`` from stored teacher probabilities."""
+
+    if legal_mask is not None:
+        logits = logits.masked_fill(~legal_mask, torch.finfo(logits.dtype).min)
+        teacher = teacher * legal_mask.to(dtype=teacher.dtype)
+    probabilities = teacher.float()
+    mass = probabilities.sum(dim=-1, keepdim=True)
+    probabilities = probabilities / mass.clamp_min(torch.finfo(torch.float32).tiny)
+    log_student = functional.log_softmax(logits.float(), dim=-1)
+    log_teacher = torch.log(probabilities.clamp_min(torch.finfo(torch.float32).tiny))
+    kl = (probabilities * (log_teacher - log_student)).sum(dim=-1)
+    return torch.where(mass.squeeze(-1) > 0, kl, torch.zeros_like(kl))
 
 
 def _soft_cross_entropy(
@@ -246,6 +324,20 @@ def _validate_shapes(
             raise ValueError(f"{name} must have shape ({batch_size},)")
     if targets.clinch_mask is not None and targets.clinch_mask.shape != (batch_size,):
         raise ValueError(f"clinch mask must have shape ({batch_size},)")
+    if targets.teacher_mask is not None:
+        if targets.teacher_mask.shape != (batch_size,):
+            raise ValueError(f"teacher mask must have shape ({batch_size},)")
+        for tensor, shape, name in (
+            (targets.teacher_policy, (batch_size, actions), "teacher policy"),
+            (targets.teacher_outcome, (batch_size, 2), "teacher outcome"),
+            (
+                targets.teacher_score_margin,
+                (batch_size, margin_bins),
+                "teacher score margin",
+            ),
+        ):
+            if tensor is None or tensor.shape != shape:
+                raise ValueError(f"{name} must have shape {shape}")
 
 
 def compute_losses(
@@ -414,6 +506,41 @@ def compute_losses(
         "alive": alive_loss,
         "soft_policy": soft_policy_loss,
     }
+    if targets.teacher_mask is not None and weights.uses_teacher:
+        teacher_mask = targets.teacher_mask.bool()
+        assert targets.teacher_policy is not None
+        assert targets.teacher_outcome is not None
+        assert targets.teacher_score_margin is not None
+        teacher_policy_values = _kl_to_teacher(
+            output.policy_logits, targets.teacher_policy, legal_action_mask
+        )
+        teacher_policy_loss = _weighted_mean(
+            teacher_policy_values,
+            teacher_mask & policy_has_mass,
+            policy_sample_weight,
+        )
+        teacher_outcome_loss = _weighted_mean(
+            _kl_to_teacher(output.outcome_logits, targets.teacher_outcome, None),
+            teacher_mask,
+            sample_weight,
+        )
+        teacher_margin_loss = _weighted_mean(
+            _kl_to_teacher(
+                output.score_margin_logits, targets.teacher_score_margin, None
+            ),
+            teacher_mask,
+            sample_weight,
+        )
+        losses["teacher_policy"] = teacher_policy_loss
+        losses["teacher_outcome"] = teacher_outcome_loss
+        losses["teacher_score_margin"] = teacher_margin_loss
+        losses["teacher_samples"] = teacher_mask.sum()
+        losses["total"] = (
+            total
+            + weights.teacher_policy * teacher_policy_loss
+            + weights.teacher_outcome * teacher_outcome_loss
+            + weights.teacher_score_margin * teacher_margin_loss
+        )
     if include_diagnostics:
         clinch_mask = (
             targets.clinch_mask.bool()

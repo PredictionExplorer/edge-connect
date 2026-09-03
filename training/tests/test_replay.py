@@ -1,3 +1,4 @@
+import json
 from dataclasses import replace
 
 import numpy as np
@@ -86,10 +87,18 @@ def sample_for(rings: int = 4) -> ReplaySample:
     )
 
 
-def test_schema_v4_is_node_only_and_binary() -> None:
+def test_schema_v5_is_node_only_and_binary() -> None:
     sample = sample_for()
     topology = get_topology(4)
-    assert sample.schema_version == REPLAY_SCHEMA_VERSION == 4
+    assert sample.schema_version == REPLAY_SCHEMA_VERSION == 5
+    assert (
+        sample.is_standard_variant if hasattr(sample, "is_standard_variant") else True
+    )
+    assert sample.segment == "standard" and sample.variant_label == "double"
+    assert not sample.has_teacher
+    assert sample.history_flags is not None and sample.history_flags.shape == (
+        topology.n,
+    )
     assert sample.rules_hash == RULES_HASH
     assert sample.feature_schema_hash == FEATURE_SCHEMA_HASH
     assert sample.soft_policy_temperature == SOFT_POLICY_TEMPERATURE == 4
@@ -126,7 +135,7 @@ def test_clinch_outcome_only_uses_existing_masks_without_schema_change(
         clinch_auxiliary_targets="outcome_only",
     )
 
-    assert synthetic.schema_version == outcome_only.schema_version == 4
+    assert synthetic.schema_version == outcome_only.schema_version == 5
     assert synthetic.target_mask & (
         TARGET_SCORE_MARGIN | TARGET_OWNERSHIP | TARGET_ALIVE
     )
@@ -242,12 +251,14 @@ def test_old_or_incomplete_shards_are_rejected(tmp_path) -> None:
 
     metadata = arrays["metadata"].item()
     arrays["metadata"] = np.asarray(
-        str(metadata).replace('"schema_version": 4', '"schema_version": 3')
+        str(metadata).replace('"schema_version": 5', '"schema_version": 3')
     )
     old = tmp_path / "old.npz"
     np.savez_compressed(old, **arrays)
     with pytest.raises(ReplaySchemaError, match="schema_version"):
         read_replay_shard(old)
+    with pytest.raises(ReplaySchemaError, match="schema_version"):
+        read_replay_shard(old, allow_legacy=True)
 
     arrays.pop("policy_weight")
     missing = tmp_path / "missing.npz"
@@ -467,3 +478,160 @@ def test_replay_branch_cutoff_is_strict_persisted_and_default_neutral(
                     0,
                     invalid,  # type: ignore[arg-type]
                 )
+
+
+def legacy_v4_shard(path, samples: list[ReplaySample]):
+    """Write a previous-lineage schema-v4 shard from v5 samples."""
+
+    from startrain.contracts import (
+        LEGACY_FEATURE_SCHEMA_HASH,
+        LEGACY_RULES_HASH,
+        LEGACY_RULES_HASH_WIRE,
+        LEGACY_RULES_SCHEMA_ID,
+    )
+    from startrain.replay import _LEGACY_SAMPLE_ARRAY_NAMES
+
+    current = write_replay_shard(path.with_name("current-source.npz"), samples)
+    with np.load(current, allow_pickle=False) as archive:
+        arrays = {name: archive[name] for name in _LEGACY_SAMPLE_ARRAY_NAMES}
+        metadata = json.loads(str(archive["metadata"].item()))
+    metadata.update(
+        {
+            "schema_version": 4,
+            "rules_schema": LEGACY_RULES_SCHEMA_ID,
+            "rules_hash": LEGACY_RULES_HASH,
+            "rules_hash_wire": LEGACY_RULES_HASH_WIRE,
+            "feature_schema_hash": LEGACY_FEATURE_SCHEMA_HASH,
+        }
+    )
+    arrays["rules_hash"] = np.full(len(samples), LEGACY_RULES_HASH, dtype=np.uint64)
+    arrays["feature_schema_hash"] = np.full(
+        len(samples), LEGACY_FEATURE_SCHEMA_HASH, dtype=np.uint64
+    )
+    arrays["metadata"] = np.asarray(json.dumps(metadata, sort_keys=True))
+    np.savez_compressed(path, **arrays)
+    return path
+
+
+def test_legacy_v4_shards_upgrade_only_through_the_adapter(tmp_path) -> None:
+    samples = [sample_for(), sample_for(6)]
+    # A ring-homogeneous legacy shard is required, so write one per ring.
+    path = legacy_v4_shard(tmp_path / "legacy.npz", samples[:1])
+    with pytest.raises(ReplaySchemaError, match="lineage-transfer"):
+        decode_replay_shard(path)
+    decoded = decode_replay_shard(path, allow_legacy=True)
+    assert decoded.legacy
+    upgraded = decoded.sample(0)
+    assert upgraded.schema_version == REPLAY_SCHEMA_VERSION
+    assert upgraded.rules_hash == RULES_HASH
+    assert upgraded.feature_schema_hash == FEATURE_SCHEMA_HASH
+    assert upgraded.segment == "standard"
+    assert not upgraded.history_known
+    assert upgraded.pda == 0
+    assert upgraded.history_flags is not None and not upgraded.history_flags.any()
+    assert "upgraded=rules-v2-features-v3" in upgraded.search_provenance
+    np.testing.assert_array_equal(upgraded.stones, samples[0].stones)
+    np.testing.assert_array_equal(upgraded.policy, samples[0].policy)
+    assert upgraded.outcome == samples[0].outcome
+    position = upgraded.to_position()
+    assert position.is_standard and not position.history_known
+
+    # The upgraded sample re-encodes and collates like any v5 sample.
+    batch = collate_replay_samples([upgraded, samples[0]])
+    assert batch.inputs.global_features[:, 23].tolist() == [0.0, 1.0]
+    rewritten = write_replay_shard(tmp_path / "rewritten.npz", [upgraded])
+    assert not decode_replay_shard(rewritten).legacy
+
+
+def test_teacher_targets_round_trip_and_collate(tmp_path) -> None:
+    position = live_position()
+    topology = get_topology(4)
+    legal = position.stones.numpy() == -1
+    teacher_policy = legal.astype(np.float32)
+    teacher_policy /= teacher_policy.sum()
+    teacher_outcome = np.asarray([0.3, 0.7], dtype=np.float32)
+    teacher_margin = np.zeros(303, dtype=np.float32)
+    teacher_margin[150:153] = 1 / 3
+    sample = ReplaySample.from_position(
+        position,
+        policy=normalized_policy(position),
+        final_score=decisive_score(position),
+        search_provenance="import:lineage",
+        policy_provenance="completed-q",
+        teacher_policy=teacher_policy,
+        teacher_outcome=teacher_outcome,
+        teacher_score_margin=teacher_margin,
+    )
+    assert sample.has_teacher
+    assert sample.teacher_policy is not None
+    assert sample.teacher_policy.dtype == np.float16
+    path = write_replay_shard(tmp_path / "teacher.npz", [sample, sample_for()])
+    decoded = read_replay_shard(path)
+    assert decoded[0].has_teacher and not decoded[1].has_teacher
+    batch = collate_replay_samples(decoded)
+    assert batch.targets.teacher_mask is not None
+    assert batch.targets.teacher_mask.tolist() == [True, False]
+    assert batch.targets.teacher_policy is not None
+    assert batch.targets.teacher_policy.shape == (2, topology.n)
+    assert batch.targets.teacher_outcome is not None
+    assert torch.allclose(
+        batch.targets.teacher_outcome[0], torch.tensor([0.3, 0.7]), atol=1e-3
+    )
+    augmented = augment_sample(decoded[0], D5Transform(rotation=2, reflected=True))
+    assert augmented.has_teacher
+    assert augmented.teacher_policy is not None
+    assert np.isclose(
+        float(augmented.teacher_policy.astype(np.float32).sum()), 1.0, atol=5e-3
+    )
+
+    bad = np.zeros(2, dtype=np.float32)
+    with pytest.raises(ReplaySchemaError, match="sum to one"):
+        replace(sample, teacher_outcome=bad)
+    with pytest.raises(ReplaySchemaError, match="illegal"):
+        replace(
+            sample, teacher_policy=np.full(topology.n, 1 / topology.n, dtype=np.float32)
+        )
+
+
+def test_variant_samples_round_trip(tmp_path) -> None:
+    topology = get_topology(4)
+    stones = torch.full((topology.n,), -1, dtype=torch.int8)
+    stones[[1, 2, 3]] = 0
+    handicap = torch.zeros(topology.n, dtype=torch.bool)
+    handicap[[1, 2, 3]] = True
+    position = DoubleStarPosition(
+        rings=4,
+        stones=stones,
+        to_move=1,
+        moves_left=1,
+        opening=False,
+        terminal=False,
+        mode="classic",
+        handicap=3,
+        previous_turn=handicap,
+        handicap_stones=handicap,
+        pda=-2,
+    )
+    sample = ReplaySample.from_position(
+        position,
+        policy=normalized_policy(position),
+        final_score=None,
+        search_provenance="gumbel:test",
+        policy_provenance="completed-q",
+    )
+    assert sample.segment == "handicap" and sample.variant_label == "handicap-3-classic"
+    assert sample.pda == -2 and sample.mode == "classic"
+    path = write_replay_shard(tmp_path / "variant.npz", [sample])
+    decoded = read_replay_shard(path)[0]
+    assert decoded.mode == "classic" and decoded.handicap == 3 and decoded.pda == -2
+    assert decoded.history_flags is not None
+    assert int(decoded.history_flags[1]) == 4 | 8
+    restored = decoded.to_position()
+    assert restored.previous_turn is not None
+    assert torch.equal(restored.previous_turn, handicap)
+    batch = collate_replay_samples([decoded])
+    assert batch.inputs.global_features[0, 17].item() == pytest.approx(0.5)
+    assert batch.inputs.global_features[0, 24].item() == pytest.approx(-2 / 3)
+    with pytest.raises(ReplaySchemaError, match="variant-homogeneous"):
+        write_replay_shard(tmp_path / "mixed.npz", [sample, sample_for()])
+        read_replay_shard(tmp_path / "mixed.npz")

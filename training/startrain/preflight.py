@@ -109,6 +109,7 @@ def _exercise_device(device: str, *, precision: str) -> dict[str, object]:
         )
         node_mask = torch.ones(batch, nodes, dtype=torch.bool, device=device)
         legal_action_mask = torch.ones(batch, nodes, dtype=torch.bool, device=device)
+        rings = torch.full((batch,), 4, dtype=torch.long, device=device)
         autocast_enabled = precision == "bf16"
         with torch.autocast(
             device_type=torch.device(device).type,
@@ -123,6 +124,7 @@ def _exercise_device(device: str, *, precision: str) -> dict[str, object]:
                 neighbor_edge_type,
                 node_mask,
                 legal_action_mask,
+                rings,
             )
             loss = (
                 output.policy_logits.float().sum() + output.outcome_logits.float().sum()

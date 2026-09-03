@@ -667,6 +667,10 @@ def build_optimizer(
             ),
         )
 
+    # Embeddings, projections, heads, the adaLN-Zero modulation matrices, and
+    # the rule-conditioning MLP are AdamW parameters: they are small,
+    # input/output-facing, or zero-initialized, none of which suits Muon's
+    # orthogonalized updates.
     adamw_name_fragments = (
         "norm",
         "bias",
@@ -675,6 +679,8 @@ def build_optimizer(
         "policy",
         "head",
         "embedding",
+        "modulation",
+        "rule_conditioner",
     )
     muon_named: list[tuple[str, nn.Parameter]] = []
     adamw_decay_named: list[tuple[str, nn.Parameter]] = []

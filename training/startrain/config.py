@@ -14,13 +14,15 @@ from .device import (
     generate_auto_topology,
     resolve_device_string,
 )
+from .contracts import MAX_HANDICAP, MODES
 from .losses import LossWeights
 from .model import ModelConfig
 from .optim import OptimizerConfig
 from .selfplay import SelfPlayConfig
 from .topology import SUPPORTED_RINGS
 
-CONFIG_SCHEMA_VERSION = 3
+CONFIG_SCHEMA_VERSION = 4
+DATA_SCHEMA_VERSION = 5
 _T = TypeVar("_T")
 
 
@@ -54,21 +56,93 @@ def parse_cpu_affinity(value: str) -> tuple[int, ...]:
 
 
 @dataclass(frozen=True, slots=True)
-class GameConfig:
-    mode: str = "double"
-    pie_rule: bool = False
-    rings: tuple[int, ...] = SUPPORTED_RINGS
+class VariantRulesConfig:
+    """Rule variants one network may be trained on and served for."""
+
+    modes: tuple[str, ...] = MODES
+    handicap_min: int = 1
+    handicap_max: int = MAX_HANDICAP
+    pie_allowed: bool = True
 
     def __post_init__(self) -> None:
+        modes = tuple(self.modes)
         if (
-            self.mode != "double"
-            or self.pie_rule
-            or any(type(ring) is not int for ring in self.rings)
-            or self.rings != SUPPORTED_RINGS
+            not modes
+            or any(type(mode) is not str or mode not in MODES for mode in modes)
+            or len(set(modes)) != len(modes)
         ):
             raise ConfigError(
-                "only no-pie Double *Star rings (4, 6, 8, 10) are supported"
+                "variants.modes must be a unique subset of classic/double"
             )
+        object.__setattr__(self, "modes", modes)
+        for name in ("handicap_min", "handicap_max"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ConfigError(f"variants.{name} must be an integer")
+        if not 1 <= self.handicap_min <= self.handicap_max <= MAX_HANDICAP:
+            raise ConfigError(
+                f"variants handicap range must satisfy 1 <= min <= max <= {MAX_HANDICAP}"
+            )
+        if type(self.pie_allowed) is not bool:
+            raise ConfigError("variants.pie_allowed must be boolean")
+
+    def allows(self, mode: str, handicap: int, pie: bool) -> bool:
+        return (
+            mode in self.modes
+            and self.handicap_min <= handicap <= self.handicap_max
+            and (self.pie_allowed or not pie)
+            and not (pie and handicap != 1)
+        )
+
+    @property
+    def standard_only(self) -> bool:
+        return (
+            self.modes == ("double",)
+            and self.handicap_min == self.handicap_max == 1
+            and not self.pie_allowed
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class GameConfig:
+    """Board sizes, the allowed variant family, and the default variant.
+
+    ``mode``, ``pie_rule``, and ``handicap`` name the default variant used by
+    contexts that need a single one (smoke self-play, standalone CLIs). The
+    variant family a run trains on is ``variants``; self-play draws games from
+    the mixture in ``selfplay.variants`` within that family.
+    """
+
+    mode: str = "double"
+    pie_rule: bool = False
+    handicap: int = 1
+    rings: tuple[int, ...] = SUPPORTED_RINGS
+    variants: VariantRulesConfig = VariantRulesConfig()
+
+    def __post_init__(self) -> None:
+        if type(self.mode) is not str or self.mode not in MODES:
+            raise ConfigError("game.mode must be 'classic' or 'double'")
+        if type(self.pie_rule) is not bool:
+            raise ConfigError("game.pie_rule must be boolean")
+        if isinstance(self.handicap, bool) or not isinstance(self.handicap, int):
+            raise ConfigError("game.handicap must be an integer")
+        if not 1 <= self.handicap <= MAX_HANDICAP:
+            raise ConfigError(f"game.handicap must be in 1..{MAX_HANDICAP}")
+        if self.pie_rule and self.handicap != 1:
+            raise ConfigError("handicap games cannot use the pie rule")
+        if (
+            any(type(ring) is not int for ring in self.rings)
+            or tuple(self.rings) != SUPPORTED_RINGS
+        ):
+            raise ConfigError("only rings (4, 6, 8, 10) are supported")
+        if not isinstance(self.variants, VariantRulesConfig):
+            raise ConfigError("game.variants must be a variant rules mapping")
+        if not self.variants.allows(self.mode, self.handicap, self.pie_rule):
+            raise ConfigError("the default game variant is outside game.variants")
+
+    @property
+    def default_variant(self) -> tuple[str, int, bool]:
+        return (self.mode, self.handicap, self.pie_rule)
 
 
 @dataclass(frozen=True, slots=True)
@@ -128,7 +202,7 @@ class TrainConfig:
 
 @dataclass(frozen=True, slots=True)
 class DataConfig:
-    schema_version: int = 4
+    schema_version: int = DATA_SCHEMA_VERSION
     ring_stratified: bool = True
     d5_augmentation: bool = True
     workers: int = 0
@@ -139,8 +213,8 @@ class DataConfig:
     shards_per_batch: int = 1
 
     def __post_init__(self) -> None:
-        if self.schema_version != 4:
-            raise ConfigError("data schema_version must be 4")
+        if self.schema_version != DATA_SCHEMA_VERSION:
+            raise ConfigError(f"data schema_version must be {DATA_SCHEMA_VERSION}")
         if (
             self.workers < 0
             or isinstance(self.min_batches_for_workers, bool)
@@ -1365,7 +1439,9 @@ def load_config(path: str | Path) -> ExperimentConfig:
             f"and unknown keys {sorted(unknown)}"
         )
     if raw["schema_version"] != CONFIG_SCHEMA_VERSION:
-        raise ConfigError("configuration schema_version must be 3")
+        raise ConfigError(
+            f"configuration schema_version must be {CONFIG_SCHEMA_VERSION}"
+        )
 
     optimizer_values = _mapping("optimizer", raw["optimizer"])
     if "betas" in optimizer_values:
@@ -1376,6 +1452,10 @@ def load_config(path: str | Path) -> ExperimentConfig:
     )
     game_values = _mapping("game", raw["game"])
     game_values["rings"] = tuple(game_values.get("rings", SUPPORTED_RINGS))
+    variant_values = _mapping("game.variants", game_values.get("variants", {}))
+    if "modes" in variant_values:
+        variant_values["modes"] = tuple(variant_values["modes"])
+    game_values["variants"] = _construct(VariantRulesConfig, variant_values)
     host = _HostInventory()
     orchestration_values = _mapping("orchestration", raw.get("orchestration", {}))
     orchestration_values = _resolve_auto_orchestration(orchestration_values, host)

@@ -9,6 +9,7 @@ from torch import Tensor, nn
 
 from .features import EncodedBatch
 from .model import GraphResTNet
+from .topology import MAX_NODES
 
 ONNX_INPUT_NAMES = (
     "node_features",
@@ -18,6 +19,7 @@ ONNX_INPUT_NAMES = (
     "neighbor_edge_type",
     "node_mask",
     "legal_action_mask",
+    "rings",
 )
 ONNX_OUTPUT_NAMES = (
     "policy_logits",
@@ -30,7 +32,12 @@ ONNX_OUTPUT_NAMES = (
 
 
 class ONNXStarModel(nn.Module):
-    """Tuple-returning wrapper that avoids Python dataclasses at export time."""
+    """Tuple-returning wrapper that avoids Python dataclasses at export time.
+
+    The per-sample ``rings`` input selects the D5-invariant relation table of
+    every board size inside the graph, so browser clients feed the same eight
+    tensors the training encoders produce.
+    """
 
     def __init__(self, model: GraphResTNet) -> None:
         super().__init__()
@@ -45,6 +52,7 @@ class ONNXStarModel(nn.Module):
         neighbor_edge_type: Tensor,
         node_mask: Tensor,
         legal_action_mask: Tensor,
+        rings: Tensor,
     ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
         output = self.model(
             node_features,
@@ -54,6 +62,7 @@ class ONNXStarModel(nn.Module):
             neighbor_edge_type,
             node_mask,
             legal_action_mask,
+            rings,
         )
         return tuple(output)  # type: ignore[return-value]
 
@@ -73,7 +82,9 @@ def export_onnx(
     was_training = model.training
     wrapper.eval()
     batch = torch.export.Dim("batch")
-    nodes = torch.export.Dim("nodes")
+    # Padded node axes never exceed the largest board; the bound lets the
+    # relation-table gather export without a specialization guard.
+    nodes = torch.export.Dim("nodes", max=MAX_NODES)
     degree = torch.export.Dim("degree")
     dynamic_shapes = (
         {0: batch, 1: nodes},
@@ -83,6 +94,7 @@ def export_onnx(
         {0: batch, 1: nodes, 2: degree},
         {0: batch, 1: nodes},
         {0: batch, 1: nodes},
+        {0: batch},
     )
     try:
         torch.onnx.export(

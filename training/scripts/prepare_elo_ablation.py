@@ -146,15 +146,17 @@ SCRATCH_INITIALIZATION_TREATMENTS = frozenset(
         *RING10_CAPACITY_TREATMENTS,
     )
 )
+# Architecture v3 counts (feature schema v4, relational bias, adaLN-Zero). The
+# previous lineage's counts were 10_476_983 / 10_476_953 / 14_614_199 / 18_556_727.
 EXPECTED_ARCHITECTURE_PARAMETERS = {
-    "ring10-attention-control": 10_476_983,
-    "ring10-attention-full-kv": 10_476_983,
-    "ring10-relational-control": 10_476_983,
-    "ring10-relational-local-heavy": 10_476_953,
-    "ring10-relational-source-gated": 10_476_983,
-    "ring10-capacity-control": 10_476_983,
-    "ring10-capacity-depth-7": 14_614_199,
-    "ring10-capacity-width-512": 18_556_727,
+    "ring10-attention-control": 10_929_399,
+    "ring10-attention-full-kv": 10_929_399,
+    "ring10-relational-control": 10_929_399,
+    "ring10-relational-local-heavy": 11_056_089,
+    "ring10-relational-source-gated": 10_929_399,
+    "ring10-capacity-control": 10_929_399,
+    "ring10-capacity-depth-7": 15_244_983,
+    "ring10-capacity-width-512": 19_159_319,
 }
 GUARD_RINGS = (4, 6, 8)
 WEIGHTED_PROMOTION_PAIR_RATIOS = {4: 1, 6: 1, 8: 1, 10: 7}

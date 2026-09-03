@@ -142,6 +142,53 @@ describe('web-only pie rule', () => {
   });
 });
 
+describe('handicap openings', () => {
+  it('lets the first player place k stones before the second player moves', () => {
+    let state = initialState({ ...base, mode: 'double', handicap: 3 });
+    expect(state.movesLeft).toBe(3);
+    state = play(state, 0, 1);
+    expect(state.toMove).toBe(0);
+    expect(state.midTurn).toBe(true);
+    expect(state.turnCount).toBe(0);
+    state = play(state, 2);
+    expect(state.toMove).toBe(1);
+    expect(state.movesLeft).toBe(2);
+    expect(state.turnCount).toBe(1);
+    expect(state.handicapStones).toEqual([0, 1, 2]);
+    expect(state.previousTurnMoves).toEqual([0, 1, 2]);
+    expect(state.ownPreviousTurnMoves).toEqual([]);
+    state = play(state, 10, 11);
+    expect(state.toMove).toBe(0);
+    expect(state.previousTurnMoves).toEqual([10, 11]);
+    expect(state.ownPreviousTurnMoves).toEqual([0, 1, 2]);
+    expect(state.handicapStones).toEqual([0, 1, 2]);
+  });
+
+  it('defaults to one opening stone and rejects invalid handicaps', () => {
+    expect(initialState(base).movesLeft).toBe(1);
+    expect(initialState({ ...base, handicap: 1 }).movesLeft).toBe(1);
+    expect(() => initialState({ ...base, handicap: 0 })).toThrow(/handicap/);
+    expect(() => initialState({ ...base, handicap: 10 })).toThrow(/handicap/);
+    expect(() => initialState({ ...base, handicap: 2.5 })).toThrow(/handicap/);
+    expect(() =>
+      initialState({ ...base, handicap: 2, pieRule: true }),
+    ).toThrow(/pie rule/);
+  });
+
+  it('keeps the opening stone as the previous turn across a swap', () => {
+    let state = initialState({ ...base, mode: 'double', pieRule: true });
+    state = play(state, 7);
+    expect(state.previousTurnMoves).toEqual([7]);
+    state = applyAction(state, { type: 'swap' });
+    expect(state.previousTurnMoves).toEqual([7]);
+    expect(state.ownPreviousTurnMoves).toEqual([]);
+    expect(state.handicapStones).toEqual([7]);
+    state = play(state, 8, 9);
+    expect(state.previousTurnMoves).toEqual([8, 9]);
+    expect(state.ownPreviousTurnMoves).toEqual([7]);
+  });
+});
+
 describe('replay', () => {
   it('rebuilds placement and swap logs exactly', () => {
     const config: GameConfig = { ...base, mode: 'double', pieRule: true };

@@ -156,7 +156,7 @@ class FixedNetwork(nn.Module):
 
     def forward(self, *arguments: torch.Tensor) -> StarModelOutput:
         node_features = arguments[0]
-        legal = arguments[-1]
+        legal = arguments[6]
         batch, nodes = node_features.shape[:2]
         policy = torch.arange(
             nodes, device=node_features.device, dtype=node_features.dtype

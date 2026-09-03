@@ -99,8 +99,8 @@ impl BatchEvaluator for ContractEvaluator {
                     .legal_actions
                     .iter()
                     .map(|action| {
-                        let Action::Place(node) = action;
-                        let action_key = u64::from(*node);
+                        let node = action.node().expect("search expands placements only");
+                        let action_key = u64::from(node);
                         let bits =
                             splitmix64(state_hash ^ action_key.wrapping_mul(0x9e37_79b9_7f4a_7c15));
                         ((bits % 2001) as i32 - 1000) as f32 / 64.0

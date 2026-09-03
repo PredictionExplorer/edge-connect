@@ -77,7 +77,12 @@ fn main() {
                 &mut evaluator,
             )
             .expect("search");
-            i64::from(result[0].selected_action.expect("active root").code())
+            i64::from(
+                result[0]
+                    .selected_action
+                    .expect("active root")
+                    .code(board.node_count()),
+            )
         })
         .sum();
     let search_elapsed = search_started.elapsed().as_secs_f64();

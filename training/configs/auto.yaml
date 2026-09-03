@@ -16,7 +16,7 @@
 #
 # The measured H100 treatment profiles (configs/h100-*.yaml) remain the
 # reference for production runs; this profile favors portability.
-schema_version: 3
+schema_version: 4
 profile: continuous
 game:
   mode: double
@@ -68,7 +68,7 @@ train:
     min_lr_ratio: 0.05
 
 data:
-  schema_version: 4
+  schema_version: 5
   ring_stratified: true
   d5_augmentation: true
   workers: 8        # clamped to the host CPU count at runtime

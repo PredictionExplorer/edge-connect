@@ -5,11 +5,12 @@ use std::sync::{Arc, LazyLock};
 use serde::Deserialize;
 use star_engine::{
     ACTION_LAYOUT_SCHEMA, Action, BitBoard, Board, CONFORMANCE_SCHEMA, D5Maps, FEATURE_SCHEMA,
-    GameState, Player, PlayerScore, RULES_HASH, RULES_HASH_VALUE, RULES_SCHEMA, RULES_VERSION,
-    SUPPORTED_RINGS, ScoreResult, ScoringScratch, Symmetry, rules_hash, terminal_value,
+    GameState, Mode, Player, PlayerScore, RULES_CANONICAL, RULES_HASH, RULES_HASH_VALUE,
+    RULES_SCHEMA, RULES_VERSION, SUPPORTED_RINGS, ScoreResult, ScoringScratch, Symmetry, Variant,
+    rules_hash, terminal_value,
 };
 
-const FIXTURE_JSON: &str = include_str!("../../../../testdata/star/conformance-v2.json");
+const FIXTURE_JSON: &str = include_str!("../../../../testdata/star/conformance-v3.json");
 
 static FIXTURE: LazyLock<ConformanceFixture> = LazyLock::new(|| {
     serde_json::from_str(FIXTURE_JSON).expect("generated conformance fixture must deserialize")
@@ -28,6 +29,7 @@ struct ConformanceFixture {
     scores: Vec<ScoreFixture>,
     games: Vec<GameFixture>,
     pair_equivalences: Vec<PairEquivalenceFixture>,
+    swap_equivalences: Vec<SwapEquivalenceFixture>,
 }
 
 #[derive(Deserialize)]
@@ -60,6 +62,7 @@ struct OutcomeEncodingFixture {
 #[serde(rename_all = "camelCase")]
 struct ActionEncodingFixture {
     placement_code: String,
+    swap_code: String,
     legal_order: String,
     native_layout: String,
 }
@@ -205,24 +208,35 @@ struct GameConfigFixture {
     rings: u8,
     mode: String,
     pie_rule: bool,
+    handicap: u8,
+}
+
+impl GameConfigFixture {
+    fn variant(&self) -> Variant {
+        let mode = Mode::parse(&self.mode).expect("fixture mode is classic or double");
+        Variant::new(mode, self.handicap, self.pie_rule).expect("fixture variant is valid")
+    }
 }
 
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 enum ActionFixture {
     Place { node: u16 },
+    Swap,
 }
 
 impl ActionFixture {
     fn to_native(&self) -> Action {
         match self {
             Self::Place { node } => Action::Place(*node),
+            Self::Swap => Action::Swap,
         }
     }
 
     fn node(&self) -> u16 {
         match self {
             Self::Place { node } => *node,
+            Self::Swap => panic!("fixture action is a swap, not a placement"),
         }
     }
 }
@@ -242,6 +256,9 @@ struct TraceStateFixture {
     swapped: bool,
     last_move: i32,
     current_turn_moves: Vec<u16>,
+    previous_turn_moves: Vec<u16>,
+    own_previous_turn_moves: Vec<u16>,
+    handicap_stones: Vec<u16>,
     turn_count: u32,
 }
 
@@ -305,11 +322,25 @@ struct SemanticStateFixture {
     mid_turn: bool,
     terminal: bool,
     current_turn_moves: Vec<u16>,
+    previous_turn_moves: Vec<u16>,
+    own_previous_turn_moves: Vec<u16>,
+    handicap_stones: Vec<u16>,
     turn_count: u32,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SwapEquivalenceFixture {
+    id: String,
+    config: GameConfigFixture,
+    opening_node: u16,
+    swap_code: i32,
+    kept: TraceStateFixture,
+    swapped: TraceStateFixture,
+}
+
 #[test]
-fn finalized_v2_schema_hash_and_encodings_match_runtime_constants() {
+fn finalized_v3_schema_hash_and_encodings_match_runtime_constants() {
     let fixture = &*FIXTURE;
     assert_eq!(fixture.schema, CONFORMANCE_SCHEMA);
     assert_eq!(fixture.schemas.conformance, CONFORMANCE_SCHEMA);
@@ -322,6 +353,7 @@ fn finalized_v2_schema_hash_and_encodings_match_runtime_constants() {
     assert_eq!(fixture.rules.contract["variant"], "double-star");
     assert_eq!(fixture.rules.hash_algorithm, "fnv1a64");
     assert_eq!(fixture.rules.hash, RULES_HASH);
+    assert_eq!(fixture.rules.canonical, RULES_CANONICAL);
     assert_eq!(
         fnv1a64(fixture.rules.canonical.as_bytes()),
         RULES_HASH_VALUE
@@ -332,10 +364,17 @@ fn finalized_v2_schema_hash_and_encodings_match_runtime_constants() {
     assert_eq!(fixture.outcome_encoding.value, "P(win)-P(loss)");
     assert_eq!(fixture.action_encoding.placement_code, "dense node id");
     assert_eq!(
+        fixture.action_encoding.swap_code,
+        "node count, one past the last node"
+    );
+    assert_eq!(
         fixture.action_encoding.legal_order,
         "ascending legal placement node ids"
     );
-    assert_eq!(fixture.action_encoding.native_layout, "node u at index u");
+    assert_eq!(
+        fixture.action_encoding.native_layout,
+        "node u at index u; the swap has no native slot"
+    );
     assert_eq!(fixture.action_layouts.schema, ACTION_LAYOUT_SCHEMA);
     assert_eq!(fixture.action_layouts.model_feature_schema, FEATURE_SCHEMA);
 }
@@ -369,15 +408,21 @@ fn generated_nodes_only_action_layouts_match_wire_and_native_order() {
         }
         for example in &row.examples {
             let action = example.action.to_native();
-            assert_eq!(action.code(), example.wire_code);
+            assert_eq!(action.code(board.node_count()), example.wire_code);
             assert_eq!(action.native_index(&board).unwrap(), example.native_index);
             assert_eq!(
                 Action::from_native_index(example.native_index, &board).unwrap(),
                 action
             );
-            let Action::Place(node) = action;
+            let node = action.node().expect("layout examples are placements");
             assert_eq!(usize::from(node), example.padded_index);
         }
+        assert_eq!(
+            Action::Swap.code(board.node_count()),
+            i32::try_from(node_count).unwrap()
+        );
+        assert!(Action::Swap.native_index(&board).is_err());
+        assert!(Action::from_native_index(node_count, &board).is_err());
     }
 }
 
@@ -484,16 +529,39 @@ fn every_generated_scoring_vector_matches() {
 #[test]
 fn every_generated_full_board_game_and_binary_terminal_value_matches() {
     let fixture = &*FIXTURE;
-    assert_eq!(fixture.games.len(), SUPPORTED_RINGS.len());
+    assert_eq!(fixture.games.len(), SUPPORTED_RINGS.len() + 6);
     for (&rings, trace) in SUPPORTED_RINGS.iter().zip(&fixture.games) {
         assert_eq!(trace.config.rings, rings);
         assert_eq!(trace.config.mode, "double");
         assert!(!trace.config.pie_rule);
+        assert_eq!(trace.config.handicap, 1);
         assert_eq!(trace.id, format!("rings-{rings}-board-full"));
+    }
+    let variant_ids: Vec<_> = fixture.games[SUPPORTED_RINGS.len()..]
+        .iter()
+        .map(|trace| trace.id.as_str())
+        .collect();
+    assert_eq!(
+        variant_ids,
+        [
+            "rings-4-classic-board-full",
+            "rings-4-handicap-5-double-board-full",
+            "rings-6-handicap-9-classic-board-full",
+            "rings-4-pie-double-swap-board-full",
+            "rings-4-pie-double-keep-board-full",
+            "rings-6-pie-classic-swap-board-full",
+        ]
+    );
+    let mut swaps_seen = 0;
+    for trace in &fixture.games {
         assert_eq!(trace.actions.len(), trace.action_codes.len());
         assert_eq!(trace.states.len(), trace.actions.len() + 1);
-        let board = Arc::new(Board::new(rings).unwrap());
-        let mut state = GameState::new(board);
+        let board = Arc::new(Board::new(trace.config.rings).unwrap());
+        let node_count = board.node_count();
+        let variant = trace.config.variant();
+        let mut state = GameState::with_variant(board, variant);
+        assert_eq!(state.variant(), variant);
+        assert_eq!(state.moves_left(), variant.handicap());
 
         for (step, expected_state) in trace.states.iter().enumerate() {
             assert_eq!(expected_state.after_actions, step);
@@ -501,14 +569,27 @@ fn every_generated_full_board_game_and_binary_terminal_value_matches() {
             assert_legal_action_contract(&state);
             if let Some(action_fixture) = trace.actions.get(step) {
                 let action = action_fixture.to_native();
-                assert_eq!(action.code(), trace.action_codes[step]);
+                assert_eq!(action.code(node_count), trace.action_codes[step]);
+                assert_eq!(
+                    Action::from_code(trace.action_codes[step], node_count).unwrap(),
+                    action
+                );
+                if action == Action::Swap {
+                    swaps_seen += 1;
+                    assert!(state.swap_available());
+                }
                 assert!(state.is_legal(action));
-                state.apply(action).unwrap();
+                let transition = state.apply(action).unwrap();
+                if action == Action::Swap {
+                    assert!(transition.turn_ended);
+                    assert_eq!(transition.player_after, Player::Zero);
+                    assert!(state.swapped());
+                }
             }
         }
-
         assert!(state.is_terminal());
         assert!(state.legal_actions().is_empty());
+        assert!(!state.swap_available());
         assert_eq!(trace.terminal.reason, "board-full");
         let score = ScoringScratch::default().score_state(&state);
         assert_score(
@@ -543,6 +624,40 @@ fn every_generated_full_board_game_and_binary_terminal_value_matches() {
         assert_eq!(perspective.outcome_class, outcome_class(value));
         assert_eq!(perspective.score_margin, margin);
     }
+    assert_eq!(swaps_seen, 2);
+}
+
+#[test]
+fn generated_swap_equivalence_relabels_colors_and_keeps_history() {
+    let fixture = &*FIXTURE;
+    assert_eq!(fixture.swap_equivalences.len(), 1);
+    for vector in &fixture.swap_equivalences {
+        assert_eq!(vector.id, "pie-swap-relabels-the-opening-stone");
+        let board = Arc::new(Board::new(vector.config.rings).unwrap());
+        let node_count = board.node_count();
+        assert_eq!(vector.swap_code, i32::from(node_count));
+        let variant = vector.config.variant();
+        assert!(variant.pie());
+        let mut kept = GameState::with_variant(Arc::clone(&board), variant);
+        assert!(kept.is_pie_pending());
+        kept.apply(Action::Place(vector.opening_node)).unwrap();
+        assert!(!kept.is_pie_pending());
+        assert!(kept.swap_available());
+        assert_trace_state(&vector.id, &kept, &vector.kept);
+
+        let mut swapped = kept.clone();
+        swapped.apply(Action::Swap).unwrap();
+        assert_trace_state(&vector.id, &swapped, &vector.swapped);
+        assert_eq!(swapped.stones(), [kept.stones()[1], kept.stones()[0]]);
+        assert_eq!(swapped.to_move(), kept.to_move().opponent());
+        assert_eq!(swapped.moves_left(), kept.moves_left());
+        assert_eq!(swapped.previous_turn_set(), kept.previous_turn_set());
+        assert_eq!(swapped.handicap_stones(), kept.handicap_stones());
+        assert!(swapped.swapped());
+        assert!(!swapped.swap_available());
+        assert!(!swapped.is_legal(Action::Swap));
+        assert_eq!(swapped.hash64(), swapped.clone().hash64());
+    }
 }
 
 #[test]
@@ -552,6 +667,7 @@ fn generated_ab_ba_paths_share_the_semantic_key() {
     for pair in &fixture.pair_equivalences {
         assert_eq!(pair.config.mode, "double");
         assert!(!pair.config.pie_rule);
+        assert_eq!(pair.config.handicap, 1);
         assert_eq!(
             pair.equivalent_fields,
             [
@@ -564,6 +680,9 @@ fn generated_ab_ba_paths_share_the_semantic_key() {
                 "midTurn",
                 "terminal",
                 "currentTurnMoves",
+                "previousTurnMoves",
+                "ownPreviousTurnMoves",
+                "handicapStones",
                 "turnCount",
             ]
         );
@@ -582,11 +701,12 @@ fn generated_ab_ba_paths_share_the_semantic_key() {
 
 fn replay_pair_path(rings: u8, path: &PairPathFixture) -> GameState {
     let board = Arc::new(Board::new(rings).unwrap());
+    let node_count = board.node_count();
     let mut state = GameState::new(board);
     assert_eq!(path.actions.len(), path.action_codes.len());
     for (action, code) in path.actions.iter().zip(&path.action_codes) {
         let action = action.to_native();
-        assert_eq!(action.code(), *code);
+        assert_eq!(action.code(node_count), *code);
         state.apply(action).unwrap();
     }
     assert_semantic_state(&state, &path.semantic_state);
@@ -601,8 +721,8 @@ fn assert_trace_state(id: &str, state: &GameState, expected: &TraceStateFixture)
     assert_eq!(state.is_opening(), expected.opening, "{id}");
     assert_eq!(state.is_mid_turn(), expected.mid_turn, "{id}");
     assert_eq!(state.is_terminal(), expected.over, "{id}");
-    assert!(!expected.can_swap, "{id}");
-    assert!(!expected.swapped, "{id}");
+    assert_eq!(state.swap_available(), expected.can_swap, "{id}");
+    assert_eq!(state.swapped(), expected.swapped, "{id}");
     assert_eq!(
         state.last_move().map_or(-1, i32::from),
         expected.last_move,
@@ -613,7 +733,27 @@ fn assert_trace_state(id: &str, state: &GameState, expected: &TraceStateFixture)
         expected.current_turn_moves,
         "{id}"
     );
+    assert_eq!(
+        state.previous_turn_moves(),
+        expected.previous_turn_moves,
+        "{id}"
+    );
+    assert_eq!(
+        state.own_previous_turn_moves(),
+        expected.own_previous_turn_moves,
+        "{id}"
+    );
+    assert_eq!(
+        sorted(state.handicap_stones().iter().collect()),
+        sorted(expected.handicap_stones.clone()),
+        "{id}"
+    );
     assert_eq!(state.turn_count(), expected.turn_count, "{id}");
+}
+
+fn sorted(mut nodes: Vec<u16>) -> Vec<u16> {
+    nodes.sort_unstable();
+    nodes
 }
 
 fn assert_semantic_state(state: &GameState, expected: &SemanticStateFixture) {
@@ -625,7 +765,22 @@ fn assert_semantic_state(state: &GameState, expected: &SemanticStateFixture) {
     assert_eq!(state.is_opening(), expected.opening);
     assert_eq!(state.is_mid_turn(), expected.mid_turn);
     assert_eq!(state.is_terminal(), expected.terminal);
-    assert_eq!(state.current_turn_moves(), expected.current_turn_moves);
+    assert_eq!(
+        sorted(state.current_turn_moves().to_vec()),
+        expected.current_turn_moves
+    );
+    assert_eq!(
+        sorted(state.previous_turn_moves().to_vec()),
+        expected.previous_turn_moves
+    );
+    assert_eq!(
+        sorted(state.own_previous_turn_moves().to_vec()),
+        expected.own_previous_turn_moves
+    );
+    assert_eq!(
+        sorted(state.handicap_stones().iter().collect()),
+        expected.handicap_stones
+    );
     assert_eq!(state.turn_count(), expected.turn_count);
 }
 
@@ -649,11 +804,12 @@ fn assert_legal_action_contract(state: &GameState) {
         assert!(actions.is_empty());
         return;
     }
+    let node_count = state.board().node_count();
     for (expected_node, action) in state.legal_actions().placements.iter().zip(&actions) {
-        let Action::Place(node) = *action;
+        let node = action.node().expect("legal actions are placements");
         assert_eq!(node, expected_node);
         assert!(state.stone_at(node).is_none());
-        assert_eq!(action.code(), i32::from(node));
+        assert_eq!(action.code(node_count), i32::from(node));
         assert_eq!(
             action.native_index(state.board()).unwrap(),
             usize::from(node)
@@ -662,7 +818,7 @@ fn assert_legal_action_contract(state: &GameState) {
     assert!(
         actions
             .windows(2)
-            .all(|window| window[0].code() < window[1].code())
+            .all(|window| window[0].code(node_count) < window[1].code(node_count))
     );
 }
 

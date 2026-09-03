@@ -265,9 +265,21 @@ def test_verified_checkpoint_config_is_normalized_and_contract_bound(
     assert verified.game_config == {
         "mode": "double",
         "pie_rule": False,
+        "handicap": 1,
         "rings": (4, 6, 8, 10),
+        "variants": {
+            "modes": ("classic", "double"),
+            "handicap_min": 1,
+            "handicap_max": 9,
+            "pie_allowed": True,
+        },
     }
     assert verified.evaluation_contract["action_layout_version"] == 1
+    assert verified.game_contract["rules_schema"] == "edgeconnect.star.rules.v3"
+    assert verified.input_contract["feature_schema_version"] == 4
+    assert set(verified.evaluation_contract) == (
+        set(verified.game_contract) | set(verified.input_contract)
+    )
 
 
 def test_verified_checkpoint_config_rejects_unsafe_or_incomplete_metadata(
