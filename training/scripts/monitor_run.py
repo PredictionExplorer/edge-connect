@@ -1039,6 +1039,12 @@ def _arena_history(
                     str(ring): _mapping(metrics).get("elo_difference")
                     for ring, metrics in _mapping(result.get("per_ring")).items()
                 },
+                "per_segment_elo": {
+                    str(segment): _mapping(metrics).get("elo_difference")
+                    for segment, metrics in _mapping(result.get("per_segment")).items()
+                },
+                "segment_vetoes": list(promotion.get("segment_vetoes") or []),
+                "regression_source": promotion.get("regression_source"),
                 "weighted_aggregate": (
                     dict(weighted_aggregate) if weighted_aggregate else None
                 ),
@@ -1096,6 +1102,9 @@ def _arena_history(
                 "losses": aggregate.get("losses"),
                 "games": aggregate.get("games"),
                 "per_ring_elo": summary.get("per_ring_elo"),
+                "per_segment_elo": summary.get("per_segment_elo"),
+                "segment_vetoes": summary.get("segment_vetoes"),
+                "regression_source": summary.get("regression_source"),
                 "weighted_aggregate": summary.get("weighted_aggregate"),
                 "weighted_wave_plan": summary.get("weighted_wave_plan"),
             }
@@ -1862,6 +1871,8 @@ def collect_snapshot(
         "utd_wait_spins": learner_metric.get("utd_wait_spins"),
         "learning_rates": learner_metric.get("learning_rates"),
         "replay_samples_by_ring": learner_metric.get("replay_samples_by_ring"),
+        "replay_samples_by_segment": learner_metric.get("replay_samples_by_segment"),
+        "replay_segment_quotas": learner_metric.get("replay_segment_quotas"),
         "ring_batch_weights": learner_metric.get("ring_batch_weights"),
         "active_rings": learner_heartbeat.get("active_rings"),
         "active_ring_weights": learner_heartbeat.get("active_ring_weights"),

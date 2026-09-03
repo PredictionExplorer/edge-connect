@@ -6,6 +6,8 @@ import json
 import os
 import pwd
 import stat
+
+from startrain.arena import ARENA_RESULT_SCHEMA_VERSION
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -461,7 +463,7 @@ class BoundaryFixture:
         _write_json(
             self.result_path,
             {
-                "schema_version": 3,
+                "schema_version": ARENA_RESULT_SCHEMA_VERSION,
                 "result_kind": "promotion",
                 "candidate": self.candidate_identity,
                 "baseline": self.champion_identity,

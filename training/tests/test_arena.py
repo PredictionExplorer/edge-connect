@@ -62,8 +62,17 @@ class RoleEvaluator:
 class FakeStateBatch:
     tied = False
 
-    def __init__(self, rings: int, batch_size: int) -> None:
+    def __init__(
+        self,
+        rings: int,
+        batch_size: int,
+        *,
+        mode: str = "double",
+        handicap: int = 1,
+        pie: bool = False,
+    ) -> None:
         assert rings == 4 and batch_size == 1
+        assert (mode, handicap, pie) == ("double", 1, False)
         self.terminal = False
         self.to_move = 0
         self.winner = -1
@@ -77,7 +86,11 @@ class FakeStateBatch:
         self.terminal = True
 
     def data(self) -> object:
-        return SimpleNamespace(terminal=[self.terminal], to_move=[self.to_move])
+        return SimpleNamespace(
+            terminal=[self.terminal],
+            to_move=[self.to_move],
+            swap_available=[False],
+        )
 
     def score_data(self) -> object:
         return SimpleNamespace(winner=[self.winner])
@@ -113,7 +126,11 @@ class FakeSearchBatch:
         raise AssertionError("fake search has no leaves")
 
     def results(self) -> object:
-        return SimpleNamespace(terminal=[False], selected_actions=[self.selected])
+        return SimpleNamespace(
+            terminal=[False],
+            selected_actions=[self.selected],
+            root_values=[0.0],
+        )
 
 
 class FakeNative:
@@ -474,8 +491,17 @@ def test_batched_arena_parallelizes_search_but_serializes_inference() -> None:
                     active_inference -= 1
 
     class BatchStates:
-        def __init__(self, rings: int, batch_size: int) -> None:
+        def __init__(
+            self,
+            rings: int,
+            batch_size: int,
+            *,
+            mode: str = "double",
+            handicap: int = 1,
+            pie: bool = False,
+        ) -> None:
             assert rings == 4
+            assert (mode, handicap, pie) == ("double", 1, False)
             self.rings = rings
             self.batch_size = batch_size
             self.terminal = [False] * batch_size
@@ -491,6 +517,7 @@ def test_batched_arena_parallelizes_search_but_serializes_inference() -> None:
             to_move: list[int],
             _moves_left: list[int],
             _opening: list[bool],
+            **_variant_columns: object,
         ) -> "BatchStates":
             states = cls(rings, len(to_move))
             states.to_move = list(to_move)
@@ -508,6 +535,7 @@ def test_batched_arena_parallelizes_search_but_serializes_inference() -> None:
             for row, applied in enumerate(self.applied):
                 if applied:
                     zero_bits[row * BITBOARD_WORDS] = 1
+            words = [0] * (self.batch_size * BITBOARD_WORDS)
             return SimpleNamespace(
                 rings=self.rings,
                 zero_bits=zero_bits,
@@ -516,6 +544,15 @@ def test_batched_arena_parallelizes_search_but_serializes_inference() -> None:
                 moves_left=[1 if value else 2 for value in self.applied],
                 opening=[not bool(value) for value in self.applied],
                 terminal=list(self.terminal),
+                mode=[1] * self.batch_size,
+                handicap=[1] * self.batch_size,
+                pie=[False] * self.batch_size,
+                swap_available=[False] * self.batch_size,
+                swapped=[False] * self.batch_size,
+                current_turn_bits=list(words),
+                previous_turn_bits=list(words),
+                own_previous_turn_bits=list(words),
+                handicap_bits=list(words),
             )
 
         def apply_many(self, rows: list[int], _actions: list[int]) -> None:
@@ -556,6 +593,7 @@ def test_batched_arena_parallelizes_search_but_serializes_inference() -> None:
             return SimpleNamespace(
                 terminal=[False] * self.size,
                 selected_actions=[0] * self.size,
+                root_values=[0.0] * self.size,
             )
 
     native = SimpleNamespace(StateBatch=BatchStates, SearchBatch=BatchSearch)

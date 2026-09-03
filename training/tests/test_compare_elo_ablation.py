@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 import yaml
 
+from startrain.arena import ARENA_RESULT_SCHEMA_VERSION
 from startrain.arena import bounded_confidence_sequence, elo_from_probability
 
 from scripts.compare_elo_ablation import (
@@ -254,7 +255,7 @@ def _run_fixture(
     arena = root / "arena"
     arena.mkdir()
     arena_payload: dict[str, object] = {
-        "schema_version": 3,
+        "schema_version": ARENA_RESULT_SCHEMA_VERSION,
         "candidate": candidate,
         "baseline": anchor,
         "baseline_metadata": {

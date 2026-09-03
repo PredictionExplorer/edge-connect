@@ -9,6 +9,7 @@ from typing import Any, Callable, cast
 
 import pytest
 import yaml
+from startrain.arena import ARENA_RESULT_SCHEMA_VERSION
 from startrain.arena import bounded_confidence_sequence, elo_from_probability
 
 from scripts.compare_elo_ablation import (
@@ -175,7 +176,7 @@ def _treatment(
     _write_json(
         artifact_path,
         {
-            "schema_version": 3,
+            "schema_version": ARENA_RESULT_SCHEMA_VERSION,
             "candidate": champion["model_identity"],
             "baseline": anchor,
             "completed_ns": completed_ns,

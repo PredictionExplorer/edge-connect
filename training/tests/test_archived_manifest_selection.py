@@ -22,7 +22,7 @@ from scripts.prepare_champion_warm_start import (
     prepare_champion_warm_start,
 )
 from scripts.prepare_elo_ablation import prepare_elo_ablation
-from startrain.arena import ArenaPair, summarize_pairs
+from startrain.arena import ARENA_RESULT_SCHEMA_VERSION, ArenaPair, summarize_pairs
 from startrain.checkpoint import (
     ExponentialMovingAverage,
     ModelManifest,
@@ -295,7 +295,7 @@ def _result(
     atomic_json(
         path,
         {
-            "schema_version": 3,
+            "schema_version": ARENA_RESULT_SCHEMA_VERSION,
             "result_kind": "archived_manifest_selection",
             "selection_plan_digest": plan.plan_digest,
             "selection_contract": plan.contract.as_dict(),

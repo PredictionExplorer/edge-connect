@@ -18,7 +18,13 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
-from .arena import ArenaPair, _forced_opening, _opening_seed, summarize_pairs
+from .arena import (
+    ARENA_RESULT_SCHEMA_VERSION,
+    ArenaPair,
+    _forced_opening,
+    _opening_seed,
+    summarize_pairs,
+)
 from .checkpoint import (
     ModelManifest,
     load_model_manifest,
@@ -1214,7 +1220,7 @@ def load_persisted_selection_result(
         "archived-manifest arena result",
     )
     if (
-        payload.get("schema_version") != 3
+        payload.get("schema_version") != ARENA_RESULT_SCHEMA_VERSION
         or payload.get("result_kind") != RESULT_KIND
         or payload.get("selection_plan_digest") != plan.plan_digest
         or payload.get("candidate") != candidate.model_identity
@@ -1242,9 +1248,15 @@ def load_persisted_selection_result(
             "opening_action",
             "forced_opening",
             "outcomes",
+            "variant",
+            "segment",
         }
         if set(pair) != expected_pair_fields:
             raise ManifestSelectionError("selection result pair fields are invalid")
+        if pair.get("variant") != "double" or pair.get("segment") != "standard":
+            raise ManifestSelectionError(
+                "selection result contains a non-standard variant observation"
+            )
         outcomes = _sequence(pair.get("outcomes"), "selection pair outcomes")
         if len(outcomes) != 2:
             raise ManifestSelectionError("selection pair outcomes are invalid")

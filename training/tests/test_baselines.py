@@ -129,9 +129,18 @@ def test_frozen_baselines_are_deterministic_with_native_search() -> None:
 
 
 class ArenaStateBatch:
-    def __init__(self, rings: int, batch_size: int) -> None:
+    def __init__(
+        self,
+        rings: int,
+        batch_size: int,
+        *,
+        mode: str = "double",
+        handicap: int = 1,
+        pie: bool = False,
+    ) -> None:
         assert rings == 4
         assert batch_size == 1
+        assert (mode, handicap, pie) == ("double", 1, False)
         self.to_move = 0
         self.search_started = False
         self.searched_moves = 0
@@ -154,6 +163,7 @@ class ArenaStateBatch:
         return SimpleNamespace(
             terminal=[self.terminal],
             to_move=[self.to_move],
+            swap_available=[False],
         )
 
     def score_data(self) -> object:
@@ -223,6 +233,7 @@ class ArenaSearchBatch:
         return SimpleNamespace(
             terminal=[False],
             selected_actions=[self.selected],
+            root_values=[0.0],
         )
 
 

@@ -12,6 +12,7 @@ import pytest
 import startrain.cli as cli_module
 import startrain.orchestration as orchestration_module
 from starserve.cli import main as starserve_main
+from startrain.arena import ARENA_RESULT_SCHEMA_VERSION
 from startrain.cli import (
     actor_main,
     arena_main,
@@ -246,7 +247,7 @@ def test_arena_architecture_mode_is_explicit_and_diagnostic_only(
 
         def run(self):
             return {
-                "schema_version": 3,
+                "schema_version": ARENA_RESULT_SCHEMA_VERSION,
                 "candidate": candidate_manifest.model_identity,
                 "baseline": baseline_manifest.model_identity,
                 "baseline_metadata": {"kind": "checkpoint"},

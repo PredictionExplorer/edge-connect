@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
+from startrain.arena import ARENA_RESULT_SCHEMA_VERSION
 from startrain.runtime import atomic_json
 
 SCHEMA_VERSION = 1
@@ -1310,7 +1311,7 @@ def _capture_terminal_bundle(
             name="terminal result baseline",
         )
         if (
-            result.get("schema_version") != 3
+            result.get("schema_version") != ARENA_RESULT_SCHEMA_VERSION
             or result.get("terminal") is not True
             or result.get("candidate") != candidate_identity
             or promotion.get("decision") != decision

@@ -12,12 +12,14 @@ from statistics import NormalDist
 from typing import Any, Literal, Protocol, cast
 
 from .config import ArenaConfig
+from .contracts import SEGMENT_STANDARD
 from .inference import InferenceResponse, NativeEvalBatchProtocol
 from .native import BITBOARD_WORDS
+from .selfplay import STANDARD_VARIANT, GameVariant
 from .topology import get_topology
 
 
-ARENA_RESULT_SCHEMA_VERSION = 3
+ARENA_RESULT_SCHEMA_VERSION = 4
 WEIGHTED_OBSERVATION_MODEL = "complete-weighted-macro-block-score-v1"
 
 
@@ -137,9 +139,20 @@ class ArenaGame:
     winner: int
     outcome: int
     searched_moves: int
+    variant: str = STANDARD_VARIANT.label
+    segment: str = SEGMENT_STANDARD
+    swapped: bool = False
+    pda: int = 0
 
     def __post_init__(self) -> None:
         topology = get_topology(self.ring)
+        parsed = GameVariant.parse(self.variant)
+        if parsed.segment != self.segment:
+            raise ValueError("arena game segment disagrees with its variant")
+        if type(self.swapped) is not bool or (self.swapped and not parsed.pie):
+            raise ValueError("arena swap metadata requires a pie game")
+        if type(self.pda) is not int or not 0 <= self.pda <= 3:
+            raise ValueError("arena playout-doubling advantage must be in 0..3")
         if (
             type(self.candidate_player) is not int
             or self.candidate_player not in (0, 1)
@@ -177,9 +190,13 @@ class ArenaPair:
     opening_action: int | None
     forced_opening: bool
     outcomes: tuple[int, int]
+    variant: str = STANDARD_VARIANT.label
+    segment: str = SEGMENT_STANDARD
 
     def __post_init__(self) -> None:
         topology = get_topology(self.ring)
+        if GameVariant.parse(self.variant).segment != self.segment:
+            raise ValueError("arena pair segment disagrees with its variant")
         if any(
             type(outcome) is not int or outcome not in (-1, 1)
             for outcome in self.outcomes
@@ -1042,13 +1059,126 @@ def _paired_bootstrap_interval(
     return lower, upper
 
 
+def _split_segments(
+    pairs: Sequence[ArenaPair],
+) -> tuple[list[ArenaPair], dict[str, list[ArenaPair]]]:
+    standard: list[ArenaPair] = []
+    segments: dict[str, list[ArenaPair]] = {}
+    for pair in pairs:
+        if pair.segment == SEGMENT_STANDARD:
+            standard.append(pair)
+        else:
+            segments.setdefault(pair.segment, []).append(pair)
+    return standard, segments
+
+
+def segment_floor_assessment(
+    segments: Mapping[str, Sequence[ArenaPair]],
+    config: ArenaConfig,
+) -> dict[str, object]:
+    """Veto-on-regress floors for the non-standard mixture segments.
+
+    Each segment aggregates its pairs across rings and runs the same
+    one-sided paired e-process as the ring floors. A segment can never
+    promote a candidate; ``regress`` proves the candidate lost more than the
+    segment's floor and vetoes the promotion.
+    """
+
+    error_probability = (1.0 - config.confidence) / 2.0
+    floors: dict[str, object] = {}
+    for segment in sorted(set(config.segment_pairs_per_ring) | set(segments)):
+        result = list(segments.get(segment, ()))
+        floor = config.segment_regression_floor_elo.get(
+            segment, config.regression_floor_elo
+        )
+        floor_score_rate = _expected_score(floor)
+        summary = (
+            summarize_pairs(
+                result,
+                confidence=config.confidence,
+                bootstrap_samples=config.bootstrap_samples,
+                seed=config.seed + sum(map(ord, segment)) * 1_000_003,
+            )
+            if result
+            else None
+        )
+        if not result:
+            status: Literal["pass", "regress", "continue"] = "continue"
+            pass_log_e_value = regression_log_e_value = None
+        else:
+            status, pass_log_e_value, regression_log_e_value = _pair_floor_state(
+                _pair_score_counts(result),
+                floor_score_rate=floor_score_rate,
+                error_probability=error_probability,
+            )
+        floors[segment] = {
+            "floor_elo": floor,
+            "floor_score_rate": floor_score_rate,
+            "pairs": len(result),
+            "per_ring_pairs": {
+                str(ring): sum(pair.ring == ring for pair in result)
+                for ring in config.rings
+            },
+            "summary": summary,
+            "error_probability": error_probability,
+            "pass_log_e_value": pass_log_e_value,
+            "regression_log_e_value": regression_log_e_value,
+            "evidence_test": "pair-level-mixture-betting-e-process-v1",
+            "status": status,
+            "vetoes_promotion": status == "regress",
+        }
+    return floors
+
+
+def _apply_segment_vetoes(
+    summary: dict[str, object],
+    segments: Mapping[str, Sequence[ArenaPair]],
+    config: ArenaConfig,
+) -> dict[str, object]:
+    if not segments and not config.segment_pairs_per_ring:
+        return summary
+    floors = segment_floor_assessment(segments, config)
+    summary["per_segment"] = {
+        segment: summarize_pairs(
+            values,
+            confidence=config.confidence,
+            bootstrap_samples=config.bootstrap_samples,
+            seed=config.seed + sum(map(ord, segment)) * 1_000_003,
+        )
+        for segment, values in sorted(segments.items())
+        if values
+    }
+    promotion = cast(dict[str, object], summary["promotion"])
+    promotion["segment_floors"] = floors
+    vetoes = [
+        segment
+        for segment, floor in floors.items()
+        if cast(dict[str, object], floor)["status"] == "regress"
+    ]
+    promotion["segment_vetoes"] = vetoes
+    if vetoes and promotion.get("decision") in ("promote", "continue"):
+        promotion["decision"] = "reject_ring_regression"
+        promotion["regression_source"] = "segment"
+        promotion["vetoed_decision"] = (
+            "promote"
+            if promotion.get("sequential_state") == "accept_alternative"
+            else "continue"
+        )
+    elif promotion.get("decision") == "reject_ring_regression":
+        promotion.setdefault("regression_source", "ring")
+    return summary
+
+
 def summarize_arena_pairs(
     pairs: Sequence[ArenaPair], config: ArenaConfig
 ) -> dict[str, object]:
     if not pairs:
         raise ValueError("arena summary requires pairs")
+    standard, segments = _split_segments(pairs)
+    if not standard:
+        raise ValueError("arena summary requires standard-segment pairs")
     per_ring: dict[int, list[ArenaPair]] = {ring: [] for ring in config.rings}
-    for pair in pairs:
+    for pair in standard:
         if pair.ring not in per_ring:
             raise ValueError("arena pair has an unconfigured ring")
         per_ring[pair.ring].append(pair)
@@ -1056,7 +1186,7 @@ def summarize_arena_pairs(
         raise ValueError("arena summary requires at least one pair per ring")
     summary: dict[str, object] = {
         "aggregate": summarize_pairs(
-            pairs,
+            standard,
             confidence=config.confidence,
             bootstrap_samples=config.bootstrap_samples,
             seed=config.seed,
@@ -1070,12 +1200,12 @@ def summarize_arena_pairs(
             )
             for ring, values in per_ring.items()
         },
-        "promotion": promotion_assessment(pairs, per_ring, config),
+        "promotion": promotion_assessment(standard, per_ring, config),
     }
     if config.promotion_pair_ratios:
         promotion = cast(dict[str, object], summary["promotion"])
         summary["weighted_aggregate"] = promotion["weighted_aggregate"]
-    return summary
+    return _apply_segment_vetoes(summary, segments, config)
 
 
 def summarize_completed_arena_pairs(
@@ -1086,23 +1216,53 @@ def summarize_completed_arena_pairs(
 
     if not pairs:
         raise ValueError("arena summary requires pairs")
-    present = {pair.ring for pair in pairs}
-    if present == set(config.rings):
+    standard, segments = _split_segments(pairs)
+    present = {pair.ring for pair in standard}
+    if standard and present == set(config.rings):
         return summarize_arena_pairs(pairs, config)
-    unknown = present - set(config.rings)
+    unknown = {pair.ring for pair in pairs} - set(config.rings)
     if unknown:
         raise ValueError("arena pair has an unconfigured ring")
     per_ring = {
-        ring: [pair for pair in pairs if pair.ring == ring] for ring in config.rings
+        ring: [pair for pair in standard if pair.ring == ring] for ring in config.rings
     }
-    if config.promotion_pair_ratios:
-        promotion = promotion_assessment(pairs, per_ring, config)
-        return {
-            "aggregate": summarize_pairs(
-                pairs,
-                confidence=config.confidence,
-                bootstrap_samples=config.bootstrap_samples,
-                seed=config.seed,
+    if config.promotion_pair_ratios and standard:
+        promotion = promotion_assessment(standard, per_ring, config)
+        return _apply_segment_vetoes(
+            {
+                "aggregate": summarize_pairs(
+                    standard,
+                    confidence=config.confidence,
+                    bootstrap_samples=config.bootstrap_samples,
+                    seed=config.seed,
+                ),
+                "per_ring": {
+                    str(ring): summarize_pairs(
+                        values,
+                        confidence=config.confidence,
+                        bootstrap_samples=config.bootstrap_samples,
+                        seed=config.seed + ring * 1_000_003,
+                    )
+                    for ring, values in per_ring.items()
+                    if values
+                },
+                "promotion": promotion,
+                "weighted_aggregate": promotion["weighted_aggregate"],
+            },
+            segments,
+            config,
+        )
+    return _apply_segment_vetoes(
+        {
+            "aggregate": (
+                summarize_pairs(
+                    standard,
+                    confidence=config.confidence,
+                    bootstrap_samples=config.bootstrap_samples,
+                    seed=config.seed,
+                )
+                if standard
+                else None
             ),
             "per_ring": {
                 str(ring): summarize_pairs(
@@ -1114,36 +1274,19 @@ def summarize_completed_arena_pairs(
                 for ring, values in per_ring.items()
                 if values
             },
-            "promotion": promotion,
-            "weighted_aggregate": promotion["weighted_aggregate"],
-        }
-    return {
-        "aggregate": summarize_pairs(
-            pairs,
-            confidence=config.confidence,
-            bootstrap_samples=config.bootstrap_samples,
-            seed=config.seed,
-        ),
-        "per_ring": {
-            str(ring): summarize_pairs(
-                values,
-                confidence=config.confidence,
-                bootstrap_samples=config.bootstrap_samples,
-                seed=config.seed + ring * 1_000_003,
-            )
-            for ring, values in per_ring.items()
-            if values
+            "promotion": {
+                "decision": "continue",
+                "sequential_state": "continue",
+                "reason": "incomplete_ring_coverage",
+                "incomplete_rings": [
+                    ring for ring, values in per_ring.items() if not values
+                ],
+                "pair_model": "complete-role-reversed-pairs-only",
+            },
         },
-        "promotion": {
-            "decision": "continue",
-            "sequential_state": "continue",
-            "reason": "incomplete_ring_coverage",
-            "incomplete_rings": [
-                ring for ring, values in per_ring.items() if not values
-            ],
-            "pair_model": "complete-role-reversed-pairs-only",
-        },
-    }
+        segments,
+        config,
+    )
 
 
 def _wave_local_summary_config(
@@ -1227,7 +1370,6 @@ class ArenaRunner:
             thread_name_prefix="arena-inference",
         ) as inference_executor:
             for ring in self.config.rings:
-                node_count = get_topology(ring).n
                 first_pair = int((pair_starts or {}).get(ring, 0))
                 pair_count = int(
                     (pair_counts or {}).get(ring, self.config.pairs_per_ring)
@@ -1242,74 +1384,71 @@ class ArenaRunner:
                     if should_stop():
                         interrupted = True
                         break
-                    specifications: list[tuple[int, int, int, int | None]] = []
                     chunk_stop = min(
                         final_pair,
                         chunk_start + chunk_size,
                     )
-                    for pair in range(chunk_start, chunk_stop):
-                        opening_seed = _opening_seed(self.config.seed, ring, pair)
-                        forced_opening = _forced_opening(
-                            opening_seed, self.config.unforced_opening_fraction
-                        )
-                        opening_action = (
-                            opening_seed % node_count if forced_opening else None
-                        )
-                        for candidate_player in (0, 1):
-                            specifications.append(
-                                (
-                                    pair,
-                                    candidate_player,
-                                    opening_seed,
-                                    opening_action,
-                                )
-                            )
-                    ring_games = self._play_ring_batch(
+                    specifications = self._pair_specifications(
+                        ring, range(chunk_start, chunk_stop), STANDARD_VARIANT
+                    )
+                    completed = self._play_specifications(
                         ring,
                         specifications,
+                        STANDARD_VARIANT,
+                        games,
+                        pairs,
                         progress=progress,
                         inference_executor=inference_executor,
                         stop_requested=should_stop,
                     )
-                    if len(ring_games) % 2:
-                        raise RuntimeError(
-                            "arena cancellation produced an incomplete role-reversed pair"
-                        )
-                    games.extend(ring_games)
-                    for offset in range(0, len(ring_games), 2):
-                        pair_games = ring_games[offset : offset + 2]
-                        pair = pair_games[0].pair
-                        if pair_games[1].pair != pair or {
-                            pair_games[0].candidate_player,
-                            pair_games[1].candidate_player,
-                        } != {0, 1}:
-                            raise RuntimeError(
-                                "arena batch did not preserve role-reversed pairs"
-                            )
-                        opening_seed = pair_games[0].opening_seed
-                        opening_action = pair_games[0].opening_action
-                        forced_opening = pair_games[0].forced_opening
-                        completed_pair = ArenaPair(
-                            ring=ring,
-                            pair=pair,
-                            opening_seed=opening_seed,
-                            opening_action=opening_action,
-                            forced_opening=forced_opening,
-                            outcomes=(
-                                pair_games[0].outcome,
-                                pair_games[1].outcome,
-                            ),
-                        )
-                        pairs.append(completed_pair)
-                        if progress is not None:
-                            progress(
-                                phase="arena",
-                                ring=ring,
-                                pair=pair,
-                                completed_pairs=len(pairs),
-                            )
-                    if len(ring_games) != len(specifications) or should_stop():
+                    if not completed or should_stop():
                         interrupted = True
+                        break
+                if interrupted:
+                    break
+                # Non-standard segments play alongside the standard pairs in
+                # proportion to their configured counts; every batch stays
+                # variant-homogeneous.
+                for segment, per_ring in sorted(
+                    self.config.segment_pairs_per_ring.items()
+                ):
+                    if should_stop():
+                        interrupted = True
+                        break
+                    segment_first, segment_final = _segment_pair_range(
+                        first_pair,
+                        final_pair,
+                        pairs_per_ring=self.config.pairs_per_ring,
+                        segment_pairs_per_ring=per_ring,
+                    )
+                    by_variant: dict[GameVariant, list[int]] = {}
+                    for pair in range(segment_first, segment_final):
+                        variant = _segment_variant(
+                            segment,
+                            _opening_seed(self.config.seed, ring, pair),
+                            self.config,
+                        )
+                        by_variant.setdefault(variant, []).append(pair)
+                    for variant, variant_pairs in sorted(
+                        by_variant.items(), key=lambda item: item[0].label
+                    ):
+                        specifications = self._pair_specifications(
+                            ring, variant_pairs, variant
+                        )
+                        completed = self._play_specifications(
+                            ring,
+                            specifications,
+                            variant,
+                            games,
+                            pairs,
+                            progress=progress,
+                            inference_executor=inference_executor,
+                            stop_requested=should_stop,
+                        )
+                        if not completed or should_stop():
+                            interrupted = True
+                            break
+                    if interrupted:
                         break
                 if interrupted:
                     break
@@ -1376,7 +1515,14 @@ class ArenaRunner:
             "search": {
                 "deterministic": True,
                 **self.candidate_search.metadata(),
-                "pie_rule": False,
+                "pie_rule": "pie" in self.config.segment_pairs_per_ring,
+                "segments": {
+                    SEGMENT_STANDARD: self.config.pairs_per_ring,
+                    **dict(sorted(self.config.segment_pairs_per_ring.items())),
+                },
+                "segment_handicaps": list(self.config.segment_handicaps),
+                "segment_handicap_pda": list(self.config.segment_handicap_pda),
+                "swap_dead_zone": self.config.swap_dead_zone,
                 "search_workers": self.search_workers,
                 "inference_workers": 1,
                 "pair_chunk_size": self.config.pair_chunk_size,
@@ -1392,11 +1538,110 @@ class ArenaRunner:
             "pairs": [asdict(pair) for pair in pairs],
         }
 
+    def _pair_specifications(
+        self,
+        ring: int,
+        pair_indices: Sequence[int],
+        variant: GameVariant,
+    ) -> list[tuple[int, int, int, int | None]]:
+        node_count = get_topology(ring).n
+        specifications: list[tuple[int, int, int, int | None]] = []
+        for pair in pair_indices:
+            opening_seed = _opening_seed(self.config.seed, ring, pair)
+            forced_opening = _forced_opening(
+                opening_seed, self.config.unforced_opening_fraction
+            )
+            opening_action = opening_seed % node_count if forced_opening else None
+            for candidate_player in (0, 1):
+                specifications.append(
+                    (pair, candidate_player, opening_seed, opening_action)
+                )
+        return specifications
+
+    def _play_specifications(
+        self,
+        ring: int,
+        specifications: Sequence[tuple[int, int, int, int | None]],
+        variant: GameVariant,
+        games: list[ArenaGame],
+        pairs: list[ArenaPair],
+        *,
+        progress: Callable[..., None] | None,
+        inference_executor: Executor,
+        stop_requested: Callable[[], bool],
+    ) -> bool:
+        """Play one variant-homogeneous batch; return whether it completed."""
+
+        ring_games = self._play_ring_batch(
+            ring,
+            specifications,
+            variant=variant,
+            progress=progress,
+            inference_executor=inference_executor,
+            stop_requested=stop_requested,
+        )
+        if len(ring_games) % 2:
+            raise RuntimeError(
+                "arena cancellation produced an incomplete role-reversed pair"
+            )
+        games.extend(ring_games)
+        for offset in range(0, len(ring_games), 2):
+            pair_games = ring_games[offset : offset + 2]
+            pair = pair_games[0].pair
+            if pair_games[1].pair != pair or {
+                pair_games[0].candidate_player,
+                pair_games[1].candidate_player,
+            } != {0, 1}:
+                raise RuntimeError("arena batch did not preserve role-reversed pairs")
+            pairs.append(
+                ArenaPair(
+                    ring=ring,
+                    pair=pair,
+                    opening_seed=pair_games[0].opening_seed,
+                    opening_action=pair_games[0].opening_action,
+                    forced_opening=pair_games[0].forced_opening,
+                    outcomes=(pair_games[0].outcome, pair_games[1].outcome),
+                    variant=variant.label,
+                    segment=variant.segment,
+                )
+            )
+            if progress is not None:
+                progress(
+                    phase="arena",
+                    ring=ring,
+                    pair=pair,
+                    variant=variant.label,
+                    completed_pairs=len(pairs),
+                )
+        return len(ring_games) == len(specifications)
+
+    def _pda_seats(self, variant: GameVariant) -> tuple[int, int]:
+        """Seat advantages: the second player in a handicap game is advantaged."""
+
+        if variant.handicap < 2:
+            return (0, 0)
+        advantage = self.config.segment_handicap_pda[variant.handicap - 2]
+        return (-advantage, advantage)
+
+    def _budgets(
+        self,
+        budget: ArenaSearchBudget,
+        to_move: Sequence[int],
+        pda_seats: tuple[int, int],
+    ) -> list[int]:
+        return [
+            budget.simulations * (2 ** pda_seats[player])
+            if pda_seats[player] > 0
+            else budget.simulations
+            for player in to_move
+        ]
+
     def _play_ring_batch(
         self,
         ring: int,
         specifications: Sequence[tuple[int, int, int, int | None]],
         *,
+        variant: GameVariant = STANDARD_VARIANT,
         progress: Callable[..., None] | None,
         inference_executor: Executor,
         stop_requested: Callable[[], bool],
@@ -1420,6 +1665,7 @@ class ArenaRunner:
                         candidate_player=candidate_player,
                         opening_seed=opening_seed,
                         opening_action=opening_action,
+                        variant=variant,
                         inference_executor=inference_executor,
                         stop_requested=stop_requested,
                     )
@@ -1430,7 +1676,15 @@ class ArenaRunner:
                     break
                 output.extend(pair_games)
             return output
-        states = self.native.StateBatch(ring, len(specifications))
+        states = self.native.StateBatch(
+            ring,
+            len(specifications),
+            mode=variant.mode,
+            handicap=variant.handicap,
+            pie=variant.pie,
+        )
+        node_count = get_topology(ring).n
+        pda_seats = self._pda_seats(variant)
         forced_rows = [
             index
             for index, specification in enumerate(specifications)
@@ -1442,8 +1696,9 @@ class ArenaRunner:
                 [cast(int, specifications[index][3]) for index in forced_rows],
             )
         searched_moves = [0] * len(specifications)
+        swapped = [False] * len(specifications)
         wave = 0
-        maximum_moves = get_topology(ring).n
+        maximum_moves = node_count + 1
         with ThreadPoolExecutor(
             max_workers=self.search_workers,
             thread_name_prefix="arena-search",
@@ -1494,6 +1749,14 @@ class ArenaRunner:
                             rows,
                             inference_executor,
                             stop_requested,
+                            self._budgets(
+                                budget,
+                                [int(data.to_move[row]) for row in rows],
+                                pda_seats,
+                            ),
+                            pda_seats,
+                            [bool(data.swap_available[row]) for row in rows],
+                            node_count,
                         )
                     )
                 search_results = [future.result() for future in futures]
@@ -1503,8 +1766,10 @@ class ArenaRunner:
                     assert result is not None
                     rows, actions = result
                     states.apply_many(rows, actions)
-                    for row in rows:
+                    for row, action in zip(rows, actions, strict=True):
                         searched_moves[row] += 1
+                        if action == node_count:
+                            swapped[row] = True
                         if searched_moves[row] > maximum_moves:
                             raise RuntimeError(
                                 "batched arena game exceeded the move bound"
@@ -1514,6 +1779,7 @@ class ArenaRunner:
                     progress(
                         phase="arena_batch",
                         ring=ring,
+                        variant=variant.label,
                         active_games=len(active),
                         wave=wave,
                     )
@@ -1545,6 +1811,10 @@ class ArenaRunner:
                         winner=winner,
                         outcome=outcome,
                         searched_moves=searched_moves[row],
+                        variant=variant.label,
+                        segment=variant.segment,
+                        swapped=swapped[row],
+                        pda=max(pda_seats),
                     )
                 )
         return output
@@ -1559,9 +1829,20 @@ class ArenaRunner:
         rows: Sequence[int],
         inference_executor: Executor,
         stop_requested: Callable[[], bool],
+        budgets: Sequence[int] | None = None,
+        pda_seats: tuple[int, int] = (0, 0),
+        swap_available: Sequence[bool] | None = None,
+        node_count: int | None = None,
     ) -> tuple[list[int], list[int]] | None:
         if stop_requested():
             return None
+        options: dict[str, object] = {}
+        if budgets is not None and any(
+            value != budget.simulations for value in budgets
+        ):
+            options["simulations_per_root"] = [int(value) for value in budgets]
+        if pda_seats != (0, 0):
+            options["pda_by_seat"] = [pda_seats] * row_count
         search = self.native.SearchBatch(
             states,
             simulations=budget.simulations,
@@ -1569,6 +1850,7 @@ class ArenaRunner:
             c_visit=budget.c_visit,
             c_scale=budget.c_scale,
             deterministic_seed=seed,
+            **options,
         )
         roots = search.root_requests()
         response = self._evaluate_serialized(
@@ -1580,11 +1862,14 @@ class ArenaRunner:
             return None
         search.initialize_roots(*response.submit_args())
         guard = 0
+        guard_limit = (
+            max(budgets) if budgets else budget.simulations
+        ) * row_count * 4 + 16
         while not search.is_done():
             if stop_requested():
                 return None
             guard += 1
-            if guard > budget.simulations * row_count * 4 + 16:
+            if guard > guard_limit:
                 raise RuntimeError("batched arena search failed to make progress")
             requests = search.next_requests()
             if len(requests) == 0:
@@ -1603,6 +1888,13 @@ class ArenaRunner:
             raise RuntimeError("batched arena search returned the wrong row count")
         if any(action < 0 for action in actions):
             raise RuntimeError("active batched arena row returned invalid placement")
+        if swap_available is not None and any(swap_available):
+            if node_count is None:
+                raise RuntimeError("pie arena rows require the node count")
+            root_values = [float(value) for value in results.root_values]
+            for index, available in enumerate(swap_available):
+                if available and root_values[index] < -self.config.swap_dead_zone:
+                    actions[index] = node_count
         return list(rows), actions
 
     def _evaluate_serialized(
@@ -1633,13 +1925,26 @@ class ArenaRunner:
                 output.extend(source[start : start + BITBOARD_WORDS])
             return output
 
+        def column(name: str, convert: Callable[[Any], Any]) -> list[Any]:
+            source = getattr(data, name)
+            return [convert(source[row]) for row in rows]
+
         return self.native.StateBatch.from_semantic(
             int(data.rings),
             words("zero_bits"),
             words("one_bits"),
-            [int(data.to_move[row]) for row in rows],
-            [int(data.moves_left[row]) for row in rows],
-            [bool(data.opening[row]) for row in rows],
+            column("to_move", int),
+            column("moves_left", int),
+            column("opening", bool),
+            mode=column("mode", int),
+            handicap=column("handicap", int),
+            pie=column("pie", bool),
+            swap_available=column("swap_available", bool),
+            swapped=column("swapped", bool),
+            current_turn_bits=words("current_turn_bits"),
+            previous_turn_bits=words("previous_turn_bits"),
+            own_previous_turn_bits=words("own_previous_turn_bits"),
+            handicap_bits=words("handicap_bits"),
         )
 
     def _play_game(
@@ -1650,16 +1955,22 @@ class ArenaRunner:
         candidate_player: int,
         opening_seed: int,
         opening_action: int | None,
+        variant: GameVariant = STANDARD_VARIANT,
         inference_executor: Executor,
         stop_requested: Callable[[], bool],
     ) -> ArenaGame | None:
-        states = self.native.StateBatch(ring, 1)
-        # Both games in a pair receive the same legal one-stone opening. The
-        # native rules expose no swap/pie action, so role reversal cannot alter it.
+        states = self.native.StateBatch(
+            ring, 1, mode=variant.mode, handicap=variant.handicap, pie=variant.pie
+        )
+        node_count = get_topology(ring).n
+        pda_seats = self._pda_seats(variant)
+        # Both games in a pair receive the same legal one-stone opening, so
+        # role reversal cannot alter it; in a pie game the responder may swap.
         if opening_action is not None:
             states.apply_many([0], [opening_action])
         moves = 0
-        maximum_moves = get_topology(ring).n
+        swapped = False
+        maximum_moves = node_count + 1
         while True:
             if stop_requested():
                 return None
@@ -1673,48 +1984,29 @@ class ArenaRunner:
                 if player == candidate_player
                 else self.baseline_search
             )
-            search = self.native.SearchBatch(
+            result = self._search_group(
                 states,
-                simulations=budget.simulations,
-                max_considered=budget.max_considered,
-                c_visit=budget.c_visit,
-                c_scale=budget.c_scale,
-                deterministic_seed=_search_seed(opening_seed, moves),
-            )
-            roots = search.root_requests()
-            root_response = self._evaluate_serialized(
-                inference_executor,
                 evaluator,
-                roots,
+                budget,
+                _search_seed(opening_seed, moves),
+                1,
+                [0],
+                inference_executor,
+                stop_requested,
+                self._budgets(budget, [player], pda_seats),
+                pda_seats,
+                [bool(state_data.swap_available[0])],
+                node_count,
             )
-            if stop_requested():
+            if result is None:
                 return None
-            search.initialize_roots(*root_response.submit_args())
-            guard = 0
-            while not search.is_done():
-                if stop_requested():
-                    return None
-                guard += 1
-                if guard > budget.simulations * 4 + 16:
-                    raise RuntimeError("arena native search failed to make progress")
-                requests = search.next_requests()
-                if len(requests) == 0:
-                    continue
-                response = self._evaluate_serialized(
-                    inference_executor,
-                    evaluator,
-                    requests,
-                )
-                if stop_requested():
-                    return None
-                search.submit(*response.submit_args())
-            results = search.results()
-            if bool(results.terminal[0]) or int(results.selected_actions[0]) < 0:
-                raise RuntimeError("arena search marked an active state terminal")
-            states.apply_many([0], [int(results.selected_actions[0])])
+            action = result[1][0]
+            if action == node_count:
+                swapped = True
+            states.apply_many([0], [action])
             moves += 1
             if moves > maximum_moves:
-                raise RuntimeError("arena game exceeded the no-pie move bound")
+                raise RuntimeError("arena game exceeded the move bound")
         winner = int(states.score_data().winner[0])
         if winner not in (0, 1):
             raise RuntimeError("arena terminal result cannot be tied")
@@ -1729,6 +2021,10 @@ class ArenaRunner:
             winner=winner,
             outcome=outcome,
             searched_moves=moves,
+            variant=variant.label,
+            segment=variant.segment,
+            swapped=swapped,
+            pda=max(pda_seats),
         )
 
 
@@ -1771,3 +2067,41 @@ def _batch_search_seed(
 def _forced_opening(opening_seed: int, unforced_fraction: float) -> bool:
     threshold = int(unforced_fraction * (1 << 64))
     return opening_seed >= threshold
+
+
+def _segment_pair_range(
+    first_pair: int,
+    final_pair: int,
+    *,
+    pairs_per_ring: int,
+    segment_pairs_per_ring: int,
+) -> tuple[int, int]:
+    """Map a standard pair range onto a segment's proportional pair range.
+
+    Pair indices stay absolute across continuation waves so durable prior
+    waves merge without duplicates.
+    """
+
+    scale = segment_pairs_per_ring / pairs_per_ring
+    start = math.ceil(first_pair * scale)
+    stop = math.ceil(final_pair * scale)
+    return start, max(start, stop)
+
+
+def _segment_variant(
+    segment: str, opening_seed: int, config: ArenaConfig
+) -> GameVariant:
+    """Deterministically pick the concrete variant of one segment pair."""
+
+    if segment == "classic":
+        return GameVariant(mode="classic")
+    if segment == "handicap":
+        handicaps = config.segment_handicaps
+        return GameVariant(
+            mode="double", handicap=handicaps[(opening_seed >> 8) % len(handicaps)]
+        )
+    if segment == "pie":
+        return GameVariant(
+            mode="classic" if (opening_seed >> 16) & 1 else "double", pie=True
+        )
+    raise ValueError(f"unknown arena segment {segment!r}")

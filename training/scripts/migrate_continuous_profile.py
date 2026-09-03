@@ -73,6 +73,36 @@ _ALLOWED_PROFILE_PATHS = {
     ("orchestration", "historical_evaluation", "simulations"),
     ("orchestration", "historical_evaluation", "max_considered"),
     ("orchestration", "historical_evaluation", "measure_direct_predecessor"),
+    # Variant mixture (Stage B of the variant-capable network plan). Turning
+    # the mixture on changes only which rule variants self-play generates, how
+    # the learner stratifies its replay window, and which arena segments veto;
+    # the game family, model, optimizer, and replay schema stay immutable.
+    ("selfplay", "variants", "enabled"),
+    ("selfplay", "variants", "standard"),
+    ("selfplay", "variants", "classic"),
+    ("selfplay", "variants", "handicap"),
+    ("selfplay", "variants", "pie"),
+    ("selfplay", "variants", "pie_classic_share"),
+    ("selfplay", "variants", "handicap_min"),
+    ("selfplay", "variants", "handicap_max"),
+    ("selfplay", "variants", "asymmetric_pda_fraction"),
+    ("selfplay", "variants", "swap_dead_zone"),
+    *(
+        ("selfplay", "variants", "score_utility_weight_by_segment", segment)
+        for segment in ("standard", "classic", "handicap", "pie")
+    ),
+    *(
+        ("learner", "segment_quotas", segment)
+        for segment in ("standard", "classic", "handicap", "pie")
+    ),
+    *(
+        ("arena", "segment_pairs_per_ring", segment)
+        for segment in ("classic", "handicap", "pie")
+    ),
+    *(
+        ("arena", "segment_regression_floor_elo", segment)
+        for segment in ("classic", "handicap", "pie")
+    ),
 }
 
 

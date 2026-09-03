@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+
+from startrain.arena import ARENA_RESULT_SCHEMA_VERSION
 from pathlib import Path
 
 import pytest
@@ -50,7 +52,7 @@ def _checkpoint_arena_result(
     ring_losses: int,
 ) -> dict:
     return {
-        "schema_version": 3,
+        "schema_version": ARENA_RESULT_SCHEMA_VERSION,
         "candidate": candidate,
         "baseline": baseline,
         "baseline_metadata": {

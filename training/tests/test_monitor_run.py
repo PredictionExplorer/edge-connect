@@ -10,6 +10,7 @@ import pytest
 import yaml
 
 from scripts import monitor_run as monitor
+from startrain.arena import ARENA_RESULT_SCHEMA_VERSION
 from startrain import continuity
 
 CONFIGS = Path(__file__).parents[1] / "configs"
@@ -635,7 +636,7 @@ def test_snapshot_warns_about_fragmented_arena_continuation(
     _write_json(
         root / "arena" / "superseded.json",
         {
-            "schema_version": 3,
+            "schema_version": ARENA_RESULT_SCHEMA_VERSION,
             "candidate": "candidate",
             "baseline": "baseline",
             "completed_ns": now_ns,
@@ -1472,7 +1473,7 @@ def test_monitor_shows_headline_segment_loader_and_result_kind_counts(
         },
     )
     common = {
-        "schema_version": 3,
+        "schema_version": ARENA_RESULT_SCHEMA_VERSION,
         "candidate": "candidate",
         "baseline": "baseline",
         "aggregate": {

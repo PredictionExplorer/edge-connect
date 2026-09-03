@@ -8,6 +8,7 @@ import hashlib
 import json
 import re
 from collections.abc import Mapping, Sequence
+from typing import cast
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -213,6 +214,23 @@ def _manifest_reference(
     return path.resolve()
 
 
+def _variant_fields(payload: Mapping[str, object], name: str) -> dict[str, object]:
+    """Validate the rules-v3 variant provenance of one arena pair or game."""
+
+    variant = payload["variant"]
+    segment = payload["segment"]
+    if type(variant) is not str or type(segment) is not str:
+        raise ValueError(f"{name} variant and segment must be strings")
+    fields: dict[str, object] = {"variant": variant, "segment": segment}
+    if "swapped" in payload:
+        if type(payload["swapped"]) is not bool:
+            raise ValueError(f"{name} swapped must be boolean")
+        fields["swapped"] = payload["swapped"]
+    if "pda" in payload:
+        fields["pda"] = _nonnegative_int(payload["pda"], f"{name} pda")
+    return fields
+
+
 def _arena_pair(value: object, name: str) -> ArenaPair:
     payload = _mapping(value, name)
     _exact_keys(
@@ -224,6 +242,8 @@ def _arena_pair(value: object, name: str) -> ArenaPair:
             "opening_action",
             "forced_opening",
             "outcomes",
+            "variant",
+            "segment",
         ),
         name,
     )
@@ -239,6 +259,7 @@ def _arena_pair(value: object, name: str) -> ArenaPair:
         raise ValueError(f"{name} opening_action must be an integer or null")
     if type(payload["forced_opening"]) is not bool:
         raise ValueError(f"{name} forced_opening must be boolean")
+    variant_fields = _variant_fields(payload, name)
     return ArenaPair(
         ring=_positive_int(payload["ring"], f"{name} ring"),
         pair=_nonnegative_int(payload["pair"], f"{name} pair"),
@@ -246,6 +267,8 @@ def _arena_pair(value: object, name: str) -> ArenaPair:
         opening_action=opening_action,
         forced_opening=payload["forced_opening"],
         outcomes=(outcomes[0], outcomes[1]),
+        variant=cast(str, variant_fields["variant"]),
+        segment=cast(str, variant_fields["segment"]),
     )
 
 
@@ -263,6 +286,10 @@ def _arena_game(value: object, name: str) -> ArenaGame:
             "winner",
             "outcome",
             "searched_moves",
+            "variant",
+            "segment",
+            "swapped",
+            "pda",
         ),
         name,
     )
@@ -271,6 +298,7 @@ def _arena_game(value: object, name: str) -> ArenaGame:
         raise ValueError(f"{name} opening_action must be an integer or null")
     if type(payload["forced_opening"]) is not bool:
         raise ValueError(f"{name} forced_opening must be boolean")
+    variant_fields = _variant_fields(payload, name)
     return ArenaGame(
         ring=_positive_int(payload["ring"], f"{name} ring"),
         pair=_nonnegative_int(payload["pair"], f"{name} pair"),
@@ -287,6 +315,10 @@ def _arena_game(value: object, name: str) -> ArenaGame:
         searched_moves=_nonnegative_int(
             payload["searched_moves"], f"{name} searched_moves"
         ),
+        variant=cast(str, variant_fields["variant"]),
+        segment=cast(str, variant_fields["segment"]),
+        swapped=cast(bool, variant_fields.get("swapped", False)),
+        pda=cast(int, variant_fields.get("pda", 0)),
     )
 
 

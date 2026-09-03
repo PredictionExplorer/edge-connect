@@ -1153,6 +1153,15 @@ class ArenaConfig:
     unforced_opening_fraction: float = 0.2
     minimum_pairs_per_ring: int = 40
     max_pairs_per_ring: int = 200
+    # Non-standard mixture segments played alongside the standard pairs. Each
+    # value is the number of extra role-reversed pairs per ring for that
+    # segment per ``pairs_per_ring`` standard pairs; those pairs never promote
+    # a candidate but veto it once the segment floor is provably regressed.
+    segment_pairs_per_ring: dict[str, int] = field(default_factory=dict)
+    segment_regression_floor_elo: dict[str, float] = field(default_factory=dict)
+    segment_handicaps: tuple[int, ...] = (2, 4, 6, 9)
+    segment_handicap_pda: tuple[int, ...] = (1, 1, 2, 2, 2, 3, 3, 3)
+    swap_dead_zone: float = 0.02
 
     def __post_init__(self) -> None:
         if (
@@ -1166,6 +1175,64 @@ class ArenaConfig:
             raise ConfigError(
                 "arena rings must be a sorted unique subset of (4, 6, 8, 10)"
             )
+        if not isinstance(self.segment_pairs_per_ring, dict) or any(
+            segment not in SEGMENTS
+            or segment == "standard"
+            or isinstance(count, bool)
+            or not isinstance(count, int)
+            or count <= 0
+            for segment, count in self.segment_pairs_per_ring.items()
+        ):
+            raise ConfigError(
+                "arena segment_pairs_per_ring must map classic/handicap/pie "
+                "segments to positive pair counts"
+            )
+        if not isinstance(self.segment_regression_floor_elo, dict) or any(
+            segment not in self.segment_pairs_per_ring
+            or isinstance(floor, bool)
+            or not isinstance(floor, int | float)
+            or not math.isfinite(float(floor))
+            for segment, floor in self.segment_regression_floor_elo.items()
+        ):
+            raise ConfigError(
+                "arena segment_regression_floor_elo must reference configured "
+                "segments with finite floors"
+            )
+        object.__setattr__(
+            self,
+            "segment_regression_floor_elo",
+            {
+                segment: float(floor)
+                for segment, floor in self.segment_regression_floor_elo.items()
+            },
+        )
+        handicaps = tuple(self.segment_handicaps)
+        if not handicaps or any(
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or not 2 <= value <= MAX_HANDICAP
+            for value in handicaps
+        ):
+            raise ConfigError(
+                f"arena segment_handicaps must be non-empty values in 2..{MAX_HANDICAP}"
+            )
+        object.__setattr__(self, "segment_handicaps", handicaps)
+        pdas = tuple(self.segment_handicap_pda)
+        if len(pdas) != MAX_HANDICAP - 1 or any(
+            isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 3
+            for value in pdas
+        ):
+            raise ConfigError(
+                "arena segment_handicap_pda must give one advantage in 0..3 "
+                "for each handicap 2..9"
+            )
+        object.__setattr__(self, "segment_handicap_pda", pdas)
+        if (
+            isinstance(self.swap_dead_zone, bool)
+            or not isinstance(self.swap_dead_zone, int | float)
+            or not 0 <= float(self.swap_dead_zone) < 1
+        ):
+            raise ConfigError("arena swap_dead_zone must be in [0, 1)")
         if (
             self.pairs_per_ring < 2
             or (
@@ -1618,6 +1685,25 @@ def load_config(path: str | Path) -> ExperimentConfig:
             arena_values.get("promotion_pair_ratios", {}),
         ).items()
     }
+    arena_values["segment_pairs_per_ring"] = {
+        str(segment): count
+        for segment, count in _mapping(
+            "segment_pairs_per_ring",
+            arena_values.get("segment_pairs_per_ring", {}),
+        ).items()
+    }
+    arena_values["segment_regression_floor_elo"] = {
+        str(segment): value
+        for segment, value in _mapping(
+            "segment_regression_floor_elo",
+            arena_values.get("segment_regression_floor_elo", {}),
+        ).items()
+    }
+    for name in ("segment_handicaps", "segment_handicap_pda"):
+        if name in arena_values:
+            if not isinstance(arena_values[name], list | tuple):
+                raise ConfigError(f"arena.{name} must be a list")
+            arena_values[name] = tuple(arena_values[name])
     required_regression_rings = arena_values.get("required_regression_rings")
     if required_regression_rings is not None:
         try:

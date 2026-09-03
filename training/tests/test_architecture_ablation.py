@@ -14,7 +14,7 @@ from scripts.compare_architecture_ablation import (
     main,
 )
 from scripts.run_architecture_ablation_queue import architecture_suite_document
-from startrain.arena import ArenaGame, ArenaPair
+from startrain.arena import ARENA_RESULT_SCHEMA_VERSION, ArenaGame, ArenaPair
 from startrain.checkpoint import (
     ExponentialMovingAverage,
     extract_verified_manifest_config,
@@ -115,7 +115,7 @@ def _write_arena(
     path.write_text(
         json.dumps(
             {
-                "schema_version": 3,
+                "schema_version": ARENA_RESULT_SCHEMA_VERSION,
                 "result_kind": "architecture_evaluation",
                 "evaluation_mode": "architecture",
                 "candidate": candidate.model_identity,
