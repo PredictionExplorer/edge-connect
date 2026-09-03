@@ -471,6 +471,47 @@ def test_monitor_warns_about_reduced_and_collapsed_learning_rates(
     )
 
 
+def test_monitor_flags_a_learner_whose_steps_stopped(tmp_path, monkeypatch) -> None:
+    """A running learner without a training step for 20 minutes is an error.
+
+    The heartbeat keeps advancing during a stall, so the age of the last
+    training-metrics record is the signal; short update-to-data waits stay quiet.
+    """
+
+    now_ns = 10_000_000_000
+    root = _fixture(tmp_path, now_ns=now_ns)
+    _healthy_dependencies(monkeypatch)
+    metrics_path = root / "learner" / "metrics.jsonl"
+    metric = json.loads(metrics_path.read_text(encoding="utf-8"))
+    heartbeat_path = root / "status" / "learner.heartbeat.json"
+    heartbeat = json.loads(heartbeat_path.read_text(encoding="utf-8"))
+
+    def snapshot_codes() -> dict[str, dict[str, Any]]:
+        snapshot: Any = monitor.collect_snapshot(root, now_ns=now_ns)
+        return {warning["code"]: warning for warning in snapshot["warnings"]}
+
+    # A twelve-minute wait for the first allowance of a fresh UTD segment.
+    metric["timestamp_ns"] = now_ns - 12 * 60 * 1_000_000_000
+    metrics_path.write_text(json.dumps(metric) + "\n", encoding="utf-8")
+    assert "learner_step_stalled" not in snapshot_codes()
+
+    # Three hours at a replay-lag cap.
+    metric["timestamp_ns"] = now_ns - 3 * 3600 * 1_000_000_000
+    metrics_path.write_text(json.dumps(metric) + "\n", encoding="utf-8")
+    heartbeat.update(
+        {
+            "heartbeat_ns": now_ns,
+            "phase": "replay_wait",
+            "reason": "invalid_window_capacity",
+        }
+    )
+    heartbeat_path.write_text(json.dumps(heartbeat), encoding="utf-8")
+    stalled = snapshot_codes()["learner_step_stalled"]
+    assert stalled["severity"] == "ERROR"
+    assert "180 minutes" in stalled["message"]
+    assert "invalid_window_capacity" in stalled["message"]
+
+
 def test_monitor_exposes_training_objective(tmp_path, monkeypatch) -> None:
     now_ns = 10_000_000_000
     root = _fixture(tmp_path, now_ns=now_ns)

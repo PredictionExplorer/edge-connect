@@ -37,6 +37,9 @@ DISASTER_BACKUP_STALE_SECONDS = 30.0 * 60.0
 STRENGTH_REPORT_WARN_SECONDS = 20.0 * 60.0
 STRENGTH_REPORT_ERROR_SECONDS = 45.0 * 60.0
 STRENGTH_REPORT_CLOCK_SKEW_SECONDS = 5.0
+# Longer than any legitimate update-to-data wait (a fresh segment baseline took
+# twelve minutes to accrue its first allowance) but far shorter than a stall.
+LEARNER_STEP_STALL_SECONDS = 20.0 * 60.0
 DEFAULT_TELEMETRY_MAX_BYTES = 50 * 1024 * 1024
 DEFAULT_TELEMETRY_RETAIN_FILES = 7
 _DIGEST_CACHE: dict[Path, tuple[int, int, int, str]] = {}
@@ -1795,6 +1798,25 @@ def collect_snapshot(
             "WARN",
             "gradient_clipping_high",
             f"gradient clipping frequency={clipping_frequency:.1%}",
+        )
+    # A running learner whose last training step is far older than any UTD wait
+    # can explain is stalled, whatever its heartbeat says. On 2026-09-03 the
+    # production learner waited almost three hours at a replay-lag cap while its
+    # heartbeat kept advancing and the lag read as "exactly at the limit".
+    training_age = _age_seconds(learner_metric.get("timestamp_ns"), now)
+    if (
+        learner_worker_state == "running"
+        and training_age is not None
+        and training_age > LEARNER_STEP_STALL_SECONDS
+    ):
+        phase = learner_heartbeat.get("phase")
+        reason = learner_heartbeat.get("reason")
+        _add_warning(
+            warnings,
+            "ERROR",
+            "learner_step_stalled",
+            "learner has not completed a training step for "
+            f"{int(training_age // 60)} minutes (phase={phase}, reason={reason})",
         )
     learner = {
         "step": learner_heartbeat.get("step", learner_metric.get("step")),
