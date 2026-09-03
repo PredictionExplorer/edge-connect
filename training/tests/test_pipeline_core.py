@@ -3544,6 +3544,55 @@ def test_keep_weights_plateau_policy_ignores_champion_lag(
     assert learner._rank_zero_plateau_action(counting) == {"kind": "proceed"}
 
 
+def test_plateau_step_budget_caps_only_the_rewinding_policy(
+    tmp_path, monkeypatch
+) -> None:
+    """Keep-weights training never stops at champion + max_replay_lag_steps.
+
+    The production learner sat in ``replay_wait`` for hours at exactly that
+    lag because the window budget still applied the rewinding policy's cap.
+    """
+
+    learner, _status, _status_path = _plateau_policy_fixture(tmp_path, monkeypatch)
+    learner.rank = 0
+    learner.learner_config = SimpleNamespace(
+        max_replay_lag_steps=60_000, steps_per_window=1_000
+    )
+    learner._broadcast_object = lambda value: value
+    configs = {}
+    learner._plateau_config = lambda: configs["current"]
+
+    configs["current"] = PlateauConfig(
+        enabled=True,
+        action="reduce_lr_keep_weights",
+        reset_learning_rate_scale=0.5,
+        max_learner_champion_lag_steps=40_000,
+        consecutive_terminal_rejections=2,
+    )
+    for step in (100_000, 159_000, 160_000, 400_000):
+        learner.step = step
+        assert learner._plateau_step_budget() == 1_000
+
+    configs["current"] = PlateauConfig(
+        enabled=True,
+        action="reset_from_champion",
+        reset_learning_rate_scale=0.5,
+        max_learner_champion_lag_steps=40_000,
+        consecutive_terminal_rejections=2,
+    )
+    learner.step = 100_000
+    assert learner._plateau_step_budget() == 60_000
+    learner.step = 159_500
+    assert learner._plateau_step_budget() == 500
+    learner.step = 160_000
+    assert learner._plateau_step_budget() == 0
+    learner.step = 400_000
+    assert learner._plateau_step_budget() == 0
+
+    configs["current"] = PlateauConfig(enabled=False)
+    assert learner._plateau_step_budget() == 1_000
+
+
 def test_reset_from_champion_plateau_policy_keeps_lag_gating(
     tmp_path, monkeypatch
 ) -> None:

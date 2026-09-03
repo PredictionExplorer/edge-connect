@@ -3562,34 +3562,30 @@ class LearnerLoop:
         }
 
     def _plateau_step_budget(self) -> int:
+        """Bound a window so a rewinding policy cannot outrun its replay window.
+
+        Only ``reset_from_champion`` needs the bound: its rewind returns to the
+        champion, so training past ``champion + max_replay_lag_steps`` would be
+        discarded anyway. Under ``reduce_lr_keep_weights`` weights are never
+        rewound and the lag grows without bound between promotions, so the cap
+        would simply stop the learner at the lag limit forever.
+        """
+
         configured = self._plateau_config()
         budget = self.learner_config.steps_per_window
         if (
             configured.enabled
+            and configured.action != "reduce_lr_keep_weights"
             and self.rank == 0
             and self.publisher.champion_path.is_file()
         ):
             champion = load_model_manifest(self.publisher.champion_path)
-            candidate = (
-                load_model_manifest(self.publisher.candidate_path)
-                if self.publisher.candidate_path.is_file()
-                else None
+            budget = max(
+                0,
+                champion.model_step
+                + self.learner_config.max_replay_lag_steps
+                - self.step,
             )
-            recovery_token = (
-                champion.model_identity,
-                candidate.model_identity if candidate is not None else "",
-            )
-            recovered_in_place = (
-                configured.action == "reduce_lr_keep_weights"
-                and self._last_plateau_reset == recovery_token
-            )
-            if not recovered_in_place:
-                budget = max(
-                    0,
-                    champion.model_step
-                    + self.learner_config.max_replay_lag_steps
-                    - self.step,
-                )
         value = self._broadcast_object(budget if self.rank == 0 else None)
         if not isinstance(value, int):
             raise RuntimeError("distributed plateau step budget is invalid")
