@@ -3,12 +3,43 @@
 Handicap openings, the classic one-stone variant, the pie rule, and architecture v3
 for a single GraphResTNet lineage.
 
-Status: implemented locally on branch `variant-capable-network`, 2026-09-03. Every
-phase below is code-complete and tested (Rust, Python, TypeScript); nothing has been
-deployed or trained on an H100 host yet. The live gates of Section 11 become roadmap
-registry entries with pre-registered thresholds before the first Stage A run
-(`model-improvement-roadmap.md`), in the same form as R10-LR-RECOVERY-01 through
-R10-ANNEAL-HOVER-05.
+Status: implemented on branch `variant-capable-network` (2026-09-03) and running
+Stage A on the H100 host since 2026-09-04 01:27 UTC. Every phase below is code-complete
+and tested (Rust, Python, TypeScript). The live gates of Section 11 become roadmap
+registry entries with pre-registered thresholds (`model-improvement-roadmap.md`), in
+the same form as R10-LR-RECOVERY-01 through R10-ANNEAL-HOVER-05.
+
+Deployment record (2026-09-04):
+
+- The previous lineage (`lr-recovery-742979`, run `star-warmstart-20260719T042241Z`)
+  was stopped gracefully at learner step ~877,800 with champion step 864,090 after a
+  replay-ledger backup, a verified DR snapshot, a control-plane backup, and a manual
+  copy of its learner pointers, manifests, checkpoints, and profiles to
+  `/lambda/nfs/texas-north-fs/edgeconnect-dr/manual/lr-recovery-742979-<utc>/`. Its
+  units, the fallback workload, and the continuity timer are disabled; the continuity
+  operator hold is in place. The champion snapshot lives in
+  `training/runs/server-champion-864090-37c38c80/` on the development machine and is
+  served locally by the `main` worktree (`../EdgeConnect-legacy`, rules v2).
+- Immutable release `/home/ubuntu/edgeconnect-releases/variant-f36dc87-384x8` (commit
+  `f36dc87`, uv-locked venv, `star_native` rules `fnv1a64:a5d932b0ef8354e8`).
+- Lineage transfer: 4,806,026 samples (1.2 M most recent per ring, 1,353 shards)
+  labelled by the step-864,090 champion with 32 worker processes over eight GPUs in
+  about eleven minutes; report `/home/ubuntu/edgeconnect-runs/variant-network/
+  lineage-transfer.json` (digest `686a76d4…`).
+- Workload `edgeconnect-startrain-variant-network.service` runs the Stage A profile
+  (`profile.yaml`, sha256 `7b0ab365…`) as a standalone continuous unit with hourly
+  replay-ledger backups, 14-minute DR snapshots to
+  `/lambda/nfs/texas-north-fs/edgeconnect-dr/variant-network`, and the 5 s monitor.
+  `profile-stage-b.yaml` sits beside it for the Stage B migration.
+- Measured on the host at batch 512, ring 10: compiled learner step 0.395 s, peak
+  62.6 GiB; eager inference 96 ms per 128 positions. First minutes: 0.27–0.29 s per
+  step, ~1,850 examples/s, every batch carrying teacher targets
+  (`teacher_policy` ≈ 0.8–1.2 nats at step 1,300), 13 actor lanes at 27–29 samples/s
+  each against the random bootstrap champion.
+- Stage B trigger: once the learner passes `learner.max_replay_lag_steps` (120,000)
+  the transferred shards have left the window; run `scripts/run_lineage_arena.py`
+  against the legacy champion and, if it passes, migrate with
+  `scripts/migrate_continuous_profile.py` to `profile-stage-b.yaml`.
 
 Implementation summary:
 
@@ -57,6 +88,18 @@ Design decisions taken during implementation that refine the text below:
 - The lineage transfer keeps `model_step = 0` on transferred shards so they age out
   through `learner.max_replay_lag_steps` without a special retention rule, and the
   Stage A → Stage B profile change is an ordinary continuous-profile migration.
+- Fused attention kernels do not differentiate an additive mask, so a
+  gradient-requiring relation bias forced `scaled_dot_product_attention` onto the
+  math path (fp32 N × N × H tensors per layer; the 384 x 8 learner exceeded 80 GiB at
+  batch 512 on ring 10). `GlobalGQABlock` now takes its value from the fused kernel
+  with a detached mask and routes the exact bias gradient through a zero-valued,
+  activation-checkpointed explicit-attention carrier built from detached queries,
+  keys, and values (`_relation_bias_gradient_carrier`).
+- The arena shares GPU 7 with a single-lane actor (pause-sharing) instead of the
+  learner's GPU, and `prepare_lineage_transfer.py` gained `--max-samples-per-ring`,
+  `--workers`, and a device list so a transfer takes minutes rather than hours.
+- The run root produced by the transfer has an identity and a replay store but no
+  learner state; `preflight_run_state.py` reports `seeded_first_launch` for it.
 
 ## 1. Requirements
 

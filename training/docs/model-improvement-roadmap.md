@@ -567,6 +567,23 @@ Cumulative roadmap H100-hours: not tracked before this entry
 
 ## Decision log
 
+### 2026-09-04 — Launch Stage A at 384 x 8 on the transferred replay
+
+Decision: retire `lr-recovery-742979` at champion step 864,090 (backed up,
+snapshotted, exported for local play) and launch the variant-capable lineage
+as workload `variant-network` from release `variant-f36dc87-384x8` with
+17,402,775 parameters (384 x 8 groups, about 1.6x the inference cost of
+384 x 5). Capacity is chosen at Stage A because the lineage transfer makes
+the size free to pick and `model` is immutable afterwards; the roadmap's
+earlier "capacity is not the first intervention" stance applied to the
+previous lineage's plateau, not to a lineage whose replay and targets are
+new. The seed is 4,806,026 transferred samples (1.2 M most recent per ring)
+labelled by the step-864,090 champion. Pre-registered checks for this run:
+the learner must stay below 72 GiB on GPU 0 at batch 512 (measured 62.6 GiB
+peak compiled), the cross-schema lineage arena against champion 864,090 must
+pass before the Stage B migration, and the transferred shards must have left
+the window (learner step > 120,000) before the variant mixture turns on.
+
 ### 2026-09-03 — Start the variant-capable lineage by transfer, not by scratch
 
 Decision: the next lineage plays classic, handicap, and pie games with one
