@@ -175,7 +175,8 @@ orchestration:
     role: actor
     cpu_threads: 8
     actor_batch_size: 128
-    actor_lanes: 2
+    # One lane: the arena pauses this actor while it evaluates on GPU 7.
+    actor_lanes: 1
     cpu_affinity: 104-207
   actor_games_per_batch: 128
   ring_mixture:
@@ -228,7 +229,9 @@ orchestration:
     require_gpu_model: H100
   promotion:
     enabled: true
-    gpu_id: 0
+    # The 384x8 learner peaks near 63 GiB at batch 512 on ring 10; the arena
+    # shares GPU 7 with the single-lane actor instead of the learner's GPU.
+    gpu_id: 7
     cpu_threads: 8
     poll_seconds: 10.0
     bootstrap_initial_champion: true
