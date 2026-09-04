@@ -26,8 +26,10 @@ model:
   feature_schema_version: 4
   relational_bias: true
   adaln_hidden: 32
+  # 384 x 8 groups: 17,402,775 parameters, about 1.6x the inference cost of the
+  # previous 384 x 5 lineage; sixteen local message-passing hops.
   width: 384
-  rrt_groups: 5
+  rrt_groups: 8
   attention_heads: 12
   kv_heads: 3
   bottleneck_ratio: 0.5

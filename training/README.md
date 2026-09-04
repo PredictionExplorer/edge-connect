@@ -420,9 +420,10 @@ python scripts/prepare_lineage_transfer.py \
 startrain-orchestrate --config configs/h100-8gpu-variant-stage-a.yaml
 ```
 
-The Stage A profile trains the v3 architecture from random weights with
-`loss.teacher_*` distilling the transferred targets while the actors generate standard
-Double *Star games with real history planes. The transferred shards carry
+The Stage A profile trains the v3 architecture at 384 x 8 groups (17,402,775
+parameters, about 1.6x the inference cost of the previous 384 x 5 lineage) from random
+weights with `loss.teacher_*` distilling the transferred targets while the actors
+generate standard Double *Star games with real history planes. The transferred shards carry
 `model_step 0`, so they leave the replay window once the learner passes
 `learner.max_replay_lag_steps`. Measure how much of the old strength the new lineage
 recovered with the cross-schema arena, which evaluates the legacy champion through its

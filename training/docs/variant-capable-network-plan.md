@@ -34,6 +34,10 @@ Implementation summary:
   browser features v4 pinned to Python via `testdata/star/features-v4.json`, browser
   manifest v3 with the `rings` input, `configs/h100-8gpu-variant-stage-a.yaml` and
   `-stage-b.yaml`, `configs/distill-browser.yaml` v3.
+- Capacity (Section 7, item 5) was decided at Stage A rather than deferred to Stage B:
+  the shipped profiles use 384 x 8 groups (17,402,775 parameters, about 1.6x the
+  inference cost of 384 x 5), because the lineage transfer makes the size free to
+  choose at the start and `model` is immutable for the rest of the run.
 
 Design decisions taken during implementation that refine the text below:
 

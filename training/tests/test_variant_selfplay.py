@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from startrain.inference import GraphInferenceAdapter, InferenceConfig
-from startrain.model import GraphResTNet, ModelConfig
+from startrain.model import GraphResTNet, ModelConfig, model_parameter_count
 from startrain.native import validate_native_module
 from startrain.replay import collate_replay_samples
 from startrain.replay_store import ReplayStore
@@ -312,6 +312,9 @@ def test_variant_stage_profiles_validate_and_migrate(tmp_path) -> None:
     stage_b = load_config(configs / "h100-8gpu-variant-stage-b.yaml")
     assert stage_a.model.relational_bias and stage_a.model.adaln_hidden == 32
     assert stage_a.model.feature_schema_version == 4
+    assert (stage_a.model.width, stage_a.model.rrt_groups) == (384, 8)
+    assert model_parameter_count(stage_a.model) == 17_402_775
+    assert stage_b.model == stage_a.model
     assert stage_a.loss.uses_teacher
     assert not stage_a.selfplay.variants.enabled
     assert stage_a.learner.segment_quotas is None
