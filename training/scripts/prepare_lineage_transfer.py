@@ -68,6 +68,12 @@ def _parser() -> argparse.ArgumentParser:
         help="keep only the most recent legacy samples up to this count",
     )
     parser.add_argument(
+        "--max-samples-per-ring",
+        type=int,
+        default=None,
+        help="keep only the most recent legacy samples of every ring up to this count",
+    )
+    parser.add_argument(
         "--rings",
         default=None,
         help="comma-separated rings to transfer (default: every ring)",
@@ -99,6 +105,7 @@ def main(argv: list[str] | None = None) -> int:
         shards = select_recent_legacy_shards(
             list_legacy_shards(args.legacy_replay_root, rings=rings),
             max_samples=args.max_samples,
+            max_samples_per_ring=args.max_samples_per_ring,
         )
         if not shards:
             raise LineageTransferError("no legacy shards matched the transfer request")

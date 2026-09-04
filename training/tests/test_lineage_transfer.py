@@ -279,6 +279,15 @@ def test_lineage_transfer_labels_and_rehomes_legacy_replay(tmp_path) -> None:
     assert [shard.shard_id for shard in recent] == [4, 5]
     with pytest.raises(LineageTransferError, match="max_samples"):
         select_recent_legacy_shards(shards, max_samples=0)
+    # Shards alternate rings 4, 6, 4, 6, 4: one per ring keeps the newest of each.
+    per_ring = select_recent_legacy_shards(
+        shards, max_samples=None, max_samples_per_ring=1
+    )
+    assert [(shard.shard_id, shard.ring) for shard in per_ring] == [(4, 6), (5, 4)]
+    both = select_recent_legacy_shards(shards, max_samples=1, max_samples_per_ring=1)
+    assert [shard.shard_id for shard in both] == [5]
+    with pytest.raises(LineageTransferError, match="max_samples_per_ring"):
+        select_recent_legacy_shards(shards, max_samples=None, max_samples_per_ring=0)
 
     output_root = tmp_path / "new-run"
     output_root.mkdir()

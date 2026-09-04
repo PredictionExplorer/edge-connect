@@ -301,17 +301,43 @@ def list_legacy_shards(
 
 
 def select_recent_legacy_shards(
-    shards: Sequence[LegacyShard], *, max_samples: int | None
+    shards: Sequence[LegacyShard],
+    *,
+    max_samples: int | None,
+    max_samples_per_ring: int | None = None,
 ) -> list[LegacyShard]:
-    """Keep the most recent shards up to ``max_samples``, oldest first."""
+    """Keep the most recent shards, oldest first.
 
+    ``max_samples`` bounds the total across rings; ``max_samples_per_ring``
+    bounds every ring separately so a store whose newest shards all belong to
+    one ring still transfers recent positions of the other rings. Both bounds
+    may be combined; the per-ring bound applies first.
+    """
+
+    for name, value in (
+        ("max_samples", max_samples),
+        ("max_samples_per_ring", max_samples_per_ring),
+    ):
+        if value is not None and value <= 0:
+            raise LineageTransferError(f"{name} must be positive")
+    ordered = sorted(shards, key=lambda shard: shard.shard_id)
+    if max_samples_per_ring is not None:
+        kept: list[LegacyShard] = []
+        for ring in sorted({shard.ring for shard in ordered}):
+            total = 0
+            chosen: list[LegacyShard] = []
+            for shard in reversed([shard for shard in ordered if shard.ring == ring]):
+                if total >= max_samples_per_ring:
+                    break
+                chosen.append(shard)
+                total += shard.sample_count
+            kept.extend(chosen)
+        ordered = sorted(kept, key=lambda shard: shard.shard_id)
     if max_samples is None:
-        return list(shards)
-    if max_samples <= 0:
-        raise LineageTransferError("max_samples must be positive")
+        return ordered
     selected: list[LegacyShard] = []
     total = 0
-    for shard in reversed(list(shards)):
+    for shard in reversed(ordered):
         if total >= max_samples:
             break
         selected.append(shard)
