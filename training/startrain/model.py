@@ -338,6 +338,34 @@ class LocalEdgeBlock(nn.Module):
         return output * node_mask.unsqueeze(-1).to(dtype=output.dtype)
 
 
+def _relation_bias_gradient_carrier(
+    query: Tensor,
+    key: Tensor,
+    value: Tensor,
+    attn_mask: Tensor,
+    *,
+    groups: int,
+) -> Tensor:
+    """Zero-valued tensor whose gradient is exactly ``d attention / d attn_mask``.
+
+    ``query``, ``key``, and ``value`` are detached, so the explicit
+    softmax attention below contributes gradient only to the additive mask
+    (and through it to the relation-bias table). Its value is subtracted from
+    itself, so the forward result is unchanged and only one materialised
+    ``[batch, heads, length, length]`` probability tensor per layer is kept
+    for the backward pass.
+    """
+
+    if groups > 1:
+        key = key.repeat_interleave(groups, dim=1)
+        value = value.repeat_interleave(groups, dim=1)
+    scale = query.shape[-1] ** -0.5
+    scores = torch.matmul(query, key.transpose(-2, -1)) * scale + attn_mask
+    probabilities = torch.softmax(scores, dim=-1)
+    explicit = torch.matmul(probabilities, value)
+    return explicit - explicit.detach()
+
+
 class GlobalGQABlock(nn.Module):
     """Masked global-token attention using fused scaled-dot-product attention.
 
@@ -405,22 +433,43 @@ class GlobalGQABlock(nn.Module):
         value = value.transpose(1, 2)
         key_mask = sequence_mask[:, None, None, :]
         attn_mask: Tensor
-        if self.relation_bias is not None and relation_index is not None:
+        relational = self.relation_bias is not None and relation_index is not None
+        if relational:
+            assert self.relation_bias is not None
             bias = self.relation_bias(relation_index).permute(0, 3, 1, 2)
             attn_mask = bias.to(dtype=query.dtype).masked_fill(
                 ~key_mask, torch.finfo(query.dtype).min
             )
         else:
             attn_mask = key_mask
+        dropout = self.dropout if self.training else 0.0
+        carry_bias_gradient = (
+            relational
+            and dropout == 0.0
+            and torch.is_grad_enabled()
+            and attn_mask.requires_grad
+        )
         attended = functional.scaled_dot_product_attention(
             query,
             key,
             value,
-            attn_mask=attn_mask,
-            dropout_p=self.dropout if self.training else 0.0,
+            # Fused attention kernels do not differentiate the additive mask;
+            # a mask that requires grad forces the memory-hungry math path. The
+            # value comes from the fused kernel with a detached mask and the
+            # bias gradient travels through a zero-valued explicit carrier.
+            attn_mask=attn_mask.detach() if carry_bias_gradient else attn_mask,
+            dropout_p=dropout,
             is_causal=False,
             enable_gqa=self.query_heads != self.kv_heads,
         )
+        if carry_bias_gradient:
+            attended = attended + _relation_bias_gradient_carrier(
+                query.detach(),
+                key.detach(),
+                value.detach(),
+                attn_mask,
+                groups=self.query_heads // self.kv_heads,
+            )
         attended = attended.transpose(1, 2)
         if torch.compiler.is_exporting():
             # With an additive mask the math kernel hands back a transposed

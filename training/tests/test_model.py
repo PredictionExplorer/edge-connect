@@ -13,6 +13,7 @@ from startrain.model import (
     LocalOperator,
     ModelConfig,
     StarModelOutput,
+    _relation_bias_gradient_carrier,
     model_parameter_count,
     model_parameter_counts,
 )
@@ -524,6 +525,83 @@ def test_relational_bias_and_conditioning_start_as_the_identity() -> None:
     assert not torch.allclose(third.policy_logits, first.policy_logits)
     with pytest.raises(ValueError, match="rings"):
         with_additions(*batch.model_args()[:-1])
+
+
+def test_relation_bias_gradient_carrier_matches_the_explicit_attention_gradient() -> (
+    None
+):
+    """The fused-attention value plus the carrier differentiates exactly like math attention."""
+
+    torch.manual_seed(11)
+    batch, heads, kv_heads, length, width = 2, 4, 2, 9, 8
+    query = torch.randn(batch, heads, length, width, dtype=torch.float64)
+    key = torch.randn(batch, kv_heads, length, width, dtype=torch.float64)
+    value = torch.randn(batch, kv_heads, length, width, dtype=torch.float64)
+    table = torch.randn(7, heads, dtype=torch.float64, requires_grad=True)
+    relation = torch.randint(0, 7, (batch, length, length))
+    key_mask = torch.ones(batch, 1, 1, length, dtype=torch.bool)
+    key_mask[1, ..., -2:] = False
+    upstream = torch.randn(batch, heads, length, width, dtype=torch.float64)
+
+    def mask() -> torch.Tensor:
+        bias = table[relation].permute(0, 3, 1, 2)
+        return bias.masked_fill(~key_mask, torch.finfo(torch.float64).min)
+
+    reference = functional.scaled_dot_product_attention(
+        query, key, value, attn_mask=mask(), enable_gqa=True
+    )
+    (reference * upstream).sum().backward()
+    assert table.grad is not None
+    expected = table.grad.clone()
+    table.grad = None
+
+    attn_mask = mask()
+    fused = functional.scaled_dot_product_attention(
+        query, key, value, attn_mask=attn_mask.detach(), enable_gqa=True
+    )
+    carrier = _relation_bias_gradient_carrier(
+        query.detach(),
+        key.detach(),
+        value.detach(),
+        attn_mask,
+        groups=heads // kv_heads,
+    )
+    torch.testing.assert_close(carrier, torch.zeros_like(carrier), atol=0.0, rtol=0.0)
+    ((fused + carrier) * upstream).sum().backward()
+    assert table.grad is not None
+    torch.testing.assert_close(table.grad, expected, atol=1e-9, rtol=1e-9)
+    torch.testing.assert_close(fused, reference, atol=1e-12, rtol=1e-12)
+
+    # The whole model: training-mode gradients of the bias table equal the
+    # gradients of a pure math-attention reference built from the same weights.
+    model = tiny_model(rrt_groups=2).train()
+    randomize_v3_parameters(model)
+    inputs = encode_batch([position(4), position(6)])
+    output = model(*inputs.model_args())
+    output.policy_logits.sum().backward()
+    grads = {
+        name: parameter.grad.clone()
+        for name, parameter in model.named_parameters()
+        if "relation_bias" in name and parameter.grad is not None
+    }
+    assert grads
+    model.zero_grad(set_to_none=True)
+    with patch("startrain.model._relation_bias_gradient_carrier") as carrier_mock:
+        carrier_mock.side_effect = AssertionError("carrier must not run in eval mode")
+        model.eval()
+        with torch.no_grad():
+            model(*inputs.model_args())
+    model.train()
+    with patch.object(torch, "is_grad_enabled", return_value=False):
+        # Forcing the math path (mask keeps its gradient) must give the same table gradients.
+        output = model(*inputs.model_args())
+        output.policy_logits.sum().backward()
+    for name, parameter in model.named_parameters():
+        if name in grads:
+            assert parameter.grad is not None
+            torch.testing.assert_close(
+                parameter.grad, grads[name], atol=1e-5, rtol=1e-4
+            )
 
 
 def test_parameter_matched_relational_variants_report_exact_deltas() -> None:
