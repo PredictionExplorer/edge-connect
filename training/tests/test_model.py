@@ -569,7 +569,8 @@ def test_relation_bias_gradient_carrier_matches_the_explicit_attention_gradient(
     torch.testing.assert_close(carrier, torch.zeros_like(carrier), atol=0.0, rtol=0.0)
     ((fused + carrier) * upstream).sum().backward()
     assert table.grad is not None
-    torch.testing.assert_close(table.grad, expected, atol=1e-9, rtol=1e-9)
+    # The carrier evaluates its explicit attention in fp32 by design.
+    torch.testing.assert_close(table.grad, expected, atol=1e-6, rtol=1e-5)
     torch.testing.assert_close(fused, reference, atol=1e-12, rtol=1e-12)
 
     # The whole model: training-mode gradients of the bias table equal the

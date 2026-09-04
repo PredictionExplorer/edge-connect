@@ -16,6 +16,7 @@ from typing import Literal, NamedTuple
 import torch
 import torch.nn.functional as functional
 from torch import Tensor, nn
+from torch.utils.checkpoint import checkpoint
 
 from .contracts import (
     FEATURE_SCHEMA_VERSION,
@@ -338,6 +339,24 @@ class LocalEdgeBlock(nn.Module):
         return output * node_mask.unsqueeze(-1).to(dtype=output.dtype)
 
 
+def _explicit_attention_in_fp32(
+    query: Tensor,
+    key: Tensor,
+    value: Tensor,
+    attn_mask: Tensor,
+    groups: int,
+) -> Tensor:
+    if groups > 1:
+        key = key.repeat_interleave(groups, dim=1)
+        value = value.repeat_interleave(groups, dim=1)
+    with torch.autocast(device_type=query.device.type, enabled=False):
+        scale = query.shape[-1] ** -0.5
+        scores = torch.matmul(query.float(), key.float().transpose(-2, -1)) * scale
+        probabilities = torch.softmax(scores + attn_mask.float(), dim=-1)
+        explicit = torch.matmul(probabilities, value.float())
+    return explicit.to(query.dtype)
+
+
 def _relation_bias_gradient_carrier(
     query: Tensor,
     key: Tensor,
@@ -348,21 +367,24 @@ def _relation_bias_gradient_carrier(
 ) -> Tensor:
     """Zero-valued tensor whose gradient is exactly ``d attention / d attn_mask``.
 
-    ``query``, ``key``, and ``value`` are detached, so the explicit
-    softmax attention below contributes gradient only to the additive mask
-    (and through it to the relation-bias table). Its value is subtracted from
-    itself, so the forward result is unchanged and only one materialised
-    ``[batch, heads, length, length]`` probability tensor per layer is kept
-    for the backward pass.
+    ``query``, ``key``, and ``value`` are detached, so the explicit fp32
+    softmax attention contributes gradient only to the additive mask (and
+    through it to the relation-bias table). Its value is subtracted from
+    itself, so the forward result is unchanged. The explicit attention runs
+    under activation checkpointing: nothing of its ``[batch, heads, length,
+    length]`` intermediates survives the forward pass, and the backward pass
+    recomputes one layer at a time.
     """
 
-    if groups > 1:
-        key = key.repeat_interleave(groups, dim=1)
-        value = value.repeat_interleave(groups, dim=1)
-    scale = query.shape[-1] ** -0.5
-    scores = torch.matmul(query, key.transpose(-2, -1)) * scale + attn_mask
-    probabilities = torch.softmax(scores, dim=-1)
-    explicit = torch.matmul(probabilities, value)
+    explicit = checkpoint(
+        _explicit_attention_in_fp32,
+        query,
+        key,
+        value,
+        attn_mask,
+        groups,
+        use_reentrant=False,
+    )
     return explicit - explicit.detach()
 
 
