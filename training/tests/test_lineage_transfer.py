@@ -40,8 +40,10 @@ from startrain.lineage import (
     list_legacy_shards,
     load_legacy_teacher,
     new_run_identity,
+    partition_legacy_shards,
     select_recent_legacy_shards,
     transfer_lineage,
+    transfer_lineage_parallel,
     write_transfer_report,
 )
 from startrain.model import GraphResTNet, ModelConfig
@@ -448,6 +450,87 @@ def test_prepare_lineage_transfer_cli(tmp_path, capsys) -> None:
     )
     assert code == 1
     assert "already exists" in capsys.readouterr().err
+
+
+def test_parallel_lineage_transfer_matches_the_serial_store(tmp_path) -> None:
+    checkpoint = write_legacy_checkpoint(tmp_path / "legacy.pt")
+    legacy_root = tmp_path / "legacy-replay"
+    write_legacy_store(legacy_root, games=3)
+    shards = list_legacy_shards(legacy_root)
+    groups = partition_legacy_shards(shards, 2)
+    assert sorted(shard.shard_id for group in groups for shard in group) == [
+        shard.shard_id for shard in shards
+    ]
+    assert all(
+        group == sorted(group, key=lambda shard: shard.shard_id) for group in groups
+    )
+    assert abs(
+        sum(shard.sample_count for shard in groups[0])
+        - sum(shard.sample_count for shard in groups[1])
+    ) <= max(shard.sample_count for shard in shards)
+    with pytest.raises(LineageTransferError, match="workers"):
+        partition_legacy_shards(shards, 0)
+
+    serial_root = tmp_path / "serial"
+    serial_root.mkdir()
+    serial_identity = new_run_identity(
+        serial_root, run_id="variant-run", generation_family="variant-family"
+    )
+    teacher = load_legacy_teacher(checkpoint, device=torch.device("cpu"))
+    serial = transfer_lineage(
+        teacher=teacher,
+        legacy_shards=shards,
+        replay_root=serial_root / "replay",
+        identity=serial_identity,
+        batch_size=4,
+    )
+    parallel_root = tmp_path / "parallel"
+    parallel_root.mkdir()
+    parallel_identity = new_run_identity(
+        parallel_root, run_id="variant-run", generation_family="variant-family"
+    )
+    parallel = transfer_lineage_parallel(
+        checkpoint=checkpoint,
+        device="cpu",
+        legacy_shards=shards,
+        replay_root=parallel_root / "replay",
+        identity=parallel_identity,
+        workers=2,
+        batch_size=4,
+    )
+    for key in (
+        "committed_shards",
+        "committed_samples",
+        "committed_games",
+        "samples_by_ring",
+    ):
+        assert parallel[key] == serial[key], key
+    assert parallel["legacy_shards"] == serial["legacy_shards"]
+    assert parallel["actor_id"] == TRANSFER_ACTOR_ID and parallel["generation"] is None
+    assert sorted(worker["actor_id"] for worker in parallel["workers"]) == [
+        f"{TRANSFER_ACTOR_ID}-0",
+        f"{TRANSFER_ACTOR_ID}-1",
+    ]
+    assert (
+        sum(worker["committed_samples"] for worker in parallel["workers"])
+        == (parallel["committed_samples"])
+    )
+    # Both reports pin the same evidence.
+    write_transfer_report(parallel_root / "lineage-transfer.json", parallel)
+    write_transfer_report(serial_root / "lineage-transfer.json", serial)
+    assert (
+        json.loads((parallel_root / "lineage-transfer.json").read_text())["digest"]
+        == (json.loads((serial_root / "lineage-transfer.json").read_text())["digest"])
+    )
+    with sqlite3.connect(parallel_root / "replay" / "manifest.sqlite3") as connection:
+        rows = connection.execute(
+            "SELECT actor_id, sample_count FROM shards WHERE state = 'ready'"
+        ).fetchall()
+    assert sum(count for _, count in rows) == serial["committed_samples"]
+    assert {actor for actor, _ in rows} == {
+        f"{TRANSFER_ACTOR_ID}-0",
+        f"{TRANSFER_ACTOR_ID}-1",
+    }
 
 
 @pytest.mark.native

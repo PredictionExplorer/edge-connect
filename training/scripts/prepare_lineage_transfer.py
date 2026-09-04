@@ -30,6 +30,7 @@ from startrain.lineage import (  # noqa: E402
     resolve_legacy_champion,
     select_recent_legacy_shards,
     transfer_lineage,
+    transfer_lineage_parallel,
     write_transfer_report,
 )
 
@@ -81,6 +82,12 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--batch-size", type=int, default=512)
     parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="spawn this many labelling processes, each with its own teacher copy",
+    )
+    parser.add_argument(
         "--replay-subdirectory",
         default="replay",
         help="replay directory name under the output root",
@@ -101,7 +108,8 @@ def main(argv: list[str] | None = None) -> int:
             if args.legacy_checkpoint is not None
             else resolve_legacy_champion(args.legacy_champion)
         )
-        teacher = load_legacy_teacher(checkpoint, device=torch.device(args.device))
+        if args.workers <= 0:
+            raise LineageTransferError("--workers must be positive")
         shards = select_recent_legacy_shards(
             list_legacy_shards(args.legacy_replay_root, rings=rings),
             max_samples=args.max_samples,
@@ -115,14 +123,26 @@ def main(argv: list[str] | None = None) -> int:
             run_id=args.run_id,
             generation_family=args.generation_family,
         )
-        report = transfer_lineage(
-            teacher=teacher,
-            legacy_shards=shards,
-            replay_root=args.output_root / args.replay_subdirectory,
-            identity=identity,
-            batch_size=args.batch_size,
-            progress=lambda **fields: print(json.dumps(fields), file=sys.stderr),
-        )
+        if args.workers == 1:
+            teacher = load_legacy_teacher(checkpoint, device=torch.device(args.device))
+            report = transfer_lineage(
+                teacher=teacher,
+                legacy_shards=shards,
+                replay_root=args.output_root / args.replay_subdirectory,
+                identity=identity,
+                batch_size=args.batch_size,
+                progress=lambda **fields: print(json.dumps(fields), file=sys.stderr),
+            )
+        else:
+            report = transfer_lineage_parallel(
+                checkpoint=checkpoint,
+                device=args.device,
+                legacy_shards=shards,
+                replay_root=args.output_root / args.replay_subdirectory,
+                identity=identity,
+                workers=args.workers,
+                batch_size=args.batch_size,
+            )
         destination = write_transfer_report(
             args.output_root / "lineage-transfer.json", report
         )

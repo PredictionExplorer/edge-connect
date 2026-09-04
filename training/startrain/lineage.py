@@ -21,6 +21,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sys
+import multiprocessing
 import sqlite3
 import time
 from collections.abc import Callable, Iterator, Sequence
@@ -405,6 +407,7 @@ def label_samples(
     identity: RunIdentity,
     generation: int,
     batch_size: int = 512,
+    actor_id: str = TRANSFER_ACTOR_ID,
 ) -> list[ReplaySample]:
     """Attach teacher targets and re-home the samples under the new identity."""
 
@@ -416,7 +419,7 @@ def label_samples(
                 sample,
                 run_id=identity.run_id,
                 generation_family=identity.generation_family,
-                actor_id=TRANSFER_ACTOR_ID,
+                actor_id=actor_id,
                 generation=generation,
                 model_identity=teacher.identity,
                 search_provenance=(
@@ -458,6 +461,7 @@ def transfer_lineage(
     identity: RunIdentity,
     batch_size: int = 512,
     progress: Callable[..., None] | None = None,
+    actor_id: str = TRANSFER_ACTOR_ID,
 ) -> dict[str, Any]:
     """Commit teacher-labelled copies of the legacy shards to the new store."""
 
@@ -469,7 +473,7 @@ def transfer_lineage(
     samples_by_ring: dict[str, int] = {}
     with ReplayStore(root) as store:
         store.register_run(identity)
-        generation = store.lease_generation(identity, TRANSFER_ACTOR_ID)
+        generation = store.lease_generation(identity, actor_id)
         for shard, samples in iter_legacy_samples(legacy_shards):
             labelled = label_samples(
                 teacher,
@@ -477,6 +481,7 @@ def transfer_lineage(
                 identity=identity,
                 generation=generation,
                 batch_size=batch_size,
+                actor_id=actor_id,
             )
             record = store.append(
                 labelled,
@@ -487,7 +492,7 @@ def transfer_lineage(
                 model_identity=teacher.identity,
                 run_id=identity.run_id,
                 generation_family=identity.generation_family,
-                actor_id=TRANSFER_ACTOR_ID,
+                actor_id=actor_id,
                 generation=generation,
             )
             committed_shards += 1
@@ -499,6 +504,7 @@ def transfer_lineage(
             if progress is not None:
                 progress(
                     phase="lineage_transfer",
+                    actor_id=actor_id,
                     legacy_shard=shard.shard_id,
                     committed_shards=committed_shards,
                     committed_samples=committed_samples,
@@ -510,8 +516,16 @@ def transfer_lineage(
         "completed_ns": time.time_ns(),
         "run_id": identity.run_id,
         "generation_family": identity.generation_family,
-        "actor_id": TRANSFER_ACTOR_ID,
+        "actor_id": actor_id,
         "generation": generation,
+        "workers": [
+            {
+                "actor_id": actor_id,
+                "generation": generation,
+                "committed_shards": committed_shards,
+                "committed_samples": committed_samples,
+            }
+        ],
         "teacher": {
             "identity": teacher.identity,
             "checkpoint": str(teacher.checkpoint),
@@ -542,6 +556,121 @@ def transfer_lineage(
         "samples_by_ring": samples_by_ring,
         "replay_root": str(root.resolve()),
     }
+
+
+def partition_legacy_shards(
+    shards: Sequence[LegacyShard], workers: int
+) -> list[list[LegacyShard]]:
+    """Split shards into ``workers`` groups with balanced sample counts."""
+
+    if workers <= 0:
+        raise LineageTransferError("workers must be positive")
+    groups: list[list[LegacyShard]] = [[] for _ in range(workers)]
+    totals = [0] * workers
+    for shard in sorted(
+        shards, key=lambda shard: (-shard.sample_count, shard.shard_id)
+    ):
+        index = min(range(workers), key=lambda i: (totals[i], i))
+        groups[index].append(shard)
+        totals[index] += shard.sample_count
+    return [sorted(group, key=lambda shard: shard.shard_id) for group in groups]
+
+
+def _transfer_worker(
+    index: int,
+    checkpoint: str,
+    device: str,
+    shards: list[LegacyShard],
+    replay_root: str,
+    identity: RunIdentity,
+    batch_size: int,
+) -> dict[str, Any]:
+    teacher = load_legacy_teacher(checkpoint, device=torch.device(device))
+
+    def progress(**fields: object) -> None:
+        print(json.dumps(fields), file=sys.stderr, flush=True)
+
+    return transfer_lineage(
+        teacher=teacher,
+        legacy_shards=shards,
+        replay_root=replay_root,
+        identity=identity,
+        batch_size=batch_size,
+        progress=progress,
+        actor_id=f"{TRANSFER_ACTOR_ID}-{index}",
+    )
+
+
+def transfer_lineage_parallel(
+    *,
+    checkpoint: str | Path,
+    device: str,
+    legacy_shards: Sequence[LegacyShard],
+    replay_root: str | Path,
+    identity: RunIdentity,
+    workers: int,
+    batch_size: int = 512,
+) -> dict[str, Any]:
+    """Run ``transfer_lineage`` across spawned processes and merge the reports.
+
+    Every worker loads its own copy of the teacher, holds its own actor
+    generation lease (``lineage-transfer-<index>``), and appends to the shared
+    replay store, which is safe for concurrent writers exactly as it is for
+    self-play actors. Reports are merged with summed counts; the ``digest``
+    of the merged report covers the same evidence as a serial transfer.
+    """
+
+    if workers <= 0:
+        raise LineageTransferError("workers must be positive")
+    groups = [
+        group for group in partition_legacy_shards(legacy_shards, workers) if group
+    ]
+    started_ns = time.time_ns()
+    context = multiprocessing.get_context("spawn")
+    with context.Pool(processes=len(groups)) as pool:
+        reports = pool.starmap(
+            _transfer_worker,
+            [
+                (
+                    index,
+                    str(checkpoint),
+                    device,
+                    group,
+                    str(replay_root),
+                    identity,
+                    batch_size,
+                )
+                for index, group in enumerate(groups)
+            ],
+        )
+    merged = dict(reports[0])
+    merged["started_ns"] = started_ns
+    merged["completed_ns"] = time.time_ns()
+    merged["actor_id"] = TRANSFER_ACTOR_ID
+    merged["generation"] = None
+    merged["workers"] = [worker for report in reports for worker in report["workers"]]
+    merged["committed_shards"] = sum(report["committed_shards"] for report in reports)
+    merged["committed_samples"] = sum(report["committed_samples"] for report in reports)
+    merged["committed_games"] = sum(report["committed_games"] for report in reports)
+    samples_by_ring: dict[str, int] = {}
+    for report in reports:
+        for ring, count in report["samples_by_ring"].items():
+            samples_by_ring[ring] = samples_by_ring.get(ring, 0) + int(count)
+    merged["samples_by_ring"] = dict(
+        sorted(samples_by_ring.items(), key=lambda kv: int(kv[0]))
+    )
+    merged["legacy_shards"] = [
+        {
+            "shard_id": shard.shard_id,
+            "path": str(shard.path),
+            "sample_count": shard.sample_count,
+            "ring": shard.ring,
+            "model_step": shard.model_step,
+            "checksum_sha256": shard.checksum_sha256,
+        }
+        for shard in sorted(legacy_shards, key=lambda shard: shard.shard_id)
+    ]
+    return merged
 
 
 def transfer_digest(report: dict[str, Any]) -> str:
