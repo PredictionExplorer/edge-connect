@@ -254,6 +254,57 @@ def test_preflight_cli_can_skip_a_genuine_first_launch(
     assert report["reason"] == "first_launch"
 
 
+def test_preflight_accepts_a_seeded_run_root_without_learner_state(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A lineage-transferred root has an identity and replay but no learner yet."""
+
+    root = tmp_path / "seeded"
+    root.mkdir()
+    profile = _profile(root, tmp_path)
+    identity = RunIdentity(root / "run.json", "run-preflight", "family-seeded", 1)
+    _write_json(
+        identity.path,
+        {
+            "schema_version": 1,
+            "run_id": identity.run_id,
+            "generation_family": identity.generation_family,
+            "created_ns": identity.created_ns,
+        },
+    )
+    with ReplayStore(root / "replay") as store:
+        store.register_run(identity)
+
+    for apply in (False, True):
+        assert (
+            preflight_main(
+                [
+                    "--run-root",
+                    str(root),
+                    "--profile",
+                    str(profile),
+                    "--if-present",
+                    *(["--apply"] if apply else []),
+                ]
+            )
+            == 0
+        )
+        report = json.loads(capsys.readouterr().out)
+        assert report["status"] == "ok"
+        assert report["reason"] == "seeded_first_launch"
+        assert report["mode"] == ("apply" if apply else "dry-run")
+        assert report["recovery"] is None and report["migrations"] == []
+        assert report["replay"]["committed_samples"] == 0
+    assert not (root / "learner").exists()
+
+    # Learner pointers without a recovery pointer are corruption, not a seed.
+    (root / "learner").mkdir()
+    _write_json(root / "learner" / "champion.json", {"schema_version": 1})
+    assert preflight_main(["--run-root", str(root), "--profile", str(profile)]) == 2
+    assert "without a recovery pointer" in capsys.readouterr().err
+
+
 @pytest.mark.parametrize("missing_counter_table", [False, True])
 def test_preflight_reconciles_history_only_when_manifest_proves_it(
     tmp_path: Path,

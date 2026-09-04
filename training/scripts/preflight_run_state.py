@@ -785,6 +785,36 @@ def run_state_preflight(
         generation_family=identity.generation_family,
         created_ns=identity.created_ns,
     )
+    if not (root / "learner" / "recovery.json").exists():
+        # A run root seeded by scripts/prepare_lineage_transfer.py carries an
+        # identity and a replay store but no learner state yet. There is
+        # nothing to migrate before the first launch; the learner initialises
+        # from the profile and starts consuming the transferred shards.
+        for name in ("candidate.json", "champion.json", "utd-segment.json"):
+            if (root / "learner" / name).exists():
+                raise StatePreflightError(
+                    f"learner/{name} exists without a recovery pointer"
+                )
+        if reconcile_history:
+            raise StatePreflightError(
+                "seeded replay store needs committed-sample history reconciliation"
+            )
+        return {
+            "schema_version": PREFLIGHT_SCHEMA_VERSION,
+            "status": "ok",
+            "mode": "apply" if apply else "dry-run",
+            "reason": "seeded_first_launch",
+            "run_root": str(root),
+            "run_id": identity.run_id,
+            "generation_family": identity.generation_family,
+            "coordinator_lock": lock_status,
+            "profile": profile_report,
+            "recovery": None,
+            "cadence": None,
+            "utd_segment": None,
+            "replay": replay_report,
+            "migrations": [],
+        }
     recovery_report, recovery_metadata = _validate_recovery(
         root,
         experiment,
