@@ -491,7 +491,7 @@ def test_parallel_lineage_transfer_matches_the_serial_store(tmp_path) -> None:
     )
     parallel = transfer_lineage_parallel(
         checkpoint=checkpoint,
-        device="cpu",
+        device="cpu,cpu",
         legacy_shards=shards,
         replay_root=parallel_root / "replay",
         identity=parallel_identity,

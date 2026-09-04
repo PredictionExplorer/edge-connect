@@ -616,12 +616,16 @@ def transfer_lineage_parallel(
     Every worker loads its own copy of the teacher, holds its own actor
     generation lease (``lineage-transfer-<index>``), and appends to the shared
     replay store, which is safe for concurrent writers exactly as it is for
-    self-play actors. Reports are merged with summed counts; the ``digest``
+    self-play actors. ``device`` may list several devices separated by commas;
+    workers are assigned to them round-robin. Reports are merged with summed counts; the ``digest``
     of the merged report covers the same evidence as a serial transfer.
     """
 
     if workers <= 0:
         raise LineageTransferError("workers must be positive")
+    devices = [name.strip() for name in str(device).split(",") if name.strip()]
+    if not devices:
+        raise LineageTransferError("device must name at least one device")
     groups = [
         group for group in partition_legacy_shards(legacy_shards, workers) if group
     ]
@@ -634,7 +638,7 @@ def transfer_lineage_parallel(
                 (
                     index,
                     str(checkpoint),
-                    device,
+                    devices[index % len(devices)],
                     group,
                     str(replay_root),
                     identity,

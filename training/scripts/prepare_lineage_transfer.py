@@ -79,7 +79,11 @@ def _parser() -> argparse.ArgumentParser:
         default=None,
         help="comma-separated rings to transfer (default: every ring)",
     )
-    parser.add_argument("--device", default="cpu")
+    parser.add_argument(
+        "--device",
+        default="cpu",
+        help="torch device; with --workers a comma-separated list is spread round-robin",
+    )
     parser.add_argument("--batch-size", type=int, default=512)
     parser.add_argument(
         "--workers",
