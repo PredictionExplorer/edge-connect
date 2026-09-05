@@ -133,6 +133,11 @@ establish shared-lock safety.
   24 complete pairs, and 2,505 searched moves retained. The same actor PID 662788
   confirmed release of the matching token and resumed both cohorts, with zero
   actor or service restarts and no coordinator failure.
+- A second live pause at 22:21:34 UTC retained both active generation-5 cohorts
+  (ring 10 handicap-6-classic and ring 8 handicap-2-classic) in PID 662788.
+  Readiness took 1.403 seconds; both unfinished games' cohort identities remained
+  unchanged, and the shared replay database was writable during this active-game
+  pause as well.
 - Final validation: 1,257 local tests passed, five hardware-specific skips;
   331 target-host tests passed. Lint, formatting, type checking, and both CUDA
   canaries passed. Backups and report/monitor timers are active with valid current
