@@ -24,6 +24,8 @@ not bound GPU occupancy.
   promoted. Historical work resumes during idle candidate periods.
 - `evaluation-session-events.jsonl` records lease duration, stop reason, and
   durable move/game/pair progress. Scheduling state survives coordinator restarts.
+- Future waits return to the interpreter every 100 milliseconds so the main
+  thread can dispatch queued shutdown signals while parallel searches run.
 
 Move-level resumability and wall-time slicing apply to the balanced arena, which
 already uses stable per-game seeds. Legacy nonbalanced evaluations retain their
@@ -39,7 +41,7 @@ strength results are available.
 ## Deployment procedure
 
 Build and validate a new release at
-`/home/ubuntu/edgeconnect-releases/variant-evaluation-sessions-20260905` while the
+`/home/ubuntu/edgeconnect-releases/variant-evaluation-sessions-20260905-v2` while the
 active runtime continues. Save units, profile, recovery provenance, and backups
 under `/home/ubuntu/edgeconnect-rollouts/evaluation-sessions-20260905` before a
 graceful stop. The old runtime can retain completed pairs at shutdown but cannot
@@ -54,3 +56,20 @@ Verify candidate priority, advancing learner steps, a bounded lease, durable gam
 progress, actor recovery during cooldown, and current backups.
 
 The previous release, profile, and unit files remain available for rollback.
+
+## Cutover findings
+
+The initial full validation passed 1,157 tests with five hardware-specific skips;
+the server passed 175 targeted tests. During graceful shutdown, the old evaluator
+continued running despite queued SIGTERM/SIGINT signals. Read-only process
+inspection confirmed the correct Python handler and pending signal flags, while
+the main thread waited indefinitely on a variant future. Dispatching the already
+queued handlers on its main thread allowed the existing shutdown path to finish.
+No forced kill was used: every worker exited with code zero at 21:10:49 UTC.
+
+The final learner checkpoint is step 56,528. The historical measurement saved 70
+complete pairs (140 games) and remains nonterminal. A follow-up release adds timed
+future waits and a subprocess regression that sends SIGTERM to a search thread
+while the main thread waits. The focused arena/session suite passed 61 tests after
+that correction. The initial frozen release was never activated; the `-v2`
+release includes this shutdown correction.

@@ -8,11 +8,11 @@ import random
 import time
 import threading
 from contextlib import contextmanager
-from concurrent.futures import Executor, ThreadPoolExecutor
+from concurrent.futures import Executor, Future, ThreadPoolExecutor
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass, replace
 from statistics import NormalDist
-from typing import Any, Iterator, Literal, Protocol, cast
+from typing import Any, Iterator, Literal, Protocol, TypeVar, cast
 
 from .config import ArenaConfig
 from .contracts import RULES_HASH, SEGMENT_STANDARD
@@ -27,6 +27,27 @@ from .balanced_evaluation import (
     cell_variant,
 )
 from .topology import get_topology
+
+
+_FutureResult = TypeVar("_FutureResult")
+
+
+def _wait_for_future(future: Future[_FutureResult]) -> _FutureResult:
+    """Keep the main interpreter available to dispatch pending signal handlers.
+
+    Python handles signals on the main thread even when the kernel delivers
+    them to a search/inference thread. An unbounded native lock wait can leave
+    the stop handler pending until the very arena work it should stop finishes.
+    """
+
+    while True:
+        try:
+            return future.result(timeout=0.1)
+        except TimeoutError:
+            if future.done():
+                # Preserve a TimeoutError raised by the task itself, and the
+                # result of a task that completed at the timeout boundary.
+                return future.result()
 
 
 ARENA_RESULT_SCHEMA_VERSION = 4
@@ -1935,7 +1956,7 @@ class ArenaRunner:
             futures = [pool.submit(play, item) for item in ordered]
             try:
                 for future in futures:
-                    finished, local_games, local_pairs = future.result()
+                    finished, local_games, local_pairs = _wait_for_future(future)
                     games.extend(local_games)
                     pairs.extend(local_pairs)
                     complete = complete and finished
@@ -2239,7 +2260,7 @@ class ArenaRunner:
                             ),
                         )
                     )
-                search_results = [future.result() for future in futures]
+                search_results = [_wait_for_future(future) for future in futures]
                 cancelled = any(result is None for result in search_results)
                 if cancelled and self._resume_contract is None:
                     break
@@ -2461,7 +2482,7 @@ class ArenaRunner:
             # this wait through the serial executor would prevent any batching.
             return cast(
                 InferenceResponse,
-                self._shared_broker.submit(evaluator, requests).result(),
+                _wait_for_future(self._shared_broker.submit(evaluator, requests)),
             )
         submitted = time.perf_counter()
 
@@ -2474,7 +2495,7 @@ class ArenaRunner:
                 self._inference_calls += 1
                 self._inference_seconds += time.perf_counter() - started
 
-        return inference_executor.submit(evaluate).result()
+        return _wait_for_future(inference_executor.submit(evaluate))
 
     def _semantic_subset(self, data: Any, rows: Sequence[int]) -> Any:
         def words(name: str) -> list[int]:
