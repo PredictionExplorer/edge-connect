@@ -1175,10 +1175,12 @@ def test_snapshot_discovers_custom_cpu_actor_and_ignores_non_actor_metrics(
 
 
 @pytest.mark.parametrize("child_evidence", ["metric", "healthy", "mismatch"])
+@pytest.mark.parametrize("legacy_parent_metric", [False, True])
 def test_snapshot_checks_active_cohort_with_child_ring_evidence(
     tmp_path,
     monkeypatch,
     child_evidence,
+    legacy_parent_metric,
 ) -> None:
     now_ns = 20_000_000_000
     root = _fixture(tmp_path, now_ns=now_ns)
@@ -1213,7 +1215,11 @@ def test_snapshot_checks_active_cohort_with_child_ring_evidence(
         policy_samples=10,
         active_ring_weights=weights,
     )
-    metric_path.unlink()
+    if legacy_parent_metric:
+        legacy = dict(metric, worker="actor-gpu-1", active_ring_weights=None)
+        metric_path.write_text(json.dumps(legacy) + "\n")
+    else:
+        metric_path.unlink()
     (root / "metrics" / "actor-gpu-1-cohort-0.jsonl").write_text(
         json.dumps(metric) + "\n"
     )
@@ -1225,6 +1231,39 @@ def test_snapshot_checks_active_cohort_with_child_ring_evidence(
     assert "policy_supervision_low" in codes
     assert ("actor_ring_weight_mismatch" in codes) == (child_evidence == "mismatch")
     assert snapshot["actors"]["low_policy_workers"] == ["actor-gpu-1-cohort-0"]
+
+
+def test_snapshot_ignores_old_parent_ring_metric_while_shared_cohorts_start(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    now_ns = 20_000_000_000
+    root = _fixture(tmp_path, now_ns=now_ns)
+    profile_path = root / "profile.yaml"
+    profile = yaml.safe_load(profile_path.read_text())
+    profile["orchestration"]["ring_mixture"] = {
+        "step_weights": [{"from_step": 0, "weights": [0.25, 0.25, 0.25, 0.25]}]
+    }
+    profile_path.write_text(yaml.safe_dump(profile))
+    heartbeat_path = root / "status" / "actor-gpu-1.heartbeat.json"
+    heartbeat = json.loads(heartbeat_path.read_text())
+    heartbeat.update(phase="shared_cohorts", cohorts=2)
+    heartbeat.pop("active_ring_weights", None)
+    _write_json(heartbeat_path, heartbeat)
+    metric_path = root / "metrics" / "actor-gpu-1.jsonl"
+    metric = json.loads(metric_path.read_text())
+    metric.update(active_ring_weights=None, timestamp_ns=1_000_000_000)
+    metric_path.write_text(json.dumps(metric) + "\n")
+    _healthy_dependencies(monkeypatch)
+
+    snapshot: Any = monitor.collect_snapshot(root, now_ns=now_ns)
+
+    assert "actor_ring_weight_mismatch" not in {
+        warning["code"] for warning in snapshot["warnings"]
+    }
+    assert snapshot["actors"]["noncompliant_weight_workers"] == []
+    assert snapshot["actors"]["ring_weight_variants"] == []
+    assert snapshot["actors"]["workers"] == 1
 
 
 def test_snapshot_prefers_exact_cpu_worker_name_to_inferred_cohort_parent(

@@ -2035,6 +2035,7 @@ def collect_snapshot(
     worker_map = workers if isinstance(workers, dict) else {}
     worker_health_map = {str(row.get("name")): row for row in workers_output}
     actor_health_map = {}
+    active_actor_rows = []
     for row in actors:
         worker_name = str(row.get("worker"))
         coordinator_name = _actor_worker_name(worker_name, worker_map)
@@ -2060,12 +2061,14 @@ def collect_snapshot(
             for key in ("phase", "active_ring_weights", "active_rings", "ring"):
                 health[key] = child_heartbeat.get(key, row.get(key, health.get(key)))
         actor_health_map[worker_name] = health
-    active_actor_rows = [
-        row
-        for row in actors
-        if _mapping(actor_health_map.get(str(row.get("worker")))).get("state")
-        == "running"
-    ]
+        # Shared brokers report aggregate progress, not ring allocation. A
+        # metric under the broker's own name belongs to its earlier standalone
+        # actor; retain that history for throughput, but check current allocation
+        # using the cohorts' own evidence rather than missing broker weights.
+        if health.get("state") == "running" and not (
+            coordinator_name == worker_name and health.get("phase") == "shared_cohorts"
+        ):
+            active_actor_rows.append(row)
     if ring10_objective_active:
         ring10_actor_violations = []
         for row in active_actor_rows:
