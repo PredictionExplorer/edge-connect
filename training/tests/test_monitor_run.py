@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sqlite3
 from pathlib import Path
 from typing import Any
@@ -882,6 +883,136 @@ def test_snapshot_surfaces_stale_restart_quarantine_and_hardware(
     } <= codes
 
 
+def test_snapshot_accepts_suspended_worker_with_live_pid_and_old_heartbeat(
+    tmp_path, monkeypatch
+) -> None:
+    now_ns = 300_000_000_000
+    root = _fixture(tmp_path, now_ns=now_ns)
+    heartbeat_path = root / "status/actor-gpu-1.heartbeat.json"
+    heartbeat = json.loads(heartbeat_path.read_text())
+    heartbeat.update(heartbeat_ns=1_000_000_000, progress_ns=1_000_000_000)
+    _write_json(heartbeat_path, heartbeat)
+    coordinator_path = root / "status/coordinator.json"
+    coordinator = json.loads(coordinator_path.read_text())
+    coordinator["workers"]["actor-gpu-1"].update(state="paused", pid=os.getpid())
+    coordinator["pause_sharing"] = {
+        "target_worker": "actor-gpu-1",
+        "target_suspended": True,
+    }
+    _write_json(coordinator_path, coordinator)
+    _healthy_dependencies(monkeypatch)
+
+    snapshot: Any = monitor.collect_snapshot(root, now_ns=now_ns)
+
+    assert not {"worker_unhealthy", "heartbeat_stale", "worker_stalled"} & {
+        warning["code"] for warning in snapshot["warnings"]
+    }
+    worker = next(row for row in snapshot["workers"] if row["name"] == "actor-gpu-1")
+    assert worker["state"] == "paused"
+    assert worker["pid"] == os.getpid()
+    assert worker["heartbeat_age_seconds"] == 299.0
+
+
+@pytest.mark.parametrize(
+    ("heartbeat_age", "expected_error"),
+    [(250, "heartbeat_stale"), (1, "worker_stalled")],
+)
+def test_resumed_worker_grace_expires_and_requires_fresh_heartbeat_progress(
+    tmp_path, monkeypatch, heartbeat_age, expected_error
+) -> None:
+    now_ns = 300_000_000_000
+    root = _fixture(tmp_path, now_ns=now_ns)
+    heartbeat_path = root / "status/actor-gpu-1.heartbeat.json"
+    heartbeat = json.loads(heartbeat_path.read_text())
+    heartbeat.update(
+        heartbeat_ns=now_ns - heartbeat_age * 1_000_000_000,
+        progress_ns=1_000_000_000,
+    )
+    _write_json(heartbeat_path, heartbeat)
+    coordinator_path = root / "status/coordinator.json"
+    coordinator = json.loads(coordinator_path.read_text())
+    coordinator["workers"]["actor-gpu-1"]["heartbeat_grace_until_ns"] = (
+        now_ns + 5_000_000_000
+    )
+    _write_json(coordinator_path, coordinator)
+    _healthy_dependencies(monkeypatch)
+
+    snapshot: Any = monitor.collect_snapshot(root, now_ns=now_ns)
+    assert not {"heartbeat_stale", "worker_stalled"} & {
+        warning["code"] for warning in snapshot["warnings"]
+    }
+    worker = next(row for row in snapshot["workers"] if row["name"] == "actor-gpu-1")
+    assert worker["heartbeat_grace_active"] is True
+
+    expired: Any = monitor.collect_snapshot(root, now_ns=now_ns + 5_000_000_000)
+    assert expected_error in {warning["code"] for warning in expired["warnings"]}
+    worker = next(row for row in expired["workers"] if row["name"] == "actor-gpu-1")
+    assert worker["heartbeat_grace_active"] is False
+
+    heartbeat.update(
+        heartbeat_ns=now_ns + 5_000_000_000,
+        progress_ns=now_ns + 5_000_000_000,
+    )
+    _write_json(heartbeat_path, heartbeat)
+    healthy: Any = monitor.collect_snapshot(root, now_ns=now_ns + 6_000_000_000)
+    assert not {"heartbeat_stale", "worker_stalled"} & {
+        warning["code"] for warning in healthy["warnings"]
+    }
+
+
+@pytest.mark.parametrize(
+    "deadline",
+    [
+        None,
+        True,
+        False,
+        "305000000000",
+        305_000_000_000.0,
+        299_000_000_000,
+        300_000_000_000,
+        400_000_000_001,
+    ],
+)
+def test_invalid_or_unbounded_resume_grace_cannot_mask_stale_worker(
+    tmp_path, monkeypatch, deadline
+) -> None:
+    now_ns = 300_000_000_000
+    root = _fixture(tmp_path, now_ns=now_ns)
+    heartbeat_path = root / "status/actor-gpu-1.heartbeat.json"
+    heartbeat = json.loads(heartbeat_path.read_text())
+    heartbeat.update(heartbeat_ns=1_000_000_000)
+    _write_json(heartbeat_path, heartbeat)
+    coordinator_path = root / "status/coordinator.json"
+    coordinator = json.loads(coordinator_path.read_text())
+    coordinator["workers"]["actor-gpu-1"]["heartbeat_grace_until_ns"] = deadline
+    _write_json(coordinator_path, coordinator)
+    _healthy_dependencies(monkeypatch)
+
+    snapshot: Any = monitor.collect_snapshot(root, now_ns=now_ns)
+
+    assert "heartbeat_stale" in {warning["code"] for warning in snapshot["warnings"]}
+
+
+def test_resume_grace_does_not_mask_worker_failure_or_restart(tmp_path, monkeypatch):
+    now_ns = 300_000_000_000
+    root = _fixture(tmp_path, now_ns=now_ns)
+    coordinator_path = root / "status/coordinator.json"
+    coordinator = json.loads(coordinator_path.read_text())
+    coordinator["workers"]["actor-gpu-1"].update(
+        state="fatal",
+        restart_count=1,
+        heartbeat_grace_until_ns=now_ns + 100_000_000_000,
+    )
+    _write_json(coordinator_path, coordinator)
+    _healthy_dependencies(monkeypatch)
+
+    snapshot: Any = monitor.collect_snapshot(root, now_ns=now_ns)
+
+    assert {"worker_unhealthy", "worker_restarted"} <= {
+        warning["code"] for warning in snapshot["warnings"]
+    }
+
+
 def test_snapshot_surfaces_persistent_sram_threshold_with_zero_volatile(
     tmp_path, monkeypatch
 ) -> None:
@@ -1233,9 +1364,20 @@ def test_snapshot_checks_active_cohort_with_child_ring_evidence(
     assert snapshot["actors"]["low_policy_workers"] == ["actor-gpu-1-cohort-0"]
 
 
+@pytest.mark.parametrize(
+    "phase",
+    [
+        "shared_cohorts",
+        "arena_gpu_quiescing",
+        "arena_gpu_resume",
+        "arena_gpu_resuming",
+        "cohort_draining",
+    ],
+)
 def test_snapshot_ignores_old_parent_ring_metric_while_shared_cohorts_start(
     tmp_path,
     monkeypatch,
+    phase,
 ) -> None:
     now_ns = 20_000_000_000
     root = _fixture(tmp_path, now_ns=now_ns)
@@ -1247,7 +1389,7 @@ def test_snapshot_ignores_old_parent_ring_metric_while_shared_cohorts_start(
     profile_path.write_text(yaml.safe_dump(profile))
     heartbeat_path = root / "status" / "actor-gpu-1.heartbeat.json"
     heartbeat = json.loads(heartbeat_path.read_text())
-    heartbeat.update(phase="shared_cohorts", cohorts=2)
+    heartbeat.update(phase=phase, cohorts=2)
     heartbeat.pop("active_ring_weights", None)
     _write_json(heartbeat_path, heartbeat)
     metric_path = root / "metrics" / "actor-gpu-1.jsonl"

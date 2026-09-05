@@ -397,6 +397,7 @@ def actor_main(argv: list[str] | None = None) -> None:
     parser.add_argument("--run-identity", required=True)
     parser.add_argument("--heartbeat", required=True)
     parser.add_argument("--learner-heartbeat")
+    parser.add_argument("--gpu-pause")
     parser.add_argument("--metrics", required=True)
     parser.add_argument("--device", default="auto", help="cuda, mps, cpu, or auto")
     arguments = parser.parse_args(argv)
@@ -457,6 +458,7 @@ def actor_main(argv: list[str] | None = None) -> None:
         heartbeat_path=arguments.heartbeat,
         metrics_path=arguments.metrics,
         learner_heartbeat_path=arguments.learner_heartbeat,
+        gpu_pause_path=arguments.gpu_pause,
         device=arguments.device,
         lane_id=arguments.lane_id,
         actor_id=cpu_actor.actor_id if cpu_actor else None,

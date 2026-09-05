@@ -878,6 +878,10 @@ class PromotionConfig:
     bootstrap_initial_champion: bool = False
     device: str = "cuda"
     pause_sharing_mode: bool = False
+    # Suspend cooperatively parks actor cohorts and drains shared inference,
+    # preserving games, processes, and GPU allocations. The arena must fit
+    # alongside that retained memory. Terminate drains and exits the actor.
+    pause_strategy: Literal["terminate", "suspend"] = "terminate"
     pause_ready_timeout_seconds: float = 1_200.0
     pause_release_timeout_seconds: float = 120.0
     final_drain_timeout_seconds: float = 7_200.0
@@ -890,6 +894,8 @@ class PromotionConfig:
     def __post_init__(self) -> None:
         if self.cpu_affinity is not None:
             parse_cpu_affinity(self.cpu_affinity)
+        if self.pause_strategy not in ("terminate", "suspend"):
+            raise ConfigError("promotion pause_strategy must be terminate or suspend")
         if (
             isinstance(self.session_seconds, bool)
             or not isinstance(self.session_seconds, int | float)
@@ -1255,6 +1261,15 @@ class OrchestrationConfig:
             raise ConfigError("promotion GPU overlap requires pause-sharing mode")
         if (
             self.promotion.enabled
+            and self.promotion.pause_strategy == "suspend"
+            and (
+                not self.promotion.pause_sharing_mode
+                or self.promotion.gpu_id not in actor_ids
+            )
+        ):
+            raise ConfigError("promotion suspend strategy requires actor pause-sharing")
+        if (
+            self.promotion.enabled
             and self.promotion.pause_sharing_mode
             and not promotion_overlap
         ):
@@ -1272,6 +1287,18 @@ class OrchestrationConfig:
         if shared_actor is not None and shared_actor.actor_lanes != 1:
             raise ConfigError(
                 "the pause-shared arena GPU must use exactly one actor lane"
+            )
+        if (
+            shared_actor is not None
+            and self.promotion.pause_strategy == "suspend"
+            and (
+                shared_actor.actor_cohorts <= 1
+                or not self.model_refresh.inference.shared_batching
+            )
+        ):
+            raise ConfigError(
+                "promotion suspend requires multiple actor cohorts and shared "
+                "inference batching"
             )
         if not self.distributed.enabled and len(learners) > 1:
             raise ConfigError("multiple learner GPUs require distributed.enabled")

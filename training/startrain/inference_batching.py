@@ -213,7 +213,17 @@ class BoundedInferenceBroker:
     def _release_owned_job(self, job: _Job) -> None:
         with self._condition:
             self._owned_jobs.remove(job)
+            self._condition.notify_all()
         self._slots.release()
+
+    def is_idle(self) -> bool:
+        """Prove no queued or active inference/compilation remains.
+
+        Callers must first stop producers from submitting new work. An empty
+        queue alone is insufficient because a worker may own an active batch.
+        """
+        with self._condition:
+            return not self._queue and not self._owned_jobs
 
     def _run_batches(self) -> None:
         while True:
@@ -278,6 +288,7 @@ class BoundedInferenceBroker:
                 "batched_requests": self._batched_requests,
                 "requested_rows": self._rows,
                 "pending_requests": len(self._queue),
+                "active_requests": len(self._owned_jobs),
                 "queue_wait_seconds": self._queue_wait_seconds,
                 "worker_seconds": self._worker_seconds,
                 "worker_failures": self._worker_failures,

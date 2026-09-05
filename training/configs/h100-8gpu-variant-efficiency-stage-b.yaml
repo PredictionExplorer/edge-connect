@@ -307,6 +307,9 @@ orchestration:
     bootstrap_initial_champion: true
     device: cuda
     pause_sharing_mode: true
+    # Cooperatively pause self-play, preserving unfinished games and GPU memory.
+    # The arena must fit alongside the actor's retained allocations.
+    pause_strategy: suspend
     pause_ready_timeout_seconds: 930.0
     pause_release_timeout_seconds: 120.0
     final_drain_timeout_seconds: 57600.0

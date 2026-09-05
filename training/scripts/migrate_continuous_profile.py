@@ -62,6 +62,7 @@ _ALLOWED_PROFILE_PATHS = {
     ("orchestration", "promotion", "finish_inflight_candidate"),
     # Evaluation scheduling changes only when work runs, never its evidence.
     ("orchestration", "promotion", "session_seconds"),
+    ("orchestration", "promotion", "pause_strategy"),
     ("orchestration", "promotion", "inter_wave_cooldown_seconds"),
     ("orchestration", "historical_evaluation", "session_seconds"),
     ("orchestration", "historical_evaluation", "cooldown_seconds"),

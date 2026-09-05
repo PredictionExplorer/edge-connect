@@ -591,10 +591,10 @@ def test_additive_default_field_accepts_legacy_chain_hash(tmp_path: Path) -> Non
                 *(path for bit, path in enumerate(additive) if mask >> bit & 1)
             )
         )
-    # Session scheduling retains both existing efficiency representations,
-    # while preserving every previously supported additive-default combination.
+    # Session scheduling and actor pause strategy retain all existing efficiency
+    # representations and every supported additive-default combination.
     assert expected <= compatible
-    assert len(compatible) == 4 * len(expected)
+    assert len(compatible) == 8 * len(expected)
     # A profile that opts into a new field no longer matches releases that
     # never had it, but keeps the variants for the other additive fields.
     opted = yaml.safe_load(fixture.old_profile.read_text(encoding="utf-8"))
@@ -603,7 +603,7 @@ def test_additive_default_field_accepts_legacy_chain_hash(tmp_path: Path) -> Non
     opted_path = tmp_path / "opted.yaml"
     opted_path.write_text(yaml.safe_dump(opted, sort_keys=False), encoding="utf-8")
     opted_config = load_config(opted_path)
-    assert len(migration._compatible_source_config_sha256s(opted_config)) == 32
+    assert len(migration._compatible_source_config_sha256s(opted_config)) == 64
 
     opted.setdefault("selfplay", {}).setdefault("variants", {})[
         "handicap_classic_share"
@@ -611,7 +611,7 @@ def test_additive_default_field_accepts_legacy_chain_hash(tmp_path: Path) -> Non
     opted.setdefault("arena", {})["segment_handicap_classic_share"] = 0.5
     opted_path.write_text(yaml.safe_dump(opted, sort_keys=False), encoding="utf-8")
     assert (
-        len(migration._compatible_source_config_sha256s(load_config(opted_path))) == 8
+        len(migration._compatible_source_config_sha256s(load_config(opted_path))) == 16
     )
 
     # The head a release without scheduling or plateau additions recorded.
@@ -623,6 +623,7 @@ def test_additive_default_field_accepts_legacy_chain_hash(tmp_path: Path) -> Non
         ("orchestration", "promotion", "session_seconds"),
         ("orchestration", "historical_evaluation", "session_seconds"),
         ("orchestration", "historical_evaluation", "cooldown_seconds"),
+        ("orchestration", "promotion", "pause_strategy"),
     )
     source_profile_sha256 = hashlib.sha256(fixture.old_profile_bytes).hexdigest()
     record = {
@@ -921,6 +922,45 @@ def test_evaluation_scheduling_migration_preserves_contract_and_pending_evidence
     assert pending.read_bytes() == pending_bytes
     record = json.loads((fixture.root / "continuous-migrations.jsonl").read_text())
     assert "evaluation_contract_transition" not in record
+
+
+def test_actor_suspend_migration_preserves_all_training_and_evaluation_state(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture(tmp_path, "h100-8gpu-variant-efficiency-stage-a.yaml")
+    old = load_config(fixture.old_profile)
+    assert old.orchestration.promotion.pause_strategy == "terminate"
+    target = yaml.safe_load(fixture.old_profile.read_text())
+    target["orchestration"]["promotion"]["pause_strategy"] = "suspend"
+    fixture.candidate_profile.write_text(yaml.safe_dump(target, sort_keys=False))
+    preserved = {
+        path: path.read_bytes()
+        for path in (
+            fixture.root / "run.json",
+            fixture.root / "learner/recovery.json",
+            fixture.root / "learner/champion.json",
+            fixture.checkpoint,
+        )
+    }
+    result = migration.migrate_continuous_profile(fixture.request, apply=True)
+
+    assert result["changes"] == [
+        {
+            "path": "orchestration.promotion.pause_strategy",
+            "from": "terminate",
+            "to": "suspend",
+        }
+    ]
+    active = load_config(fixture.root / fixture.target_name)
+    for section in ("game", "model", "loss", "optimizer", "train", "learner", "arena"):
+        assert getattr(active, section) == getattr(old, section)
+    assert active.orchestration.historical_evaluation == (
+        old.orchestration.historical_evaluation
+    )
+    assert all(path.read_bytes() == data for path, data in preserved.items())
+    record = json.loads((fixture.root / "continuous-migrations.jsonl").read_text())
+    assert "evaluation_contract_transition" not in record
+    assert "utd_segment" not in record
 
 
 def _with_update_to_data(

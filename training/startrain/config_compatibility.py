@@ -12,6 +12,21 @@ from collections.abc import Mapping
 from typing import Any
 
 
+def without_pause_strategy_default(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Represent releases whose actor pause strategy was always terminate."""
+
+    result = deepcopy(dict(payload))
+    orchestration = result.get("orchestration")
+    if isinstance(orchestration, dict):
+        promotion = orchestration.get("promotion")
+        if (
+            isinstance(promotion, dict)
+            and promotion.get("pause_strategy") == "terminate"
+        ):
+            del promotion["pause_strategy"]
+    return result
+
+
 def without_evaluation_session_defaults(
     payload: Mapping[str, Any],
 ) -> dict[str, Any]:
@@ -44,7 +59,7 @@ def without_evaluation_session_defaults(
 def compatible_config_epoch_payloads(
     payload: Mapping[str, Any],
 ) -> tuple[dict[str, Any], ...]:
-    """Preserve existing efficiency-default guards with and without sessions.
+    """Preserve existing guards across scheduling and actor-pause releases.
 
     Existing independent compatibility guards for older additions can operate
     on each representation. The new scheduling fields strip as one release
@@ -53,12 +68,15 @@ def compatible_config_epoch_payloads(
     """
 
     pre_session = without_evaluation_session_defaults(payload)
-    return (
+    variants = (
         deepcopy(dict(payload)),
         without_efficiency_defaults(payload),
         pre_session,
         without_efficiency_defaults(pre_session),
     )
+    if without_pause_strategy_default(payload) == payload:
+        return variants
+    return (*variants, *(without_pause_strategy_default(row) for row in variants))
 
 
 def without_efficiency_defaults(payload: Mapping[str, Any]) -> dict[str, Any]:

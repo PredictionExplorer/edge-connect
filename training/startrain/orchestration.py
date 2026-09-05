@@ -285,6 +285,7 @@ class ManagedWorker:
     last_progress_at: float = 0.0
     process_group_id: int | None = None
     last_pid: int | None = None
+    health_grace_until: float = 0.0
 
     @property
     def live(self) -> bool:
@@ -310,6 +311,10 @@ class PauseLease:
     target_pause_generation: int | None = None
     target_checkpoint_step: int | None = None
     ready_latency_seconds: float | None = None
+    target_suspended: bool = False
+    target_pid: int | None = None
+    resume_requested_ns: int | None = None
+    resume_deadline: float = 0.0
 
 
 class CoordinatorLock:
@@ -539,6 +544,13 @@ def build_worker_specs(
                         str(directories.metrics / f"{name}.jsonl"),
                         "--device",
                         worker_device,
+                        *(
+                            ("--gpu-pause", str(directories.gpu_pause))
+                            if orchestration.promotion.pause_sharing_mode
+                            and orchestration.promotion.pause_strategy == "suspend"
+                            and gpu.gpu_id == orchestration.promotion.gpu_id
+                            else ()
+                        ),
                     ),
                     environment=actor_environment,
                     heartbeat_path=directories.status / f"{name}.heartbeat.json",
@@ -784,8 +796,10 @@ class Coordinator:
                 and shared_gpu in worker.spec.gpu_ids
             ]
             if len(targets) > 1:
-                # With colocated learner+actor on the shared GPU, pausing the
-                # actor frees its memory while the learner keeps training.
+                # With colocated learner+actor on the shared GPU, pause the
+                # actor while the learner keeps training. Termination releases
+                # actor memory; cooperative suspension retains live cohorts
+                # after shared writes and inference have drained.
                 actor_targets = [
                     worker for worker in targets if worker.spec.role == "actor"
                 ]
@@ -1071,7 +1085,9 @@ class Coordinator:
         )
         health_failure = (
             self._heartbeat_failure(worker, now)
-            if worker.state == "running" and not pause_learner_ready
+            if worker.state == "running"
+            and not pause_learner_ready
+            and now >= worker.health_grace_until
             else None
         )
         if health_failure is not None:
@@ -1094,7 +1110,11 @@ class Coordinator:
             code is not None
             and lease is not None
             and worker is self.pause_target
-            and (worker.state.startswith("pause_") or worker.spec.role == "learner")
+            and (
+                worker.state.startswith("pause_")
+                or worker.spec.role == "learner"
+                or lease.target_pid is not None
+            )
         ):
             self._pause_target_exited(worker, code=code, now=now)
             return self.pause_failed
@@ -1200,6 +1220,9 @@ class Coordinator:
             return
         payload = self._read_pause_request()
         lease = self.pause_lease
+        if lease is not None and lease.state == "resuming":
+            self._confirm_actor_resume(lease, now)
+            return
         if lease is None:
             if payload is None:
                 return
@@ -1279,6 +1302,16 @@ class Coordinator:
             return
         if lease.target_role == "learner" and lease.state == "waiting":
             self._maybe_ack_learner_pause(lease)
+        elif (
+            lease.target_pid is not None
+            and lease.state
+            in (
+                "waiting",
+                "ready",
+            )
+            and self.pause_target.state in ("running", "pause_suspended")
+        ):
+            self._observe_suspended_target(lease, now)
 
     def _read_pause_request(self) -> dict[str, object] | None:
         try:
@@ -1356,6 +1389,9 @@ class Coordinator:
             return
         if target.live:
             assert target.process is not None
+            if self.experiment.orchestration.promotion.pause_strategy == "suspend":
+                self._begin_actor_suspend(lease, now)
+                return
             _signal_process(target.process, signal.SIGTERM)
             target.state = "pause_terminating"
             target.failure_reason = f"GPU pause lease {lease.token}"
@@ -1384,6 +1420,176 @@ class Coordinator:
         target.state = "paused"
         lease.target_reaped = True
         self._mark_pause_ready(lease)
+
+    def _begin_actor_suspend(self, lease: PauseLease, now: float) -> None:
+        assert self.pause_target is not None
+        target = self.pause_target
+        assert target.process is not None
+        if target.spec.role != "actor":
+            self._fail_pause_lease("cooperative suspension requires an actor target")
+            return
+        lease.target_pid = target.process.pid
+        target.termination_deadline = (
+            now + self.experiment.orchestration.promotion.pause_ready_timeout_seconds
+        )
+        lease.state = "waiting"
+        # Validate owner/token/target before the actor adopts a request. Never
+        # use SIGSTOP: it could freeze shared SQLite or compiler locks.
+        self._write_pause_ack(lease, state="waiting")
+        self._pause_event(
+            "pause_target_quiescence_requested",
+            token=lease.token,
+            target=target.spec.name,
+            pid=lease.target_pid,
+        )
+
+    def _observe_suspended_target(self, lease: PauseLease, now: float) -> None:
+        assert self.pause_target is not None
+        target = self.pause_target
+        if not target.live:
+            return  # The supervised-exit path handles owner recovery.
+        if target.process is None or target.process.pid != lease.target_pid:
+            self._fail_pause_lease("cooperatively paused actor identity changed")
+            return
+        try:
+            heartbeat = json.loads(
+                target.spec.heartbeat_path.read_text(encoding="utf-8")
+            )
+        except (OSError, json.JSONDecodeError):
+            heartbeat = {}
+        if not isinstance(heartbeat, dict):
+            heartbeat = {}
+        progress_ns = heartbeat.get("progress_ns")
+        heartbeat_ns = heartbeat.get("heartbeat_ns")
+        parked = heartbeat.get("parked_cohorts")
+        live = heartbeat.get("live_cohorts")
+        now_ns = time.time_ns()
+        stale_ns = int(
+            self.experiment.orchestration.shutdown.stale_heartbeat_seconds
+            * 1_000_000_000
+        )
+        quiescent = (
+            heartbeat.get("pid") == lease.target_pid
+            and heartbeat.get("phase") == "arena_gpu_pause"
+            and heartbeat.get("lease_token") == lease.token
+            and heartbeat.get("lease_owner_pid", lease.owner_pid) == lease.owner_pid
+            and heartbeat.get("lease_requested_ns", lease.requested_ns)
+            == lease.requested_ns
+            and heartbeat.get("actor_quiescent") is True
+            and heartbeat.get("inference_idle") is True
+            and heartbeat.get("cuda_synchronized") is True
+            and type(parked) is int
+            and type(live) is int
+            and 0 < parked == live
+            and type(progress_ns) is int
+            and type(heartbeat_ns) is int
+            and lease.requested_ns
+            <= progress_ns
+            <= heartbeat_ns
+            <= now_ns + 1_000_000_000
+            and now_ns - heartbeat_ns <= stale_ns
+        )
+        if quiescent:
+            lease.target_suspended = True
+            target.state = "pause_suspended"
+            if lease.state != "ready":
+                lease.ready_latency_seconds = max(
+                    0.0, (now_ns - lease.requested_ns) / 1_000_000_000
+                )
+            self._mark_pause_ready(lease)
+        elif lease.state == "ready":
+            self._begin_pause_owner_recovery(
+                "actor quiescence acknowledgement became stale or invalid", now
+            )
+        elif now >= target.termination_deadline:
+            self._fail_pause_lease(
+                "actor did not acknowledge quiescence before timeout"
+            )
+
+    def _resume_suspended_target(self, lease: PauseLease, now: float) -> bool:
+        assert self.pause_target is not None
+        target = self.pause_target
+        if not target.live:
+            return False
+        if target.process is None or target.process.pid != lease.target_pid:
+            self._fail_pause_lease(
+                "cooperatively paused actor identity changed before release"
+            )
+            return False
+        lease.target_suspended = False
+        lease.state = "resuming"
+        lease.resume_deadline = (
+            now + self.experiment.orchestration.promotion.pause_release_timeout_seconds
+        )
+        target.state = "pause_resuming"
+        target.last_progress_at = now
+        target.health_grace_until = (
+            now + self.experiment.orchestration.shutdown.stale_heartbeat_seconds
+        )
+        self._pause_event(
+            "pause_target_resumed",
+            token=lease.token,
+            target=target.spec.name,
+            pid=lease.target_pid,
+            restart=False,
+        )
+        return True
+
+    def _confirm_actor_resume(self, lease: PauseLease, now: float) -> None:
+        assert self.pause_target is not None
+        target = self.pause_target
+        if not target.live:
+            return
+        if target.process is None or target.process.pid != lease.target_pid:
+            self._fail_pause_lease("actor identity changed during cooperative resume")
+            return
+        try:
+            heartbeat = json.loads(
+                target.spec.heartbeat_path.read_text(encoding="utf-8")
+            )
+        except (OSError, json.JSONDecodeError):
+            heartbeat = {}
+        if not isinstance(heartbeat, dict):
+            heartbeat = {}
+        progress_ns = heartbeat.get("progress_ns")
+        heartbeat_ns = heartbeat.get("heartbeat_ns")
+        now_ns = time.time_ns()
+        if (
+            heartbeat.get("pid") == lease.target_pid
+            and heartbeat.get("last_resumed_lease_token") == lease.token
+            and heartbeat.get("actor_quiescent") is False
+            and type(heartbeat.get("parked_cohorts")) is int
+            and heartbeat.get("parked_cohorts") == 0
+            and heartbeat.get("phase") in ("arena_gpu_resume", "shared_cohorts")
+            and type(progress_ns) is int
+            and type(heartbeat_ns) is int
+            and lease.resume_requested_ns is not None
+            and lease.resume_requested_ns
+            <= progress_ns
+            <= heartbeat_ns
+            <= now_ns + 1_000_000_000
+            and now_ns - heartbeat_ns
+            <= int(
+                self.experiment.orchestration.shutdown.stale_heartbeat_seconds
+                * 1_000_000_000
+            )
+        ):
+            target.state = "running"
+            target.last_progress_at = now
+            target.health_grace_until = (
+                now + self.experiment.orchestration.shutdown.stale_heartbeat_seconds
+            )
+            self._pause_event(
+                "pause_target_resume_confirmed",
+                token=lease.token,
+                target=target.spec.name,
+                pid=lease.target_pid,
+            )
+            self.pause_lease = None
+        elif now >= lease.resume_deadline:
+            self._fail_pause_lease(
+                "actor did not confirm cooperative resume before timeout"
+            )
 
     def _maybe_ack_learner_pause(self, lease: PauseLease) -> None:
         assert self.pause_target is not None
@@ -1436,8 +1642,10 @@ class Coordinator:
     def _mark_pause_ready(self, lease: PauseLease) -> None:
         if lease.state == "ready" or lease.release_requested:
             return
-        if lease.target_role == "actor" and not lease.target_reaped:
-            raise RuntimeError("actor pause cannot be acknowledged before process exit")
+        if lease.target_role == "actor" and not (
+            lease.target_reaped or lease.target_suspended
+        ):
+            raise RuntimeError("actor pause requires proven process exit or suspension")
         lease.state = "ready"
         self._write_pause_ack(lease, state="ready")
         self._pause_event(
@@ -1445,6 +1653,8 @@ class Coordinator:
             token=lease.token,
             target=lease.target_name,
             target_role=lease.target_role,
+            target_pid=lease.target_pid,
+            target_suspended=lease.target_suspended,
         )
 
     def _pause_target_exited(
@@ -1452,6 +1662,7 @@ class Coordinator:
     ) -> None:
         assert self.pause_lease is not None
         lease = self.pause_lease
+        lease.target_suspended = False
         worker.last_exit_code = code
         if not self._reap_worker_process_group(worker):
             self._fail_pause_lease("pause target process group could not be reaped")
@@ -1473,6 +1684,11 @@ class Coordinator:
         if learner_completed:
             self._event("worker_completed", worker, exit_code=code)
             self._begin_drain(now)
+        if lease.target_pid is not None and not self.draining and not self.stopping:
+            self._fail_pause_lease(
+                f"cooperative actor exited during pause with code {code}"
+            )
+            return
         if lease.release_requested or lease.owner_stop_requested:
             self._finish_pause_release(now)
         else:
@@ -1546,10 +1762,49 @@ class Coordinator:
         lease = self.pause_lease
         if lease is None or not lease.release_requested:
             return
+        if lease.state == "resuming":
+            if lease.target_reaped and (self.draining or self.stopping):
+                self._write_pause_ack(
+                    lease, state="draining", reason=lease.failure_reason
+                )
+                assert self.pause_target is not None
+                self.pause_target.state = "drained"
+                self.pause_lease = None
+                return
+            self._confirm_actor_resume(lease, now)
+            return
         if lease.owner_stop_requested and not lease.owner_reaped:
             return
         assert self.pause_target is not None
         target = self.pause_target
+        if (
+            lease.target_pid is not None
+            and target.live
+            and target.state in ("running", "pause_suspended")
+        ):
+            if not self._resume_suspended_target(lease, now):
+                return
+            state = (
+                "draining"
+                if self.draining or self.stopping
+                else ("recovered" if lease.failure_reason is not None else "released")
+            )
+            lease.resume_requested_ns = self._write_pause_ack(
+                lease, state=state, reason=lease.failure_reason
+            )
+            if self.draining or self.stopping:
+                assert target.process is not None
+                _signal_process(target.process, signal.SIGTERM)
+                target.state = "draining" if self.draining else "stopping"
+            self._pause_event(
+                "pause_lease_released",
+                token=lease.token,
+                target=target.spec.name,
+                target_pid=lease.target_pid,
+                restart=False,
+                outcome=state,
+            )
+            return
         if target.spec.role == "learner" and target.live:
             self.pause_request_path.unlink(missing_ok=True)
             state = "draining" if self.draining else "released"
@@ -1646,7 +1901,8 @@ class Coordinator:
         *,
         state: str,
         reason: str | None = None,
-    ) -> None:
+    ) -> int:
+        ack_ns = time.time_ns()
         atomic_json(
             self.pause_ack_path,
             {
@@ -1657,11 +1913,15 @@ class Coordinator:
                 "gpu_id": self.experiment.orchestration.promotion.gpu_id,
                 "target_worker": lease.target_name,
                 "target_role": lease.target_role,
+                "pause_strategy": self.experiment.orchestration.promotion.pause_strategy,
+                "target_pid": lease.target_pid,
+                "target_suspended": lease.target_suspended,
                 "coordinator_pid": os.getpid(),
-                "ack_ns": time.time_ns(),
+                "ack_ns": ack_ns,
                 "reason": reason,
             },
         )
+        return ack_ns
 
     def _pause_event(self, event: str, **details: object) -> None:
         append_jsonl(
@@ -1670,6 +1930,7 @@ class Coordinator:
                 "schema_version": 1,
                 "timestamp_ns": time.time_ns(),
                 "event": event,
+                "pause_strategy": self.experiment.orchestration.promotion.pause_strategy,
                 **details,
             },
             durable=True,
@@ -2210,6 +2471,11 @@ class Coordinator:
             if worker.spec.role != "actor":
                 continue
             if worker is self.pause_target and self.pause_lease is not None:
+                if self.pause_lease.target_pid is not None and worker.live:
+                    # Real shutdown releases the cooperative gate. Preserve the
+                    # current lease acknowledgement for the final arena drain.
+                    self.pause_lease.target_suspended = False
+                    worker.state = "running"
                 if worker.live and not worker.state.startswith("pause_"):
                     assert worker.process is not None
                     _signal_process(worker.process, signal.SIGTERM)
@@ -2275,7 +2541,9 @@ class Coordinator:
         if self.pause_lease is not None:
             self._write_pause_ack(
                 self.pause_lease,
-                state="failed" if self.pause_failed else "stopping",
+                state="draining"
+                if self.pause_lease.target_pid is not None
+                else ("failed" if self.pause_failed else "stopping"),
                 reason=(
                     self.pause_lease.failure_reason
                     if self.pause_failed
@@ -2345,11 +2613,13 @@ class Coordinator:
         )
 
     def _write_status(self, *, final: bool = False) -> None:
+        now = self.clock()
+        now_ns = time.time_ns()
         atomic_json(
             self.status_path,
             {
                 "schema_version": 1,
-                "timestamp_ns": time.time_ns(),
+                "timestamp_ns": now_ns,
                 "coordinator_pid": os.getpid(),
                 "state": "stopped" if final else "running",
                 "draining": self.draining,
@@ -2374,6 +2644,9 @@ class Coordinator:
                         "request_state": self.pause_lease.request_state,
                         "target_worker": self.pause_lease.target_name,
                         "target_role": self.pause_lease.target_role,
+                        "pause_strategy": self.experiment.orchestration.promotion.pause_strategy,
+                        "target_pid": self.pause_lease.target_pid,
+                        "target_suspended": self.pause_lease.target_suspended,
                         "owner_pid": self.pause_lease.owner_pid,
                         "heartbeat_ns": self.pause_lease.heartbeat_ns,
                         "release_requested": self.pause_lease.release_requested,
@@ -2400,7 +2673,17 @@ class Coordinator:
                             if worker.process is not None and worker.live
                             else None
                         ),
-                        "state": worker.state,
+                        "state": "paused"
+                        if worker.state == "pause_suspended"
+                        else "running"
+                        if worker.state == "pause_resuming"
+                        else worker.state,
+                        "heartbeat_grace_until_ns": (
+                            now_ns
+                            + int((worker.health_grace_until - now) * 1_000_000_000)
+                            if worker.health_grace_until > now
+                            else None
+                        ),
                         "restart_count": worker.restart_count,
                         "last_exit_code": worker.last_exit_code,
                         "failure_exit_code": worker.failure_exit_code,

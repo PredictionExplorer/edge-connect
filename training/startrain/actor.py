@@ -17,6 +17,7 @@ from typing import Any, Literal, cast
 
 import torch
 
+from .actor_pause import ActorPauseGate
 from .checkpoint import (
     ModelManifest,
     load_ema_checkpoint,
@@ -494,6 +495,8 @@ class ActorSupervisor:
         allowed_rings: tuple[int, ...] | None = None,
         registry: SharedModelRegistry | None = None,
         games_per_batch: int | None = None,
+        gpu_pause_path: str | Path | None = None,
+        pause_checkpoint: Callable[[], None] | None = None,
     ) -> None:
         if gpu.role != "actor" or gpu.actor_batch_size is None:
             raise ValueError("actor supervisor requires an actor GPU assignment")
@@ -507,6 +510,21 @@ class ActorSupervisor:
                 "actor games_per_batch must be an integer at least actor_batch_size"
             )
         self.games_per_batch = selected_games
+        if gpu_pause_path is not None and (
+            gpu.actor_cohorts <= 1
+            or gpu.actor_lanes != 1
+            or not experiment.orchestration.model_refresh.inference.shared_batching
+            or experiment.orchestration.promotion.pause_strategy != "suspend"
+            or experiment.orchestration.promotion.gpu_id != gpu.gpu_id
+            or registry is not None
+        ):
+            raise ValueError(
+                "cooperative GPU pause requires the shared-cohort actor target"
+            )
+        self.gpu_pause_path = (
+            Path(gpu_pause_path) if gpu_pause_path is not None else None
+        )
+        self._pause_checkpoint = pause_checkpoint
         if (
             isinstance(lane_id, bool)
             or not isinstance(lane_id, int)
@@ -765,6 +783,8 @@ class ActorSupervisor:
                             generation=generation,
                         ),
                     )
+                    if self._pause_checkpoint is not None:
+                        selfplay.pause_checkpoint = self._pause_checkpoint
                     try:
                         summaries = selfplay.run(
                             stop_requested=stop_requested,
@@ -1085,6 +1105,26 @@ class ActorSupervisor:
             max_wait_seconds=configuration.max_wait_seconds,
         )
         registry = SharedModelRegistry(broker, max_entries=self.gpu.actor_cohorts + 2)
+        gate: ActorPauseGate | None = None
+        if self.gpu_pause_path is not None:
+            gate = ActorPauseGate(
+                request_path=self.gpu_pause_path,
+                gpu_id=self.gpu.gpu_id,
+                worker_name=self.actor_id,
+                run_identity=self.run_identity,
+                cohort_ids=[
+                    f"{self.actor_id}-cohort-{index}"
+                    for index in range(self.gpu.actor_cohorts)
+                ],
+                stop_requested=lambda: stopped.is_set() or stop_requested(),
+                inference_idle=broker.is_idle,
+                synchronize=(
+                    (lambda: torch.cuda.synchronize(self.device))
+                    if self.device.type == "cuda"
+                    else (lambda: None)
+                ),
+                stale_seconds=self.experiment.orchestration.shutdown.stale_heartbeat_seconds,
+            )
         try:
             for cohort in range(self.gpu.actor_cohorts):
                 paths = dict(self._source_paths)
@@ -1114,58 +1154,101 @@ class ActorSupervisor:
                 )
                 child.scheduler.random.seed(seed)
                 child.model_random.seed(seed + 0x5E1F)
+                if gate is not None:
+                    child._pause_checkpoint = lambda identity=child.actor_id: (
+                        gate.checkpoint(identity)
+                    )
                 children.append(child)
 
             def run_child(child):
+                def child_stopping():
+                    if gate is not None:
+                        gate.checkpoint(child.actor_id)
+                    return stopped.is_set() or stop_requested()
+
                 try:
-                    return child.run(
-                        stop_requested=lambda: stopped.is_set() or stop_requested()
-                    )
+                    return child.run(stop_requested=child_stopping)
                 except BaseException:
                     stopped.set()
                     raise
+                finally:
+                    if gate is not None:
+                        gate.finish(child.actor_id)
 
-            last_progress = None
+            last_report_key = None
+            last_heartbeat_emit = 0.0
             with ThreadPoolExecutor(
                 max_workers=len(children), thread_name_prefix="actor-cohort"
             ) as pool:
                 futures = [pool.submit(run_child, child) for child in children]
-                while not all(future.done() for future in futures):
-                    if stop_requested():
-                        stopped.set()
-                    progress = []
-                    for child in children:
-                        try:
-                            payload = json.loads(child.heartbeat.path.read_text())
-                            progress.append(
-                                (child.actor_id, payload.get("progress", 0))
+                try:
+                    while not all(future.done() for future in futures):
+                        if stop_requested():
+                            stopped.set()
+                        pause_details = gate.poll() if gate is not None else None
+                        progress = []
+                        for child in children:
+                            try:
+                                payload = json.loads(child.heartbeat.path.read_text())
+                                progress.append(
+                                    (child.actor_id, payload.get("progress", 0))
+                                )
+                            except (OSError, ValueError):
+                                progress.append((child.actor_id, 0))
+                        details: dict[str, object] = dict(
+                            phase="cohort_draining"
+                            if stopped.is_set()
+                            else "shared_cohorts",
+                            cohorts=len(children),
+                            cohort_progress=progress,
+                            inference=broker.metrics_snapshot(),
+                        )
+                        if gate is not None:
+                            details.update(
+                                pause_details
+                                or {
+                                    "lease_token": None,
+                                    "actor_quiescent": False,
+                                    "inference_idle": False,
+                                    "cuda_synchronized": False,
+                                    "parked_cohorts": 0,
+                                }
                             )
-                        except (OSError, ValueError):
-                            progress.append((child.actor_id, 0))
-                    details = dict(
-                        phase="cohort_draining"
-                        if stopped.is_set()
-                        else "shared_cohorts",
-                        cohorts=len(children),
-                        cohort_progress=progress,
-                        inference=broker.metrics_snapshot(),
-                    )
-                    if progress != last_progress:
-                        self.heartbeat.advance(**details)
-                        last_progress = progress
-                    else:
-                        self.heartbeat.update(**details)
-                    wait(
-                        [future for future in futures if not future.done()],
-                        timeout=1.0,
-                        return_when=FIRST_EXCEPTION,
-                    )
+                        report_key = (
+                            tuple(progress),
+                            tuple(sorted((pause_details or {}).items())),
+                        )
+                        if report_key != last_report_key:
+                            # Readiness must get a fresh progress_ns even when
+                            # every parked cohort's search progress is unchanged.
+                            self.heartbeat.advance(**details)
+                            last_report_key = report_key
+                            last_heartbeat_emit = time.monotonic()
+                        elif gate is None or (
+                            time.monotonic() - last_heartbeat_emit
+                            >= self.heartbeat.interval_seconds
+                        ):
+                            self.heartbeat.update(**details)
+                            last_heartbeat_emit = time.monotonic()
+                        wait(
+                            [future for future in futures if not future.done()],
+                            timeout=0.1 if gate is not None else 1.0,
+                            return_when=FIRST_EXCEPTION,
+                        )
+                except BaseException:
+                    # Unpark before ThreadPoolExecutor.__exit__ joins producers.
+                    stopped.set()
+                    if gate is not None:
+                        gate.close()
+                    raise
                 return sum(future.result() for future in futures)
         except BaseException:
             phase = "failed"
             stopped.set()
             raise
         finally:
+            if gate is not None:
+                gate.close()
             broker.shutdown(wait=True, cancel_pending=False)
             registry.close()
             self.heartbeat.close(final_phase=phase)

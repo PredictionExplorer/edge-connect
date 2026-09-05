@@ -73,3 +73,40 @@ future waits and a subprocess regression that sends SIGTERM to a search thread
 while the main thread waits. The focused arena/session suite passed 61 tests after
 that correction. The initial frozen release was never activated; the `-v2`
 release includes this shutdown correction.
+
+## Preserving self-play between evaluation sessions
+
+The first live lease ended after 300.326 seconds, saved 654 searched moves, and
+returned GPU 7 to self-play. Its next evaluation session extended those exact
+action histories to 1,342 moves. However, both self-play cohorts reported zero
+completed games and zero samples when the five-minute cooldown ended: terminating
+their processes discarded the unfinished work.
+
+Stage B therefore uses `promotion.pause_strategy: suspend`. This is a cooperative
+pause that preserves the actor process, native searches, trajectories, loaded
+models, and inference caches. Each cohort parks at a safe checkpoint outside
+replay transactions and model refresh. The shared inference broker must have no
+queued or active jobs, and CUDA must synchronize before the actor acknowledges
+readiness. The coordinator binds that acknowledgement to the current worker PID
+and lease token. It retains the release acknowledgement until the same actor
+confirms that every producer has resumed, preventing a rapid next lease from
+overwriting the release signal.
+
+Abrupt process suspension is not used: a stopped actor could retain a shared
+SQLite write lock or a compiler-cache lock. The actor control thread and its
+heartbeat remain active during a cooperative pause. Shutdown still cancels work
+through the normal stop path; routine GPU handoffs preserve it.
+
+The final release is
+`/home/ubuntu/edgeconnect-releases/variant-cooperative-evaluation-20260905`.
+Its scheduling-only migration preserves the learner and evaluation state. The
+older terminate strategy remains the default for existing profiles. Cooperative
+suspension requires shared inference and multiple actor cohorts, with GPU memory
+capacity for the resident actor and arena together.
+
+Owned-process CUDA canaries on GPU 7 passed with both an existing competing
+context and a newly created competing context. They verified continuing GPU
+computation, preservation of the paused CUDA graph and counter, and clean process
+shutdown. Native search and SQLite transaction tests additionally validate the
+cooperative checkpoints and release handshake; the CUDA canaries alone do not
+establish shared-lock safety.

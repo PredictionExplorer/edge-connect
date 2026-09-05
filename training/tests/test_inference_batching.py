@@ -183,6 +183,30 @@ def test_broker_backpressure_cancellation_and_shutdown_release_waiters(
     assert broker.metrics_snapshot()["cancelled_requests"] == 1
 
 
+def test_broker_idle_proof_includes_active_owned_inference(feature_requests):
+    base = GraphInferenceAdapter(ObservedNetwork(), model_identity="a")
+    base.model.started = threading.Event()
+    base.model.release = threading.Event()
+    broker = BoundedInferenceBroker(max_wait_seconds=0)
+    assert broker.is_idle()
+    request = feature_requests(encode_batch([position()]))
+    future = broker.submit(base, request)
+    try:
+        assert base.model.started.wait(2)
+        assert broker.metrics_snapshot()["pending_requests"] == 0
+        assert broker.metrics_snapshot()["active_requests"] == 1
+        assert not broker.is_idle()
+        # Closing admission does not make an in-flight inference safe to pause.
+        broker.shutdown(wait=False)
+        assert not broker.is_idle()
+    finally:
+        base.model.release.set()
+        broker.shutdown()
+    assert future.result(timeout=1).tokens == [1]
+    assert broker.is_idle()
+    assert broker.metrics_snapshot()["active_requests"] == 0
+
+
 def test_shutdown_cancels_a_request_waiting_for_batch_partners(feature_requests):
     base = cached_adapter()
     broker = BoundedInferenceBroker(max_batch_rows=4, max_wait_seconds=0.5)

@@ -1655,6 +1655,11 @@ def collect_snapshot(
             heartbeat_age = _age_seconds(heartbeat.get("heartbeat_ns"), now)
             progress_age = _age_seconds(heartbeat.get("progress_ns"), now)
             state = str(worker.get("state", "unknown"))
+            grace_until = worker.get("heartbeat_grace_until_ns")
+            heartbeat_grace_active = (
+                type(grace_until) is int
+                and 0 < grace_until - now <= stale_threshold * 1_000_000_000
+            )
             restart_count = int(worker.get("restart_count", 0) or 0)
             if state not in ("running", "paused", "drained", "completed"):
                 _add_warning(
@@ -1670,8 +1675,10 @@ def collect_snapshot(
                     "worker_restarted",
                     f"{name} restarts={restart_count}",
                 )
-            if state == "running" and (
-                heartbeat_age is None or heartbeat_age > stale_threshold
+            if (
+                state == "running"
+                and not heartbeat_grace_active
+                and (heartbeat_age is None or heartbeat_age > stale_threshold)
             ):
                 _add_warning(
                     warnings,
@@ -1681,6 +1688,7 @@ def collect_snapshot(
                 )
             elif (
                 state == "running"
+                and not heartbeat_grace_active
                 and progress_age is not None
                 and progress_age > stall_threshold
             ):
@@ -1706,6 +1714,10 @@ def collect_snapshot(
                     "active_rings": heartbeat.get("active_rings"),
                     "ring": heartbeat.get("ring"),
                     "heartbeat_age_seconds": heartbeat_age,
+                    "heartbeat_grace_active": heartbeat_grace_active,
+                    "heartbeat_grace_until_ns": (
+                        grace_until if heartbeat_grace_active else None
+                    ),
                     "progress_age_seconds": progress_age,
                 }
             )
@@ -2066,7 +2078,16 @@ def collect_snapshot(
         # actor; retain that history for throughput, but check current allocation
         # using the cohorts' own evidence rather than missing broker weights.
         if health.get("state") == "running" and not (
-            coordinator_name == worker_name and health.get("phase") == "shared_cohorts"
+            coordinator_name == worker_name
+            and health.get("phase")
+            in (
+                "shared_cohorts",
+                "arena_gpu_quiescing",
+                "arena_gpu_pause",
+                "arena_gpu_resume",
+                "arena_gpu_resuming",
+                "cohort_draining",
+            )
         ):
             active_actor_rows.append(row)
     if ring10_objective_active:

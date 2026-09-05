@@ -557,6 +557,7 @@ class SelfPlayActor:
         source_role: Literal[
             "champion", "candidate", "history", "unattributed"
         ] = "unattributed",
+        pause_checkpoint: Callable[[], None] | None = None,
     ) -> None:
         self.native = native_module
         self.evaluator = evaluator
@@ -566,6 +567,7 @@ class SelfPlayActor:
         if source_role not in ("champion", "candidate", "history", "unattributed"):
             raise ValueError("self-play source_role is invalid")
         self.source_role = source_role
+        self.pause_checkpoint = pause_checkpoint
         self.model_identity = str(
             getattr(evaluator, "model_identity", evaluator.model_version)
         )
@@ -844,6 +846,8 @@ class SelfPlayActor:
             roots = search.root_requests()
             root_response = self.evaluator.evaluate(roots)
             search.initialize_roots(*root_response.submit_args())
+            if self.pause_checkpoint is not None:
+                self.pause_checkpoint()
             guard = 0
             guard_limit = max(budgets) * self.config.batch_size * 4 + 16
             while not search.is_done():
@@ -855,6 +859,10 @@ class SelfPlayActor:
                     continue
                 response = self.evaluator.evaluate(requests)
                 search.submit(*response.submit_args())
+                if self.pause_checkpoint is not None:
+                    # Keep the native tree and its submitted evaluations alive;
+                    # this safe point does not cancel or restart the search.
+                    self.pause_checkpoint()
             results = search.results()
             swap_available = [bool(value) for value in state_data.swap_available]
             root_values = [float(value) for value in results.root_values]
