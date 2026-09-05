@@ -883,11 +883,20 @@ class PromotionConfig:
     final_drain_timeout_seconds: float = 7_200.0
     max_waves_per_lease: int | None = None
     inter_wave_cooldown_seconds: float = 0.0
+    # Yield at resumable move boundaries; a running search can overrun this slice.
+    session_seconds: float = 300.0
     finish_inflight_candidate: bool = False
 
     def __post_init__(self) -> None:
         if self.cpu_affinity is not None:
             parse_cpu_affinity(self.cpu_affinity)
+        if (
+            isinstance(self.session_seconds, bool)
+            or not isinstance(self.session_seconds, int | float)
+            or not math.isfinite(float(self.session_seconds))
+            or self.session_seconds <= 0
+        ):
+            raise ConfigError("promotion session_seconds must be finite and positive")
         if (
             type(self.enabled) is not bool
             or type(self.bootstrap_initial_champion) is not bool
@@ -937,9 +946,12 @@ class HistoricalEvaluationConfig:
     # at a cheaper budget, these keep the historical Elo ladder on one scale.
     simulations: int | None = None
     max_considered: int | None = None
-    # Measure every new champion against its direct predecessor before the next
-    # candidate is gated, so the ladder link exists at the measurement budget.
+    # Include each new champion's direct predecessor at the measurement budget;
+    # historical sessions yield to actionable promotion candidates.
     measure_direct_predecessor: bool = False
+    # Bound each scheduling slice, preserving completed pairs and game progress.
+    session_seconds: float = 300.0
+    cooldown_seconds: float = 1_800.0
 
     def __post_init__(self) -> None:
         if (
@@ -947,6 +959,20 @@ class HistoricalEvaluationConfig:
             or type(self.measure_direct_predecessor) is not bool
         ):
             raise ConfigError("historical evaluation booleans must be boolean")
+        for name, value, minimum, inclusive in (
+            ("session_seconds", self.session_seconds, 0, False),
+            ("cooldown_seconds", self.cooldown_seconds, 0, True),
+        ):
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, int | float)
+                or not math.isfinite(float(value))
+                or (value < minimum if inclusive else value <= minimum)
+            ):
+                bound = "non-negative" if inclusive else "positive"
+                raise ConfigError(
+                    f"historical evaluation {name} must be finite and {bound}"
+                )
         values = (
             self.every_promotions,
             self.anchors_per_evaluation,

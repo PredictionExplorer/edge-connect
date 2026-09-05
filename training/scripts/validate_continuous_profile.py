@@ -322,10 +322,19 @@ def validate_continuous_config(config: ExperimentConfig) -> None:
     promotion = config.orchestration.promotion
     if (
         not promotion.enabled
+        or promotion.session_seconds > 900
         or config.arena.minimum_pairs_per_ring < config.arena.pairs_per_ring
         or config.arena.max_pairs_per_ring < config.arena.minimum_pairs_per_ring
     ):
         raise ValueError("continuous service requires bounded promotion supervision")
+    historical = config.orchestration.historical_evaluation
+    if historical.enabled and (
+        historical.session_seconds > 900 or historical.cooldown_seconds < 300
+    ):
+        raise ValueError(
+            "continuous historical evaluation requires at most 15-minute "
+            "sessions and at least a five-minute catch-up interval"
+        )
     plateau = config.orchestration.plateau
     if (
         not plateau.enabled

@@ -283,9 +283,12 @@ orchestration:
     final_drain_timeout_seconds: 57600.0
     max_waves_per_lease: 1
     inter_wave_cooldown_seconds: 1800.0
+    session_seconds: 300.0
     finish_inflight_candidate: true
   historical_evaluation:
     enabled: false
+    session_seconds: 300.0
+    cooldown_seconds: 1800.0
     every_promotions: 4
     anchors_per_evaluation: 1
     pairs_per_ring: 10

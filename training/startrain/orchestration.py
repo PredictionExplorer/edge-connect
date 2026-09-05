@@ -140,7 +140,7 @@ def _compatible_autonomous_config_sha256s(experiment: ExperimentConfig) -> set[s
     All other profile fields remain part of the exact recorded hash.
     """
 
-    from .config_compatibility import without_efficiency_defaults
+    from .config_compatibility import compatible_config_epoch_payloads
 
     materialized = experiment.as_dict()
     hashes: set[str] = set()
@@ -148,7 +148,7 @@ def _compatible_autonomous_config_sha256s(experiment: ExperimentConfig) -> set[s
         ("selfplay", "variants", "handicap_classic_share"),
         ("arena", "segment_handicap_classic_share"),
     )
-    for source in (materialized, without_efficiency_defaults(materialized)):
+    for source in compatible_config_epoch_payloads(materialized):
         for mask in range(1 << len(paths)):
             payload = json.loads(json.dumps(source))
             for bit, path in enumerate(paths):

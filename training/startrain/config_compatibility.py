@@ -1,8 +1,8 @@
-"""Explicit compatibility with profiles predating optional efficiency services.
+"""Explicit compatibility with profiles predating additive configuration epochs.
 
-Only semantically inert defaults may be omitted. This is a single release epoch,
-not an exponential search over arbitrary configuration edits. Unknown and
-non-default values remain part of the hash and cannot acquire legacy authority.
+Only known defaults may be omitted through explicit release representations.
+This is not an exponential search over arbitrary configuration edits. Unknown
+and non-default values remain in the hash and cannot acquire legacy authority.
 """
 
 from __future__ import annotations
@@ -10,6 +10,55 @@ from __future__ import annotations
 from copy import deepcopy
 from collections.abc import Mapping
 from typing import Any
+
+
+def without_evaluation_session_defaults(
+    payload: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Represent the release before resumable evaluation scheduling defaults.
+
+    Scheduling limits do not change evaluation evidence, model identity, or
+    optimizer budgets. Preserve every explicit non-default in hash authority.
+    """
+
+    result = deepcopy(dict(payload))
+    orchestration = result.get("orchestration")
+    if not isinstance(orchestration, dict):
+        return result
+    for section, defaults in (
+        ("promotion", {"session_seconds": 300.0}),
+        (
+            "historical_evaluation",
+            {"session_seconds": 300.0, "cooldown_seconds": 1_800.0},
+        ),
+    ):
+        parent = orchestration.get(section)
+        if not isinstance(parent, dict):
+            continue
+        for name, default in defaults.items():
+            if type(parent.get(name)) is type(default) and parent[name] == default:
+                del parent[name]
+    return result
+
+
+def compatible_config_epoch_payloads(
+    payload: Mapping[str, Any],
+) -> tuple[dict[str, Any], ...]:
+    """Preserve existing efficiency-default guards with and without sessions.
+
+    Existing independent compatibility guards for older additions can operate
+    on each representation. The new scheduling fields strip as one release
+    block, without multiplying by every newly added field or dropping a
+    previously accepted representation that retained scheduling defaults.
+    """
+
+    pre_session = without_evaluation_session_defaults(payload)
+    return (
+        deepcopy(dict(payload)),
+        without_efficiency_defaults(payload),
+        pre_session,
+        without_efficiency_defaults(pre_session),
+    )
 
 
 def without_efficiency_defaults(payload: Mapping[str, Any]) -> dict[str, Any]:

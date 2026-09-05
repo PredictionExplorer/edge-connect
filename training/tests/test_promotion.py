@@ -1371,11 +1371,11 @@ def test_historical_crossplay_persists_bounded_waves_without_promoting(
     assert not case.publisher.champion_path.exists()
 
 
-def test_measurement_link_runs_before_waiting_candidate_at_its_own_budget(
+def test_waiting_candidate_precedes_measurement_link_at_its_own_budget(
     tmp_path,
     monkeypatch,
 ) -> None:
-    """A promoted champion is linked to its predecessor before the next gate."""
+    """Gate ready candidates before spending idle time on predecessor links."""
 
     case = _promotion_wave_case(tmp_path, monkeypatch)
     case.supervisor.experiment = replace(
@@ -1450,12 +1450,6 @@ def test_measurement_link_runs_before_waiting_candidate_at_its_own_budget(
     def progress(**details) -> None:
         phases.append(details)
 
-    # First pass: the measurement link runs even though a candidate waits, and
-    # it is not yielded to that candidate.
-    assert (
-        case.supervisor.run(stop_requested=lambda: False, progress=progress, once=True)
-        == 1
-    )
     crossplay_path = (
         tmp_path
         / "arena"
@@ -1464,25 +1458,38 @@ def test_measurement_link_runs_before_waiting_candidate_at_its_own_budget(
             f"{case.champion.model_identity}.json"
         )
     )
+    # Finish the waiting candidate's three waves at the promotion budget.
+    for _ in range(3):
+        assert (
+            case.supervisor.run(
+                stop_requested=lambda: False, progress=progress, once=True
+            )
+            == 1
+        )
+        assert not crossplay_path.exists()
+    gated = json.loads(
+        case.supervisor._result_path(waiting, case.candidate).read_text()
+    )
+    assert gated["terminal"] is True
+    assert configured_budgets == [(1, 2)] * 3
+
+    # Terminal candidates do not starve idle historical work.
+    assert (
+        case.supervisor.run(stop_requested=lambda: False, progress=progress, once=True)
+        == 1
+    )
     measurement = json.loads(crossplay_path.read_text(encoding="utf-8"))
     assert measurement["result_kind"] == "historical_crossplay"
     assert measurement["crossplay_kind"] == "measurement"
     assert measurement["terminal"] is True
     assert measurement["promotion"]["decision"] == "evaluation"
-    assert configured_budgets == [(16, 4)]
+    assert configured_budgets == [(1, 2)] * 3 + [(16, 4)]
     assert any(
         item.get("phase") == "historical_crossplay"
         and item.get("crossplay_kind") == "measurement"
         and item.get("simulations") == 16
         for item in phases
     )
-    assert not case.supervisor._result_path(waiting, case.candidate).exists()
-
-    # Second pass: the link exists, so the waiting candidate is gated at the
-    # arena's own budget.
-    case.supervisor.run(stop_requested=lambda: False, progress=progress, once=True)
-    assert configured_budgets == [(16, 4), (1, 2)]
-    assert case.supervisor._result_path(waiting, case.candidate).exists()
 
 
 def test_promotion_stop_persists_wave_and_once_resumes_next_pair_indices(

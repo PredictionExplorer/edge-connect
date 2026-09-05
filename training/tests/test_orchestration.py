@@ -450,8 +450,9 @@ def test_autonomous_run_provenance_rejects_imports_and_profile_drift(
 
 @pytest.mark.parametrize("omitted_mask", [1, 2, 3])
 @pytest.mark.parametrize("prior_efficiency_epoch", [False, True])
+@pytest.mark.parametrize("prior_session_epoch", [False, True])
 def test_autonomous_resume_accepts_only_unchanged_omitted_handicap_defaults(
-    tmp_path, omitted_mask, prior_efficiency_epoch
+    tmp_path, omitted_mask, prior_efficiency_epoch, prior_session_epoch
 ) -> None:
     configured = load_config(CONFIGS / "h100-8gpu-autonomous.yaml")
     configured = replace(
@@ -469,6 +470,10 @@ def test_autonomous_resume_accepts_only_unchanged_omitted_handicap_defaults(
     ensure_autonomous_provenance(configured, directories, identity)
     provenance = json.loads(directories.autonomous_provenance.read_text())
     legacy_config = configured.as_dict()
+    if prior_session_epoch:
+        from startrain.config_compatibility import without_evaluation_session_defaults
+
+        legacy_config = without_evaluation_session_defaults(legacy_config)
     if prior_efficiency_epoch:
         from startrain.config_compatibility import without_efficiency_defaults
 
@@ -500,6 +505,25 @@ def test_autonomous_resume_accepts_only_unchanged_omitted_handicap_defaults(
             arena=replace(configured.arena, segment_handicap_classic_share=0.5),
         ),
         replace(configured, train=replace(configured.train, per_rank_batch_size=256)),
+        replace(
+            configured,
+            orchestration=replace(
+                configured.orchestration,
+                promotion=replace(
+                    configured.orchestration.promotion, session_seconds=120.0
+                ),
+            ),
+        ),
+        replace(
+            configured,
+            orchestration=replace(
+                configured.orchestration,
+                historical_evaluation=replace(
+                    configured.orchestration.historical_evaluation,
+                    cooldown_seconds=3600.0,
+                ),
+            ),
+        ),
         replace(
             configured, selfplay=replace(configured.selfplay, exact_endgame_max_empty=4)
         ),

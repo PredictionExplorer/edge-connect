@@ -52,7 +52,9 @@ def _fixture(
     old_raw["orchestration"]["directories"]["root"] = str(root)
     old_raw["orchestration"]["autonomous"] = {"enabled": False}
     old_raw["orchestration"]["promotion"]["finish_inflight_candidate"] = False
-    old_raw["arena"]["continuation_pairs_per_ring"] = 150
+    old_raw["arena"]["continuation_pairs_per_ring"] = min(
+        150, old_raw["arena"]["max_pairs_per_ring"]
+    )
 
     old_profile = root / "profile-throughput-v1.yaml"
     old_profile.write_text(yaml.safe_dump(old_raw, sort_keys=False), encoding="utf-8")
@@ -77,7 +79,9 @@ def _fixture(
         target_raw["learner"]["max_replay_lag_steps"]
     )
     target_raw["orchestration"]["promotion"]["finish_inflight_candidate"] = True
-    target_raw["arena"]["continuation_pairs_per_ring"] = 25
+    target_raw["arena"]["continuation_pairs_per_ring"] = min(
+        25, target_raw["arena"]["max_pairs_per_ring"]
+    )
     candidate_profile = tmp_path / "profile-candidate.yaml"
     candidate_profile.write_text(
         yaml.safe_dump(target_raw, sort_keys=False),
@@ -587,10 +591,10 @@ def test_additive_default_field_accepts_legacy_chain_hash(tmp_path: Path) -> Non
                 *(path for bit, path in enumerate(additive) if mask >> bit & 1)
             )
         )
-    # The efficiency-services release adds one explicitly stripped prior epoch,
-    # while retaining every previously supported additive-default combination.
+    # Session scheduling retains both existing efficiency representations,
+    # while preserving every previously supported additive-default combination.
     assert expected <= compatible
-    assert len(compatible) == 2 * len(expected)
+    assert len(compatible) == 4 * len(expected)
     # A profile that opts into a new field no longer matches releases that
     # never had it, but keeps the variants for the other additive fields.
     opted = yaml.safe_load(fixture.old_profile.read_text(encoding="utf-8"))
@@ -599,7 +603,7 @@ def test_additive_default_field_accepts_legacy_chain_hash(tmp_path: Path) -> Non
     opted_path = tmp_path / "opted.yaml"
     opted_path.write_text(yaml.safe_dump(opted, sort_keys=False), encoding="utf-8")
     opted_config = load_config(opted_path)
-    assert len(migration._compatible_source_config_sha256s(opted_config)) == 16
+    assert len(migration._compatible_source_config_sha256s(opted_config)) == 32
 
     opted.setdefault("selfplay", {}).setdefault("variants", {})[
         "handicap_classic_share"
@@ -607,11 +611,19 @@ def test_additive_default_field_accepts_legacy_chain_hash(tmp_path: Path) -> Non
     opted.setdefault("arena", {})["segment_handicap_classic_share"] = 0.5
     opted_path.write_text(yaml.safe_dump(opted, sort_keys=False), encoding="utf-8")
     assert (
-        len(migration._compatible_source_config_sha256s(load_config(opted_path))) == 4
+        len(migration._compatible_source_config_sha256s(load_config(opted_path))) == 8
     )
 
-    # The head a release without the plateau additions recorded.
-    legacy_hash = hash_without(count, restore, handicap, arena_handicap)
+    # The head a release without scheduling or plateau additions recorded.
+    legacy_hash = hash_without(
+        count,
+        restore,
+        handicap,
+        arena_handicap,
+        ("orchestration", "promotion", "session_seconds"),
+        ("orchestration", "historical_evaluation", "session_seconds"),
+        ("orchestration", "historical_evaluation", "cooldown_seconds"),
+    )
     source_profile_sha256 = hashlib.sha256(fixture.old_profile_bytes).hexdigest()
     record = {
         "schema_version": 1,
@@ -862,6 +874,53 @@ def test_gate_budget_and_measurement_crossplay_are_migratable(tmp_path: Path) ->
         "orchestration.historical_evaluation.measure_direct_predecessor",
     } <= changed
     assert not any(path.startswith("optimizer") for path in changed)
+
+
+def test_evaluation_scheduling_migration_preserves_contract_and_pending_evidence(
+    tmp_path: Path,
+) -> None:
+    from startrain.balanced_evaluation import evaluation_contract
+
+    fixture = _fixture(tmp_path, "h100-8gpu-variant-efficiency-stage-b.yaml")
+    old_config = load_config(fixture.old_profile)
+    target = yaml.safe_load(fixture.old_profile.read_text())
+    target["orchestration"]["promotion"].update(
+        session_seconds=120.0, inter_wave_cooldown_seconds=600.0
+    )
+    target["orchestration"]["historical_evaluation"].update(
+        session_seconds=150.0, cooldown_seconds=3600.0
+    )
+    fixture.candidate_profile.write_text(yaml.safe_dump(target, sort_keys=False))
+    pending = fixture.root / "arena" / "pending-balanced.json"
+    _write_json(
+        pending,
+        {
+            "result_kind": "promotion",
+            "terminal": False,
+            "evaluation_contract": evaluation_contract(old_config.arena),
+            "pairs": [{"pair_seed": 123, "score": 0.5}],
+        },
+    )
+    pending_bytes = pending.read_bytes()
+
+    result = migration.migrate_continuous_profile(fixture.request, apply=True)
+
+    assert {change["path"] for change in result["changes"]} == {
+        "orchestration.promotion.session_seconds",
+        "orchestration.promotion.inter_wave_cooldown_seconds",
+        "orchestration.historical_evaluation.session_seconds",
+        "orchestration.historical_evaluation.cooldown_seconds",
+    }
+    active = load_config(fixture.root / fixture.target_name)
+    assert evaluation_contract(active.arena) == evaluation_contract(old_config.arena)
+    for section in ("game", "model", "optimizer", "learner", "train", "arena"):
+        assert getattr(active, section) == getattr(old_config, section)
+    assert active.orchestration.historical_evaluation.search_budget(active.arena) == (
+        old_config.orchestration.historical_evaluation.search_budget(old_config.arena)
+    )
+    assert pending.read_bytes() == pending_bytes
+    record = json.loads((fixture.root / "continuous-migrations.jsonl").read_text())
+    assert "evaluation_contract_transition" not in record
 
 
 def _with_update_to_data(

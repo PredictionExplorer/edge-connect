@@ -25,7 +25,7 @@ import torch
 
 from startrain.checkpoint import CHECKPOINT_FORMAT, CHECKPOINT_VERSION
 from startrain.config import ExperimentConfig, load_config
-from startrain.config_compatibility import without_efficiency_defaults
+from startrain.config_compatibility import compatible_config_epoch_payloads
 
 if __package__:
     from scripts.validate_continuous_profile import validate_continuous_config
@@ -60,6 +60,11 @@ _ALLOWED_PROFILE_PATHS = {
     ("orchestration", "plateau", "count_inconclusive_rejections"),
     ("orchestration", "plateau", "restore_learning_rate_scale"),
     ("orchestration", "promotion", "finish_inflight_candidate"),
+    # Evaluation scheduling changes only when work runs, never its evidence.
+    ("orchestration", "promotion", "session_seconds"),
+    ("orchestration", "promotion", "inter_wave_cooldown_seconds"),
+    ("orchestration", "historical_evaluation", "session_seconds"),
+    ("orchestration", "historical_evaluation", "cooldown_seconds"),
     ("arena", "continuation_pairs_per_ring"),
     # Promotion-gate budget and the measurement crossplay that keeps the Elo
     # ladder on one search scale. These change arena evidence only; model,
@@ -365,10 +370,9 @@ def _without_field(
 
 def _compatible_source_config_sha256s(config: ExperimentConfig) -> set[str]:
     materialized = config.as_dict()
-    variants: list[dict[str, object]] = [
-        dict(materialized),
-        without_efficiency_defaults(materialized),
-    ]
+    variants: list[dict[str, object]] = list(
+        compatible_config_epoch_payloads(materialized)
+    )
     for path, default in _ADDITIVE_DEFAULT_FIELDS:
         current = materialized
         for key in path:

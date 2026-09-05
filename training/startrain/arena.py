@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import json
 import random
 import time
 import threading
@@ -14,7 +15,7 @@ from statistics import NormalDist
 from typing import Any, Iterator, Literal, Protocol, cast
 
 from .config import ArenaConfig
-from .contracts import SEGMENT_STANDARD
+from .contracts import RULES_HASH, SEGMENT_STANDARD
 from .inference import GraphInferenceAdapter, InferenceResponse, NativeEvalBatchProtocol
 from .inference_batching import BoundedInferenceBroker
 from .native import BITBOARD_WORDS
@@ -1372,6 +1373,10 @@ class ArenaRunner:
         self._inference_calls = 0
         self._inference_seconds = 0.0
         self._inference_queue_wait_seconds = 0.0
+        self._resume_lock = threading.Lock()
+        self._resume_contract: dict[str, object] | None = None
+        self._resume_games: dict[tuple[int, str, int, int], dict[str, Any]] = {}
+        self._checkpoint: Callable[[dict[str, object]], None] | None = None
 
     def run(
         self,
@@ -1381,7 +1386,17 @@ class ArenaRunner:
         pair_counts: Mapping[int, int] | None = None,
         stop_requested: Callable[[], bool] | None = None,
         previous_pairs: Sequence[ArenaPair] | None = None,
+        resume_state: Mapping[str, object] | None = None,
+        checkpoint: Callable[[dict[str, object]], None] | None = None,
     ) -> dict[str, object]:
+        """Run an arena wave, optionally retaining exact game positions on stop.
+
+        Checkpoints contain completed games and searched action histories. A
+        stopped search restarts only its current move; completed moves and lone
+        finished seats survive. Stable per-game seeds make regrouping resumed
+        games independent of which other games have already finished.
+        """
+        self._initialize_resume(resume_state, checkpoint)
         started_ns = time.time_ns()
         started = time.perf_counter()
         should_stop = stop_requested or (lambda: False)
@@ -1562,7 +1577,7 @@ class ArenaRunner:
         baseline_metadata["search_budget"] = self.baseline_search.metadata()
         baseline_metadata["deterministic"] = True
         baseline_metadata["seed_schedule"] = "arena-runner-v2-pair-chunks"
-        return {
+        result: dict[str, object] = {
             "schema_version": ARENA_RESULT_SCHEMA_VERSION,
             "candidate": self.candidate.model_version,
             "baseline": self.baseline.model_version,
@@ -1624,6 +1639,199 @@ class ArenaRunner:
             "games": [asdict(game) for game in games],
             "pairs": [asdict(pair) for pair in pairs],
         }
+        if self._resume_contract is not None:
+            with self._resume_lock:
+                result["resume_state"] = self._resume_snapshot()
+        return result
+
+    def _initialize_resume(
+        self,
+        resume_state: Mapping[str, object] | None,
+        checkpoint: Callable[[dict[str, object]], None] | None,
+    ) -> None:
+        self._resume_contract = None
+        self._resume_games = {}
+        self._checkpoint = checkpoint
+        if resume_state is None and checkpoint is None:
+            return
+        if not self.stable_pair_seeds:
+            raise ValueError("resumable arena requires stable pair seeds")
+        # Normalize tuples and integer mapping keys to their JSON round-trip
+        # representation so an on-disk checkpoint compares identically.
+        contract = json.loads(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "candidate": self.candidate.model_version,
+                    "baseline": self.baseline.model_version,
+                    "rules_hash": RULES_HASH,
+                    "seed_stream_policy": "independent-cell-pair-seat-move-v2",
+                    "config": asdict(self.config),
+                    "candidate_search": self.candidate_search.metadata(),
+                    "baseline_search": self.baseline_search.metadata(),
+                }
+            )
+        )
+        if resume_state is not None:
+            if any(resume_state.get(key) != value for key, value in contract.items()):
+                raise ValueError(
+                    "arena resume state disagrees with evaluation contract"
+                )
+            entries = resume_state.get("game_states")
+            if not isinstance(entries, list):
+                raise ValueError("arena resume state requires game_states")
+            for value in entries:
+                if not isinstance(value, dict):
+                    raise ValueError("arena resume game state must be an object")
+                entry = json.loads(json.dumps(value))
+                try:
+                    ring, variant, pair, seat = (
+                        entry["ring"],
+                        entry["variant"],
+                        entry["pair"],
+                        entry["candidate_player"],
+                    )
+                    parsed = GameVariant.parse(variant)
+                    actions = entry["actions"]
+                    node_count = get_topology(ring).n
+                    if (
+                        ring not in self.config.rings
+                        or type(pair) is not int
+                        or pair < 0
+                        or type(seat) is not int
+                        or seat not in (0, 1)
+                        or not isinstance(actions, list)
+                        or len(actions) > node_count + 1
+                        or any(
+                            type(action) is not int
+                            or not 0 <= action <= node_count
+                            or (action == node_count and not parsed.pie)
+                            for action in actions
+                        )
+                    ):
+                        raise ValueError("invalid arena resume game state")
+                    if self.config.balanced_cells and not any(
+                        cell_variant(name, pair, self.config) == parsed
+                        for name in BALANCED_CATEGORIES
+                    ):
+                        raise ValueError(
+                            "arena resume variant disagrees with balanced cell schedule"
+                        )
+                    expected = self._pair_specifications(ring, [pair], parsed)[seat]
+                    if (entry["opening_seed"], entry["opening_action"]) != expected[2:]:
+                        raise ValueError(
+                            "arena resume opening disagrees with seed schedule"
+                        )
+                    completed = entry.get("result")
+                    if completed is not None:
+                        game = ArenaGame(**completed)
+                        if (
+                            (game.ring, game.variant, game.pair, game.candidate_player)
+                            != (ring, variant, pair, seat)
+                            or game.searched_moves != len(actions)
+                            or game.opening_seed != entry["opening_seed"]
+                            or game.opening_action != entry["opening_action"]
+                            or game.swapped != (node_count in actions)
+                            or game.pda != max(self._pda_seats(parsed))
+                        ):
+                            raise ValueError(
+                                "arena resume result disagrees with game state"
+                            )
+                    key = (ring, variant, pair, seat)
+                    if key in self._resume_games:
+                        raise ValueError("duplicate arena resume game state")
+                    self._resume_games[key] = entry
+                except (KeyError, TypeError) as error:
+                    raise ValueError("malformed arena resume game state") from error
+        self._resume_contract = contract
+
+    def _resume_actions(
+        self,
+        ring: int,
+        variant: GameVariant,
+        specification: tuple[int, int, int, int | None],
+    ) -> list[int]:
+        key = (ring, variant.label, specification[0], specification[1])
+        with self._resume_lock:
+            entry = self._resume_games.get(key)
+            return list(entry["actions"]) if entry is not None else []
+
+    def _save_resume_games(
+        self,
+        ring: int,
+        variant: GameVariant,
+        specifications: Sequence[tuple[int, int, int, int | None]],
+        actions: Sequence[Sequence[int]],
+        results: Sequence[ArenaGame],
+    ) -> None:
+        if self._resume_contract is None:
+            return
+        completed = {(game.pair, game.candidate_player): game for game in results}
+        with self._resume_lock:
+            for specification, history in zip(specifications, actions, strict=True):
+                pair, seat, opening_seed, opening_action = specification
+                game = completed.get((pair, seat))
+                self._resume_games[(ring, variant.label, pair, seat)] = {
+                    "ring": ring,
+                    "variant": variant.label,
+                    "pair": pair,
+                    "candidate_player": seat,
+                    "opening_seed": opening_seed,
+                    "opening_action": opening_action,
+                    "actions": list(history),
+                    "result": asdict(game) if game is not None else None,
+                }
+            if self._checkpoint is not None:
+                # Serialize callbacks across parallel variant groups. Each
+                # callback receives its own snapshot, never mutable live state.
+                self._checkpoint(self._resume_snapshot())
+
+    def _resume_snapshot(self) -> dict[str, object]:
+        entries = [self._resume_games[key] for key in sorted(self._resume_games)]
+        games = [
+            entry["result"] for entry in entries if entry.get("result") is not None
+        ]
+        grouped: dict[tuple[int, str, int], dict[int, dict[str, Any]]] = {}
+        for game in games:
+            grouped.setdefault((game["ring"], game["variant"], game["pair"]), {})[
+                game["candidate_player"]
+            ] = game
+        pairs = []
+        for seats in grouped.values():
+            if set(seats) != {0, 1}:
+                continue
+            first, second = seats[0], seats[1]
+            pairs.append(
+                asdict(
+                    ArenaPair(
+                        ring=first["ring"],
+                        pair=first["pair"],
+                        opening_seed=first["opening_seed"],
+                        opening_action=first["opening_action"],
+                        forced_opening=first["forced_opening"],
+                        outcomes=(first["outcome"], second["outcome"]),
+                        variant=first["variant"],
+                        segment=first["segment"],
+                    )
+                )
+            )
+        return json.loads(
+            json.dumps(
+                {
+                    **cast(dict[str, object], self._resume_contract),
+                    "game_states": entries,
+                    "games": games,
+                    "pairs": pairs,
+                    "progress": {
+                        "completed_games": len(games),
+                        "completed_pairs": len(pairs),
+                        "completed_moves": sum(
+                            len(entry["actions"]) for entry in entries
+                        ),
+                    },
+                }
+            )
+        )
 
     @contextmanager
     def _inference_owner(self) -> Iterator[Executor]:
@@ -1782,13 +1990,34 @@ class ArenaRunner:
             inference_executor=inference_executor,
             stop_requested=stop_requested,
         )
-        if len(ring_games) % 2:
+        if self._resume_contract is not None:
+            # A completed seat is durable even when its role reversal is still
+            # in progress. Only complete pairs enter normal arena statistics.
+            by_pair: dict[int, dict[int, ArenaGame]] = {}
+            for game in ring_games:
+                by_pair.setdefault(game.pair, {})[game.candidate_player] = game
+            complete_games = []
+            for index in dict.fromkeys(
+                specification[0] for specification in specifications
+            ):
+                seats = by_pair.get(index, {})
+                if set(seats) != {0, 1}:
+                    if not self.config.balanced_cells:
+                        # Legacy continuation advances its pair index past
+                        # reported results. Keep its prefix contract; later
+                        # completed games remain durable in the resume state.
+                        break
+                    continue
+                complete_games.extend(seats[seat] for seat in (0, 1))
+        else:
+            complete_games = ring_games
+        if len(complete_games) % 2:
             raise RuntimeError(
                 "arena cancellation produced an incomplete role-reversed pair"
             )
-        games.extend(ring_games)
-        for offset in range(0, len(ring_games), 2):
-            pair_games = ring_games[offset : offset + 2]
+        games.extend(complete_games)
+        for offset in range(0, len(complete_games), 2):
+            pair_games = complete_games[offset : offset + 2]
             pair = pair_games[0].pair
             if pair_games[1].pair != pair or {
                 pair_games[0].candidate_player,
@@ -1851,6 +2080,23 @@ class ArenaRunner:
         importer = getattr(self.native.StateBatch, "from_semantic", None)
         if not callable(importer):
             output: list[ArenaGame] = []
+            if self._resume_contract is not None:
+                for pair, seat, seed, opening in specifications:
+                    if stop_requested():
+                        break
+                    game = self._play_game(
+                        ring=ring,
+                        pair=pair,
+                        candidate_player=seat,
+                        opening_seed=seed,
+                        opening_action=opening,
+                        variant=variant,
+                        inference_executor=inference_executor,
+                        stop_requested=stop_requested,
+                    )
+                    if game is not None:
+                        output.append(game)
+                return output
             for offset in range(0, len(specifications), 2):
                 if stop_requested():
                     break
@@ -1899,6 +2145,24 @@ class ArenaRunner:
             )
         searched_moves = [0] * len(specifications)
         swapped = [False] * len(specifications)
+        histories = [
+            self._resume_actions(ring, variant, specification)
+            if self._resume_contract is not None
+            else []
+            for specification in specifications
+        ]
+        # Replaying placements is cheap and reconstructs every rule-specific
+        # native state field, including pie swaps and turn-history bitboards.
+        for move in range(max((len(history) for history in histories), default=0)):
+            replay_rows = [
+                row for row, history in enumerate(histories) if len(history) > move
+            ]
+            states.apply_many(
+                replay_rows, [histories[row][move] for row in replay_rows]
+            )
+        for row, history in enumerate(histories):
+            searched_moves[row] = len(history)
+            swapped[row] = node_count in history
         wave = 0
         maximum_moves = node_count + 1
         with ThreadPoolExecutor(
@@ -1976,20 +2240,37 @@ class ArenaRunner:
                         )
                     )
                 search_results = [future.result() for future in futures]
-                if any(result is None for result in search_results):
+                cancelled = any(result is None for result in search_results)
+                if cancelled and self._resume_contract is None:
                     break
                 for result in search_results:
-                    assert result is not None
+                    if result is None:
+                        continue
                     rows, actions = result
                     states.apply_many(rows, actions)
                     for row, action in zip(rows, actions, strict=True):
                         searched_moves[row] += 1
+                        histories[row].append(action)
                         if action == node_count:
                             swapped[row] = True
                         if searched_moves[row] > maximum_moves:
                             raise RuntimeError(
                                 "batched arena game exceeded the move bound"
                             )
+                if self._resume_contract is not None:
+                    completed_games = self._terminal_batch_games(
+                        ring,
+                        specifications,
+                        variant,
+                        states,
+                        searched_moves,
+                        swapped,
+                    )
+                    self._save_resume_games(
+                        ring, variant, specifications, histories, completed_games
+                    )
+                if cancelled:
+                    break
                 wave += 1
                 if progress is not None and wave % 16 == 0:
                     progress(
@@ -1999,6 +2280,17 @@ class ArenaRunner:
                         active_games=len(active),
                         wave=wave,
                     )
+        if self._resume_contract is not None:
+            output = self._terminal_batch_games(
+                ring,
+                specifications,
+                variant,
+                states,
+                searched_moves,
+                swapped,
+            )
+            self._save_resume_games(ring, variant, specifications, histories, output)
+            return output
         terminal = [bool(value) for value in states.data().terminal]
         winners = [int(value) for value in states.score_data().winner]
         output = []
@@ -2031,6 +2323,42 @@ class ArenaRunner:
                         segment=variant.segment,
                         swapped=swapped[row],
                         pda=max(pda_seats),
+                    )
+                )
+        return output
+
+    def _terminal_batch_games(
+        self,
+        ring: int,
+        specifications: Sequence[tuple[int, int, int, int | None]],
+        variant: GameVariant,
+        states: Any,
+        searched_moves: Sequence[int],
+        swapped: Sequence[bool],
+    ) -> list[ArenaGame]:
+        terminal = [bool(value) for value in states.data().terminal]
+        winners = [int(value) for value in states.score_data().winner]
+        output = []
+        for row, (pair, seat, seed, opening) in enumerate(specifications):
+            if terminal[row]:
+                winner = winners[row]
+                if winner not in (0, 1):
+                    raise RuntimeError("arena terminal result cannot be tied")
+                output.append(
+                    ArenaGame(
+                        ring=ring,
+                        pair=pair,
+                        candidate_player=seat,
+                        opening_seed=seed,
+                        opening_action=opening,
+                        forced_opening=opening is not None,
+                        winner=winner,
+                        outcome=1 if winner == seat else -1,
+                        searched_moves=searched_moves[row],
+                        variant=variant.label,
+                        segment=variant.segment,
+                        swapped=swapped[row],
+                        pda=max(self._pda_seats(variant)),
                     )
                 )
         return output
@@ -2191,6 +2519,8 @@ class ArenaRunner:
         inference_executor: Executor,
         stop_requested: Callable[[], bool],
     ) -> ArenaGame | None:
+        specification = (pair, candidate_player, opening_seed, opening_action)
+        history = self._resume_actions(ring, variant, specification)
         states = self.native.StateBatch(
             ring, 1, mode=variant.mode, handicap=variant.handicap, pie=variant.pie
         )
@@ -2200,15 +2530,20 @@ class ArenaRunner:
         # role reversal cannot alter it; in a pie game the responder may swap.
         if opening_action is not None:
             states.apply_many([0], [opening_action])
-        moves = 0
-        swapped = False
+        for action in history:
+            states.apply_many([0], [action])
+        moves = len(history)
+        swapped = node_count in history
         maximum_moves = node_count + 1
         while True:
-            if stop_requested():
+            if self._resume_contract is None and stop_requested():
                 return None
             state_data = states.data()
             if bool(state_data.terminal[0]):
                 break
+            if stop_requested():
+                self._save_resume_games(ring, variant, [specification], [history], [])
+                return None
             player = int(state_data.to_move[0])
             evaluator = self.candidate if player == candidate_player else self.baseline
             budget = (
@@ -2240,19 +2575,23 @@ class ArenaRunner:
                 ),
             )
             if result is None:
+                self._save_resume_games(ring, variant, [specification], [history], [])
                 return None
             action = result[1][0]
             if action == node_count:
                 swapped = True
             states.apply_many([0], [action])
             moves += 1
+            history.append(action)
             if moves > maximum_moves:
                 raise RuntimeError("arena game exceeded the move bound")
+            if not bool(states.data().terminal[0]):
+                self._save_resume_games(ring, variant, [specification], [history], [])
         winner = int(states.score_data().winner[0])
         if winner not in (0, 1):
             raise RuntimeError("arena terminal result cannot be tied")
         outcome = 1 if winner == candidate_player else -1
-        return ArenaGame(
+        game = ArenaGame(
             ring=ring,
             pair=pair,
             candidate_player=candidate_player,
@@ -2267,6 +2606,8 @@ class ArenaRunner:
             swapped=swapped,
             pda=max(pda_seats),
         )
+        self._save_resume_games(ring, variant, [specification], [history], [game])
+        return game
 
 
 def _expected_score(elo: float) -> float:
