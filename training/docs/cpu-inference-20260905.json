@@ -1,0 +1,74 @@
+{
+  "schema_version": 1,
+  "date_utc": "2026-09-05",
+  "cpu_model": "Intel Xeon Platinum 8480+; two sockets, 104 physical cores, 208 logical CPUs",
+  "sampled_cpu_busy_percent": 9.44,
+  "sampled_cpu_idle_percent": 90.56,
+  "sample_duration_seconds": 15,
+  "available_memory_approx_tib": 1.6,
+  "conditions": "Read-only checkpoint load, CPU-only eager BF16 full-network forward with synthetic inputs, actual champion weights at step19532, batch8/32, one warmup and two timed repetitions, CPU affinity0-103. Production training remained active. Not compiled, quantized, or end-to-end self-play; no linear scaling claim.",
+  "benchmark": {
+    "benchmark": "CPU eager BF16 synthetic full-network forward",
+    "checkpoint_step": 19532,
+    "parameters": 17402775,
+    "torch": "2.13.0+cu130"
+  },
+  "results": [
+    {
+      "threads": 8,
+      "ring": 4,
+      "batch": 8,
+      "latency_seconds": 0.09008594101760536,
+      "rows_per_second": 88.8040898461234
+    },
+    {
+      "threads": 8,
+      "ring": 4,
+      "batch": 32,
+      "latency_seconds": 0.228556549991481,
+      "rows_per_second": 140.00911372346465
+    },
+    {
+      "threads": 8,
+      "ring": 10,
+      "batch": 8,
+      "latency_seconds": 0.2977595638949424,
+      "rows_per_second": 26.867315008637693
+    },
+    {
+      "threads": 8,
+      "ring": 10,
+      "batch": 32,
+      "latency_seconds": 1.826033597579226,
+      "rows_per_second": 17.52432159102791
+    },
+    {
+      "threads": 16,
+      "ring": 4,
+      "batch": 8,
+      "latency_seconds": 0.0497669514734298,
+      "rows_per_second": 160.74924750556883
+    },
+    {
+      "threads": 16,
+      "ring": 4,
+      "batch": 32,
+      "latency_seconds": 0.12017264089081436,
+      "rows_per_second": 266.2835713918806
+    },
+    {
+      "threads": 16,
+      "ring": 10,
+      "batch": 8,
+      "latency_seconds": 0.16628066287375987,
+      "rows_per_second": 48.11142716019597
+    },
+    {
+      "threads": 16,
+      "ring": 10,
+      "batch": 32,
+      "latency_seconds": 1.1174190379679203,
+      "rows_per_second": 28.637421515739987
+    }
+  ]
+}

@@ -133,6 +133,41 @@ def _autonomous_config_sha256(experiment: ExperimentConfig) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _compatible_autonomous_config_sha256s(experiment: ExperimentConfig) -> set[str]:
+    """Accept old hashes only when omitted handicap shares still mean zero.
+
+    This does not rewrite frozen provenance or permit a changed allocation.
+    All other profile fields remain part of the exact recorded hash.
+    """
+
+    from .config_compatibility import without_efficiency_defaults
+
+    materialized = experiment.as_dict()
+    hashes: set[str] = set()
+    paths = (
+        ("selfplay", "variants", "handicap_classic_share"),
+        ("arena", "segment_handicap_classic_share"),
+    )
+    for source in (materialized, without_efficiency_defaults(materialized)):
+        for mask in range(1 << len(paths)):
+            payload = json.loads(json.dumps(source))
+            for bit, path in enumerate(paths):
+                if not mask & (1 << bit):
+                    continue
+                parent = payload
+                for key in path[:-1]:
+                    parent = parent[key]
+                if type(parent[path[-1]]) is not float or parent[path[-1]] != 0.0:
+                    break
+                del parent[path[-1]]
+            else:
+                encoded = json.dumps(
+                    payload, sort_keys=True, separators=(",", ":")
+                ).encode("utf-8")
+                hashes.add(hashlib.sha256(encoded).hexdigest())
+    return hashes
+
+
 def _autonomous_artifacts(directories: RunDirectories) -> tuple[Path, ...]:
     candidates = (
         directories.replay / "manifest.sqlite3",
@@ -198,6 +233,15 @@ def ensure_autonomous_provenance(
             payload = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
             raise ValueError(f"cannot read autonomous provenance: {exc}") from exc
+        recorded_hash = (
+            payload.get("config_sha256") if isinstance(payload, dict) else None
+        )
+        if isinstance(recorded_hash, str) and recorded_hash in (
+            _compatible_autonomous_config_sha256s(experiment)
+        ):
+            # Compare every provenance field while retaining its original hash
+            # and bytes, including provenance authored before these defaults.
+            expected["config_sha256"] = recorded_hash
         if payload != expected:
             raise ValueError(
                 "autonomous provenance disagrees with the frozen run profile"
@@ -359,6 +403,8 @@ def build_worker_specs(
         cpu_threads=learner_threads,
         cpu_affinity=learner_affinity,
         device=worker_device,
+        native_threads=learner_gpus[0].native_threads,
+        blas_threads=learner_gpus[0].blas_threads,
     )
     learner_failure_path = directories.status / "learner.failure.json"
     learner_environment.update(
@@ -450,6 +496,8 @@ def build_worker_specs(
                 cpu_threads=gpu.cpu_threads,
                 cpu_affinity=affinity,
                 device=worker_device,
+                native_threads=gpu.native_threads,
+                blas_threads=gpu.blas_threads,
             )
             actor_environment.update(
                 _worker_failure_environment(
@@ -500,6 +548,66 @@ def build_worker_specs(
                     cpu_affinity=affinity,
                 )
             )
+    for index, cpu in enumerate(orchestration.cpu_actors):
+        name = cpu.actor_id
+        assert cpu.cpu_affinity is not None
+        affinity = parse_cpu_affinity(cpu.cpu_affinity)
+        failure_path = directories.status / f"{name}.failure.json"
+        actor_environment = _worker_environment(
+            environment,
+            gpu_ids=(),
+            cpu_threads=cpu.cpu_threads,
+            cpu_affinity=affinity,
+            device="cpu",
+            native_threads=cpu.native_threads,
+            blas_threads=cpu.blas_threads,
+        )
+        actor_environment.update(
+            _worker_failure_environment(
+                name=name, role="actor", failure_path=failure_path
+            )
+        )
+        actor_environment["CUDA_VISIBLE_DEVICES"] = ""
+        specs.append(
+            WorkerSpec(
+                name=name,
+                role="actor",
+                gpu_ids=(),
+                cpu_threads=cpu.cpu_threads,
+                command=(
+                    python_executable,
+                    "-m",
+                    "startrain.cli",
+                    "actor",
+                    "--config",
+                    config,
+                    "--cpu-actor-index",
+                    str(index),
+                    "--replay-store",
+                    str(directories.replay),
+                    "--manifest",
+                    str(champion_manifest),
+                    "--candidate-manifest",
+                    str(selfplay_manifest),
+                    "--run-identity",
+                    str(directories.run_identity),
+                    "--heartbeat",
+                    str(directories.status / f"{name}.heartbeat.json"),
+                    "--learner-heartbeat",
+                    str(directories.status / "learner.heartbeat.json"),
+                    "--metrics",
+                    str(directories.metrics / f"{name}.jsonl"),
+                    "--device",
+                    "cpu",
+                ),
+                environment=actor_environment,
+                heartbeat_path=directories.status / f"{name}.heartbeat.json",
+                metrics_path=directories.metrics / f"{name}.jsonl",
+                log_path=directories.logs / f"{name}.log",
+                failure_path=failure_path,
+                cpu_affinity=affinity,
+            )
+        )
     promotion = orchestration.promotion
     if promotion.enabled:
         name = "arena-promotion"
@@ -509,7 +617,9 @@ def build_worker_specs(
             None,
         )
         promotion_affinity = (
-            parse_cpu_affinity(promotion_gpu.cpu_affinity)
+            parse_cpu_affinity(promotion.cpu_affinity)
+            if promotion.cpu_affinity is not None
+            else parse_cpu_affinity(promotion_gpu.cpu_affinity)
             if promotion_gpu is not None and promotion_gpu.cpu_affinity is not None
             else None
         )
@@ -576,14 +686,16 @@ def _worker_environment(
     cpu_threads: int,
     cpu_affinity: Sequence[int] | None = None,
     device: str = "cuda",
+    native_threads: int | None = None,
+    blas_threads: int | None = None,
 ) -> dict[str, str]:
     output = dict(base)
     output.update(
         {
-            "RAYON_NUM_THREADS": str(cpu_threads),
-            "OMP_NUM_THREADS": str(cpu_threads),
-            "MKL_NUM_THREADS": str(cpu_threads),
-            "OPENBLAS_NUM_THREADS": str(cpu_threads),
+            "RAYON_NUM_THREADS": str(native_threads or cpu_threads),
+            "OMP_NUM_THREADS": str(blas_threads or cpu_threads),
+            "MKL_NUM_THREADS": str(blas_threads or cpu_threads),
+            "OPENBLAS_NUM_THREADS": str(blas_threads or cpu_threads),
             "PYTHONUNBUFFERED": "1",
         }
     )

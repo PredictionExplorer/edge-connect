@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from collections import Counter
 from pathlib import Path
 
 import pytest
@@ -87,6 +88,37 @@ def test_variant_mixture_draws_follow_the_fractions() -> None:
         VariantMixtureConfig(score_utility_weight_by_segment={"bogus": 0.1})
 
 
+@pytest.mark.parametrize("share", [0.0, 0.3, 0.5, 1.0])
+def test_handicap_modes_are_independent_of_size_and_preserve_legacy_draws(
+    share,
+) -> None:
+    legacy = VariantMixtureConfig(enabled=True)
+    mixed = replace(legacy, handicap_classic_share=share)
+    counts: Counter[tuple[int, str]] = Counter()
+    for seed in range(40_000):
+        roll = (seed * 0x9E3779B97F4A7C15) & ((1 << 64) - 1)
+        before, after = legacy.draw(roll), mixed.draw(roll)
+        assert mixed.draw(roll) == after
+        if before.segment != "handicap":
+            assert after == before
+            continue
+        assert before.mode == "double"
+        assert after.handicap == before.handicap
+        assert after.segment == "handicap" and not after.pie
+        counts[after.handicap, after.mode] += 1
+    for handicap in range(2, 10):
+        classic = counts[handicap, "classic"]
+        total = classic + counts[handicap, "double"]
+        assert total > 800
+        assert classic / total == pytest.approx(share, abs=0.02)
+
+
+@pytest.mark.parametrize("share", [-0.1, 1.1, float("nan"), float("inf"), True, "0.5"])
+def test_handicap_classic_share_rejects_invalid_values(share) -> None:
+    with pytest.raises(ValueError, match="handicap_classic_share"):
+        VariantMixtureConfig(handicap_classic_share=share)
+
+
 def test_playout_budgets_keep_the_doubling_ratio_inside_the_caps() -> None:
     config = SelfPlayConfig(
         rings=6,
@@ -118,6 +150,7 @@ def test_playout_budgets_keep_the_doubling_ratio_inside_the_caps() -> None:
     [
         (GameVariant(mode="classic"), (0, 0)),
         (GameVariant(mode="double", handicap=4), (-2, 2)),
+        (GameVariant(mode="classic", handicap=4), (-2, 2)),
         (GameVariant(mode="double", pie=True), (0, 0)),
         (GameVariant(mode="classic", pie=True), (0, 0)),
     ],
@@ -323,19 +356,55 @@ def test_variant_stage_profiles_validate_and_migrate(tmp_path) -> None:
     validate_continuous_config(stage_a)
 
     assert stage_b.selfplay.variants.enabled
+    assert stage_a.selfplay.variants.handicap_classic_share == 0.0
+    assert stage_a.arena.segment_handicap_classic_share == 0.0
+    assert stage_b.selfplay.variants.handicap_classic_share == 0.5
+    assert stage_b.selfplay.variants.pie_classic_share == 0.5
+    assert stage_b.arena.segment_handicap_classic_share == 0.5
+    for step in (0, 120_001, 150_000, 500_000, 10**9):
+        assert stage_b.orchestration.ring_mixture.weights_for_step(step) == (
+            0.25,
+            0.25,
+            0.25,
+            0.25,
+        )
     assert stage_b.selfplay.variants.segment_fractions == {
-        "standard": 0.45,
-        "classic": 0.25,
-        "handicap": 0.2,
-        "pie": 0.1,
+        "standard": 1 / 6,
+        "classic": 1 / 6,
+        "handicap": 1 / 3,
+        "pie": 1 / 3,
     }
+    category_counts: Counter[tuple[str, str]] = Counter()
+    for seed in range(40_000):
+        roll = (seed * 0x9E3779B97F4A7C15) & ((1 << 64) - 1)
+        variant = stage_b.selfplay.variants.draw(roll)
+        category_counts[variant.segment, variant.mode] += 1
+    assert len(category_counts) == 6
+    assert all(
+        count / 40_000 == pytest.approx(1 / 6, abs=0.005)
+        for count in category_counts.values()
+    )
     assert stage_b.learner.segment_quotas == stage_b.selfplay.variants.segment_fractions
     assert set(stage_b.arena.segment_pairs_per_ring) == {"classic", "handicap", "pie"}
     assert stage_b.arena.segment_handicap_pda == stage_b.selfplay.variants.handicap_pda
     validate_continuous_config(stage_b)
+    legacy = load_config(configs / "h100-8gpu-autonomous.yaml")
+    with pytest.raises(ValueError, match="ring-10-weighted"):
+        validate_continuous_config(
+            replace(
+                legacy,
+                orchestration=replace(
+                    legacy.orchestration,
+                    ring_mixture=replace(
+                        legacy.orchestration.ring_mixture,
+                        step_weights=stage_b.orchestration.ring_mixture.step_weights,
+                    ),
+                ),
+            )
+        )
 
     # Stage A -> Stage B is a legal mid-run migration: only mixture, quota,
-    # and arena-segment paths differ.
+    # ring allocation, and arena-segment paths differ.
     differences = list(_profile_diffs(stage_a.as_dict(), stage_b.as_dict()))
     assert differences
     assert [
@@ -345,8 +414,6 @@ def test_variant_stage_profiles_validate_and_migrate(tmp_path) -> None:
     ] == []
 
     # The validator refuses a mixture whose learner quotas or arena guards drift.
-    from dataclasses import replace
-
     with pytest.raises(ValueError, match="segment_quotas"):
         validate_continuous_config(
             replace(
@@ -364,4 +431,49 @@ def test_variant_stage_profiles_validate_and_migrate(tmp_path) -> None:
                     segment_regression_floor_elo={},
                 ),
             )
+        )
+    with pytest.raises(ValueError, match="arena handicap modes"):
+        validate_continuous_config(
+            replace(
+                stage_b,
+                arena=replace(stage_b.arena, segment_handicap_classic_share=0.0),
+            )
+        )
+
+
+@pytest.mark.parametrize("mode", ["classic", "double"])
+def test_handicap_mixture_and_arena_respect_the_allowed_mode_family(mode) -> None:
+    from startrain.config import ConfigError, VariantRulesConfig, load_config
+
+    base = load_config(Path(__file__).parents[1] / "configs" / "small.yaml")
+    family = VariantRulesConfig(modes=(mode,))
+    share = float(mode == "classic")
+    game = replace(base.game, mode=mode, variants=family)
+    mixture = VariantMixtureConfig(
+        enabled=True,
+        standard=0,
+        classic=0,
+        handicap=1,
+        pie=0,
+        handicap_classic_share=share,
+    )
+    selfplay = replace(base.selfplay, mode=mode, variants=mixture)
+    arena = replace(
+        base.arena,
+        segment_pairs_per_ring={"handicap": 2},
+        segment_handicap_classic_share=share,
+    )
+    supported = replace(base, game=game, selfplay=selfplay, arena=arena)
+    assert supported.selfplay.variants.draw(0).mode == mode
+    with pytest.raises(ConfigError, match="selfplay.variants handicap"):
+        replace(
+            supported,
+            selfplay=replace(
+                selfplay, variants=replace(mixture, handicap_classic_share=0.5)
+            ),
+        )
+    with pytest.raises(ConfigError, match="arena handicap variants"):
+        replace(
+            supported,
+            arena=replace(arena, segment_handicap_classic_share=0.5),
         )

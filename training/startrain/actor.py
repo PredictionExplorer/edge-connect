@@ -6,12 +6,14 @@ import hashlib
 import json
 import random
 import statistics
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_EXCEPTION
 from collections import OrderedDict
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import asdict, replace
+from dataclasses import asdict, is_dataclass, replace
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal, cast
 
 import torch
 
@@ -28,11 +30,106 @@ from .device import (
     reset_peak_memory_stats,
 )
 from .inference import GraphInferenceAdapter, InferenceConfig
+from .inference_batching import CohortInferenceAdapter
 from .model import GraphResTNet
 from .replay_store import ReplayStore
 from .runtime import HeartbeatReporter, RunIdentity, append_jsonl
 from .selfplay import SelfPlayActor, SelfPlayIdentity, SelfPlayMetrics
 from .training import maybe_compile_model
+
+
+def _inference_metrics(evaluator) -> dict:
+    snapshot = getattr(evaluator, "metrics_snapshot", None)
+    if not callable(snapshot):
+        return {}
+    value = snapshot()
+    if is_dataclass(value) and not isinstance(value, type):
+        return asdict(value)
+    if isinstance(value, Mapping):
+        return dict(value)
+    raise TypeError("inference metrics must be a dataclass or mapping")
+
+
+class SharedModelRegistry:
+    """Bounded immutable model storage shared by independently pinned cohorts."""
+
+    def __init__(self, broker, *, max_entries: int) -> None:
+        if max_entries <= 0:
+            raise ValueError("shared model registry capacity must be positive")
+        self.broker = broker
+        self.max_entries = max_entries
+        self._condition = threading.Condition()
+        self._entries: OrderedDict[str, list] = OrderedDict()
+
+    def acquire(self, provider, manifest):
+        key = manifest.model_identity
+        with self._condition:
+            while key not in self._entries and len(self._entries) >= self.max_entries:
+                unused = next(
+                    (
+                        identity
+                        for identity, entry in self._entries.items()
+                        if entry[1] == 0
+                    ),
+                    None,
+                )
+                if unused is not None:
+                    self._entries.pop(unused)[0].close()
+                    break
+                self._condition.wait(timeout=0.1)
+            if key not in self._entries:
+                immutable = manifest.artifact_manifest or manifest.path
+                direct = load_model_manifest(immutable)
+                config = provider.config
+                inference = config.orchestration.model_refresh.inference
+                entries = inference.cache_max_entries // self.max_entries
+                byte_limit = inference.cache_max_bytes // self.max_entries
+                if not entries or not byte_limit:
+                    entries = byte_limit = 0
+                config = replace(
+                    config,
+                    orchestration=replace(
+                        config.orchestration,
+                        model_refresh=replace(
+                            config.orchestration.model_refresh,
+                            inference=replace(
+                                inference,
+                                cache_max_entries=entries,
+                                cache_max_bytes=byte_limit,
+                            ),
+                        ),
+                    ),
+                )
+                loader = ManifestModelProvider(
+                    config,
+                    immutable,
+                    device=str(provider.device),
+                    run_identity=provider.run_identity,
+                    expected_role=cast(
+                        Literal["champion", "candidate", "direct"], direct.role
+                    ),
+                )
+                self._entries[key] = [loader.refresh(), 0]
+            entry = self._entries.pop(key)
+            self._entries[key] = entry
+            entry[1] += 1
+            return self.broker.cohort_adapter(entry[0])
+
+    def release(self, identity: str) -> None:
+        with self._condition:
+            entry = self._entries[identity]
+            if entry[1] <= 0:
+                raise RuntimeError("shared model pin count underflow")
+            entry[1] -= 1
+            self._condition.notify_all()
+
+    def close(self) -> None:
+        with self._condition:
+            if any(entry[1] for entry in self._entries.values()):
+                raise RuntimeError("shared model registry still has pinned cohorts")
+            for entry in self._entries.values():
+                entry[0].close()
+            self._entries.clear()
 
 
 class RingMixtureScheduler:
@@ -76,14 +173,16 @@ class ManifestModelProvider:
         device: str,
         run_identity: RunIdentity,
         expected_role: Literal["champion", "candidate", "direct"] = "champion",
+        registry: SharedModelRegistry | None = None,
     ) -> None:
         self.config = config
         self.manifest_path = Path(manifest_path)
         self.device = device
         self.run_identity = run_identity
         self.expected_role = expected_role
+        self.registry = registry
         self.manifest: ModelManifest | None = None
-        self.evaluator: GraphInferenceAdapter | None = None
+        self.evaluator: GraphInferenceAdapter | CohortInferenceAdapter | None = None
         self._raw_model: GraphResTNet | None = None
         self._pointer_signature: tuple[int, int, int] | None = None
         self._reload_failed = False
@@ -93,7 +192,7 @@ class ManifestModelProvider:
         *,
         stop_requested: Callable[[], bool],
         progress: Callable[..., None] | None = None,
-    ) -> GraphInferenceAdapter | None:
+    ) -> GraphInferenceAdapter | CohortInferenceAdapter | None:
         refresh = self.config.orchestration.model_refresh
         started = time.monotonic()
         while not stop_requested():
@@ -108,7 +207,26 @@ class ManifestModelProvider:
             time.sleep(refresh.manifest_poll_seconds)
         return None
 
-    def refresh(self) -> GraphInferenceAdapter:
+    def refresh(self) -> GraphInferenceAdapter | CohortInferenceAdapter:
+        if self.registry is not None:
+            manifest = load_model_manifest(self.manifest_path)
+            if (
+                manifest.role != self.expected_role
+                or manifest.run_id != self.run_identity.run_id
+                or manifest.generation_family != self.run_identity.generation_family
+            ):
+                raise ValueError("shared actor model manifest identity is incompatible")
+            if (
+                self.evaluator is not None
+                and self.manifest is not None
+                and self.manifest.model_identity == manifest.model_identity
+            ):
+                return self.evaluator
+            self.release()
+            self.evaluator = self.registry.acquire(self, manifest)
+            self.manifest = manifest
+            assert self.evaluator is not None
+            return self.evaluator
         if self._reload_failed:
             raise RuntimeError(
                 "model provider is unusable after a failed in-place refresh"
@@ -162,7 +280,13 @@ class ManifestModelProvider:
                 config=InferenceConfig(
                     precision=self.config.train.precision,
                     score_utility_weight=self.config.selfplay.score_utility_weight,
+                    cache_max_entries=refresh.inference.cache_max_entries,
+                    cache_max_bytes=refresh.inference.cache_max_bytes,
+                    deduplicate=refresh.inference.deduplicate,
+                    pinned_transfers=refresh.inference.pinned_transfers,
+                    pinned_buffer_slots=refresh.inference.pinned_buffer_slots,
                 ),
+                homogeneous_relational_bias=refresh.inference.homogeneous_relational_bias,
                 model_version=manifest.model_version,
                 model_step=manifest.model_step,
                 model_identity=manifest.model_identity,
@@ -170,7 +294,7 @@ class ManifestModelProvider:
             self._raw_model = model
             self.evaluator = evaluator
         else:
-            assert self.evaluator is not None
+            assert isinstance(self.evaluator, GraphInferenceAdapter)
             try:
                 self._load_weights(self._raw_model, manifest)
                 self._raw_model.eval()
@@ -186,6 +310,12 @@ class ManifestModelProvider:
         self.manifest = manifest
         self._pointer_signature = signature
         return self.evaluator
+
+    def release(self) -> None:
+        if self.registry is not None and self.evaluator is not None:
+            assert self.manifest is not None
+            self.registry.release(self.manifest.model_identity)
+            self.evaluator = None
 
     def _load_weights(
         self,
@@ -221,6 +351,7 @@ class HistoricalModelPool:
         evaluator_cache_size: int = 2,
         additional_manifest_directories: Sequence[str | Path] = (),
         cutover_path: str | Path | None = None,
+        registry: SharedModelRegistry | None = None,
     ) -> None:
         if pool_size <= 0 or evaluator_cache_size <= 0:
             raise ValueError("historical model pool sizes must be positive")
@@ -239,14 +370,23 @@ class HistoricalModelPool:
         self.evaluator_cache_size = min(pool_size, evaluator_cache_size)
         self.providers: OrderedDict[str, ManifestModelProvider] = OrderedDict()
         self.cutover_path = Path(cutover_path) if cutover_path is not None else None
+        self.last_selection_metrics: dict[str, int] = {}
+        self.registry = registry
 
     def select(
         self,
         *,
         random_source: random.Random,
         exclude: set[str],
+        minimum_model_step: int = 0,
+        maximum_model_step: int | None = None,
     ) -> ManifestModelProvider | None:
+        if minimum_model_step < 0 or (
+            maximum_model_step is not None and maximum_model_step < minimum_model_step
+        ):
+            raise ValueError("history model eligibility interval is invalid")
         by_identity: dict[str, ModelManifest] = {}
+        ineligible: set[str] = set()
         cutover_ns = self._cutover_created_ns()
         for directory in self.manifest_directories:
             for path in sorted(directory.glob("manifest-*.json")):
@@ -262,7 +402,18 @@ class HistoricalModelPool:
                     and manifest.published_ns >= cutover_ns
                     and manifest.model_identity not in exclude
                 ):
+                    if manifest.model_step < minimum_model_step or (
+                        maximum_model_step is not None
+                        and manifest.model_step > maximum_model_step
+                    ):
+                        ineligible.add(manifest.model_identity)
+                        continue
                     by_identity[manifest.model_identity] = manifest
+        self.last_selection_metrics = {
+            "history_eligible_models": len(by_identity),
+            "history_ineligible_models": len(ineligible),
+            "history_minimum_model_step": minimum_model_step,
+        }
         manifests = list(by_identity.values())
         manifests.sort(key=lambda item: (item.model_step, item.model_identity))
         if not manifests:
@@ -278,6 +429,7 @@ class HistoricalModelPool:
                 device=self.device,
                 run_identity=self.run_identity,
                 expected_role="direct",
+                registry=self.registry,
             )
         self.providers[selected.model_identity] = provider
         while len(self.providers) > self.evaluator_cache_size:
@@ -338,9 +490,23 @@ class ActorSupervisor:
         learner_heartbeat_path: str | Path | None = None,
         device: str = "cuda",
         lane_id: int = 0,
+        actor_id: str | None = None,
+        allowed_rings: tuple[int, ...] | None = None,
+        registry: SharedModelRegistry | None = None,
+        games_per_batch: int | None = None,
     ) -> None:
         if gpu.role != "actor" or gpu.actor_batch_size is None:
             raise ValueError("actor supervisor requires an actor GPU assignment")
+        selected_games = (
+            experiment.orchestration.actor_games_per_batch
+            if games_per_batch is None
+            else games_per_batch
+        )
+        if type(selected_games) is not int or selected_games < gpu.actor_batch_size:
+            raise ValueError(
+                "actor games_per_batch must be an integer at least actor_batch_size"
+            )
+        self.games_per_batch = selected_games
         if (
             isinstance(lane_id, bool)
             or not isinstance(lane_id, int)
@@ -354,12 +520,21 @@ class ActorSupervisor:
         self.replay_directory = Path(replay_directory)
         self.run_identity = run_identity
         self.lane_id = lane_id
-        self.actor_id = (
+        self.actor_id = actor_id or (
             f"actor-gpu-{gpu.gpu_id}"
             if gpu.actor_lanes == 1
             else f"actor-gpu-{gpu.gpu_id}-lane-{lane_id}"
         )
         self.device = torch.device(device)
+        self.registry = registry
+        self.allowed_rings = allowed_rings
+        self._source_paths: dict[str, Any] = dict(
+            manifest_path=manifest_path,
+            candidate_manifest_path=candidate_manifest_path,
+            heartbeat_path=heartbeat_path,
+            metrics_path=metrics_path,
+            learner_heartbeat_path=learner_heartbeat_path,
+        )
         self.candidate_manifest_path = Path(candidate_manifest_path)
         self._candidate_manifest: ModelManifest | None = None
         self._candidate_signature: tuple[int, int, int] | None = None
@@ -369,6 +544,7 @@ class ActorSupervisor:
             device=device,
             run_identity=run_identity,
             expected_role="champion",
+            registry=registry,
         )
         source = experiment.orchestration.model_refresh.selfplay_source
         self.candidate_provider = (
@@ -378,6 +554,7 @@ class ActorSupervisor:
                 device=device,
                 run_identity=run_identity,
                 expected_role="candidate",
+                registry=registry,
             )
             if source != "champion"
             else None
@@ -397,6 +574,7 @@ class ActorSupervisor:
                 pool_size=experiment.orchestration.model_refresh.history_pool_size,
                 additional_manifest_directories=(learner_root / "manifests",),
                 cutover_path=learner_root / "resume-cutover.json",
+                registry=registry,
             )
             if source == "candidate_champion_history_mix"
             else None
@@ -426,6 +604,8 @@ class ActorSupervisor:
         )
 
     def run(self, *, stop_requested: Callable[[], bool]) -> int:
+        if self.gpu.actor_cohorts > 1 and self.registry is None:
+            return self._run_cohorts(stop_requested=stop_requested)
         batches = 0
         process_started_ns = time.time_ns()
         cumulative_games = 0
@@ -441,6 +621,8 @@ class ActorSupervisor:
             )
             if evaluator is None:
                 return batches
+            if self.registry is not None:
+                self.provider.release()
             if self.candidate_provider is not None:
                 candidate_evaluator = self.candidate_provider.wait_for_initial(
                     stop_requested=stop_requested,
@@ -448,6 +630,8 @@ class ActorSupervisor:
                 )
                 if candidate_evaluator is None:
                     return batches
+                if self.registry is not None:
+                    self.candidate_provider.release()
             with ReplayStore(self.replay_directory) as store:
                 if any(store.reconciliation_metrics.values()):
                     self.heartbeat.advance(
@@ -509,6 +693,8 @@ class ActorSupervisor:
                         # generated only for the replay window to discard them,
                         # so the batch plays the candidate instead.
                         stale_champion_step = evaluator.model_step
+                        if self.registry is not None:
+                            provider.release()
                         model_role, provider = "candidate", self.candidate_provider
                         evaluator = provider.refresh()
                         self.heartbeat.advance(
@@ -526,6 +712,8 @@ class ActorSupervisor:
                         counts,
                         learner_step=scheduling_step,
                     )
+                    if self.allowed_rings is not None:
+                        ring = self.scheduler.random.choice(self.allowed_rings)
                     generation = store.lease_generation(
                         self.run_identity, self.actor_id
                     )
@@ -536,7 +724,7 @@ class ActorSupervisor:
                         self.experiment.selfplay,
                         rings=ring,
                         batch_size=self.gpu.actor_batch_size,
-                        games=self.experiment.orchestration.actor_games_per_batch,
+                        games=self.games_per_batch,
                     ).with_variant(variant)
                     set_score_utility_weight = getattr(
                         evaluator, "set_score_utility_weight", None
@@ -577,10 +765,14 @@ class ActorSupervisor:
                             generation=generation,
                         ),
                     )
-                    summaries = selfplay.run(
-                        stop_requested=stop_requested,
-                        progress=self.heartbeat.advance,
-                    )
+                    try:
+                        summaries = selfplay.run(
+                            stop_requested=stop_requested,
+                            progress=self.heartbeat.advance,
+                        )
+                    finally:
+                        if self.registry is not None:
+                            provider.release()
                     elapsed = time.monotonic() - started
                     evaluator_calls = (
                         int(getattr(evaluator, "evaluator_calls", 0))
@@ -658,6 +850,15 @@ class ActorSupervisor:
                         peak_cuda_reserved_memory_bytes,
                     ) = self._peak_cuda_memory()
                     batch_completed_ns = time.time_ns()
+                    completion_step, _ = self._read_learner_scheduling_step(
+                        fallback_step=candidate.model_step
+                    )
+                    model_lag_at_commit = completion_step - evaluator.model_step
+                    replay_eligible_at_commit = (
+                        0
+                        <= model_lag_at_commit
+                        <= self.experiment.learner.max_replay_lag_steps
+                    )
                     cumulative_games += len(summaries)
                     cumulative_samples += samples
                     cumulative_evaluator_rows += evaluator_rows
@@ -671,6 +872,14 @@ class ActorSupervisor:
                             "batch_completed_ns": batch_completed_ns,
                             "worker": self.actor_id,
                             "gpu_id": self.gpu.gpu_id,
+                            "compute_device": str(self.device),
+                            "physical_gpu_id": self.gpu.gpu_id
+                            if self.device.type == "cuda"
+                            else None,
+                            "native_threads": self.gpu.native_threads
+                            or self.gpu.cpu_threads,
+                            "blas_threads": self.gpu.blas_threads
+                            or self.gpu.cpu_threads,
                             "lane_id": self.lane_id,
                             "run_id": self.run_identity.run_id,
                             "generation_family": (self.run_identity.generation_family),
@@ -694,6 +903,12 @@ class ActorSupervisor:
                             "pie_decisions": selfplay_metrics.pie_decisions,
                             "pie_swaps": selfplay_metrics.pie_swaps,
                             "asymmetric_games": selfplay_metrics.asymmetric_games,
+                            "exact_endgame_attempts": selfplay_metrics.exact_endgame_attempts,
+                            "exact_endgame_solved": selfplay_metrics.exact_endgame_solved,
+                            "exact_endgame_exhausted": selfplay_metrics.exact_endgame_exhausted,
+                            "exact_endgame_nodes": selfplay_metrics.exact_endgame_nodes,
+                            "exact_endgame_seconds": selfplay_metrics.exact_endgame_seconds,
+                            "inference_metrics": _inference_metrics(evaluator),
                             "scheduling_step": scheduling_step,
                             "scheduling_step_source": scheduling_step_source,
                             "active_ring_weights": active_ring_weights,
@@ -797,6 +1012,19 @@ class ActorSupervisor:
                             "model_version": evaluator.model_version,
                             "model_identity": evaluator.model_identity,
                             "model_step": evaluator.model_step,
+                            "model_lag_at_commit": model_lag_at_commit,
+                            "replay_eligible_at_commit": replay_eligible_at_commit,
+                            "eligible_samples_at_commit": (
+                                samples if replay_eligible_at_commit else 0
+                            ),
+                            "ineligible_samples_at_commit": (
+                                0 if replay_eligible_at_commit else samples
+                            ),
+                            **(
+                                self.history_pool.last_selection_metrics
+                                if self.history_pool is not None
+                                else {}
+                            ),
                         },
                     )
                     if not summaries and stop_requested():
@@ -828,11 +1056,124 @@ class ActorSupervisor:
             final_phase = "failed"
             raise
         finally:
+            if self.registry is not None:
+                self.provider.release()
+                if self.candidate_provider is not None:
+                    self.candidate_provider.release()
+                if self.history_pool is not None:
+                    for retained_provider in self.history_pool.providers.values():
+                        retained_provider.release()
             self.heartbeat.close(final_phase=final_phase)
+            if self.registry is None:
+                empty_device_cache(self.device)
+
+    def _run_cohorts(self, *, stop_requested: Callable[[], bool]) -> int:
+        from .inference_batching import BoundedInferenceBroker
+
+        configuration = self.experiment.orchestration.model_refresh.inference
+        if not configuration.shared_batching or self.gpu.actor_lanes != 1:
+            raise ValueError(
+                "multiple actor cohorts require shared batching and one process lane"
+            )
+        stopped = threading.Event()
+        children = []
+        self.heartbeat.start()
+        phase = "stopped"
+        broker = BoundedInferenceBroker(
+            max_batch_rows=configuration.max_batch_rows,
+            max_pending_requests=configuration.max_pending_requests,
+            max_wait_seconds=configuration.max_wait_seconds,
+        )
+        registry = SharedModelRegistry(broker, max_entries=self.gpu.actor_cohorts + 2)
+        try:
+            for cohort in range(self.gpu.actor_cohorts):
+                paths = dict(self._source_paths)
+                for kind in ("heartbeat_path", "metrics_path"):
+                    path = Path(paths[kind])
+                    paths[kind] = path.with_name(
+                        f"{path.stem}-cohort-{cohort}{path.suffix}"
+                    )
+                child = ActorSupervisor(
+                    native_module=self.native,
+                    experiment=self.experiment,
+                    gpu=replace(self.gpu, actor_cohorts=1),
+                    replay_directory=self.replay_directory,
+                    run_identity=self.run_identity,
+                    device=str(self.device),
+                    lane_id=self.lane_id,
+                    actor_id=f"{self.actor_id}-cohort-{cohort}",
+                    registry=registry,
+                    allowed_rings=self.allowed_rings,
+                    games_per_batch=self.games_per_batch,
+                    **paths,
+                )
+                seed = (
+                    self.experiment.selfplay.seed
+                    + self.gpu.gpu_id * 1_000_003
+                    + cohort * 104_729
+                )
+                child.scheduler.random.seed(seed)
+                child.model_random.seed(seed + 0x5E1F)
+                children.append(child)
+
+            def run_child(child):
+                try:
+                    return child.run(
+                        stop_requested=lambda: stopped.is_set() or stop_requested()
+                    )
+                except BaseException:
+                    stopped.set()
+                    raise
+
+            last_progress = None
+            with ThreadPoolExecutor(
+                max_workers=len(children), thread_name_prefix="actor-cohort"
+            ) as pool:
+                futures = [pool.submit(run_child, child) for child in children]
+                while not all(future.done() for future in futures):
+                    if stop_requested():
+                        stopped.set()
+                    progress = []
+                    for child in children:
+                        try:
+                            payload = json.loads(child.heartbeat.path.read_text())
+                            progress.append(
+                                (child.actor_id, payload.get("progress", 0))
+                            )
+                        except (OSError, ValueError):
+                            progress.append((child.actor_id, 0))
+                    details = dict(
+                        phase="cohort_draining"
+                        if stopped.is_set()
+                        else "shared_cohorts",
+                        cohorts=len(children),
+                        cohort_progress=progress,
+                        inference=broker.metrics_snapshot(),
+                    )
+                    if progress != last_progress:
+                        self.heartbeat.advance(**details)
+                        last_progress = progress
+                    else:
+                        self.heartbeat.update(**details)
+                    wait(
+                        [future for future in futures if not future.done()],
+                        timeout=1.0,
+                        return_when=FIRST_EXCEPTION,
+                    )
+                return sum(future.result() for future in futures)
+        except BaseException:
+            phase = "failed"
+            stopped.set()
+            raise
+        finally:
+            broker.shutdown(wait=True, cancel_pending=False)
+            registry.close()
+            self.heartbeat.close(final_phase=phase)
             empty_device_cache(self.device)
 
     def _reset_peak_cuda_memory(self) -> None:
-        reset_peak_memory_stats(self.device)
+        if self.registry is None:
+            reset_peak_memory_stats(self.device)
 
     def _peak_cuda_memory(self) -> tuple[int | None, int | None]:
         return peak_memory_stats(self.device)
@@ -876,8 +1217,16 @@ class ActorSupervisor:
                 if self.provider.manifest is not None
                 else None
             )
+            scheduling_step, _ = self._read_learner_scheduling_step(
+                fallback_step=candidate.model_step
+            )
             historical = self.history_pool.select(
                 random_source=self.model_random,
+                minimum_model_step=max(
+                    0,
+                    scheduling_step - self.experiment.learner.max_replay_lag_steps + 1,
+                ),
+                maximum_model_step=scheduling_step,
                 exclude={
                     candidate.model_identity,
                     *({champion_identity} if champion_identity is not None else set()),

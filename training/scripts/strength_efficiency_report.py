@@ -15,6 +15,7 @@ from typing import cast
 
 from startrain.autonomous_elo import DecisiveMatch, fit_bradley_terry_elo
 from startrain.runtime import atomic_json
+from startrain.balanced_strength import balanced_strength_summary
 
 SCHEMA_VERSION = 1
 REPORT_NAME = "startrain-strength-efficiency"
@@ -2305,6 +2306,12 @@ def build_strength_efficiency_report(
             actor_records=actor_records,
             actor_summary=actor_summary,
             provisioned_gpu_hours=provisioned_gpu_hours,
+        ),
+        "balanced_strength": balanced_strength_summary(
+            root,
+            arenas,
+            wall_seconds=wall_seconds,
+            provisioned_gpus=provisioned_gpus,
         ),
         "parse_failure_count": len(failures),
         "parse_failures": failures,

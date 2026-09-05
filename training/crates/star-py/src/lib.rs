@@ -22,7 +22,7 @@ use rayon::prelude::*;
 use star_engine::{
     Action, BITBOARD_WORDS, BitBoard, Board, D5Maps, GameState, MAX_HANDICAP, Mode, Player,
     RULES_HASH, RULES_SCHEMA, ScoreResult, ScoringScratch, StateParts, Symmetry, Variant,
-    rules_hash, score_completion_bounds,
+    rules_hash, score_completion_bounds, solve_exact_endgame,
 };
 use star_search::{
     Evaluation, EvaluationRequest, GumbelParameters, GumbelSequentialHalving, RootSearchConfig,
@@ -338,6 +338,20 @@ struct PyClinchData {
     empty_nodes: Vec<u16>,
     last_move: Vec<i32>,
     turn_count: Vec<u32>,
+}
+
+/// Exact completions and bounded solver accounting. Unsolved rows are untouched.
+#[pyclass(name = "ExactEndgameData", frozen, skip_from_py_object)]
+#[derive(Clone)]
+struct PyExactEndgameData {
+    #[pyo3(get)]
+    completions: PyClinchData,
+    #[pyo3(get)]
+    attempted: usize,
+    #[pyo3(get)]
+    budget_exhausted: usize,
+    #[pyo3(get)]
+    nodes: u64,
 }
 
 #[pymethods]
@@ -943,6 +957,72 @@ impl PyStateBatch {
         Ok(output)
     }
 
+    /// Exhaustively solve small tails; exhausted searches do not modify states.
+    fn complete_exact_endgames(
+        &mut self,
+        py: Python<'_>,
+        max_empty: u16,
+        max_nodes: u64,
+    ) -> PyResult<PyExactEndgameData> {
+        if max_empty == 0 || max_empty > 8 || max_nodes == 0 || max_nodes > 1_000_000 {
+            return Err(PyValueError::new_err(
+                "exact endgame limits must be 1..8 empties and 1..1000000 nodes",
+            ));
+        }
+        let prepared: Vec<_> = py.detach(|| {
+            self.states
+                .par_iter()
+                .enumerate()
+                .filter(|(_, state)| {
+                    !state.is_terminal() && state.legal_actions().len() <= usize::from(max_empty)
+                })
+                .map(|(index, state)| {
+                    (
+                        index,
+                        state.legal_actions().len() as u16,
+                        state.last_move().map_or(-1, i32::from),
+                        state.turn_count(),
+                        solve_exact_endgame(state, max_empty, max_nodes),
+                    )
+                })
+                .collect()
+        });
+        let batch_size = self.states.len();
+        let mut output = PyExactEndgameData {
+            completions: PyClinchData {
+                batch_size,
+                clinched: vec![false; batch_size],
+                winner: vec![-1; batch_size],
+                empty_nodes: vec![0; batch_size],
+                last_move: vec![-1; batch_size],
+                turn_count: vec![0; batch_size],
+            },
+            attempted: prepared.len(),
+            budget_exhausted: 0,
+            nodes: 0,
+        };
+        for (index, empty_nodes, last_move, turn_count, solved) in prepared {
+            let Some(solved) = solved else {
+                output.budget_exhausted += 1;
+                output.nodes += max_nodes;
+                continue;
+            };
+            let winner = star_engine::score_state(&solved.terminal)
+                .leader
+                .ok_or_else(|| {
+                    PyRuntimeError::new_err("exact solver produced a tied terminal board")
+                })?;
+            output.nodes += solved.nodes;
+            output.completions.clinched[index] = true;
+            output.completions.winner[index] = winner as i8;
+            output.completions.empty_nodes[index] = empty_nodes;
+            output.completions.last_move[index] = last_move;
+            output.completions.turn_count[index] = turn_count;
+            self.states[index] = solved.terminal;
+        }
+        Ok(output)
+    }
+
     /// Packed state metadata, fixed bitboards, variants, and history sets.
     fn data(&self, py: Python<'_>) -> PyStateData {
         py.detach(|| pack_states(&self.states))
@@ -1194,6 +1274,7 @@ struct PySearchBatch {
     config: RootSearchConfig,
     budgets: Vec<u32>,
     pda_by_seat: Vec<[i8; 2]>,
+    seeds_per_root: Option<Vec<u64>>,
     pending: Vec<PendingRow>,
 }
 
@@ -1214,7 +1295,8 @@ impl PySearchBatch {
         c_scale=1.0,
         deterministic_seed=None,
         simulations_per_root=None,
-        pda_by_seat=None
+        pda_by_seat=None,
+        seeds_per_root=None
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -1227,6 +1309,7 @@ impl PySearchBatch {
         deterministic_seed: Option<u64>,
         simulations_per_root: Option<Vec<u32>>,
         pda_by_seat: Option<Vec<(i8, i8)>>,
+        seeds_per_root: Option<Vec<u64>>,
     ) -> PyResult<Self> {
         if simulations == 0 {
             return Err(PyValueError::new_err("simulations must be positive"));
@@ -1237,6 +1320,14 @@ impl PySearchBatch {
         let parameters = GumbelParameters { c_visit, c_scale };
         parameters.validate().map_err(value_error)?;
         let rows = states.states.len();
+        if seeds_per_root
+            .as_ref()
+            .is_some_and(|seeds| seeds.len() != rows)
+        {
+            return Err(PyValueError::new_err(
+                "seeds_per_root must contain one seed per row",
+            ));
+        }
         let budgets = match simulations_per_root {
             None => vec![simulations; rows],
             Some(budgets) => {
@@ -1283,6 +1374,7 @@ impl PySearchBatch {
             config,
             budgets,
             pda_by_seat,
+            seeds_per_root,
             pending: Vec::new(),
         })
     }
@@ -1295,6 +1387,17 @@ impl PySearchBatch {
     #[getter]
     fn budgets(&self) -> Vec<u32> {
         self.budgets.clone()
+    }
+
+    /// Effective Gumbel seeds. Explicit root streams ignore batch membership,
+    /// root ordering and the legacy shared deterministic nonce.
+    #[getter]
+    fn root_seeds(&self) -> Vec<u64> {
+        self.trees
+            .iter()
+            .enumerate()
+            .map(|(index, tree)| scheduler_seed(self, index, tree.root_state().hash64()))
+            .collect()
     }
 
     /// One inference row per active root; terminal roots are omitted.
@@ -1352,11 +1455,7 @@ impl PySearchBatch {
                         self.budgets[tree_index],
                         self.config.max_considered,
                         self.config.parameters,
-                        derive_root_seed(
-                            self.config.nonce.value(),
-                            tree.root_state().hash64(),
-                            tree_index,
-                        ),
+                        scheduler_seed(self, tree_index, tree.root_state().hash64()),
                     )
                     .map_err(|error| error.to_string())?;
                     Ok((tree_index, tree, scheduler))
@@ -2598,6 +2697,13 @@ fn derive_root_seed(nonce: u64, state_hash: u64, index: usize) -> u64 {
     splitmix64(nonce ^ state_hash.rotate_left(17) ^ (index as u64).rotate_left(41))
 }
 
+fn scheduler_seed(search: &PySearchBatch, index: usize, state_hash: u64) -> u64 {
+    search.seeds_per_root.as_ref().map_or_else(
+        || derive_root_seed(search.config.nonce.value(), state_hash, index),
+        |seeds| derive_root_seed(seeds[index], state_hash, 0),
+    )
+}
+
 const fn splitmix64(mut value: u64) -> u64 {
     value = value.wrapping_add(0x9e37_79b9_7f4a_7c15);
     value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
@@ -2717,6 +2823,7 @@ fn star_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyStateData>()?;
     module.add_class::<PyTrajectoryData>()?;
     module.add_class::<PyClinchData>()?;
+    module.add_class::<PyExactEndgameData>()?;
     module.add_class::<PyScoreData>()?;
     module.add_class::<PyFeatureData>()?;
     module.add_class::<PyStateBatch>()?;
@@ -3319,6 +3426,7 @@ mod tests {
                 config: RootSearchConfig::deterministic(6, 4, GumbelParameters::PAPER, 0x77),
                 budgets: vec![6, 12, 3],
                 pda_by_seat: vec![[0, 0], [2, -2], [-1, 1]],
+                seeds_per_root: None,
                 pending: Vec::new(),
             };
             let roots = search.root_requests(py).unwrap();
@@ -3417,6 +3525,7 @@ mod tests {
                     config: RootSearchConfig::deterministic(9, 4, GumbelParameters::PAPER, 0x5eed),
                     budgets: vec![9; transformed.states.len()],
                     pda_by_seat: vec![[0, 0]; transformed.states.len()],
+                    seeds_per_root: None,
                     pending: Vec::new(),
                 };
                 let roots = search.root_requests(py).unwrap();
@@ -3446,6 +3555,86 @@ mod tests {
                 }
             })
         })
+    }
+
+    #[test]
+    fn explicit_root_streams_ignore_reordering_partitioning_and_batch_nonce() {
+        Python::initialize();
+        Python::attach(|py| {
+            let board = Arc::new(Board::new(4).unwrap());
+            let states: Vec<_> = [
+                (Mode::Classic, 1, false),
+                (Mode::Double, 1, false),
+                (Mode::Classic, 4, false),
+                (Mode::Double, 4, false),
+                (Mode::Classic, 1, true),
+                (Mode::Double, 1, true),
+            ]
+            .into_iter()
+            .enumerate()
+            .map(|(index, (mode, handicap, pie))| {
+                let mut state = GameState::with_variant(
+                    Arc::clone(&board),
+                    Variant::new(mode, handicap, pie).unwrap(),
+                );
+                state.apply(Action::Place(index as u16)).unwrap();
+                state
+            })
+            .collect();
+            let run = |indices: &[usize], nonce: u64, explicit: bool| {
+                let mut search = PySearchBatch {
+                    trees: indices
+                        .iter()
+                        .map(|index| SearchTree::new(states[*index].clone()))
+                        .collect(),
+                    schedulers: None,
+                    config: RootSearchConfig::deterministic(24, 8, GumbelParameters::PAPER, nonce),
+                    budgets: vec![24; indices.len()],
+                    pda_by_seat: vec![[0, 0]; indices.len()],
+                    seeds_per_root: explicit.then(|| {
+                        indices
+                            .iter()
+                            .map(|index| 0x12_345 + *index as u64 * 0x77)
+                            .collect()
+                    }),
+                    pending: Vec::new(),
+                };
+                let seeds = search.root_seeds();
+                let roots = search.root_requests(py).unwrap();
+                submit_uniform_roots(&mut search, py, roots);
+                while !search.is_done() {
+                    let leaves = search.next_requests(py).unwrap();
+                    if !leaves.tokens.is_empty() {
+                        submit_uniform_leaves(&mut search, py, leaves);
+                    }
+                }
+                let results = search.results(py).unwrap();
+                (0..indices.len())
+                    .map(|row| {
+                        let range = results.action_offsets[row]..results.action_offsets[row + 1];
+                        (
+                            seeds[row],
+                            results.selected_actions[row],
+                            results.actions[range.clone()].to_vec(),
+                            results.visits[range.clone()].to_vec(),
+                            results.policy_target[range.clone()].to_vec(),
+                            results.q_values[range].to_vec(),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let whole = run(&[0, 1, 2, 3, 4, 5], 100, true);
+            let order = [5, 1, 3, 0, 4, 2];
+            let reordered = run(&order, 999, true);
+            for (row, index) in order.into_iter().enumerate() {
+                assert_eq!(whole[index], reordered[row]);
+                assert_eq!(whole[index], run(&[index], 123, true)[0]);
+            }
+            assert_eq!(
+                run(&[0, 1, 2, 3, 4, 5], 100, false),
+                run(&[0, 1, 2, 3, 4, 5], 100, false)
+            );
+        });
     }
 
     fn submit_uniform_roots(search: &mut PySearchBatch, py: Python<'_>, requests: PyEvalBatch) {

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import signal
 import shutil
 import time
@@ -445,6 +446,87 @@ def test_autonomous_run_provenance_rejects_imports_and_profile_drift(
     drifted = replace(configured, train=replace(configured.train, seed=99))
     with pytest.raises(ValueError, match="frozen run profile"):
         ensure_autonomous_provenance(drifted, directories, identity)
+
+
+@pytest.mark.parametrize("omitted_mask", [1, 2, 3])
+@pytest.mark.parametrize("prior_efficiency_epoch", [False, True])
+def test_autonomous_resume_accepts_only_unchanged_omitted_handicap_defaults(
+    tmp_path, omitted_mask, prior_efficiency_epoch
+) -> None:
+    configured = load_config(CONFIGS / "h100-8gpu-autonomous.yaml")
+    configured = replace(
+        configured,
+        orchestration=replace(
+            configured.orchestration,
+            directories=replace(
+                configured.orchestration.directories, root=str(tmp_path)
+            ),
+        ),
+    )
+    directories = RunDirectories.from_experiment(configured)
+    directories.create()
+    identity = load_or_create_run_identity(directories.run_identity)
+    ensure_autonomous_provenance(configured, directories, identity)
+    provenance = json.loads(directories.autonomous_provenance.read_text())
+    legacy_config = configured.as_dict()
+    if prior_efficiency_epoch:
+        from startrain.config_compatibility import without_efficiency_defaults
+
+        legacy_config = without_efficiency_defaults(legacy_config)
+    if omitted_mask & 1:
+        del legacy_config["selfplay"]["variants"]["handicap_classic_share"]
+    if omitted_mask & 2:
+        del legacy_config["arena"]["segment_handicap_classic_share"]
+    provenance["config_sha256"] = hashlib.sha256(
+        json.dumps(legacy_config, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    original_bytes = json.dumps(provenance, indent=4).encode()
+    directories.autonomous_provenance.write_bytes(original_bytes)
+
+    ensure_autonomous_provenance(configured, directories, identity)
+    assert directories.autonomous_provenance.read_bytes() == original_bytes
+    changed_configs = (
+        replace(
+            configured,
+            selfplay=replace(
+                configured.selfplay,
+                variants=replace(
+                    configured.selfplay.variants, handicap_classic_share=0.5
+                ),
+            ),
+        ),
+        replace(
+            configured,
+            arena=replace(configured.arena, segment_handicap_classic_share=0.5),
+        ),
+        replace(configured, train=replace(configured.train, per_rank_batch_size=256)),
+        replace(
+            configured, selfplay=replace(configured.selfplay, exact_endgame_max_empty=4)
+        ),
+        replace(
+            configured,
+            orchestration=replace(
+                configured.orchestration,
+                model_refresh=replace(
+                    configured.orchestration.model_refresh,
+                    inference=replace(
+                        configured.orchestration.model_refresh.inference,
+                        cache_max_entries=16,
+                        cache_max_bytes=65536,
+                    ),
+                ),
+            ),
+        ),
+    )
+    for changed in changed_configs:
+        with pytest.raises(ValueError, match="frozen run profile"):
+            ensure_autonomous_provenance(changed, directories, identity)
+        assert directories.autonomous_provenance.read_bytes() == original_bytes
+
+    provenance["external_weights"] = True
+    directories.autonomous_provenance.write_text(json.dumps(provenance))
+    with pytest.raises(ValueError, match="frozen run profile"):
+        ensure_autonomous_provenance(configured, directories, identity)
 
 
 def test_actor_lanes_expand_worker_specs_with_distinct_identity_and_affinity(

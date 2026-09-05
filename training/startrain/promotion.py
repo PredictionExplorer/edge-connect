@@ -47,6 +47,7 @@ from .historical_evaluation import (
     select_historical_evaluation,
 )
 from .model import GraphResTNet
+from .balanced_evaluation import completed_counts_by_ring
 from .native import load_star_native
 from .orchestration import gpu_pause_ack_path
 from .runtime import (
@@ -62,6 +63,16 @@ from .training import maybe_compile_model
 REJECTION_DECISIONS = frozenset(
     {"reject", "reject_ring_regression", "reject_max_pairs"}
 )
+
+
+def _persisted_pair_key(pair: ArenaPair) -> tuple[int, str, int]:
+    # Segment/cell identity is part of a pair: every cell reuses the same
+    # absolute index so a standard pair cannot overwrite a handicap/pie pair.
+    from .balanced_evaluation import pair_key
+
+    return pair_key(pair)
+
+
 # Exhausting the pair budget is terminal but carries no evidence either way.
 INCONCLUSIVE_DECISIONS = frozenset({"reject_max_pairs"})
 
@@ -126,10 +137,16 @@ def load_manifest_evaluator(
         config=InferenceConfig(
             precision=experiment.train.precision,
             score_utility_weight=experiment.selfplay.score_utility_weight,
+            cache_max_entries=refresh.inference.cache_max_entries,
+            cache_max_bytes=refresh.inference.cache_max_bytes,
+            deduplicate=refresh.inference.deduplicate,
+            pinned_transfers=refresh.inference.pinned_transfers,
+            pinned_buffer_slots=refresh.inference.pinned_buffer_slots,
         ),
         model_version=manifest.model_version,
         model_step=manifest.model_step,
         model_identity=manifest.model_identity,
+        homogeneous_relational_bias=refresh.inference.homogeneous_relational_bias,
     )
 
 
@@ -694,15 +711,37 @@ class PromotionSupervisor:
             run_identity=self.run_identity,
         )
         manifests[champion.model_identity] = champion
+        arena_results = load_arena_results(self.results_directory)
+        strength_contract: dict[str, object] = {}
+        if self.experiment.arena.balanced_cells:
+            from .balanced_evaluation import evaluation_contract
+
+            strength_contract = evaluation_contract(self._historical_arena_config())
+            # Screen evidence can establish champion transitions, but only
+            # matching strength-budget crossplay can resume a ladder edge.
+            arena_results = [
+                (path, result)
+                for path, result in arena_results
+                if result.get("result_kind") != HISTORICAL_CROSSPLAY_RESULT_KIND
+                or result.get("evaluation_contract") == strength_contract
+            ]
         plan = select_historical_evaluation(
             config=configured,
             champion=champion,
             manifests=manifests,
-            arena_results=load_arena_results(self.results_directory),
+            arena_results=arena_results,
             results_directory=self.results_directory,
         )
         if plan is None or plan.kind not in kinds:
             return 0
+        if self.experiment.arena.balanced_cells and plan.previous is None:
+            identity = str(strength_contract["identity"]).removeprefix("sha256-")[:16]
+            plan = replace(
+                plan,
+                result_path=plan.result_path.with_name(
+                    f"{plan.result_path.stem}-{identity}.json"
+                ),
+            )
         with self._gpu_pause(
             stop_requested=stop_requested,
             progress=progress,
@@ -719,6 +758,25 @@ class PromotionSupervisor:
                 yield_to_candidates=plan.kind != "measurement",
                 crossplay_kind=plan.kind,
             )
+
+    def _historical_arena_config(self) -> ArenaConfig:
+        configured = self.experiment.orchestration.historical_evaluation
+        simulations, max_considered = configured.search_budget(self.experiment.arena)
+        if self.experiment.arena.balanced_cells:
+            simulations = self.experiment.arena.strength_simulations
+        return replace(
+            self.experiment.arena,
+            pairs_per_ring=configured.pairs_per_ring,
+            minimum_pairs_per_ring=configured.max_pairs_per_ring,
+            max_pairs_per_ring=configured.max_pairs_per_ring,
+            simulations=simulations,
+            max_considered=max_considered,
+            promotion_pair_ratios={},
+            required_regression_rings=None,
+            weighted_initial_blocks=0,
+            weighted_continuation_blocks=0,
+            weighted_max_blocks=0,
+        )
 
     def _evaluate_historical_waves(
         self,
@@ -739,21 +797,14 @@ class PromotionSupervisor:
             f"{candidate.model_identity}\0{baseline.model_identity}"
         ).encode("utf-8")
         seed = int.from_bytes(hashlib.sha256(material).digest()[:8], "big")
-        simulations, max_considered = configured.search_budget(self.experiment.arena)
-        arena_config = replace(
-            self.experiment.arena,
-            pairs_per_ring=configured.pairs_per_ring,
-            minimum_pairs_per_ring=configured.max_pairs_per_ring,
-            max_pairs_per_ring=configured.max_pairs_per_ring,
-            simulations=simulations,
-            max_considered=max_considered,
-            promotion_pair_ratios={},
-            required_regression_rings=None,
-            weighted_initial_blocks=0,
-            weighted_continuation_blocks=0,
-            weighted_max_blocks=0,
-            seed=seed,
-        )
+        arena_config = replace(self._historical_arena_config(), seed=seed)
+        if previous is not None and arena_config.balanced_cells:
+            from .balanced_evaluation import evaluation_contract
+
+            if previous.get("evaluation_contract") != evaluation_contract(arena_config):
+                raise ValueError(
+                    "historical evaluation contract changed across continuation"
+                )
         accumulated = self._pairs_from_result(previous)
         candidate_evaluator = load_manifest_evaluator(
             self.experiment, candidate, device=self.device
@@ -791,11 +842,17 @@ class PromotionSupervisor:
                         )
                         for ring in arena_config.rings
                     }
+                    if arena_config.balanced_cells:
+                        starts = completed_counts_by_ring(accumulated, arena_config)
                     counts = {
                         ring: min(
                             configured.pairs_per_ring,
                             configured.max_pairs_per_ring
-                            - sum(pair.ring == ring for pair in accumulated),
+                            - (
+                                starts[ring]
+                                if arena_config.balanced_cells
+                                else sum(pair.ring == ring for pair in accumulated)
+                            ),
                         )
                         for ring in arena_config.rings
                     }
@@ -816,6 +873,11 @@ class PromotionSupervisor:
                         pair_starts=starts,
                         pair_counts=counts,
                         stop_requested=stop_requested,
+                        **(
+                            {"previous_pairs": accumulated}
+                            if arena_config.balanced_cells
+                            else {}
+                        ),
                     )
                     completed = self._pairs_from_result(result)
                     if not completed:
@@ -824,9 +886,9 @@ class PromotionSupervisor:
                         raise RuntimeError(
                             "historical arena completed no role-reversed pairs"
                         )
-                    unique = {(pair.ring, pair.pair): pair for pair in accumulated}
+                    unique = {_persisted_pair_key(pair): pair for pair in accumulated}
                     for pair in completed:
-                        key = (pair.ring, pair.pair)
+                        key = _persisted_pair_key(pair)
                         existing = unique.get(key)
                         if existing is not None and existing != pair:
                             raise ValueError(
@@ -864,7 +926,11 @@ class PromotionSupervisor:
                         result["evaluation_metrics"] = metrics
                     metrics["round_wall_seconds"] = time.perf_counter() - started
                     terminal = all(
-                        sum(pair.ring == ring for pair in accumulated)
+                        (
+                            completed_counts_by_ring(accumulated, arena_config)[ring]
+                            if arena_config.balanced_cells
+                            else sum(pair.ring == ring for pair in accumulated)
+                        )
                         >= configured.max_pairs_per_ring
                         for ring in arena_config.rings
                     )
@@ -1069,6 +1135,11 @@ class PromotionSupervisor:
                             pair_starts=chunk_starts,
                             pair_counts=chunk_counts,
                             stop_requested=stop_requested,
+                            **(
+                                {"previous_pairs": accumulated}
+                                if arena_config.balanced_cells
+                                else {}
+                            ),
                         )
                         completed = self._pairs_from_result(result)
                         if not completed:
@@ -1132,6 +1203,15 @@ class PromotionSupervisor:
         pair_starts: Mapping[int, int],
         pair_counts: Mapping[int, int],
     ) -> tuple[str, bool]:
+        if arena_config.balanced_cells:
+            from .balanced_evaluation import evaluation_contract
+
+            expected_contract = evaluation_contract(arena_config)
+            if result.get("evaluation_contract") != expected_contract or (
+                previous is not None
+                and previous.get("evaluation_contract") != expected_contract
+            ):
+                raise ValueError("cannot merge different balanced evaluation contracts")
         synchronize_device(metric_device)
         completed_pairs = self._pairs_from_result(result)
         evaluation_metrics = result.get("evaluation_metrics")
@@ -1243,9 +1323,9 @@ class PromotionSupervisor:
         result["wave_plan"] = wave_plan
         result["wave_history"] = [*previous_history, wave_plan]
         result["arena_seed_block"] = arena_config.seed
-        unique = {(pair.ring, pair.pair): pair for pair in accumulated}
+        unique = {_persisted_pair_key(pair): pair for pair in accumulated}
         for pair in completed_pairs:
-            key = (pair.ring, pair.pair)
+            key = _persisted_pair_key(pair)
             existing = unique.get(key)
             if existing is not None and existing != pair:
                 raise ValueError("arena wave changed a persisted pair")
@@ -1415,8 +1495,12 @@ class PromotionSupervisor:
         self,
         accumulated: list[ArenaPair],
     ) -> dict[int, int]:
+        if self.experiment.arena.balanced_cells:
+            return completed_counts_by_ring(accumulated, self.experiment.arena)
         return {
-            ring: sum(pair.ring == ring for pair in accumulated)
+            ring: sum(
+                pair.ring == ring and pair.segment == "standard" for pair in accumulated
+            )
             for ring in self.experiment.arena.rings
         }
 
@@ -1437,6 +1521,11 @@ class PromotionSupervisor:
         self,
         accumulated: list[ArenaPair],
     ) -> bool:
+        if self.experiment.arena.balanced_cells:
+            return all(
+                count >= self.experiment.arena.max_pairs_per_ring
+                for count in self._ring_pair_counts(accumulated).values()
+            )
         pair_ratios = self.experiment.arena.promotion_pair_ratios
         if pair_ratios:
             return (
@@ -1447,7 +1536,9 @@ class PromotionSupervisor:
                 >= self.experiment.arena.weighted_max_blocks
             )
         return all(
-            sum(pair.ring == ring for pair in accumulated)
+            sum(
+                pair.ring == ring and pair.segment == "standard" for pair in accumulated
+            )
             >= self.experiment.arena.max_pairs_per_ring
             for ring in self.experiment.arena.rings
         )
@@ -1460,13 +1551,19 @@ class PromotionSupervisor:
         starts = {
             ring: (
                 max(
-                    (pair.pair for pair in accumulated if pair.ring == ring),
+                    (
+                        pair.pair
+                        for pair in accumulated
+                        if pair.ring == ring and pair.segment == "standard"
+                    ),
                     default=-1,
                 )
                 + 1
             )
             for ring in self.experiment.arena.rings
         }
+        if self.experiment.arena.balanced_cells:
+            starts = dict(existing_counts)
         pair_ratios = self.experiment.arena.promotion_pair_ratios
         if pair_ratios:
             complete_blocks = self._complete_blocks(existing_counts, pair_ratios)
@@ -1661,6 +1758,14 @@ class PromotionSupervisor:
             yield
 
     def _result_path(self, candidate: ModelManifest, champion: ModelManifest) -> Path:
+        if self.experiment.arena.balanced_cells:
+            from .balanced_evaluation import evaluation_contract
+
+            contract = evaluation_contract(self._arena_config(candidate, champion))
+            identity = str(contract["identity"]).removeprefix("sha256-")[:16]
+            return self.results_directory / (
+                f"balanced-{identity}-{candidate.model_identity}-vs-{champion.model_identity}.json"
+            )
         return self.results_directory / (
             f"{candidate.model_identity}-vs-{champion.model_identity}.json"
         )
@@ -1685,6 +1790,15 @@ class PromotionSupervisor:
             and isinstance(payload.get("promotion"), dict)
             and (not isinstance(result_kind, str) or result_kind == "promotion")
         )
+        if valid and self.experiment.arena.balanced_cells:
+            from .balanced_evaluation import evaluation_contract
+
+            if payload.get("evaluation_contract") != evaluation_contract(
+                self._arena_config(candidate, champion)
+            ):
+                raise ValueError(
+                    "promotion evaluation contract changed across continuation"
+                )
         return payload if valid else None
 
     @staticmethod
@@ -1726,6 +1840,12 @@ class PromotionSupervisor:
             "games": [],
             "promotion": {},
         }
+        if self.experiment.arena.balanced_cells:
+            from .balanced_evaluation import evaluation_contract
+
+            payload["evaluation_contract"] = evaluation_contract(
+                self._arena_config(candidate, champion)
+            )
         payload["schema_version"] = ARENA_RESULT_SCHEMA_VERSION
         payload["terminal"] = True
         payload["conclusive"] = False

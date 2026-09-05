@@ -25,6 +25,7 @@ import torch
 
 from startrain.checkpoint import CHECKPOINT_FORMAT, CHECKPOINT_VERSION
 from startrain.config import ExperimentConfig, load_config
+from startrain.config_compatibility import without_efficiency_defaults
 
 if __package__:
     from scripts.validate_continuous_profile import validate_continuous_config
@@ -83,10 +84,54 @@ _ALLOWED_PROFILE_PATHS = {
     ("selfplay", "variants", "handicap"),
     ("selfplay", "variants", "pie"),
     ("selfplay", "variants", "pie_classic_share"),
+    ("selfplay", "variants", "handicap_classic_share"),
     ("selfplay", "variants", "handicap_min"),
     ("selfplay", "variants", "handicap_max"),
     ("selfplay", "variants", "asymmetric_pda_fraction"),
     ("selfplay", "variants", "swap_dead_zone"),
+    ("arena", "segment_handicap_classic_share"),
+    # Explicit board-size allocation, validated as a complete typed schedule.
+    ("orchestration", "ring_mixture", "step_weights"),
+    ("orchestration", "cpu_actors"),
+    ("orchestration", "promotion", "cpu_affinity"),
+    ("selfplay", "exact_endgame_max_empty"),
+    ("selfplay", "exact_endgame_max_nodes"),
+    ("selfplay", "full_simulations"),
+    ("selfplay", "fast_simulations"),
+    ("arena", "balanced_cells"),
+    ("arena", "cell_regression_floor_elo"),
+    ("arena", "handicap_severity_cycle"),
+    ("arena", "strength_simulations"),
+    ("arena", "pairs_per_ring"),
+    ("arena", "minimum_pairs_per_ring"),
+    *(
+        ("orchestration", "model_refresh", "inference", name)
+        for name in (
+            "cache_max_entries",
+            "cache_max_bytes",
+            "deduplicate",
+            "pinned_transfers",
+            "pinned_buffer_slots",
+            "homogeneous_relational_bias",
+            "shared_batching",
+            "max_batch_rows",
+            "max_pending_requests",
+            "max_wait_seconds",
+        )
+    ),
+    *(
+        ("orchestration", "gpus", str(index), name)
+        for index in range(8)
+        for name in (
+            "cpu_threads",
+            "native_threads",
+            "blas_threads",
+            "cpu_affinity",
+            "actor_lanes",
+            "actor_cohorts",
+            "actor_batch_size",
+        )
+    ),
     *(
         ("selfplay", "variants", "score_utility_weight_by_segment", segment)
         for segment in ("standard", "classic", "handicap", "pie")
@@ -285,6 +330,8 @@ _ADDITIVE_DEFAULT_FIELDS: tuple[tuple[tuple[str, ...], object], ...] = (
     (("orchestration", "promotion", "finish_inflight_candidate"), False),
     (("orchestration", "plateau", "count_inconclusive_rejections"), False),
     (("orchestration", "plateau", "restore_learning_rate_scale"), 1.0),
+    (("selfplay", "variants", "handicap_classic_share"), 0.0),
+    (("arena", "segment_handicap_classic_share"), 0.0),
 )
 
 
@@ -318,7 +365,10 @@ def _without_field(
 
 def _compatible_source_config_sha256s(config: ExperimentConfig) -> set[str]:
     materialized = config.as_dict()
-    variants: list[dict[str, object]] = [dict(materialized)]
+    variants: list[dict[str, object]] = [
+        dict(materialized),
+        without_efficiency_defaults(materialized),
+    ]
     for path, default in _ADDITIVE_DEFAULT_FIELDS:
         current = materialized
         for key in path:
@@ -443,6 +493,17 @@ def _profile_diffs(
     new: object,
     path: tuple[str, ...] = (),
 ) -> Iterator[tuple[tuple[str, ...], object, object]]:
+    # The typed loader validates this entire schedule before migration. Treat
+    # it as one allocation field so stage additions/removals are reviewable
+    # without allowing arbitrary changes to the surrounding ring configuration.
+    if path in {
+        ("orchestration", "ring_mixture", "step_weights"),
+        ("orchestration", "cpu_actors"),
+        ("arena", "handicap_severity_cycle"),
+    }:
+        if old != new:
+            yield path, old, new
+        return
     if isinstance(old, Mapping) and isinstance(new, Mapping):
         for key in sorted(set(old) | set(new), key=str):
             yield from _profile_diffs(
@@ -1231,6 +1292,61 @@ def _fingerprint(path: Path) -> _InputFingerprint:
     )
 
 
+def _validate_variant_arena_boundary(
+    run_root: Path, changed_paths: Sequence[str], *, champion_identity: str
+) -> tuple[Path, ...]:
+    """Keep a new variant allocation from resuming evidence under an old one."""
+
+    if not any(
+        path == "arena.segment_handicap_classic_share"
+        or path == "arena.segment_pairs_per_ring"
+        or path.startswith("arena.segment_pairs_per_ring.")
+        or path
+        in {
+            "arena.balanced_cells",
+            "arena.cell_regression_floor_elo",
+            "arena.handicap_severity_cycle",
+            "arena.simulations",
+            "arena.strength_simulations",
+            "arena.pairs_per_ring",
+        }
+        for path in changed_paths
+    ):
+        return ()
+    arena_root = run_root / "arena"
+    status_path = arena_root / "promotion-status.json"
+    inspected: list[Path] = []
+    if status_path.exists():
+        status, _ = _read_json(status_path, "promotion status")
+        if status.get("terminal") is not True:
+            raise MigrationError(
+                "arena variant allocation changes require a terminal arena boundary; "
+                "finish the in-flight evaluation before migrating"
+            )
+        inspected.append(status_path)
+    # Promotion may resume an older candidate even when the latest status is
+    # terminal. Results against former champions are historical, not resumable.
+    result_paths = set(arena_root.glob(f"*-vs-{champion_identity}.json"))
+    # Historical crossplay resumes the current champion as the candidate and
+    # inherits the same variant allocation, so its partial evidence matters too.
+    crossplay_prefix = f"crossplay-{champion_identity}-vs-"
+    result_paths.update(arena_root.glob(f"{crossplay_prefix}*.json"))
+    for path in sorted(result_paths):
+        result, _ = _read_json(path, "arena boundary result")
+        kind = result.get("result_kind")
+        if kind not in (None, "promotion") and not (
+            kind == "historical_crossplay" and path.name.startswith(crossplay_prefix)
+        ):
+            continue
+        if result.get("terminal") is not True:
+            raise MigrationError(
+                "arena variant allocation changes require a terminal arena boundary; "
+                f"resumable arena evidence remains in {path.name}"
+            )
+        inspected.append(path)
+    return tuple(inspected)
+
+
 def plan_migration(request: MigrationRequest) -> MigrationPlan:
     old_profile = _resolved_input_file(request.old_profile, "old profile")
     new_profile = _resolved_input_file(request.new_profile, "new profile")
@@ -1346,6 +1462,9 @@ def plan_migration(request: MigrationRequest) -> MigrationPlan:
             run_id=run_id,
             generation_family=generation_family,
         )
+    )
+    arena_boundary_paths = _validate_variant_arena_boundary(
+        run_root, [path for path, _, _ in changes], champion_identity=champion_identity
     )
     recovery_interval = old_config.learner.recovery_interval_steps
     if recovery_interval is None:
@@ -1464,6 +1583,7 @@ def plan_migration(request: MigrationRequest) -> MigrationPlan:
         (champion_path, "learner champion"),
         (champion_manifest, "champion manifest"),
         *((path, "source profile checksum") for path in source_checksums),
+        *((path, "arena boundary evidence") for path in arena_boundary_paths),
     ]
     optional_paths = (
         (run_root / "source-commit.txt", "source commit"),
@@ -1757,6 +1877,11 @@ def _create_backup(plan: MigrationPlan) -> Path:
 def _assert_inputs_unchanged(plan: MigrationPlan, *, check_lock: bool) -> None:
     if check_lock:
         _coordinator_lock_status(plan.run_root)
+    _validate_variant_arena_boundary(
+        plan.run_root,
+        [path for path, _, _ in plan.changes],
+        champion_identity=str(plan.migration_record["champion_model_identity"]),
+    )
     for expected in plan.input_fingerprints:
         path = expected.path
         if path.is_symlink() or not path.is_file():

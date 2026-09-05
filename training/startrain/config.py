@@ -391,8 +391,17 @@ class GPUWorkerConfig:
     actor_batch_size: int | None = None
     actor_lanes: int = 1
     cpu_affinity: str | None = None
+    actor_cohorts: int = 1
+    native_threads: int | None = None
+    blas_threads: int | None = None
 
     def __post_init__(self) -> None:
+        if type(self.actor_cohorts) is not int or not 1 <= self.actor_cohorts <= 32:
+            raise ConfigError("actor_cohorts must be an integer in 1..32")
+        for name in ("native_threads", "blas_threads"):
+            value = getattr(self, name)
+            if value is not None and (type(value) is not int or value <= 0):
+                raise ConfigError(f"GPU {name} must be a positive integer or null")
         if (
             isinstance(self.gpu_id, bool)
             or not isinstance(self.gpu_id, int)
@@ -424,8 +433,58 @@ class GPUWorkerConfig:
             raise ConfigError("learner GPUs cannot set actor_batch_size")
         elif self.actor_lanes != 1:
             raise ConfigError("learner GPUs cannot configure actor lanes")
+        if self.role == "learner" and self.actor_cohorts != 1:
+            raise ConfigError("learner GPUs cannot configure actor cohorts")
+        if self.actor_cohorts > 1 and self.actor_lanes != 1:
+            raise ConfigError("shared actor cohorts require exactly one actor lane")
         if self.cpu_affinity is not None:
             parse_cpu_affinity(self.cpu_affinity)
+
+
+@dataclass(frozen=True, slots=True)
+class CPUActorConfig:
+    """An explicitly reserved CPU actor supplementing GPU self-play."""
+
+    actor_id: str
+    rings: tuple[int, ...] = (4,)
+    cpu_threads: int = 8
+    native_threads: int = 4
+    blas_threads: int = 4
+    actor_batch_size: int = 16
+    cpu_affinity: str | None = None
+    precision: Literal["bf16"] = "bf16"
+
+    def __post_init__(self) -> None:
+        from .runtime import validate_identifier
+
+        validate_identifier("CPU actor_id", self.actor_id)
+        if self.actor_id in {
+            "learner",
+            "arena-promotion",
+            "coordinator",
+        } or self.actor_id.startswith("actor-gpu-"):
+            raise ConfigError("CPU actor_id conflicts with a reserved worker name")
+        if (
+            not self.rings
+            or tuple(sorted(set(self.rings))) != self.rings
+            or any(type(ring) is not int or ring not in (4, 6) for ring in self.rings)
+        ):
+            raise ConfigError("CPU actors require a sorted unique subset of rings 4/6")
+        for name in (
+            "cpu_threads",
+            "native_threads",
+            "blas_threads",
+            "actor_batch_size",
+        ):
+            if type(getattr(self, name)) is not int or getattr(self, name) <= 0:
+                raise ConfigError(f"CPU actor {name} must be a positive integer")
+        if self.precision != "bf16":
+            raise ConfigError("CPU actors require explicit bf16 precision")
+        if self.cpu_affinity is None:
+            raise ConfigError("CPU actors require an explicit reserved cpu_affinity")
+        cpus = parse_cpu_affinity(self.cpu_affinity)
+        if max(self.cpu_threads, self.native_threads, self.blas_threads) > len(cpus):
+            raise ConfigError("CPU actor thread budgets exceed its reserved CPUs")
 
 
 @dataclass(frozen=True, slots=True)
@@ -554,6 +613,49 @@ class RingMixtureConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class ActorInferenceConfig:
+    """Bounded, optional inference services; no model/checkpoint shape changes."""
+
+    cache_max_entries: int = 0
+    cache_max_bytes: int = 0
+    deduplicate: bool = False
+    pinned_transfers: bool = False
+    pinned_buffer_slots: int = 2
+    homogeneous_relational_bias: bool = False
+    shared_batching: bool = False
+    max_batch_rows: int = 256
+    max_pending_requests: int = 16
+    max_wait_seconds: float = 0.002
+
+    def __post_init__(self) -> None:
+        for name in ("cache_max_entries", "cache_max_bytes"):
+            if type(getattr(self, name)) is not int or getattr(self, name) < 0:
+                raise ConfigError(f"inference.{name} must be a non-negative integer")
+        if (self.cache_max_entries == 0) != (self.cache_max_bytes == 0):
+            raise ConfigError("inference cache requires both entry and byte limits")
+        for name in ("pinned_buffer_slots", "max_batch_rows", "max_pending_requests"):
+            if type(getattr(self, name)) is not int or getattr(self, name) <= 0:
+                raise ConfigError(f"inference.{name} must be a positive integer")
+        if self.pinned_buffer_slots > 8:
+            raise ConfigError("inference.pinned_buffer_slots must be in [1, 8]")
+        for name in (
+            "deduplicate",
+            "pinned_transfers",
+            "homogeneous_relational_bias",
+            "shared_batching",
+        ):
+            if type(getattr(self, name)) is not bool:
+                raise ConfigError(f"inference.{name} must be boolean")
+        if (
+            isinstance(self.max_wait_seconds, bool)
+            or not isinstance(self.max_wait_seconds, int | float)
+            or not math.isfinite(self.max_wait_seconds)
+            or not 0 <= self.max_wait_seconds <= 1
+        ):
+            raise ConfigError("inference.max_wait_seconds must be finite in [0, 1]")
+
+
+@dataclass(frozen=True, slots=True)
 class ModelRefreshConfig:
     manifest_poll_seconds: float = 2.0
     startup_timeout_seconds: float = 600.0
@@ -571,6 +673,7 @@ class ModelRefreshConfig:
     candidate_probability: float = 0.8
     history_probability: float = 0.0
     history_pool_size: int = 8
+    inference: ActorInferenceConfig = ActorInferenceConfig()
 
     def __post_init__(self) -> None:
         if (
@@ -770,6 +873,7 @@ class PromotionConfig:
     enabled: bool = False
     gpu_id: int = 0
     cpu_threads: int = 4
+    cpu_affinity: str | None = None
     poll_seconds: float = 10.0
     bootstrap_initial_champion: bool = False
     device: str = "cuda"
@@ -782,6 +886,8 @@ class PromotionConfig:
     finish_inflight_candidate: bool = False
 
     def __post_init__(self) -> None:
+        if self.cpu_affinity is not None:
+            parse_cpu_affinity(self.cpu_affinity)
         if (
             type(self.enabled) is not bool
             or type(self.bootstrap_initial_champion) is not bool
@@ -1006,6 +1112,7 @@ class OrchestrationConfig:
     training_objective: Literal["generalist", "ring10_only"] = "generalist"
     run_id: str | None = None
     gpus: tuple[GPUWorkerConfig, ...] = ()
+    cpu_actors: tuple[CPUActorConfig, ...] = ()
     device: str = "cuda"
     allow_colocated_workers: bool = False
     actor_games_per_batch: int = 256
@@ -1062,6 +1169,47 @@ class OrchestrationConfig:
                 )
         learners = [gpu for gpu in self.gpus if gpu.role == "learner"]
         actors = [gpu for gpu in self.gpus if gpu.role == "actor"]
+        if any(gpu.actor_cohorts > 1 for gpu in actors) and not (
+            self.model_refresh.inference.shared_batching
+        ):
+            raise ConfigError(
+                "multiple actor cohorts require shared inference batching"
+            )
+        if self.model_refresh.inference.shared_batching and any(
+            gpu.actor_batch_size is not None
+            and gpu.actor_batch_size > self.model_refresh.inference.max_batch_rows
+            for gpu in actors
+        ):
+            raise ConfigError("actor batch size exceeds the shared inference row limit")
+        cpu_ids = [actor.actor_id for actor in self.cpu_actors]
+        if len(cpu_ids) != len(set(cpu_ids)):
+            raise ConfigError("CPU actor identifiers must be unique")
+        if self.cpu_actors and any(gpu.cpu_affinity is None for gpu in self.gpus):
+            raise ConfigError("CPU actors require explicit GPU worker CPU affinities")
+        reserved = set()
+        gpu_cpus = {
+            cpu
+            for gpu in self.gpus
+            if gpu.cpu_affinity is not None
+            for cpu in parse_cpu_affinity(gpu.cpu_affinity)
+        }
+        if self.cpu_actors and self.promotion.enabled:
+            if self.promotion.cpu_affinity is not None:
+                gpu_cpus.update(parse_cpu_affinity(self.promotion.cpu_affinity))
+            elif self.promotion.gpu_id not in {gpu.gpu_id for gpu in self.gpus}:
+                raise ConfigError(
+                    "dedicated promotion GPU requires a CPU affinity when CPU actors are enabled"
+                )
+        for cpu_actor in self.cpu_actors:
+            assert cpu_actor.cpu_affinity is not None
+            cpus = set(parse_cpu_affinity(cpu_actor.cpu_affinity))
+            if cpus & (gpu_cpus | reserved):
+                raise ConfigError(
+                    "CPU actor affinities must be disjoint from other workers"
+                )
+            reserved.update(cpus)
+            if cpu_actor.actor_batch_size > self.actor_games_per_batch:
+                raise ConfigError("CPU actor batch exceeds actor_games_per_batch")
         if any(
             gpu.actor_batch_size is not None
             and gpu.actor_batch_size > self.actor_games_per_batch
@@ -1160,10 +1308,47 @@ class ArenaConfig:
     segment_pairs_per_ring: dict[str, int] = field(default_factory=dict)
     segment_regression_floor_elo: dict[str, float] = field(default_factory=dict)
     segment_handicaps: tuple[int, ...] = (2, 4, 6, 9)
+    # Default preserves the pair schedule of previously frozen profiles.
+    segment_handicap_classic_share: float = 0.0
     segment_handicap_pda: tuple[int, ...] = (1, 1, 2, 2, 2, 3, 3, 3)
     swap_dead_zone: float = 0.02
+    balanced_cells: bool = False
+    cell_regression_floor_elo: float = -100.0
+    handicap_severity_cycle: tuple[int, ...] = (2, 4, 6, 9)
+    strength_simulations: int = 1_024
 
     def __post_init__(self) -> None:
+        if type(self.balanced_cells) is not bool:
+            raise ConfigError("arena.balanced_cells must be boolean")
+        if (
+            isinstance(self.cell_regression_floor_elo, bool)
+            or not isinstance(self.cell_regression_floor_elo, int | float)
+            or not math.isfinite(self.cell_regression_floor_elo)
+        ):
+            raise ConfigError("arena.cell_regression_floor_elo must be finite")
+        if type(self.strength_simulations) is not int or self.strength_simulations <= 0:
+            raise ConfigError("arena.strength_simulations must be a positive integer")
+        if (
+            not self.handicap_severity_cycle
+            or any(
+                type(value) is not int or not 2 <= value <= MAX_HANDICAP
+                for value in self.handicap_severity_cycle
+            )
+            or len(set(self.handicap_severity_cycle))
+            != len(self.handicap_severity_cycle)
+        ):
+            raise ConfigError(
+                "arena handicap severity cycle requires unique values in 2..9"
+            )
+        if self.balanced_cells and (
+            self.rings != SUPPORTED_RINGS
+            or self.promotion_pair_ratios
+            or self.segment_pairs_per_ring
+            or self.segment_regression_floor_elo
+        ):
+            raise ConfigError(
+                "balanced arena requires all rings and no legacy segment/ratio schedules"
+            )
         if (
             not self.rings
             or any(
@@ -1217,6 +1402,17 @@ class ArenaConfig:
                 f"arena segment_handicaps must be non-empty values in 2..{MAX_HANDICAP}"
             )
         object.__setattr__(self, "segment_handicaps", handicaps)
+        if (
+            isinstance(self.segment_handicap_classic_share, bool)
+            or not isinstance(self.segment_handicap_classic_share, int | float)
+            or not 0 <= self.segment_handicap_classic_share <= 1
+        ):
+            raise ConfigError("arena segment_handicap_classic_share must be in [0, 1]")
+        object.__setattr__(
+            self,
+            "segment_handicap_classic_share",
+            float(self.segment_handicap_classic_share),
+        )
         pdas = tuple(self.segment_handicap_pda)
         if len(pdas) != MAX_HANDICAP - 1 or any(
             isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 3
@@ -1438,6 +1634,29 @@ class ExperimentConfig:
             raise ConfigError(
                 "selfplay mode/handicap/pie must equal the game's standard variant"
             )
+        if self.arena.balanced_cells and any(
+            not family.allows(mode, handicap, pie)
+            for mode in ("classic", "double")
+            for handicap, pie in (
+                (1, False),
+                (1, True),
+                *((severity, False) for severity in self.arena.handicap_severity_cycle),
+            )
+        ):
+            raise ConfigError("balanced arena cells fall outside the game family")
+        if "handicap" in self.arena.segment_pairs_per_ring:
+            share = self.arena.segment_handicap_classic_share
+            modes = ("classic",) if share == 1 else ("double",)
+            if 0 < share < 1:
+                modes = ("classic", "double")
+            if any(
+                not family.allows(mode, handicap, False)
+                for mode in modes
+                for handicap in self.arena.segment_handicaps
+            ):
+                raise ConfigError(
+                    "arena handicap variants fall outside the game family"
+                )
         if not mixture.enabled:
             return
         if mixture.classic > 0 and "classic" not in family.modes:
@@ -1458,7 +1677,8 @@ class ExperimentConfig:
         if mixture.handicap > 0 and (
             mixture.handicap_min < family.handicap_min
             or mixture.handicap_max > family.handicap_max
-            or "double" not in family.modes
+            or (mixture.handicap_classic_share > 0 and "classic" not in family.modes)
+            or (mixture.handicap_classic_share < 1 and "double" not in family.modes)
         ):
             raise ConfigError(
                 "selfplay.variants handicap range falls outside the game family"
@@ -1620,6 +1840,18 @@ def load_config(path: str | Path) -> ExperimentConfig:
         _construct(GPUWorkerConfig, value)
         for value in orchestration_values.get("gpus", ())
     )
+    cpu_actor_values = orchestration_values.get("cpu_actors", ())
+    if not isinstance(cpu_actor_values, list | tuple):
+        raise ConfigError("orchestration.cpu_actors must be a list")
+    cpu_actors = []
+    for value in cpu_actor_values:
+        actor = _mapping("CPU actor", value)
+        if "rings" in actor:
+            if not isinstance(actor["rings"], list | tuple):
+                raise ConfigError("CPU actor rings must be a list")
+            actor["rings"] = tuple(actor["rings"])
+        cpu_actors.append(_construct(CPUActorConfig, actor))
+    orchestration_values["cpu_actors"] = tuple(cpu_actors)
     ring_values = _mapping("ring_mixture", orchestration_values.get("ring_mixture", {}))
     ring_values["rings"] = tuple(ring_values.get("rings", SUPPORTED_RINGS))
     ring_values["deficit_weights"] = tuple(
@@ -1644,6 +1876,13 @@ def load_config(path: str | Path) -> ExperimentConfig:
     if promotion_values.get("device") == "auto":
         promotion_values["device"] = host.resolve("auto")
     orchestration_values["promotion"] = promotion_values
+    refresh_values = _mapping(
+        "model_refresh", orchestration_values.get("model_refresh", {})
+    )
+    refresh_values["inference"] = _construct(
+        ActorInferenceConfig, refresh_values.get("inference", {})
+    )
+    orchestration_values["model_refresh"] = refresh_values
     for key, cls in (
         ("model_refresh", ModelRefreshConfig),
         ("restart", RestartPolicyConfig),
@@ -1699,7 +1938,11 @@ def load_config(path: str | Path) -> ExperimentConfig:
             arena_values.get("segment_regression_floor_elo", {}),
         ).items()
     }
-    for name in ("segment_handicaps", "segment_handicap_pda"):
+    for name in (
+        "segment_handicaps",
+        "segment_handicap_pda",
+        "handicap_severity_cycle",
+    ):
         if name in arena_values:
             if not isinstance(arena_values[name], list | tuple):
                 raise ConfigError(f"arena.{name} must be a list")

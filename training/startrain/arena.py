@@ -5,17 +5,26 @@ from __future__ import annotations
 import math
 import random
 import time
+import threading
+from contextlib import contextmanager
 from concurrent.futures import Executor, ThreadPoolExecutor
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass, replace
 from statistics import NormalDist
-from typing import Any, Literal, Protocol, cast
+from typing import Any, Iterator, Literal, Protocol, cast
 
 from .config import ArenaConfig
 from .contracts import SEGMENT_STANDARD
-from .inference import InferenceResponse, NativeEvalBatchProtocol
+from .inference import GraphInferenceAdapter, InferenceResponse, NativeEvalBatchProtocol
+from .inference_batching import BoundedInferenceBroker
 from .native import BITBOARD_WORDS
 from .selfplay import STANDARD_VARIANT, GameVariant
+from .balanced_evaluation import (
+    BALANCED_CATEGORIES,
+    balanced_opening_seed,
+    balanced_search_seed,
+    cell_variant,
+)
 from .topology import get_topology
 
 
@@ -197,6 +206,8 @@ class ArenaPair:
         topology = get_topology(self.ring)
         if GameVariant.parse(self.variant).segment != self.segment:
             raise ValueError("arena pair segment disagrees with its variant")
+        if not isinstance(self.outcomes, (tuple, list)) or len(self.outcomes) != 2:
+            raise ValueError("arena pairs require exactly two role-reversed outcomes")
         if any(
             type(outcome) is not int or outcome not in (-1, 1)
             for outcome in self.outcomes
@@ -1172,6 +1183,10 @@ def _apply_segment_vetoes(
 def summarize_arena_pairs(
     pairs: Sequence[ArenaPair], config: ArenaConfig
 ) -> dict[str, object]:
+    if config.balanced_cells:
+        from .balanced_evaluation import summarize_balanced_pairs
+
+        return summarize_balanced_pairs(pairs, config)
     if not pairs:
         raise ValueError("arena summary requires pairs")
     standard, segments = _split_segments(pairs)
@@ -1214,6 +1229,10 @@ def summarize_completed_arena_pairs(
 ) -> dict[str, object]:
     """Summarize complete pairs without treating partial ring coverage as a decision."""
 
+    if config.balanced_cells:
+        from .balanced_evaluation import summarize_balanced_pairs
+
+        return summarize_balanced_pairs(pairs, config)
     if not pairs:
         raise ValueError("arena summary requires pairs")
     standard, segments = _split_segments(pairs)
@@ -1322,17 +1341,34 @@ class ArenaRunner:
         baseline_search: ArenaSearchBudget | None = None,
         baseline_metadata: Mapping[str, object] | None = None,
         search_workers: int = 2,
+        stable_pair_seeds: bool = False,
+        parallel_variant_groups: int = 12,
     ) -> None:
         if search_workers not in (1, 2):
             raise ValueError("arena search_workers must be one or two")
+        if type(stable_pair_seeds) is not bool:
+            raise ValueError("stable_pair_seeds must be boolean")
+        if (
+            type(parallel_variant_groups) is not int
+            or not 1 <= parallel_variant_groups <= 12
+        ):
+            raise ValueError("parallel_variant_groups must be an integer in 1..12")
         self.native = native_module
         self.candidate = candidate
         self.baseline = baseline
         self.config = config
+        self.stable_pair_seeds = stable_pair_seeds or config.balanced_cells
         self.candidate_search = ArenaSearchBudget.from_config(config)
         self.baseline_search = baseline_search or self.candidate_search
+        if config.balanced_cells and self.baseline_search != self.candidate_search:
+            raise ValueError(
+                "balanced evaluation requires identical participant search budgets"
+            )
         self.baseline_metadata = dict(baseline_metadata or {})
         self.search_workers = search_workers
+        self.parallel_variant_groups = parallel_variant_groups
+        self._shared_broker: BoundedInferenceBroker | None = None
+        self._shared_inference_metrics: dict[str, int | float] | None = None
         self._inference_calls = 0
         self._inference_seconds = 0.0
         self._inference_queue_wait_seconds = 0.0
@@ -1344,6 +1380,7 @@ class ArenaRunner:
         pair_starts: Mapping[int, int] | None = None,
         pair_counts: Mapping[int, int] | None = None,
         stop_requested: Callable[[], bool] | None = None,
+        previous_pairs: Sequence[ArenaPair] | None = None,
     ) -> dict[str, object]:
         started_ns = time.time_ns()
         started = time.perf_counter()
@@ -1362,19 +1399,51 @@ class ArenaRunner:
             for ring in self.config.rings
         )
         interrupted = False
+        prior = list(previous_pairs or ())
+        finished: set[tuple[int, str, int]] = set()
+        if self.config.balanced_cells:
+            from .balanced_evaluation import (
+                pair_key,
+                grouped_cell_pairs,
+            )
+
+            grouped_cell_pairs(prior, self.config)
+            if any((pair_starts or {}).values()) and not prior:
+                raise ValueError(
+                    "balanced continuation requires persisted previous pairs"
+                )
+            finished = {pair_key(pair) for pair in prior}
         # Dynamo/Inductor compiled models are not thread-safe. Keep the two
         # GIL-releasing native search groups parallel, but route both models
         # through one stable inference thread for the entire arena run.
-        with ThreadPoolExecutor(
-            max_workers=1,
-            thread_name_prefix="arena-inference",
-        ) as inference_executor:
+        with self._inference_owner() as inference_executor:
             for ring in self.config.rings:
                 first_pair = int((pair_starts or {}).get(ring, 0))
                 pair_count = int(
                     (pair_counts or {}).get(ring, self.config.pairs_per_ring)
                 )
                 final_pair = first_pair + pair_count
+                if self.config.balanced_cells:
+                    by_variant: dict[GameVariant, list[int]] = {}
+                    for index in range(first_pair, final_pair):
+                        for name in BALANCED_CATEGORIES:
+                            if (ring, name, index) in finished:
+                                continue
+                            variant = cell_variant(name, index, self.config)
+                            by_variant.setdefault(variant, []).append(index)
+                    completed = self._play_balanced_groups(
+                        ring,
+                        by_variant,
+                        games,
+                        pairs,
+                        progress=progress,
+                        inference_executor=inference_executor,
+                        stop_requested=should_stop,
+                    )
+                    interrupted = not completed or should_stop()
+                    if interrupted:
+                        break
+                    continue
                 chunk_size = self.config.pair_chunk_size or max(1, pair_count)
                 for chunk_start in range(
                     first_pair,
@@ -1427,6 +1496,7 @@ class ArenaRunner:
                             segment,
                             _opening_seed(self.config.seed, ring, pair),
                             self.config,
+                            pair=pair,
                         )
                         by_variant.setdefault(variant, []).append(pair)
                     for variant, variant_pairs in sorted(
@@ -1454,8 +1524,10 @@ class ArenaRunner:
                     break
         summary_config = _wave_local_summary_config(self.config, pair_starts)
         statistical = (
-            summarize_completed_arena_pairs(pairs, summary_config)
-            if pairs
+            summarize_completed_arena_pairs(
+                prior + pairs if self.config.balanced_cells else pairs, summary_config
+            )
+            if pairs or self.config.balanced_cells
             else {
                 "aggregate": None,
                 "per_ring": {},
@@ -1511,9 +1583,15 @@ class ArenaRunner:
                 "inference_queue_wait_seconds": (self._inference_queue_wait_seconds),
                 "requested_pairs": requested_pairs,
                 "completed_pairs": len(pairs),
+                "shared_inference": self._shared_inference_metrics,
             },
             "search": {
                 "deterministic": True,
+                "seed_stream_policy": (
+                    "independent-cell-pair-seat-move-v2"
+                    if self.stable_pair_seeds
+                    else "legacy-batch-coupled-v1"
+                ),
                 **self.candidate_search.metadata(),
                 "pie_rule": "pie" in self.config.segment_pairs_per_ring,
                 "segments": {
@@ -1521,10 +1599,19 @@ class ArenaRunner:
                     **dict(sorted(self.config.segment_pairs_per_ring.items())),
                 },
                 "segment_handicaps": list(self.config.segment_handicaps),
+                "segment_handicap_classic_share": (
+                    self.config.segment_handicap_classic_share
+                ),
                 "segment_handicap_pda": list(self.config.segment_handicap_pda),
                 "swap_dead_zone": self.config.swap_dead_zone,
                 "search_workers": self.search_workers,
                 "inference_workers": 1,
+                "variant_group_workers": self.parallel_variant_groups
+                if self._shared_inference_metrics is not None
+                else 1,
+                "inference_execution": "shared_broker"
+                if self._shared_inference_metrics is not None
+                else "serialized",
                 "pair_chunk_size": self.config.pair_chunk_size,
                 "effective_pair_chunking": (
                     "configured"
@@ -1538,6 +1625,117 @@ class ArenaRunner:
             "pairs": [asdict(pair) for pair in pairs],
         }
 
+    @contextmanager
+    def _inference_owner(self) -> Iterator[Executor]:
+        """Keep one model owner alive until all bounded producer groups drain."""
+        self._shared_inference_metrics = None
+        shared = (
+            self.config.balanced_cells
+            and self.parallel_variant_groups > 1
+            and isinstance(self.candidate, GraphInferenceAdapter)
+            and isinstance(self.baseline, GraphInferenceAdapter)
+        )
+        broker = (
+            BoundedInferenceBroker(
+                max_batch_rows=512, max_pending_requests=24, max_wait_seconds=0.002
+            )
+            if shared
+            else None
+        )
+        self._shared_broker = broker
+        try:
+            with ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="arena-inference"
+            ) as executor:
+                yield executor
+        finally:
+            # _play_balanced_groups joins every search producer before this
+            # context exits; no model or request lifetime outlasts this owner.
+            if broker is not None:
+                broker.shutdown(wait=True, cancel_pending=False)
+                self._shared_inference_metrics = broker.metrics_snapshot()
+            self._shared_broker = None
+
+    def _play_balanced_groups(
+        self,
+        ring: int,
+        by_variant: Mapping[GameVariant, Sequence[int]],
+        games: list[ArenaGame],
+        pairs: list[ArenaPair],
+        *,
+        progress: Callable[..., None] | None,
+        inference_executor: Executor,
+        stop_requested: Callable[[], bool],
+    ) -> bool:
+        ordered = sorted(by_variant.items(), key=lambda item: item[0].label)
+        if self._shared_broker is None:
+            for variant, indices in ordered:
+                if stop_requested() or not self._play_specifications(
+                    ring,
+                    self._pair_specifications(ring, indices, variant),
+                    variant,
+                    games,
+                    pairs,
+                    progress=progress,
+                    inference_executor=inference_executor,
+                    stop_requested=stop_requested,
+                ):
+                    return False
+            return True
+        cancelled = threading.Event()
+        progress_lock = threading.Lock()
+
+        def stopped() -> bool:
+            return cancelled.is_set() or stop_requested()
+
+        def report(**details: object) -> None:
+            if progress is not None:
+                with progress_lock:
+                    progress(**details)
+
+        def play(
+            item: tuple[GameVariant, Sequence[int]],
+        ) -> tuple[bool, list[ArenaGame], list[ArenaPair]]:
+            variant, indices = item
+            local_games: list[ArenaGame] = []
+            local_pairs: list[ArenaPair] = []
+            if stopped():
+                return False, local_games, local_pairs
+            try:
+                complete = self._play_specifications(
+                    ring,
+                    self._pair_specifications(ring, indices, variant),
+                    variant,
+                    local_games,
+                    local_pairs,
+                    progress=report,
+                    inference_executor=inference_executor,
+                    stop_requested=stopped,
+                )
+                return complete, local_games, local_pairs
+            except BaseException:
+                cancelled.set()
+                raise
+
+        complete = True
+        # At most twelve variant groups and two native seat workers per group.
+        # The finite queue has at most four standard/pie groups plus two groups
+        # per configured handicap severity; no per-game thread pool is created.
+        with ThreadPoolExecutor(
+            max_workers=self.parallel_variant_groups, thread_name_prefix="arena-variant"
+        ) as pool:
+            futures = [pool.submit(play, item) for item in ordered]
+            try:
+                for future in futures:
+                    finished, local_games, local_pairs = future.result()
+                    games.extend(local_games)
+                    pairs.extend(local_pairs)
+                    complete = complete and finished
+            except BaseException:
+                cancelled.set()
+                raise
+        return complete and not stopped()
+
     def _pair_specifications(
         self,
         ring: int,
@@ -1547,7 +1745,11 @@ class ArenaRunner:
         node_count = get_topology(ring).n
         specifications: list[tuple[int, int, int, int | None]] = []
         for pair in pair_indices:
-            opening_seed = _opening_seed(self.config.seed, ring, pair)
+            opening_seed = (
+                balanced_opening_seed(self.config.seed, ring, variant, pair)
+                if self.stable_pair_seeds
+                else _opening_seed(self.config.seed, ring, pair)
+            )
             forced_opening = _forced_opening(
                 opening_seed, self.config.unforced_opening_fraction
             )
@@ -1757,6 +1959,20 @@ class ArenaRunner:
                             pda_seats,
                             [bool(data.swap_available[row]) for row in rows],
                             node_count,
+                            **(
+                                {
+                                    "seeds_per_root": [
+                                        balanced_search_seed(
+                                            specifications[row][2],
+                                            specifications[row][1],
+                                            searched_moves[row],
+                                        )
+                                        for row in rows
+                                    ]
+                                }
+                                if self.stable_pair_seeds
+                                else {}
+                            ),
                         )
                     )
                 search_results = [future.result() for future in futures]
@@ -1833,10 +2049,15 @@ class ArenaRunner:
         pda_seats: tuple[int, int] = (0, 0),
         swap_available: Sequence[bool] | None = None,
         node_count: int | None = None,
+        seeds_per_root: Sequence[int] | None = None,
     ) -> tuple[list[int], list[int]] | None:
         if stop_requested():
             return None
         options: dict[str, object] = {}
+        if self.stable_pair_seeds:
+            if seeds_per_root is None or len(seeds_per_root) != row_count:
+                raise ValueError("stable pair search requires one seed per root")
+            options["seeds_per_root"] = list(seeds_per_root)
         if budgets is not None and any(
             value != budget.simulations for value in budgets
         ):
@@ -1903,6 +2124,17 @@ class ArenaRunner:
         evaluator: ArenaEvaluatorProtocol,
         requests: NativeEvalBatchProtocol,
     ) -> InferenceResponse:
+        if self._shared_broker is not None:
+            if not isinstance(evaluator, GraphInferenceAdapter):
+                raise RuntimeError(
+                    "shared arena inference requires an immutable graph adapter"
+                )
+            # Submission must happen on independent search producers. Sending
+            # this wait through the serial executor would prevent any batching.
+            return cast(
+                InferenceResponse,
+                self._shared_broker.submit(evaluator, requests).result(),
+            )
         submitted = time.perf_counter()
 
         def evaluate() -> InferenceResponse:
@@ -1997,6 +2229,15 @@ class ArenaRunner:
                 pda_seats,
                 [bool(state_data.swap_available[0])],
                 node_count,
+                **(
+                    {
+                        "seeds_per_root": [
+                            balanced_search_seed(opening_seed, candidate_player, moves)
+                        ]
+                    }
+                    if self.stable_pair_seeds
+                    else {}
+                ),
             )
             if result is None:
                 return None
@@ -2089,7 +2330,7 @@ def _segment_pair_range(
 
 
 def _segment_variant(
-    segment: str, opening_seed: int, config: ArenaConfig
+    segment: str, opening_seed: int, config: ArenaConfig, *, pair: int
 ) -> GameVariant:
     """Deterministically pick the concrete variant of one segment pair."""
 
@@ -2097,8 +2338,14 @@ def _segment_variant(
         return GameVariant(mode="classic")
     if segment == "handicap":
         handicaps = config.segment_handicaps
+        share = config.segment_handicap_classic_share
+        # Stratify modes by the absolute pair index, separately from the seeded
+        # size draw. A 50/50 mix covers both modes in every two adjacent pairs,
+        # and continuation waves retain the same variant for each pair.
+        classic = math.floor((pair + 1) * share) > math.floor(pair * share)
         return GameVariant(
-            mode="double", handicap=handicaps[(opening_seed >> 8) % len(handicaps)]
+            mode="classic" if classic else "double",
+            handicap=handicaps[(opening_seed >> 8) % len(handicaps)],
         )
     if segment == "pie":
         return GameVariant(

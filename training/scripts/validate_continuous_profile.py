@@ -49,6 +49,25 @@ def _validate_variant_lineage_config(config: ExperimentConfig) -> None:
                 "self-play segment fractions"
             )
         arena = config.arena
+        if arena.balanced_cells:
+            if arena.segment_handicap_pda != mixture.handicap_pda:
+                raise ValueError("balanced arena handicap PDA must match self-play")
+            if any(
+                not mixture.handicap_min <= severity <= mixture.handicap_max
+                for severity in arena.handicap_severity_cycle
+            ):
+                raise ValueError(
+                    "balanced arena handicap severities exceed trained range"
+                )
+            history = config.orchestration.historical_evaluation
+            if (
+                not history.enabled
+                or history.search_budget(arena)[0] != arena.strength_simulations
+            ):
+                raise ValueError(
+                    "balanced promotion requires a separate fixed-budget strength ladder"
+                )
+            return
         guarded = set(arena.segment_pairs_per_ring)
         trained = {
             segment
@@ -64,6 +83,17 @@ def _validate_variant_lineage_config(config: ExperimentConfig) -> None:
             raise ValueError(
                 "arena segment_handicap_pda must equal selfplay.variants.handicap_pda"
             )
+        if mixture.handicap > 0 and (
+            (
+                mixture.handicap_classic_share > 0
+                and arena.segment_handicap_classic_share == 0
+            )
+            or (
+                mixture.handicap_classic_share < 1
+                and arena.segment_handicap_classic_share == 1
+            )
+        ):
+            raise ValueError("arena handicap modes must cover both trained modes")
         if not any(
             mixture.handicap_min <= handicap <= mixture.handicap_max
             for handicap in arena.segment_handicaps
@@ -98,7 +128,8 @@ def _validate_autonomous_config(
     learner = config.learner
     if (
         learner.target_updates_per_new_sample is None
-        or learner.target_updates_per_new_sample > 1.25
+        or learner.target_updates_per_new_sample
+        > (2.0 if _is_variant_lineage_profile(config) else 1.25)
         or learner.candidate_interval_examples is None
         or learner.selfplay_snapshot_interval_examples is None
         or learner.selfplay_snapshot_warmup_interval_examples is None
@@ -128,7 +159,16 @@ def _validate_autonomous_config(
         raise ValueError("autonomous service requires non-destructive plateau recovery")
     mixture = config.orchestration.ring_mixture
     final_weights = mixture.weights_for_step(10**18)
-    if (
+    if _is_variant_lineage_profile(config):
+        if (
+            final_weights is None
+            or any(weight <= 0 for weight in final_weights)
+            or abs(sum(final_weights) - 1.0) > 1e-9
+        ):
+            raise ValueError(
+                "variant lineage requires positive normalized ring weights"
+            )
+    elif (
         final_weights is None
         or final_weights[mixture.rings.index(10)] < 0.5
         or abs(sum(final_weights) - 1.0) > 1e-9
@@ -139,10 +179,10 @@ def _validate_autonomous_config(
         raise ValueError("autonomous retention cannot protect the history pool")
     historical = config.orchestration.historical_evaluation
     if historical.enabled and (
-        historical.every_promotions < 4
+        historical.every_promotions < (1 if config.arena.balanced_cells else 4)
         or historical.anchors_per_evaluation > 1
-        or historical.pairs_per_ring > 10
-        or historical.max_pairs_per_ring > 10
+        or historical.pairs_per_ring > (4 if config.arena.balanced_cells else 10)
+        or historical.max_pairs_per_ring > (4 if config.arena.balanced_cells else 10)
     ):
         raise ValueError("autonomous historical evaluation exceeds its compute budget")
     if config.arena.max_considered < 48:

@@ -138,6 +138,8 @@ class VariantMixtureConfig:
     handicap: float = 0.20
     pie: float = 0.10
     pie_classic_share: float = 0.3
+    # Omitted in existing profiles means the original double-only handicap mix.
+    handicap_classic_share: float = 0.0
     handicap_min: int = 2
     handicap_max: int = MAX_HANDICAP
     handicap_pda: tuple[int, ...] = (1, 1, 2, 2, 2, 3, 3, 3)
@@ -159,6 +161,15 @@ class VariantMixtureConfig:
             raise ValueError("variant fractions must sum to one")
         if not 0 <= self.pie_classic_share <= 1:
             raise ValueError("pie_classic_share must be in [0, 1]")
+        if (
+            isinstance(self.handicap_classic_share, bool)
+            or not isinstance(self.handicap_classic_share, int | float)
+            or not 0 <= self.handicap_classic_share <= 1
+        ):
+            raise ValueError("handicap_classic_share must be in [0, 1]")
+        object.__setattr__(
+            self, "handicap_classic_share", float(self.handicap_classic_share)
+        )
         for name in ("handicap_min", "handicap_max"):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int):
@@ -246,8 +257,14 @@ class VariantMixtureConfig:
             return GameVariant(mode="classic")
         if segment == SEGMENT_HANDICAP:
             span = self.handicap_max - self.handicap_min + 1
-            handicap = self.handicap_min + min(span - 1, int(secondary * span))
-            return GameVariant(mode="double", handicap=handicap)
+            size_draw = secondary * span
+            size_index = min(span - 1, int(size_draw))
+            handicap = self.handicap_min + size_index
+            # The residual within a size bucket is a separate uniform draw:
+            # both modes get every handicap, without changing legacy sizes.
+            mode_draw = size_draw - size_index
+            mode = "classic" if mode_draw < self.handicap_classic_share else "double"
+            return GameVariant(mode=mode, handicap=handicap)
         mode = "classic" if secondary < self.pie_classic_share else "double"
         return GameVariant(mode=mode, pie=True)
 
@@ -281,6 +298,8 @@ class SelfPlayConfig:
     score_utility_weight: float = 0.0
     clinch_finalization: Literal["disabled", "loser-fill"] = "disabled"
     clinch_auxiliary_targets: Literal["synthetic", "outcome_only"] = "synthetic"
+    exact_endgame_max_empty: int = 0
+    exact_endgame_max_nodes: int = 100_000
     shard_size: int = 512
     seed: int = 17
 
@@ -328,6 +347,16 @@ class SelfPlayConfig:
             raise ValueError(
                 "clinch_auxiliary_targets must be synthetic or outcome_only"
             )
+        if (
+            type(self.exact_endgame_max_empty) is not int
+            or not 0 <= self.exact_endgame_max_empty <= 8
+        ):
+            raise ValueError("exact_endgame_max_empty must be an integer in 0..8")
+        if (
+            type(self.exact_endgame_max_nodes) is not int
+            or not 1 <= self.exact_endgame_max_nodes <= 1_000_000
+        ):
+            raise ValueError("exact_endgame_max_nodes must be an integer in 1..1000000")
         GameVariant(mode=self.mode, handicap=self.handicap, pie=self.pie)
         if not isinstance(self.variants, VariantMixtureConfig):
             raise ValueError("variants must be a VariantMixtureConfig")
@@ -412,7 +441,7 @@ class GameSummary:
     model_identity: str
     game_id: str
     generation: int
-    finish_reason: Literal["board-full", "clinch"]
+    finish_reason: Literal["board-full", "clinch", "exact-endgame"]
     empty_nodes_saved: int
     variant: str = "double"
     swapped: bool = False
@@ -456,6 +485,11 @@ class SelfPlayMetrics:
     pie_decisions: int = 0
     pie_swaps: int = 0
     asymmetric_games: int = 0
+    exact_endgame_attempts: int = 0
+    exact_endgame_solved: int = 0
+    exact_endgame_exhausted: int = 0
+    exact_endgame_nodes: int = 0
+    exact_endgame_seconds: float = 0.0
 
     def delta(self, previous: "SelfPlayMetrics") -> "SelfPlayMetrics":
         values = {
@@ -506,6 +540,7 @@ class _ClinchFinalization:
     empty_nodes: int
     last_move: int
     turn_count: int
+    exact: bool = False
 
 
 class SelfPlayActor:
@@ -555,6 +590,11 @@ class SelfPlayActor:
         self.replay_append_seconds = 0.0
         self.clinched_games = 0
         self.clinch_empty_nodes = 0
+        self.exact_endgame_attempts = 0
+        self.exact_endgame_solved = 0
+        self.exact_endgame_exhausted = 0
+        self.exact_endgame_nodes = 0
+        self.exact_endgame_seconds = 0.0
         self.source_champion_games = 0
         self.source_candidate_games = 0
         self.source_history_games = 0
@@ -586,6 +626,11 @@ class SelfPlayActor:
             replay_append_seconds=self.replay_append_seconds,
             clinched_games=self.clinched_games,
             clinch_empty_nodes=self.clinch_empty_nodes,
+            exact_endgame_attempts=self.exact_endgame_attempts,
+            exact_endgame_solved=self.exact_endgame_solved,
+            exact_endgame_exhausted=self.exact_endgame_exhausted,
+            exact_endgame_nodes=self.exact_endgame_nodes,
+            exact_endgame_seconds=self.exact_endgame_seconds,
             source_champion_games=self.source_champion_games,
             source_candidate_games=self.source_candidate_games,
             source_history_games=self.source_history_games,
@@ -736,6 +781,22 @@ class SelfPlayActor:
         while True:
             if self.config.clinch_finalization == "loser-fill":
                 self._complete_clinches(states, clinch_finalizations)
+            if self.config.exact_endgame_max_empty:
+                started = time.perf_counter()
+                solved = states.complete_exact_endgames(
+                    self.config.exact_endgame_max_empty,
+                    self.config.exact_endgame_max_nodes,
+                )
+                self.exact_endgame_seconds += time.perf_counter() - started
+                self.exact_endgame_attempts += int(solved.attempted)
+                self.exact_endgame_exhausted += int(solved.budget_exhausted)
+                self.exact_endgame_nodes += int(solved.nodes)
+                self.exact_endgame_solved += sum(
+                    bool(x) for x in solved.completions.clinched
+                )
+                self._record_finalizations(
+                    solved.completions, clinch_finalizations, exact=True
+                )
             state_data = states.data()
             if all(bool(terminal) for terminal in state_data.terminal):
                 break
@@ -859,6 +920,15 @@ class SelfPlayActor:
         finalizations: list[_ClinchFinalization | None],
     ) -> None:
         data = states.complete_clinches()
+        self._record_finalizations(data, finalizations)
+
+    def _record_finalizations(
+        self,
+        data: Any,
+        finalizations: list[_ClinchFinalization | None],
+        *,
+        exact: bool = False,
+    ) -> None:
         batch_size = int(data.batch_size)
         clinched = [bool(value) for value in data.clinched]
         winners = [int(value) for value in data.winner]
@@ -892,6 +962,7 @@ class SelfPlayActor:
                 empty_nodes=empty_nodes[row],
                 last_move=last_moves[row],
                 turn_count=turn_counts[row],
+                exact=exact,
             )
 
     def _record_decisions(
@@ -1090,7 +1161,7 @@ class SelfPlayActor:
                             f"simulations={decision.simulations}:"
                             f"seed={decision.search_seed}:model={model_identity}:"
                             f"game={game_id}:ply={decision.ply}:"
-                            f"final={'clinch-loser-fill' if clinch else 'board-full'}:"
+                            f"final={'exact-endgame' if clinch and clinch.exact else 'clinch-loser-fill' if clinch else 'board-full'}:"
                             f"variant={variant.label}:pda={decision.position.pda}:"
                             f"swap={'taken' if decision.swapped else 'no'}"
                         ),
@@ -1105,7 +1176,7 @@ class SelfPlayActor:
                         ),
                         clinch_auxiliary_targets=(
                             self.config.clinch_auxiliary_targets
-                            if clinch is not None
+                            if clinch is not None and not clinch.exact
                             else "synthetic"
                         ),
                         run_id=self.identity.run_id,
@@ -1123,11 +1194,15 @@ class SelfPlayActor:
                 self.pending_phases.append(decision.phase)
                 self.completed_decisions += 1
             metadata = trajectory_rows[row]
-            finish_reason: Literal["board-full", "clinch"] = (
-                "clinch" if clinch is not None else "board-full"
+            finish_reason: Literal["board-full", "clinch", "exact-endgame"] = (
+                "exact-endgame"
+                if clinch is not None and clinch.exact
+                else "clinch"
+                if clinch is not None
+                else "board-full"
             )
             empty_nodes_saved = clinch.empty_nodes if clinch is not None else 0
-            if clinch is not None:
+            if clinch is not None and not clinch.exact:
                 self.clinched_games += 1
                 self.clinch_empty_nodes += clinch.empty_nodes
             if seats != (0, 0):

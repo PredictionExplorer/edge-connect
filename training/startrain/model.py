@@ -11,7 +11,7 @@ conditioning) still build the exact module tree they were trained with.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal, NamedTuple
+from typing import Literal, NamedTuple, cast
 
 import torch
 import torch.nn.functional as functional
@@ -29,6 +29,8 @@ from .features import GLOBAL_FEATURE_DIM, NODE_FEATURE_DIM
 from .features_v3 import LEGACY_GLOBAL_FEATURE_DIM, LEGACY_NODE_FEATURE_DIM
 from .topology import (
     EDGE_CLASS_COUNT,
+    SUPPORTED_RINGS,
+    get_topology,
     relation_count,
     relation_tables,
     ring_slots,
@@ -433,6 +435,8 @@ class GlobalGQABlock(nn.Module):
         nodes: Tensor,
         node_mask: Tensor,
         relation_index: Tensor | None = None,
+        shared_relation_bias: bool = False,
+        inference_relation_bias: Tensor | None = None,
     ) -> tuple[Tensor, Tensor]:
         sequence = torch.cat((token, nodes), dim=1)
         token_mask = torch.ones(
@@ -455,12 +459,19 @@ class GlobalGQABlock(nn.Module):
         value = value.transpose(1, 2)
         key_mask = sequence_mask[:, None, None, :]
         attn_mask: Tensor
-        relational = self.relation_bias is not None and relation_index is not None
+        relational = self.relation_bias is not None and (
+            relation_index is not None or inference_relation_bias is not None
+        )
         if relational:
             assert self.relation_bias is not None
-            bias = self.relation_bias(relation_index).permute(0, 3, 1, 2)
+            if inference_relation_bias is not None:
+                bias = inference_relation_bias
+            else:
+                assert relation_index is not None
+                bias = self.relation_bias(relation_index).permute(0, 3, 1, 2)
+            bias_key_mask = key_mask[:1] if shared_relation_bias else key_mask
             attn_mask = bias.to(dtype=query.dtype).masked_fill(
-                ~key_mask, torch.finfo(query.dtype).min
+                ~bias_key_mask, torch.finfo(query.dtype).min
             )
         else:
             attn_mask = key_mask
@@ -547,6 +558,8 @@ class RRTGroup(nn.Module):
         node_mask: Tensor,
         condition: Tensor | None = None,
         relation_index: Tensor | None = None,
+        shared_relation_bias: bool = False,
+        inference_relation_bias: Tensor | None = None,
     ) -> tuple[Tensor, Tensor]:
         for block in self.local_blocks:
             nodes = block(
@@ -557,7 +570,14 @@ class RRTGroup(nn.Module):
                 node_mask,
                 condition,
             )
-        return self.global_block(token, nodes, node_mask, relation_index)
+        return self.global_block(
+            token,
+            nodes,
+            node_mask,
+            relation_index,
+            shared_relation_bias,
+            inference_relation_bias,
+        )
 
 
 def _mask_logits(logits: Tensor, legal_mask: Tensor) -> Tensor:
@@ -570,6 +590,12 @@ class GraphResTNet(nn.Module):
     def __init__(self, config: ModelConfig = ModelConfig()) -> None:
         super().__init__()
         self.config = config
+        # Runtime-only, non-persistent cache. It adds no parameters/buffers to
+        # the checkpoint module tree and is never consulted by default forward.
+        self._inference_relation_bias_cache: dict[
+            tuple[int, torch.dtype, torch.device],
+            tuple[tuple[int, ...], tuple[Tensor, ...]],
+        ] = {}
         width = config.width
         self.node_projection = nn.Linear(config.node_feature_dim, width)
         self.global_projection = nn.Linear(config.global_feature_dim, width)
@@ -622,6 +648,52 @@ class GraphResTNet(nn.Module):
         )
         return tables[slots]
 
+    def clear_inference_caches(self) -> None:
+        self._inference_relation_bias_cache.clear()
+
+    def prepare_inference_relational_bias(
+        self, ring: int, *, dtype: torch.dtype
+    ) -> tuple[Tensor, ...] | None:
+        """Precompute a ring's bias outside compiled forward, keyed by weights.
+
+        The adapter calls this only for validated homogeneous inference. Tensor
+        version counters invalidate entries after load_state_dict/weight edits.
+        Training and ONNX continue constructing differentiable bias themselves.
+        """
+
+        if ring not in SUPPORTED_RINGS:
+            raise ValueError("unsupported inference ring")
+        if self.relation_tables is None or self.ring_slots is None:
+            return None
+        embeddings = [
+            cast(RRTGroup, group).global_block.relation_bias
+            for group in self.rrt_groups
+        ]
+        if any(embedding is None for embedding in embeddings):
+            return None
+        weights = [
+            embedding.weight for embedding in embeddings if embedding is not None
+        ]
+        versions = tuple(weight._version for weight in weights)
+        key = (ring, dtype, weights[0].device)
+        cached = self._inference_relation_bias_cache.get(key)
+        if cached is not None and cached[0] == versions:
+            return cached[1]
+        with torch.no_grad():
+            nodes = get_topology(ring).n
+            slot = SUPPORTED_RINGS.index(ring)
+            indices = self.relation_tables[slot, : nodes + 1, : nodes + 1]
+            biases = tuple(
+                functional.embedding(indices, weight)
+                .permute(2, 0, 1)
+                .unsqueeze(0)
+                .to(dtype=dtype)
+                .contiguous()
+                for weight in weights
+            )
+        self._inference_relation_bias_cache[key] = (versions, biases)
+        return biases
+
     def forward(
         self,
         node_features: Tensor,
@@ -632,6 +704,9 @@ class GraphResTNet(nn.Module):
         node_mask: Tensor,
         legal_action_mask: Tensor,
         rings: Tensor | None = None,
+        *,
+        homogeneous_ring: int | None = None,
+        inference_relation_bias: tuple[Tensor, ...] | None = None,
     ) -> StarModelOutput:
         mask_values = node_mask.unsqueeze(-1).to(dtype=node_features.dtype)
         nodes = self.node_projection(node_features) * mask_values
@@ -644,13 +719,30 @@ class GraphResTNet(nn.Module):
             if self.rule_conditioner is not None
             else None
         )
+        shared_relations = (
+            homogeneous_ring is not None and not torch.compiler.is_exporting()
+        )
+        if inference_relation_bias is not None and (
+            self.training or torch.is_grad_enabled()
+        ):
+            raise ValueError(
+                "cached relational bias is for inference without gradients only"
+            )
+        if inference_relation_bias is not None and len(inference_relation_bias) != len(
+            self.rrt_groups
+        ):
+            raise ValueError("cached relation bias must match the trunk depth")
         relation_index: Tensor | None = None
         if self.relation_tables is not None:
             if rings is None:
                 raise ValueError("relational bias requires the per-sample rings tensor")
-            relation_index = self.relation_index_for(rings, node_features.shape[1])
+            # The adapter validates every row's ring and node mask on the CPU.
+            # A shared index/mask avoids B identical N x N x H bias matrices.
+            relation_index = self.relation_index_for(
+                rings[:1] if shared_relations else rings, node_features.shape[1]
+            )
 
-        for group in self.rrt_groups:
+        for group_index, group in enumerate(self.rrt_groups):
             token, nodes = group(
                 token,
                 nodes,
@@ -660,6 +752,10 @@ class GraphResTNet(nn.Module):
                 node_mask,
                 condition,
                 relation_index,
+                shared_relations,
+                inference_relation_bias[group_index]
+                if inference_relation_bias is not None and shared_relations
+                else None,
             )
 
         nodes = self.final_node_norm(nodes) * mask_values

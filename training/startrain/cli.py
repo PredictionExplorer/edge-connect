@@ -24,7 +24,7 @@ from .checkpoint import (
     load_model_manifest,
     write_model_pointer,
 )
-from .config import load_config
+from .config import GPUWorkerConfig, load_config
 from .device import resolve_device_string
 from .distill import distill_main
 from .inference import GraphInferenceAdapter, InferenceConfig
@@ -387,7 +387,9 @@ def actor_main(argv: list[str] | None = None) -> None:
         description="Run one long-lived self-play actor supervisor"
     )
     parser.add_argument("--config", required=True)
-    parser.add_argument("--gpu-id", required=True, type=int)
+    assignment = parser.add_mutually_exclusive_group(required=True)
+    assignment.add_argument("--gpu-id", type=int)
+    assignment.add_argument("--cpu-actor-index", type=int)
     parser.add_argument("--lane-id", type=int, default=0)
     parser.add_argument("--replay-store", required=True)
     parser.add_argument("--manifest", required=True)
@@ -401,15 +403,44 @@ def actor_main(argv: list[str] | None = None) -> None:
     arguments.device = resolve_device_string(arguments.device)
 
     experiment = load_config(arguments.config)
-    matches = [
-        gpu
-        for gpu in experiment.orchestration.actor_gpus
-        if gpu.gpu_id == arguments.gpu_id
-    ]
+    cpu_actor = None
+    if arguments.cpu_actor_index is not None:
+        if (
+            not 0
+            <= arguments.cpu_actor_index
+            < len(experiment.orchestration.cpu_actors)
+        ):
+            raise ValueError("cpu-actor-index is outside the configured CPU actor list")
+        cpu_actor = experiment.orchestration.cpu_actors[arguments.cpu_actor_index]
+        arguments.device = "cpu"
+        experiment = replace(
+            experiment,
+            train=replace(
+                experiment.train, precision=cpu_actor.precision, compile=False
+            ),
+        )
+        matches = [
+            GPUWorkerConfig(
+                gpu_id=0,
+                role="actor",
+                cpu_threads=cpu_actor.cpu_threads,
+                actor_batch_size=cpu_actor.actor_batch_size,
+                native_threads=cpu_actor.native_threads,
+                blas_threads=cpu_actor.blas_threads,
+                cpu_affinity=cpu_actor.cpu_affinity,
+            )
+        ]
+    else:
+        matches = [
+            gpu
+            for gpu in experiment.orchestration.actor_gpus
+            if gpu.gpu_id == arguments.gpu_id
+        ]
     if len(matches) != 1:
         raise ValueError("gpu-id is not a unique configured actor GPU")
     if arguments.lane_id < 0 or arguments.lane_id >= matches[0].actor_lanes:
         raise ValueError("lane-id is outside the configured actor lane range")
+    torch.set_num_threads(matches[0].blas_threads or matches[0].cpu_threads)
     native = load_star_native(required=True)
     assert native is not None
     stop = SignalLatch()
@@ -428,6 +459,9 @@ def actor_main(argv: list[str] | None = None) -> None:
         learner_heartbeat_path=arguments.learner_heartbeat,
         device=arguments.device,
         lane_id=arguments.lane_id,
+        actor_id=cpu_actor.actor_id if cpu_actor else None,
+        allowed_rings=cpu_actor.rings if cpu_actor else None,
+        games_per_batch=cpu_actor.actor_batch_size if cpu_actor else None,
     ).run(stop_requested=stop.is_set)
     print(json.dumps({"batches": batches}, sort_keys=True))
 

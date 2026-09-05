@@ -10,12 +10,14 @@
 
 mod bitboard;
 mod board;
+mod endgame;
 mod game;
 mod scoring;
 mod symmetry;
 
 pub use bitboard::{BITBOARD_WORDS, BitBoard, BitIter};
 pub use board::{Board, BoardError, SECTOR_CHARS};
+pub use endgame::{ExactEndgame, solve_exact_endgame};
 pub use game::{
     Action, GameError, GameState, LegalActions, MAX_HANDICAP, MAX_TURN_PLACEMENTS, Mode, Player,
     StateKey, StateParts, Transition, Undo, Variant,

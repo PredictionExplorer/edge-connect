@@ -38,10 +38,12 @@ def _write_json(path: Path, payload: object) -> None:
     )
 
 
-def _fixture(tmp_path: Path) -> _Fixture:
+def _fixture(
+    tmp_path: Path, base_profile: str = "h100-8gpu-throughput.yaml"
+) -> _Fixture:
     root = tmp_path / "active-run"
     root.mkdir()
-    base_path = Path(__file__).parents[1] / "configs" / "h100-8gpu-throughput.yaml"
+    base_path = Path(__file__).parents[1] / "configs" / base_profile
     old_raw = yaml.safe_load(base_path.read_text(encoding="utf-8"))
     run_id = "continuous-test-run"
     family = "family-continuous-test"
@@ -357,6 +359,191 @@ def test_apply_writes_immutable_profile_record_and_complete_backup(
     assert not (fixture.root / "coordinator.lock").exists()
 
 
+def test_efficiency_rollout_preserves_two_step_cadence_and_prospective_utd(
+    tmp_path: Path,
+) -> None:
+    from dataclasses import replace
+
+    fixture = _fixture(tmp_path, "h100-8gpu-variant-stage-a.yaml")
+    old = yaml.safe_load(fixture.old_profile.read_text())
+    freshness = deepcopy(old)
+    freshness["learner"]["selfplay_snapshot_interval_examples"] = freshness["learner"][
+        "selfplay_snapshot_warmup_interval_examples"
+    ]
+    freshness_input = tmp_path / "freshness-input.yaml"
+    freshness_input.write_text(yaml.safe_dump(freshness))
+    first = migration.plan_migration(
+        replace(
+            fixture.request,
+            new_profile=freshness_input,
+            target_profile_name="profile-freshness.yaml",
+            reason="keep-selfplay-fresh",
+        )
+    )
+    migration.apply_migration(first)
+    final = yaml.safe_load(
+        (
+            Path(__file__).parents[1]
+            / "configs/h100-8gpu-variant-efficiency-stage-b.yaml"
+        ).read_text()
+    )
+    final["orchestration"]["run_id"] = old["orchestration"]["run_id"]
+    final["orchestration"]["directories"]["root"] = str(fixture.root)
+    final["orchestration"]["autonomous"] = deepcopy(old["orchestration"]["autonomous"])
+    final_input = tmp_path / "efficiency-input.yaml"
+    final_input.write_text(yaml.safe_dump(final))
+    second = migration.plan_migration(
+        replace(
+            fixture.request,
+            old_profile=first.target_profile,
+            new_profile=final_input,
+            target_profile_name="profile-efficiency.yaml",
+            reason="prospective-efficiency-cutover",
+            from_source_commit="b" * 40,
+        )
+    )
+    migration.apply_migration(second)
+    segment = json.loads((fixture.root / "learner/utd-segment.json").read_text())
+    assert segment["target_updates_per_new_sample"] == 1.5
+    assert segment["baseline_committed_replay_samples"] == 60000
+    assert segment["baseline_examples_consumed"] == 51200
+    active = load_config(second.target_profile)
+    assert active.model == load_config(fixture.old_profile).model
+    assert active.arena.balanced_cells and active.orchestration.cpu_actors
+    assert active.learner.selfplay_snapshot_interval_examples == 1500000
+    records = [
+        json.loads(line)
+        for line in (fixture.root / "continuous-migrations.jsonl")
+        .read_text()
+        .splitlines()
+    ]
+    assert len(records) == 2
+    assert records[1]["from_config_sha256"] == records[0]["to_config_sha256"]
+    assert fixture.old_profile.read_bytes() == fixture.old_profile_bytes
+
+
+def test_ring_allocation_migration_is_limited_to_the_validated_schedule() -> None:
+    old = {
+        "orchestration": {
+            "ring_mixture": {
+                "rings": [4, 6, 8, 10],
+                "step_weights": [
+                    {"from_step": 150_000, "weights": [0.15, 0.15, 0.2, 0.5]}
+                ],
+            }
+        }
+    }
+    new = deepcopy(old)
+    new["orchestration"]["ring_mixture"]["step_weights"] = [
+        {"from_step": 0, "weights": [0.25, 0.25, 0.25, 0.25]}
+    ]
+    differences = list(migration._profile_diffs(old, new))
+    assert len(differences) == 1
+    assert differences[0][0] == ("orchestration", "ring_mixture", "step_weights")
+    assert differences[0][0] in migration._ALLOWED_PROFILE_PATHS
+    new["orchestration"]["ring_mixture"]["rings"] = [4, 6, 8]
+    assert any(
+        path not in migration._ALLOWED_PROFILE_PATHS
+        for path, _, _ in migration._profile_diffs(old, new)
+    )
+
+
+@pytest.mark.parametrize("allocation", ["handicap_share", "segments"])
+@pytest.mark.parametrize("arena_state", ["absent", "terminal", "running", "resumable"])
+def test_variant_allocation_migration_requires_a_terminal_arena_boundary(
+    tmp_path: Path, allocation: str, arena_state: str
+) -> None:
+    fixture = _fixture(tmp_path)
+    target = yaml.safe_load(fixture.candidate_profile.read_text())
+    if allocation == "handicap_share":
+        target["arena"]["segment_handicap_classic_share"] = 0.5
+    else:
+        target["arena"]["segment_pairs_per_ring"] = {"classic": 2}
+    fixture.candidate_profile.write_text(yaml.safe_dump(target, sort_keys=False))
+    arena_root = fixture.root / "arena"
+    if arena_state != "absent":
+        _write_json(
+            arena_root / "promotion-status.json",
+            {"terminal": arena_state != "running", "decision": "continue"},
+        )
+    result_path = arena_root / f"sha256-{'d' * 64}-vs-sha256-{'c' * 64}.json"
+    if arena_state in ("terminal", "resumable"):
+        _write_json(
+            result_path,
+            {
+                "result_kind": "promotion",
+                "terminal": arena_state == "terminal",
+                "pairs": [{"variant": "handicap-4-double"}],
+            },
+        )
+    before = _snapshot(fixture.root)
+    if arena_state in ("running", "resumable"):
+        with pytest.raises(migration.MigrationError, match="terminal arena boundary"):
+            migration.migrate_continuous_profile(fixture.request)
+    else:
+        plan = migration.plan_migration(fixture.request)
+        if result_path.exists():
+            assert result_path in {item.path for item in plan.input_fingerprints}
+    assert _snapshot(fixture.root) == before
+
+
+def test_variant_allocation_boundary_is_rechecked_before_apply(tmp_path: Path) -> None:
+    fixture = _fixture(tmp_path)
+    target = yaml.safe_load(fixture.candidate_profile.read_text())
+    target["arena"]["segment_handicap_classic_share"] = 0.5
+    fixture.candidate_profile.write_text(yaml.safe_dump(target, sort_keys=False))
+    plan = migration.plan_migration(fixture.request)
+    _write_json(
+        fixture.root / "arena" / f"sha256-{'d' * 64}-vs-sha256-{'c' * 64}.json",
+        {"terminal": False, "pairs": [{"variant": "handicap-4-double"}]},
+    )
+    with pytest.raises(migration.MigrationError, match="resumable arena evidence"):
+        migration._assert_inputs_unchanged(plan, check_lock=True)
+
+
+def test_variant_boundary_requires_terminal_current_champion_crossplay(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture(tmp_path)
+    target = yaml.safe_load(fixture.candidate_profile.read_text())
+    target["arena"]["segment_handicap_classic_share"] = 0.5
+    fixture.candidate_profile.write_text(yaml.safe_dump(target, sort_keys=False))
+    result_path = (
+        fixture.root
+        / "arena"
+        / f"crossplay-sha256-{'c' * 64}-vs-sha256-{'b' * 64}.json"
+    )
+    result = {"terminal": False, "result_kind": "historical_crossplay", "pairs": [{}]}
+    _write_json(result_path, result)
+    with pytest.raises(migration.MigrationError, match="resumable arena evidence"):
+        migration.plan_migration(fixture.request)
+    result["terminal"] = True
+    _write_json(result_path, result)
+    migration.plan_migration(fixture.request)
+
+
+def test_variant_boundary_ignores_old_champions_and_unrelated_changes(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture(tmp_path)
+    arena_root = fixture.root / "arena"
+    _write_json(arena_root / "promotion-status.json", {"terminal": False})
+    # Existing unrelated migrations retain their boundary policy.
+    migration.plan_migration(fixture.request)
+    _write_json(arena_root / "promotion-status.json", {"terminal": True})
+    _write_json(
+        arena_root / f"sha256-{'d' * 64}-vs-sha256-{'b' * 64}.json",
+        {
+            "terminal": False,
+            "pairs": [{"variant": "handicap-4-double"}],
+        },
+    )
+    target = yaml.safe_load(fixture.candidate_profile.read_text())
+    target["arena"]["segment_handicap_classic_share"] = 0.5
+    fixture.candidate_profile.write_text(yaml.safe_dump(target, sort_keys=False))
+    migration.plan_migration(fixture.request)
+
+
 def test_additive_default_field_accepts_legacy_chain_hash(tmp_path: Path) -> None:
     """Every combination of absent defaulted fields is an acceptable chain head.
 
@@ -382,7 +569,9 @@ def test_additive_default_field_accepts_legacy_chain_hash(tmp_path: Path) -> Non
     finish = ("orchestration", "promotion", "finish_inflight_candidate")
     count = ("orchestration", "plateau", "count_inconclusive_rejections")
     restore = ("orchestration", "plateau", "restore_learning_rate_scale")
-    additive = [finish, count, restore]
+    handicap = ("selfplay", "variants", "handicap_classic_share")
+    arena_handicap = ("arena", "segment_handicap_classic_share")
+    additive = [finish, count, restore, handicap, arena_handicap]
     expected = {materialized}
     for mask in range(1, 2 ** len(additive)):
         expected.add(
@@ -390,7 +579,10 @@ def test_additive_default_field_accepts_legacy_chain_hash(tmp_path: Path) -> Non
                 *(path for bit, path in enumerate(additive) if mask >> bit & 1)
             )
         )
-    assert compatible == expected
+    # The efficiency-services release adds one explicitly stripped prior epoch,
+    # while retaining every previously supported additive-default combination.
+    assert expected <= compatible
+    assert len(compatible) == 2 * len(expected)
     # A profile that opts into a new field no longer matches releases that
     # never had it, but keeps the variants for the other additive fields.
     opted = yaml.safe_load(fixture.old_profile.read_text(encoding="utf-8"))
@@ -399,10 +591,19 @@ def test_additive_default_field_accepts_legacy_chain_hash(tmp_path: Path) -> Non
     opted_path = tmp_path / "opted.yaml"
     opted_path.write_text(yaml.safe_dump(opted, sort_keys=False), encoding="utf-8")
     opted_config = load_config(opted_path)
-    assert len(migration._compatible_source_config_sha256s(opted_config)) == 2
+    assert len(migration._compatible_source_config_sha256s(opted_config)) == 16
+
+    opted.setdefault("selfplay", {}).setdefault("variants", {})[
+        "handicap_classic_share"
+    ] = 0.5
+    opted.setdefault("arena", {})["segment_handicap_classic_share"] = 0.5
+    opted_path.write_text(yaml.safe_dump(opted, sort_keys=False), encoding="utf-8")
+    assert (
+        len(migration._compatible_source_config_sha256s(load_config(opted_path))) == 4
+    )
 
     # The head a release without the plateau additions recorded.
-    legacy_hash = hash_without(count, restore)
+    legacy_hash = hash_without(count, restore, handicap, arena_handicap)
     source_profile_sha256 = hashlib.sha256(fixture.old_profile_bytes).hexdigest()
     record = {
         "schema_version": 1,

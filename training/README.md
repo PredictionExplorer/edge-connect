@@ -52,12 +52,21 @@ the legacy champion's soft targets so a fresh rules-v3 run distils it (see
 `docs/variant-capable-network-plan.md`).
 
 The self-play mixture is configured under `selfplay.variants` (default off, i.e.
-standard Double *Star only). The shipped Stage B profile draws standard 0.45 /
-classic 0.25 / handicap 0.20 / pie 0.10 batches; handicap games give the second player
-a playout-doubling advantage, the learner stratifies every ring's replay window by
+standard Double *Star only). The Stage B profile targets all six rule categories
+equally: standard double and classic each get 1/6 of batches; handicap and pie each
+get 1/3, split equally between classic and double. Both handicap modes draw sizes
+2..9 independently. Handicap games give the second player a playout-doubling
+advantage, the learner stratifies every ring's replay window by
 segment (`learner.segment_quotas`), and the arena plays extra classic, handicap, and
 pie pairs that veto a promotion only when the candidate provably regressed below the
 segment floor (`arena.segment_pairs_per_ring`, `arena.segment_regression_floor_elo`).
+Stage B targets all four ring counts equally throughout the run. These are batch
+and replay-position targets, not equal wall-clock compute: larger boards and extra
+search budgets take more time. The six-way balance within handicap and pie is an
+expected sampling share; replay quotas are enforced at the four aggregate segments.
+The legacy arena promotes on standard double with variant regression guards.
+`arena.balanced_cells` instead enables an equal 24-cell promotion objective and
+separate strength ladder; see [balanced evaluation](docs/balanced-strength-evaluation.md).
 
 Shipped self-play profiles set `clinch_finalization: loser-fill`. Before each search
 wave, the actor applies the same extremal-completion proof used by the web client. A
@@ -439,8 +448,10 @@ python scripts/run_lineage_arena.py \
 Stage B turns on the rule mixture on the same root through the ordinary
 continuous-profile migration (`scripts/migrate_continuous_profile.py` with
 `configs/h100-8gpu-variant-stage-b.yaml`; the mixture, quota, and arena-segment paths
-are on its allowlist). Self-play then draws standard 0.45 / classic 0.25 / handicap 0.20
-/ pie 0.10 batches, handicap games hand the second player a playout-doubling advantage
+are on its allowlist). Self-play then draws standard and classic 1/6 each, handicap
+and pie 1/3 each. Both `handicap_classic_share` and `pie_classic_share` are 0.5, so
+each of the six categories gets an expected 1/6 of batches. Handicap games hand the
+second player a playout-doubling advantage
 (`selfplay.variants.handicap_pda`), a fifth of the other games give one random seat an
 advantage so the network learns the input everywhere, the learner keeps every ring's
 window at the same segment shares, and the arena adds classic, handicap, and pie pairs
@@ -448,6 +459,20 @@ that veto a promotion only on a proven regression below the segment floor. Actor
 metrics report `variant`, `segment`, `pie_swaps`, and `asymmetric_games`; learner
 metrics report `replay_samples_by_segment`; arena results report `per_segment` and
 `promotion.segment_floors`.
+
+`handicap_classic_share` and `arena.segment_handicap_classic_share` default to 0
+for compatibility with older frozen profiles; Stage B explicitly sets both to 0.5.
+Handicap arena pairs alternate modes by absolute pair index, independently of their
+seeded handicap size, and record the mode in their variant label. The profile also
+sets ring weights to 0.25 each from step 0, replacing the later large-board bias.
+These fields can change through a stopped-run profile migration; architecture and
+rules remain immutable. Arena allocation changes require a terminal evaluation
+boundary, including resumable crossplay by the current champion; previous evidence
+is preserved. Older autonomous roots with omitted zero-valued handicap shares also
+retain their original frozen provenance on restart. Equal targets are the baseline
+allocation; a future
+allocation change should be justified by a strength metric that weights all six
+categories and all four board sizes equally.
 
 It preserves the throughput profile's training and search settings, runs two
 actor lanes on every GPU 1–7, and moves promotion to GPU 0. Each arena lease is

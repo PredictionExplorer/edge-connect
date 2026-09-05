@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import pytest
+from dataclasses import replace
+from collections import Counter
 
 from startrain.arena import (
     ARENA_RESULT_SCHEMA_VERSION,
     ArenaGame,
     ArenaPair,
     ArenaRunner,
+    _opening_seed,
+    _segment_variant,
     segment_floor_assessment,
     summarize_arena_pairs,
     summarize_completed_arena_pairs,
@@ -98,6 +102,43 @@ def test_arena_config_validates_segments() -> None:
         ArenaConfig(swap_dead_zone=1.5)
 
 
+@pytest.mark.parametrize("share", [-0.1, 1.1, float("nan"), float("inf"), True, "0.5"])
+def test_arena_handicap_classic_share_rejects_invalid_values(share) -> None:
+    with pytest.raises(ConfigError, match="segment_handicap_classic_share"):
+        ArenaConfig(segment_handicap_classic_share=share)
+
+
+@pytest.mark.parametrize("handicaps", [(2, 4, 6, 9), (2, 5, 9)])
+def test_arena_handicap_modes_cover_sizes_and_stay_stable_across_waves(
+    handicaps,
+) -> None:
+    legacy = ArenaConfig(segment_handicaps=handicaps)
+    mixed = replace(legacy, segment_handicap_classic_share=0.5)
+    counts: Counter[tuple[int, str]] = Counter()
+    whole = []
+    for pair in range(4_000):
+        seed = _opening_seed(17, 4, pair)
+        before = _segment_variant("handicap", seed, legacy, pair=pair)
+        after = _segment_variant("handicap", seed, mixed, pair=pair)
+        assert before.mode == "double" and after.handicap == before.handicap
+        counts[after.handicap, after.mode] += 1
+        whole.append(after)
+    for offset in range(0, len(whole) - 1):
+        assert {whole[offset].mode, whole[offset + 1].mode} == {"classic", "double"}
+    for handicap in handicaps:
+        classic = counts[handicap, "classic"]
+        total = classic + counts[handicap, "double"]
+        assert classic / total == pytest.approx(0.5, abs=0.05)
+    # Irregular continuation boundaries keep the same absolute pair variants.
+    chunks = [(0, 1), (1, 7), (7, 13), (13, len(whole))]
+    continued = [
+        _segment_variant("handicap", _opening_seed(17, 4, pair), mixed, pair=pair)
+        for start, stop in chunks
+        for pair in range(start, stop)
+    ]
+    assert continued == whole
+
+
 def test_segment_floors_veto_only_proven_regressions() -> None:
     config = ArenaConfig(
         rings=(4,),
@@ -180,6 +221,7 @@ def test_native_arena_plays_every_segment_with_variant_provenance() -> None:
         regression_floor_elo=-2_500.0,
         segment_pairs_per_ring={"classic": 2, "handicap": 2, "pie": 2},
         segment_handicaps=(3, 6),
+        segment_handicap_classic_share=0.5,
         swap_dead_zone=0.0,
         bootstrap_samples=200,
     )
@@ -203,6 +245,12 @@ def test_native_arena_plays_every_segment_with_variant_provenance() -> None:
     assert {game["variant"] for game in handicap_games} <= {
         "handicap-3-double",
         "handicap-6-double",
+        "handicap-3-classic",
+        "handicap-6-classic",
+    }
+    assert {GameVariant.parse(game["variant"]).mode for game in handicap_games} == {
+        "classic",
+        "double",
     }
     assert all(game["pda"] >= 1 for game in handicap_games)
     assert all(game["pda"] == 0 for game in games if game["segment"] != "handicap")
@@ -218,6 +266,7 @@ def test_native_arena_plays_every_segment_with_variant_provenance() -> None:
     search = result["search"]
     assert isinstance(search, dict)
     assert search["pie_rule"] is True
+    assert search["segment_handicap_classic_share"] == 0.5
     assert search["segments"] == {
         "standard": 2,
         "classic": 2,

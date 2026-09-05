@@ -1246,6 +1246,7 @@ def _strength_efficiency_status(
     run_root: Path,
     *,
     now_ns: int,
+    balanced: bool = False,
 ) -> dict[str, object]:
     path = run_root / "strength-efficiency.json"
     report = _read_json(path, attempts=1)
@@ -1320,6 +1321,21 @@ def _strength_efficiency_status(
         else None
     )
     aggregate = _mapping(autonomous.get("aggregate"))
+    balanced_strength = _mapping(report.get("balanced_strength"))
+    if balanced:
+        # A valid report with insufficient balanced evidence is different from
+        # a corrupt report. Never substitute standard-only/latest-candidate Elo.
+        headline = dict(balanced_strength)
+        headline_elo = _number(balanced_strength.get("rating"))
+        source = "balanced_champion_frontier"
+        balanced_interval = balanced_strength.get("confidence_interval")
+        confidence_interval = (
+            balanced_interval
+            if isinstance(balanced_interval, list)
+            and len(balanced_interval) == 2
+            and all(_number(value) is not None for value in balanced_interval)
+            else None
+        )
     return {
         "available": True,
         "present": True,
@@ -1333,6 +1349,7 @@ def _strength_efficiency_status(
         "headline_confidence_interval": confidence_interval,
         "statistical_role": aggregate.get("statistical_role"),
         "adoption_ranking_authorized": aggregate.get("adoption_ranking_authorized"),
+        "balanced_strength": dict(balanced_strength) if balanced else None,
     }
 
 
@@ -2460,7 +2477,19 @@ def collect_snapshot(
                     f"{continuation_waves} post-minimum waves; newer candidates may "
                     "supersede completed evaluation work",
                 )
-    strength_efficiency = _strength_efficiency_status(root, now_ns=now)
+    balanced_objective = arena_config.get("balanced_cells") is True
+    strength_efficiency = _strength_efficiency_status(
+        root, now_ns=now, balanced=balanced_objective
+    )
+    if balanced_objective and strength_efficiency.get("available") is True:
+        balanced_evidence = _mapping(strength_efficiency.get("balanced_strength"))
+        if balanced_evidence.get("available") is not True:
+            _add_warning(
+                warnings,
+                "WARN",
+                "balanced_strength_unmeasured",
+                "balanced champion strength awaits complete connected 24-cell measurement evidence",
+            )
     strength_age = _number(strength_efficiency.get("age_seconds"))
     run_created_ns = run_identity.get("created_ns")
     run_age_seconds = (

@@ -24,8 +24,9 @@ from startrain.runtime import RunIdentity
 from startrain.selfplay import SelfPlayMetrics
 
 
+@pytest.mark.parametrize("games_override", [None, 2])
 def test_actor_supervisor_refreshes_only_at_batch_boundaries_and_emits_metrics(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, games_override
 ) -> None:
     experiment = load_config(Path(__file__).parents[1] / "configs" / "small.yaml")
     experiment = replace(
@@ -72,6 +73,11 @@ def test_actor_supervisor_refreshes_only_at_batch_boundaries_and_emits_metrics(
     class FakeSelfPlayActor:
         def __init__(self, _native, selected, _store, config, actor_identity) -> None:
             assert selected is evaluator
+            assert config.games == (
+                experiment.orchestration.actor_games_per_batch
+                if games_override is None
+                else games_override
+            )
             self.selected = selected
             actor_events.append((config.rings, actor_identity.generation))
 
@@ -123,6 +129,7 @@ def test_actor_supervisor_refreshes_only_at_batch_boundaries_and_emits_metrics(
         heartbeat_path=tmp_path / "heartbeat.json",
         metrics_path=tmp_path / "metrics.jsonl",
         device="cpu",
+        games_per_batch=games_override,
     )
     candidate = SimpleNamespace(
         run_id=identity.run_id,
@@ -733,13 +740,19 @@ def test_selfplay_model_source_selects_candidate_or_controlled_mix(tmp_path) -> 
     observed_exclusions: list[set[str]] = []
 
     class FakeHistoryPool:
-        def select(self, *, random_source, exclude):
+        def select(
+            self, *, random_source, exclude, minimum_model_step, maximum_model_step
+        ):
             assert random_source is supervisor.model_random
+            assert minimum_model_step == 0 and maximum_model_step == 7
             observed_exclusions.append(exclude)
             return historical
 
     supervisor.history_pool = FakeHistoryPool()
-    supervisor._read_candidate = lambda: SimpleNamespace(model_identity="candidate-id")
+    supervisor._read_candidate = lambda: SimpleNamespace(
+        model_identity="candidate-id", model_step=7
+    )
+    supervisor._read_learner_scheduling_step = lambda **_kwargs: (7, "test")
     history_mix = replace(
         candidate_refresh,
         selfplay_source="candidate_champion_history_mix",

@@ -12,10 +12,13 @@ classic, handicap, or pie games.
 from __future__ import annotations
 
 import argparse
+from dataclasses import asdict
+import hashlib
 import json
 import sys
 import time
 from pathlib import Path
+from typing import Literal
 
 import torch
 
@@ -24,10 +27,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from startrain.arena import ArenaRunner  # noqa: E402
 from startrain.checkpoint import (  # noqa: E402
     load_ema_checkpoint,
+    load_checkpoint,
     normalize_model_config,
     sha256_file,
 )
-from startrain.config import ArenaConfig, ConfigError  # noqa: E402
+from startrain.config import ArenaConfig, ConfigError, ExperimentConfig, load_config  # noqa: E402
 from startrain.contracts import (  # noqa: E402
     FEATURE_SCHEMA_HASH,
     FEATURE_SCHEMA_VERSION,
@@ -45,6 +49,7 @@ from startrain.lineage import (  # noqa: E402
 from startrain.model import GraphResTNet, ModelConfig  # noqa: E402
 from startrain.native import validate_native_module  # noqa: E402
 from startrain.runtime import atomic_json  # noqa: E402
+from startrain.training import maybe_compile_model  # noqa: E402
 
 RESULT_KIND = "lineage_crossplay"
 EVALUATION_MODE = "cross_schema"
@@ -55,8 +60,20 @@ class LineageArenaError(RuntimeError):
 
 
 def load_candidate(
-    checkpoint: Path, *, device: torch.device
+    checkpoint: Path,
+    *,
+    device: torch.device,
+    weights: Literal["ema", "raw"] = "ema",
+    precision: Literal["fp32", "bf16"] = "fp32",
+    inference_config: InferenceConfig | None = None,
+    homogeneous_relational_bias: bool = False,
+    compile_model: bool = False,
+    compile_dynamic: bool = True,
+    compile_mode: str = "default",
 ) -> tuple[GraphInferenceAdapter, dict[str, object]]:
+    if weights not in ("ema", "raw"):
+        raise LineageArenaError("candidate weights must be ema or raw")
+    digest = sha256_file(checkpoint)
     payload = torch.load(checkpoint, map_location="cpu", weights_only=True)
     if not isinstance(payload, dict) or not isinstance(payload.get("config"), dict):
         raise LineageArenaError("candidate checkpoint configuration is missing")
@@ -70,23 +87,49 @@ def load_candidate(
     if config.is_legacy:
         raise LineageArenaError("candidate must use the variant-capable feature schema")
     model = GraphResTNet(config)
-    metadata = load_ema_checkpoint(
+    loader = load_ema_checkpoint if weights == "ema" else load_checkpoint
+    metadata = loader(
         checkpoint,
         model=model,
         expected_model_config=raw_model,
         expected_game_config=raw_game,
         map_location="cpu",
+        expected_sha256=digest,
     )
     model.to(device).eval()
-    digest = sha256_file(checkpoint)
-    identity = f"sha256-{digest}"
-    adapter = GraphInferenceAdapter(
+    if sha256_file(checkpoint) != digest:
+        raise LineageArenaError("candidate checkpoint changed while loading")
+    selected_digest = (
+        digest
+        if weights == "ema"
+        else hashlib.sha256(
+            f"startrain-weights:raw:{digest}".encode("ascii")
+        ).hexdigest()
+    )
+    identity = f"sha256-{selected_digest}"
+    options = inference_config or InferenceConfig(precision=precision)
+    if (
+        options.feature_schema_version != FEATURE_SCHEMA_VERSION
+        or options.precision != precision
+    ):
+        raise LineageArenaError(
+            "candidate inference schema/precision differs from its explicit contract"
+        )
+    inference_model = maybe_compile_model(
         model,
+        enabled=compile_model,
+        dynamic=compile_dynamic,
+        fullgraph=True,
+        mode=compile_mode,
+    )
+    adapter = GraphInferenceAdapter(
+        inference_model,
         device=device,
-        config=InferenceConfig(precision="fp32"),
+        config=options,
         model_version=identity,
         model_step=int(metadata["step"]),
         model_identity=identity,
+        homogeneous_relational_bias=homogeneous_relational_bias,
     )
     return adapter, {
         "identity": identity,
@@ -94,6 +137,8 @@ def load_candidate(
         "checkpoint_sha256": digest,
         "checkpoint_bytes": checkpoint.stat().st_size,
         "step": int(metadata["step"]),
+        "weights": weights,
+        "precision": precision,
         "rules_hash": RULES_HASH_WIRE,
         "feature_schema_version": FEATURE_SCHEMA_VERSION,
         "feature_schema_hash": f"{FEATURE_SCHEMA_HASH:016x}",
@@ -101,6 +146,23 @@ def load_candidate(
             name: getattr(config, name) for name in config.__dataclass_fields__
         },
     }
+
+
+def _profile_inference_config(
+    profile: ExperimentConfig | None, *, schema: int
+) -> InferenceConfig:
+    if profile is None:
+        return InferenceConfig(precision="fp32", feature_schema_version=schema)
+    flags = profile.orchestration.model_refresh.inference
+    return InferenceConfig(
+        precision="fp32",
+        feature_schema_version=schema,
+        cache_max_entries=flags.cache_max_entries,
+        cache_max_bytes=flags.cache_max_bytes,
+        deduplicate=flags.deduplicate,
+        pinned_transfers=flags.pinned_transfers,
+        pinned_buffer_slots=flags.pinned_buffer_slots,
+    )
 
 
 def run_lineage_arena(
@@ -114,14 +176,48 @@ def run_lineage_arena(
     max_considered: int,
     seed: int,
     device: torch.device,
+    inference_profile: ExperimentConfig | None = None,
 ) -> dict[str, object]:
-    candidate, candidate_metadata = load_candidate(candidate_checkpoint, device=device)
-    teacher = load_legacy_teacher(legacy_checkpoint, device=device)
-    baseline = GraphInferenceAdapter(
-        teacher.model,
+    refresh = (
+        inference_profile.orchestration.model_refresh
+        if inference_profile is not None
+        else None
+    )
+    compile_options = {
+        "compile_model": inference_profile.train.compile
+        if inference_profile is not None
+        else False,
+        "compile_dynamic": refresh.inference_compile_dynamic
+        if refresh is not None
+        else True,
+        "compile_mode": refresh.inference_compile_mode
+        if refresh is not None
+        else "default",
+    }
+    candidate, candidate_metadata = load_candidate(
+        candidate_checkpoint,
         device=device,
-        config=InferenceConfig(
-            precision="fp32", feature_schema_version=LEGACY_FEATURE_SCHEMA_VERSION
+        inference_config=_profile_inference_config(
+            inference_profile, schema=FEATURE_SCHEMA_VERSION
+        ),
+        homogeneous_relational_bias=refresh.inference.homogeneous_relational_bias
+        if refresh is not None
+        else False,
+        **compile_options,
+    )
+    teacher = load_legacy_teacher(legacy_checkpoint, device=device)
+    teacher_inference = maybe_compile_model(
+        teacher.model,
+        enabled=compile_options["compile_model"],
+        dynamic=compile_options["compile_dynamic"],
+        fullgraph=True,
+        mode=compile_options["compile_mode"],
+    )
+    baseline = GraphInferenceAdapter(
+        teacher_inference,
+        device=device,
+        config=_profile_inference_config(
+            inference_profile, schema=LEGACY_FEATURE_SCHEMA_VERSION
         ),
         model_version=teacher.identity,
         model_step=teacher.step,
@@ -146,6 +242,7 @@ def run_lineage_arena(
         candidate=candidate,
         baseline=baseline,
         config=config,
+        stable_pair_seeds=True,
         baseline_metadata={
             "kind": "legacy_champion",
             "rules_hash": LEGACY_RULES_HASH_WIRE,
@@ -170,6 +267,12 @@ def run_lineage_arena(
     result["candidate_metadata"] = candidate_metadata
     result["started_ns"] = started_ns
     result["segment"] = "standard"
+    result["inference_runtime"] = {
+        "candidate": asdict(candidate.config),
+        "baseline": asdict(baseline.config),
+        "homogeneous_relational_bias": candidate.homogeneous_relational_bias,
+        **compile_options,
+    }
     return result
 
 
@@ -190,12 +293,19 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-considered", type=int, default=16)
     parser.add_argument("--seed", type=int, default=17)
     parser.add_argument("--device", default="cpu")
+    parser.add_argument(
+        "--inference-profile",
+        type=Path,
+        help="Optional profile for cache/pinned/bias/compile runtime flags; both sides retain fp32.",
+    )
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
+        if args.output.exists():
+            raise LineageArenaError(f"output already exists: {args.output}")
         import star_native
 
         validate_native_module(star_native)
@@ -214,6 +324,9 @@ def main(argv: list[str] | None = None) -> int:
             max_considered=args.max_considered,
             seed=args.seed,
             device=torch.device(args.device),
+            inference_profile=load_config(args.inference_profile)
+            if args.inference_profile is not None
+            else None,
         )
         if args.output.exists():
             raise LineageArenaError(f"output already exists: {args.output}")

@@ -52,7 +52,7 @@ Implementation summary:
   `topology.py`, `GraphResTNet` v3 (relational attention bias, adaLN-Zero rule
   conditioning, `rings` forward input, ONNX export), `ModelConfig.legacy`.
 - Phase 2 — pie root transform `-|q|` and `root_value`, per-root simulation budgets,
-  `VariantMixtureConfig` (standard 0.45 / classic 0.25 / handicap 0.20 / pie 0.10),
+  `VariantMixtureConfig` (Stage B: standard 1/6, classic 1/6, handicap 1/3, pie 1/3),
   handicap↔pda pairing, swap decision by root value, replay schema v5 with variant
   provenance and teacher targets, segment-stratified replay windows
   (`learner.segment_quotas`), arena mixture segments with veto-on-regress floors
@@ -72,6 +72,18 @@ Implementation summary:
 
 Design decisions taken during implementation that refine the text below:
 
+- Stage B now targets all six mode/rule categories and all four board sizes
+  equally. Handicap and pie split 50/50 between classic and double; handicap size
+  remains uniform in 2..9 independently of mode. This corrects the original sampler
+  and arena, which generated only double-mode handicaps. Omitted new handicap mode
+  shares default to zero so frozen profiles retain their original behavior.
+  The updated Stage B profile explicitly enables the split, uses replay segment
+  quotas 1/6, 1/6, 1/3, 1/3, and keeps ring weights 0.25 from step 0. Equality is an
+  expected batch/position allocation, not equal wall-clock compute, and the replay
+  quotas enforce aggregate segments rather than their individual mode subgroups.
+  `arena.balanced_cells` now enables paired equal-24-cell promotion, per-cell
+  regression safeguards, and a separate strength-budget ladder. See
+  [balanced evaluation](balanced-strength-evaluation.md) for contracts and uncertainty.
 - Both server and browser AI received full variant support at once; the browser
   always sends `pda = 0` and real history.
 - The pda input is signed per seat: the advantaged seat sees `+d`, the other `-d`,
@@ -436,13 +448,15 @@ exactly where rule context belongs. Changes in priority order:
 
 ### 8.1 Variant mixture and data balance
 
-- Per-game sampling in `selfplay.py` from a profile block `selfplay.variants`:
-  standard double 0.55, classic 0.20, handicap 0.15 (k uniform in 2..9 with pda
-  pairing), pie 0.10 (double 0.07, classic 0.03). Asymmetric-pda games form 20%
-  of standard games in addition. All fractions are migratable profile fields.
-- Replay sampling stratifies by ring and variant (`UniqueReplayBatchSampler`
-  quotas) with inverse-frequency sample weights capped at 2x, so rare variants
-  are neither drowned nor dominant. Per-head loss weights are unchanged.
+- Per-batch sampling in `selfplay.py` from `selfplay.variants`: standard double
+  and classic each 1/6, handicap and pie each 1/3. Both mode shares are 0.5, yielding
+  six expected category shares of 1/6. Handicap size is uniform in 2..9 independently
+  of mode with pda pairing. Asymmetric-pda games form 20% of standard and classic
+  games in addition. All fractions are migratable profile fields.
+- Replay sampling stratifies each ring by standard/classic/handicap/pie at the same
+  four segment shares. Both actor and learner ring targets are 0.25 for each board
+  size throughout Stage B. Per-head loss weights are unchanged. Equal targets are
+  the baseline; future allocations should optimize a balanced strength metric.
 - Provenance: `SelfPlayIdentity` and every sample record `mode`, `handicap`,
   `pie`, `swapped`, and `pda`; the strength report and monitor summarize
   throughput and Elo per variant.
