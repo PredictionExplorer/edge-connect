@@ -1,0 +1,28 @@
+[Unit]
+Description=EdgeConnect StarTrain monitor (@RUN_ID@)
+After=network-online.target edgeconnect-startrain-@RUN_ID@.service
+Wants=network-online.target
+ConditionPathIsDirectory=@RUN_ROOT@
+
+[Service]
+Type=simple
+User=@USER@
+WorkingDirectory=@TRAINING_DIR@
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+# Include script dependencies when MONITOR_SCRIPT is a separately pinned file.
+Environment=PYTHONPATH=@TRAINING_DIR@:@TRAINING_DIR@/scripts
+ExecStart=@TRAINING_DIR@/.venv/bin/python -u @MONITOR_SCRIPT@ --run-root @RUN_ROOT@ --profile @PROFILE@ --unit edgeconnect-startrain-@RUN_ID@.service --disaster-backup-root @DR_ROOT@ --interval 5 --format jsonl --telemetry-output @RUN_ROOT@/status/monitor-5s.jsonl --telemetry-max-bytes 52428800 --telemetry-retain-files 7
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+KillSignal=SIGTERM
+StandardOutput=null
+StandardError=journal
+NoNewPrivileges=true
+UMask=0027
+ProtectSystem=strict
+ReadWritePaths=@RUN_ROOT@/status
+
+[Install]
+WantedBy=multi-user.target

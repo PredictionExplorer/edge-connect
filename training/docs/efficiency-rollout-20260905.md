@@ -120,3 +120,7 @@ journal. Other in-place arena-contract changes still require a terminal boundary
   It is deployed as a separately pinned script so the training runtime does not
   need another restart. No proactive user-notification channel is configured;
   server health checks and configured recoveries are automatic.
+- The separately pinned monitor needs both the training directory and its
+  `scripts` directory on PYTHONPATH. Its first hot-start missed the latter;
+  this was corrected in the service configuration without affecting training.
+  The reusable monitor service template now records that requirement.
