@@ -1874,6 +1874,15 @@ class PromotionSupervisor:
                     prior = loaded
             except (OSError, json.JSONDecodeError):
                 prior = {}
+        contract_identity = None
+        if self.experiment.arena.balanced_cells:
+            from .balanced_evaluation import evaluation_contract
+
+            contract_identity = evaluation_contract(self.experiment.arena)["identity"]
+        if prior.get("evaluation_contract_identity") != contract_identity:
+            # A different objective/budget starts a new rejection streak even
+            # for the same candidate; an old verdict is not a duplicate of it.
+            prior = {}
         streak = _status_counter(prior, "consecutive_terminal_rejections")
         conclusive_streak = _status_counter(
             prior,
@@ -1905,6 +1914,11 @@ class PromotionSupervisor:
             self.status_path,
             {
                 "schema_version": 1,
+                **(
+                    {"evaluation_contract_identity": contract_identity}
+                    if contract_identity is not None
+                    else {}
+                ),
                 "candidate_identity": candidate.model_identity,
                 "candidate_step": candidate.model_step,
                 "champion_identity": champion.model_identity,

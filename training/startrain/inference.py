@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 from collections import OrderedDict
+from contextlib import nullcontext
 import numbers
 import struct
 import threading
@@ -147,6 +148,7 @@ class InferenceMetrics:
     evaluator_rows: int = 0
     neural_calls: int = 0
     neural_rows: int = 0
+    neural_padding_rows: int = 0
     cache_hits: int = 0
     cache_misses: int = 0
     cache_evictions: int = 0
@@ -201,6 +203,7 @@ class GraphInferenceAdapter:
         self._evaluator_rows = 0
         self._neural_calls = 0
         self._neural_rows = 0
+        self._neural_padding_rows = 0
         self._cache_hits = 0
         self._cache_misses = 0
         self._deduplicated_rows = 0
@@ -235,6 +238,7 @@ class GraphInferenceAdapter:
             evaluator_rows=self._evaluator_rows,
             neural_calls=self._neural_calls,
             neural_rows=self._neural_rows,
+            neural_padding_rows=self._neural_padding_rows,
             cache_hits=self._cache_hits,
             cache_misses=self._cache_misses,
             cache_evictions=self._prediction_cache.evictions,
@@ -519,8 +523,11 @@ class GraphInferenceAdapter:
         return keys
 
     def _run_raw_predictions(
-        self, host: EncodedBatch, *, ring: int | None
+        self, host: EncodedBatch, *, ring: int | None, logical_rows: int | None = None
     ) -> list[RawPrediction]:
+        requested_rows = host.batch_size if logical_rows is None else logical_rows
+        if not 0 < requested_rows <= host.batch_size:
+            raise ValueError("logical inference rows must fit the physical batch")
         encoded = self._to_device(host)
         was_training = self.model.training
         self.model.eval()
@@ -579,10 +586,25 @@ class GraphInferenceAdapter:
                     raise ValueError("non-finite legal neural policy predictions")
                 self._neural_calls += 1
                 self._neural_rows += rows
+                self._neural_padding_rows += rows - requested_rows
         finally:
             if was_training:
                 self.model.train()
-        return [RawPrediction(row.numpy().tobytes(), host.max_nodes) for row in packed]
+        return [
+            RawPrediction(row.numpy().tobytes(), host.max_nodes)
+            for row in packed[:requested_rows]
+        ]
+
+    def _inference_batch_rows(self, rows: int) -> int:
+        """Reuse a small set of CUDA backend plans as cache-miss counts vary.
+
+        A new arbitrary CUDA batch shape has a measurable first-use planning
+        cost. Repeating the last valid row up to a power of two avoids it;
+        outputs of the repeated rows never become search results or cache data.
+        CPU inference retains its exact row count.
+        """
+
+        return 1 << (rows - 1).bit_length() if self.device.type == "cuda" else rows
 
     def evaluate_prepared(
         self,
@@ -605,7 +627,14 @@ class GraphInferenceAdapter:
         )
         if len(details_flags) != len(requests):
             raise ValueError("detail flags must match prepared requests")
-        with self._evaluation_lock:
+        with (
+            self._evaluation_lock,
+            (
+                torch.cuda.device(self.device)
+                if self.device.type == "cuda"
+                else nullcontext()
+            ),
+        ):
             namespace = self.namespace
             first = requests[0]
             if any(request.namespace != namespace for request in requests):
@@ -699,10 +728,14 @@ class GraphInferenceAdapter:
                 if self.config.deduplicate:
                     pending_keys[keys[row]] = row
             if misses:
-                indices = torch.tensor(misses, dtype=torch.long)
+                physical_rows = self._inference_batch_rows(len(misses))
+                indices = torch.tensor(
+                    misses + [misses[-1]] * (physical_rows - len(misses)),
+                    dtype=torch.long,
+                )
                 selected = (
                     host
-                    if len(misses) == rows
+                    if len(misses) == rows and physical_rows == rows
                     else EncodedBatch(
                         **{
                             field.name: getattr(host, field.name).index_select(
@@ -712,7 +745,9 @@ class GraphInferenceAdapter:
                         }
                     )
                 )
-                fresh = self._run_raw_predictions(selected, ring=ring)
+                fresh = self._run_raw_predictions(
+                    selected, ring=ring, logical_rows=len(misses)
+                )
                 for row, prediction in zip(misses, fresh, strict=True):
                     predictions[row] = prediction
                     if self._prediction_cache.enabled:

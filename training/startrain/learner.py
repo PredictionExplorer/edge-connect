@@ -1116,6 +1116,7 @@ class LearnerLoop:
         run_identity: RunIdentity,
         ring_mixture_config: RingMixtureConfig = RingMixtureConfig(),
         promotion_status_path: str | Path | None = None,
+        expected_promotion_contract_identity: str | None = None,
         gpu_pause_path: str | Path | None = None,
         rank: int = 0,
         world_size: int = 1,
@@ -1170,6 +1171,14 @@ class LearnerLoop:
         self.promotion_status_path = (
             Path(promotion_status_path) if promotion_status_path is not None else None
         )
+        if expected_promotion_contract_identity is not None and (
+            not isinstance(expected_promotion_contract_identity, str)
+            or not expected_promotion_contract_identity
+        ):
+            raise ValueError(
+                "expected promotion contract identity must be a nonempty string"
+            )
+        self.expected_promotion_contract_identity = expected_promotion_contract_identity
         self.gpu_pause_path = (
             Path(gpu_pause_path) if gpu_pause_path is not None else None
         )
@@ -1264,6 +1273,13 @@ class LearnerLoop:
             model,
             decay=config.train.resolved_ema_decay(world_size),
         )
+        expected_promotion_contract_identity = None
+        if config.arena.balanced_cells:
+            from .balanced_evaluation import evaluation_contract
+
+            expected_promotion_contract_identity = str(
+                evaluation_contract(config.arena)["identity"]
+            )
         return cls(
             store=store,
             model=model,
@@ -1280,6 +1296,7 @@ class LearnerLoop:
             run_identity=run_identity,
             ring_mixture_config=config.orchestration.ring_mixture,
             promotion_status_path=promotion_status_path,
+            expected_promotion_contract_identity=expected_promotion_contract_identity,
             gpu_pause_path=gpu_pause_path,
             rank=rank,
             world_size=world_size,
@@ -3694,6 +3711,7 @@ class LearnerLoop:
                             self.promotion_status_path,
                             {
                                 "schema_version": 1,
+                                **self._promotion_contract_metadata(),
                                 "candidate_identity": champion_manifest.model_identity,
                                 "candidate_step": champion_manifest.model_step,
                                 "champion_identity": champion_manifest.model_identity,
@@ -3780,6 +3798,7 @@ class LearnerLoop:
                             self.promotion_status_path,
                             {
                                 "schema_version": 1,
+                                **self._promotion_contract_metadata(),
                                 "candidate_identity": action["candidate_identity"],
                                 "candidate_step": action["candidate_step"],
                                 "champion_identity": action["champion_identity"],
@@ -4137,6 +4156,12 @@ class LearnerLoop:
         )
         return terminal_rejection, streak
 
+    def _promotion_contract_metadata(self) -> dict[str, str]:
+        identity = getattr(self, "expected_promotion_contract_identity", None)
+        return (
+            {"evaluation_contract_identity": identity} if identity is not None else {}
+        )
+
     def _learning_rate_at_floor(self, configured) -> bool:
         governor = getattr(self, "_lr_governor", None)
         if governor is None:
@@ -4171,6 +4196,14 @@ class LearnerLoop:
                     status = loaded
             except (OSError, json.JSONDecodeError):
                 status = {}
+        expected_contract = getattr(self, "expected_promotion_contract_identity", None)
+        if (
+            expected_contract is not None
+            and status.get("evaluation_contract_identity") != expected_contract
+        ):
+            # Status from a retired evaluation must not cut the learning rate
+            # while the same candidate is being measured under a new contract.
+            status = {}
         status_matches = (
             candidate is not None
             and status.get("candidate_identity") == candidate.model_identity

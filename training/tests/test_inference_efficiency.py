@@ -273,6 +273,53 @@ def test_cache_bounds_charge_keys_payload_and_evict_lru():
     assert len(cache) == cache.bytes == 0
 
 
+def test_bucket_padding_preserves_logical_outputs_cache_and_metrics(
+    feature_requests, monkeypatch
+):
+    adapter = cached_adapter()
+    monkeypatch.setattr(
+        adapter, "_inference_batch_rows", lambda rows: 1 << (rows - 1).bit_length()
+    )
+    batch = encode_batch([position(pda=value) for value in (0, 1, 2)])
+    request = feature_requests(batch)
+    reference = GraphInferenceAdapter(ObservedNetwork(), model_identity="reference")
+    expected = reference.evaluate_detailed(request)
+    actual = adapter.evaluate_detailed(request)
+    assert actual.response.tokens == expected.response.tokens
+    assert actual.response.policy_offsets == expected.response.policy_offsets
+    assert actual.response.policy_logits == expected.response.policy_logits
+    assert actual.response.values == pytest.approx(expected.response.values)
+    assert len(actual.outcome_values) == len(actual.score_probabilities) == 3
+    assert adapter.model.rows == [4]
+    assert adapter.efficiency_snapshot()["cache_entries"] == 3
+    metrics = adapter.metrics_snapshot()
+    assert metrics.evaluator_rows == 3 and metrics.neural_rows == 4
+    assert metrics.neural_padding_rows == 1
+    assert adapter.evaluate(request).tokens == request.tokens
+    assert adapter.model.rows == [4]
+    assert adapter.metrics_snapshot().cache_hits == 3
+
+
+@pytest.mark.parametrize(
+    "rows,expected",
+    (
+        (1, 1),
+        (2, 2),
+        (3, 4),
+        (127, 128),
+        (128, 128),
+        (129, 256),
+        (235, 256),
+        (257, 512),
+    ),
+)
+def test_only_cuda_inference_rounds_physical_batches(rows, expected):
+    adapter = cached_adapter()
+    assert adapter._inference_batch_rows(rows) == rows
+    adapter.device = torch.device("cuda:0")
+    assert adapter._inference_batch_rows(rows) == expected
+
+
 def test_configuration_and_unversioned_cache_fail_closed(feature_requests):
     for kwargs in (
         {"cache_max_entries": 1},
