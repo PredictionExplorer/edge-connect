@@ -381,6 +381,12 @@ def test_efficiency_rollout_preserves_two_step_cadence_and_prospective_utd(
         )
     )
     migration.apply_migration(first)
+    # A stopped legacy evaluation is retained intact. The new balanced contract
+    # uses distinct filenames, so none of these partial pairs can enter it.
+    pending = fixture.root / "arena" / f"sha256-{'d' * 64}-vs-sha256-{'c' * 64}.json"
+    _write_json(pending, {"result_kind": "promotion", "terminal": False, "pairs": []})
+    _write_json(fixture.root / "arena/promotion-status.json", {"terminal": False})
+    pending_bytes = pending.read_bytes()
     final = yaml.safe_load(
         (
             Path(__file__).parents[1]
@@ -419,6 +425,8 @@ def test_efficiency_rollout_preserves_two_step_cadence_and_prospective_utd(
     ]
     assert len(records) == 2
     assert records[1]["from_config_sha256"] == records[0]["to_config_sha256"]
+    assert records[1]["evaluation_contract_transition"]["kind"] == "legacy_to_balanced"
+    assert pending.read_bytes() == pending_bytes
     assert fixture.old_profile.read_bytes() == fixture.old_profile_bytes
 
 

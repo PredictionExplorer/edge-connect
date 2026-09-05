@@ -19,6 +19,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--lineage-result", type=Path)
     parser.add_argument("--minimum-elo-lower", type=float, default=-15.0)
     parser.add_argument("--output", type=Path)
+    parser.add_argument(
+        "--purpose",
+        choices=("legacy-certification", "curriculum"),
+        default="legacy-certification",
+        help="Curriculum readiness checks teacher-window turnover; it never certifies legacy playing strength.",
+    )
     args = parser.parse_args(argv)
     try:
         report = transfer_readiness(
@@ -27,6 +33,12 @@ def main(argv: list[str] | None = None) -> int:
             profile_path=args.profile,
             lineage_result=args.lineage_result,
             minimum_elo_lower=args.minimum_elo_lower,
+        )
+        report["requested_purpose"] = args.purpose
+        report["activation_ready"] = (
+            report["curriculum_ready"]
+            if args.purpose == "curriculum"
+            else report["legacy_strength_certified"]
         )
         if args.output is not None:
             target = args.output.resolve()
@@ -44,7 +56,7 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps({"status": "error", "error": str(error)}))
         return 2
     print(json.dumps(report, sort_keys=True))
-    return 0 if report["ready"] else 3
+    return 0 if report["activation_ready"] else 3
 
 
 if __name__ == "__main__":

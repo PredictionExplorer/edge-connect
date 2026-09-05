@@ -1,5 +1,11 @@
 # Variant-Capable Network Plan
 
+September5 rollout update: the user now prioritizes all six modes and four boards
+equally. Curriculum activation after verified teacher-window turnover is separate
+from certifying recovery of the old champion's strength. The historical within15Elo
+at1024-search criterion below remains the certification standard; no certification
+is inferred from starting StageB. See `efficiency-rollout-20260905.md`.
+
 Handicap openings, the classic one-stone variant, the pie rule, and architecture v3
 for a single GraphResTNet lineage.
 

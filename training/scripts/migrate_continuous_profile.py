@@ -1293,7 +1293,11 @@ def _fingerprint(path: Path) -> _InputFingerprint:
 
 
 def _validate_variant_arena_boundary(
-    run_root: Path, changed_paths: Sequence[str], *, champion_identity: str
+    run_root: Path,
+    changed_paths: Sequence[str],
+    *,
+    champion_identity: str,
+    legacy_to_balanced: bool = False,
 ) -> tuple[Path, ...]:
     """Keep a new variant allocation from resuming evidence under an old one."""
 
@@ -1318,7 +1322,7 @@ def _validate_variant_arena_boundary(
     inspected: list[Path] = []
     if status_path.exists():
         status, _ = _read_json(status_path, "promotion status")
-        if status.get("terminal") is not True:
+        if status.get("terminal") is not True and not legacy_to_balanced:
             raise MigrationError(
                 "arena variant allocation changes require a terminal arena boundary; "
                 "finish the in-flight evaluation before migrating"
@@ -1338,7 +1342,7 @@ def _validate_variant_arena_boundary(
             kind == "historical_crossplay" and path.name.startswith(crossplay_prefix)
         ):
             continue
-        if result.get("terminal") is not True:
+        if result.get("terminal") is not True and not legacy_to_balanced:
             raise MigrationError(
                 "arena variant allocation changes require a terminal arena boundary; "
                 f"resumable arena evidence remains in {path.name}"
@@ -1464,7 +1468,11 @@ def plan_migration(request: MigrationRequest) -> MigrationPlan:
         )
     )
     arena_boundary_paths = _validate_variant_arena_boundary(
-        run_root, [path for path, _, _ in changes], champion_identity=champion_identity
+        run_root,
+        [path for path, _, _ in changes],
+        champion_identity=champion_identity,
+        legacy_to_balanced=not old_config.arena.balanced_cells
+        and new_config.arena.balanced_cells,
     )
     recovery_interval = old_config.learner.recovery_interval_steps
     if recovery_interval is None:
@@ -1565,6 +1573,14 @@ def plan_migration(request: MigrationRequest) -> MigrationPlan:
     }
     if utd_segment_payload is not None:
         migration_record["utd_segment"] = dict(utd_segment_payload)
+    if not old_config.arena.balanced_cells and new_config.arena.balanced_cells:
+        migration_record["evaluation_contract_transition"] = {
+            "kind": "legacy_to_balanced",
+            "policy": "retain old evidence unchanged; use distinct balanced contract paths",
+            "retained_evidence": [
+                str(path.relative_to(run_root)) for path in arena_boundary_paths
+            ],
+        }
     if resume_cutover_step is not None:
         migration_record.update(
             {
@@ -1877,10 +1893,15 @@ def _create_backup(plan: MigrationPlan) -> Path:
 def _assert_inputs_unchanged(plan: MigrationPlan, *, check_lock: bool) -> None:
     if check_lock:
         _coordinator_lock_status(plan.run_root)
+    transition = plan.migration_record.get("evaluation_contract_transition")
     _validate_variant_arena_boundary(
         plan.run_root,
         [path for path, _, _ in plan.changes],
         champion_identity=str(plan.migration_record["champion_model_identity"]),
+        legacy_to_balanced=(
+            isinstance(transition, Mapping)
+            and transition.get("kind") == "legacy_to_balanced"
+        ),
     )
     for expected in plan.input_fingerprints:
         path = expected.path

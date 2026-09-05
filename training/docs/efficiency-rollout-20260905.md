@@ -74,3 +74,17 @@ not a production default without new evidence.
   actualrecentwindowteacherexclusion and independentpaired search streams. Legacy
   strength certification retains the documented1024search/within15Elo standard;
   the running256search comparison is a screen and cannot certify that gate.
+
+## Curriculum activation decision
+
+For the September5 user-authorized rollout, start the equal-six-mode curriculum
+once the selected teacher windows are empty. This is an explicit curriculum
+decision, not a declaration that legacy strength has been recovered. The
+`check_transfer_readiness.py --purpose curriculum` result exposes both
+`curriculum_ready` and `legacy_strength_certified`; the latter still requires the
+1024-search paired within15Elo criterion. The legacy reference remains preserved.
+
+A stopped in-flight legacy arena is retained byte-for-byte in the rollback
+bundle and the run. Switching to balanced evaluation uses a distinct versioned
+result namespace and records `evaluation_contract_transition` in the migration
+journal. Other in-place arena-contract changes still require a terminal boundary.

@@ -252,6 +252,8 @@ def transfer_readiness(
         "replay_maximum_shard_id": cutoff,
         "windows": windows,
         "teacher_window_empty": teacher_absent,
+        "curriculum_ready": teacher_absent,
+        "legacy_strength_certified": bool(ready),
         "ready": bool(ready),
         "lineage_evaluation": evidence,
         "lineage_result_sha256": result_sha256,

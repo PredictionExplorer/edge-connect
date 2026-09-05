@@ -143,3 +143,32 @@ def test_readiness_rejects_incompatible_or_partial_evidence(mutation):
         evidence["search"]["simulations"] = 128
     with pytest.raises(ValueError):
         assess(evidence)
+
+
+def test_curriculum_activation_never_claims_legacy_strength(
+    tmp_path, monkeypatch, capsys
+):
+    from pathlib import Path
+    from scripts import check_transfer_readiness as command
+
+    def readiness(*args, **kwargs):
+        return {
+            "ready": False,
+            "curriculum_ready": True,
+            "legacy_strength_certified": False,
+        }
+
+    monkeypatch.setattr(command, "transfer_readiness", readiness)
+    args = [
+        "--run-root",
+        str(tmp_path),
+        "--profile",
+        str(Path(__file__).parents[1] / "configs/h100-8gpu-variant-stage-a.yaml"),
+    ]
+    assert command.main(args) == 3
+    assert command.main([*args, "--purpose", "curriculum"]) == 0
+    import json
+
+    report = json.loads(capsys.readouterr().out.splitlines()[-1])
+    assert report["activation_ready"] is True
+    assert report["ready"] is False and report["legacy_strength_certified"] is False
