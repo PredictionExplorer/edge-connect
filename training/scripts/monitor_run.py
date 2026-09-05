@@ -485,11 +485,50 @@ def _merge_interval_seconds(intervals: list[tuple[int, int]]) -> float:
     return merged / 1_000_000_000
 
 
+def _is_actor_metric(row: Mapping[str, object]) -> bool:
+    # CPU actor IDs are arbitrary; identify completed self-play records rather
+    # than relying on their file or worker name. Ignore coordinator/event rows.
+    return (
+        isinstance(row.get("worker"), str)
+        and bool(row.get("worker"))
+        and "event" not in row
+        and any(
+            name in row for name in ("games", "cumulative_games", "games_per_second")
+        )
+        and (
+            "batch" in row
+            or ("batch_started_ns" in row and "batch_completed_ns" in row)
+        )
+    )
+
+
+def _actor_worker_name(worker: str, workers: Mapping[str, object]) -> str:
+    if worker in workers:
+        return worker
+    parent = re.sub(r"-cohort-\d+$", "", worker)
+    return parent if parent in workers else worker
+
+
+def _cpu_actor_id(
+    row: Mapping[str, object], cpu_actor_ids: Sequence[str]
+) -> str | None:
+    worker = str(row.get("worker"))
+    if worker in cpu_actor_ids:
+        return worker
+    parent = re.sub(r"-cohort-\d+$", "", worker)
+    if parent in cpu_actor_ids:
+        return parent
+    if str(row.get("compute_device", "")).split(":", 1)[0] == "cpu":
+        return worker
+    return None
+
+
 def _actor_throughput_window(
     metrics_root: Path,
     *,
     now_ns: int,
     window_seconds: float = 3_600.0,
+    cpu_actor_ids: Sequence[str] = (),
 ) -> dict[str, object]:
     cutoff_ns = now_ns - int(window_seconds * 1_000_000_000)
     all_records = []
@@ -504,8 +543,10 @@ def _actor_throughput_window(
         value = row.get(name, 0)
         return value if isinstance(value, int) and not isinstance(value, bool) else 0
 
-    for path in sorted(metrics_root.glob("actor-gpu-*.jsonl")):
+    for path in sorted(metrics_root.glob("*.jsonl")):
         for row in _recent_jsonl(path):
+            if not _is_actor_metric(row):
+                continue
             started = row.get("batch_started_ns")
             completed = row.get("batch_completed_ns")
             if (
@@ -542,15 +583,25 @@ def _actor_throughput_window(
     totals = {name: 0 for name in counter_names}
     totals_by_gpu: dict[int, dict[str, int]] = {}
     workers_by_gpu: dict[int, set[str]] = {}
+    totals_by_cpu: dict[str, dict[str, int]] = {}
+    workers_by_cpu: dict[str, set[str]] = {}
     partial_processes = []
     contributing_starts = []
     contributing_records = []
 
     def add_values(row: Mapping[str, object], values: Mapping[str, int]) -> None:
-        gpu_id = row.get("gpu_id")
+        gpu_id = row.get("physical_gpu_id", row.get("gpu_id"))
+        cpu_actor = _cpu_actor_id(row, cpu_actor_ids)
         for name, value in values.items():
             totals[name] += value
-        if isinstance(gpu_id, int) and not isinstance(gpu_id, bool):
+        if cpu_actor is not None:
+            cpu_totals = totals_by_cpu.setdefault(
+                cpu_actor, {name: 0 for name in counter_names}
+            )
+            for name, value in values.items():
+                cpu_totals[name] += value
+            workers_by_cpu.setdefault(cpu_actor, set()).add(str(row.get("worker")))
+        elif isinstance(gpu_id, int) and not isinstance(gpu_id, bool):
             gpu_totals = totals_by_gpu.setdefault(
                 gpu_id, {name: 0 for name in counter_names}
             )
@@ -640,6 +691,18 @@ def _actor_throughput_window(
             },
             "workers": sorted(workers_by_gpu.get(gpu_id, set())),
         }
+    by_cpu = {
+        actor_id: {
+            "wall_seconds": fleet_seconds,
+            **cpu_totals,
+            **{
+                f"{name}_per_second": value / fleet_seconds if fleet_seconds else None
+                for name, value in cpu_totals.items()
+            },
+            "workers": sorted(workers_by_cpu[actor_id]),
+        }
+        for actor_id, cpu_totals in sorted(totals_by_cpu.items())
+    }
     return {
         "schema_version": 1,
         "method": "cumulative_counter_wall_window_v1",
@@ -658,6 +721,7 @@ def _actor_throughput_window(
             },
         },
         "by_gpu": by_gpu,
+        "by_cpu": by_cpu,
     }
 
 
@@ -1962,24 +2026,51 @@ def collect_snapshot(
             )
 
     actors = []
-    for metrics_path in sorted((root / "metrics").glob("actor-gpu-*.jsonl")):
-        metric = _latest_jsonl(metrics_path)
+    for metrics_path in sorted((root / "metrics").glob("*.jsonl")):
+        metric = _latest_jsonl(metrics_path, predicate=_is_actor_metric)
         if metric is not None:
             actors.append(metric)
     actor_samples = sum(int(row.get("samples", 0) or 0) for row in actors)
     actor_policy_samples = sum(int(row.get("policy_samples", 0) or 0) for row in actors)
     worker_map = workers if isinstance(workers, dict) else {}
     worker_health_map = {str(row.get("name")): row for row in workers_output}
+    actor_health_map = {}
+    for row in actors:
+        worker_name = str(row.get("worker"))
+        coordinator_name = _actor_worker_name(worker_name, worker_map)
+        health = dict(_mapping(worker_health_map.get(coordinator_name)))
+        if coordinator_name != worker_name:
+            # The shared-process parent only reports aggregate cohort progress.
+            # Use its state for liveness and the child's own ring evidence.
+            parent_heartbeat = _mapping(worker_map.get(coordinator_name)).get(
+                "heartbeat"
+            )
+            child_heartbeat = {}
+            if isinstance(parent_heartbeat, str):
+                heartbeat_path = Path(parent_heartbeat)
+                suffix = worker_name[len(coordinator_name) :]
+                child_heartbeat = (
+                    _read_json(
+                        heartbeat_path.with_name(
+                            f"{heartbeat_path.stem}{suffix}{heartbeat_path.suffix}"
+                        )
+                    )
+                    or {}
+                )
+            for key in ("phase", "active_ring_weights", "active_rings", "ring"):
+                health[key] = child_heartbeat.get(key, row.get(key, health.get(key)))
+        actor_health_map[worker_name] = health
     active_actor_rows = [
         row
         for row in actors
-        if _mapping(worker_map.get(str(row.get("worker")))).get("state") == "running"
+        if _mapping(actor_health_map.get(str(row.get("worker")))).get("state")
+        == "running"
     ]
     if ring10_objective_active:
         ring10_actor_violations = []
         for row in active_actor_rows:
             worker_name = str(row.get("worker"))
-            worker_health = _mapping(worker_health_map.get(worker_name))
+            worker_health = _mapping(actor_health_map.get(worker_name))
             for source, weights in (
                 ("heartbeat weights", worker_health.get("active_ring_weights")),
                 ("metric weights", row.get("active_ring_weights")),
@@ -2018,7 +2109,7 @@ def collect_snapshot(
         for row in active_actor_rows
         if isinstance(
             (
-                weights := _mapping(worker_health_map.get(str(row.get("worker")))).get(
+                weights := _mapping(actor_health_map.get(str(row.get("worker")))).get(
                     "active_ring_weights"
                 )
             ),
@@ -2036,7 +2127,7 @@ def collect_snapshot(
     )
     for row in active_actor_rows:
         worker_name = str(row.get("worker"))
-        worker_health = _mapping(worker_health_map.get(worker_name))
+        worker_health = _mapping(actor_health_map.get(worker_name))
         weights = worker_health.get("active_ring_weights")
         configured_weights = (
             tuple(float(value) for value in weights)
@@ -2078,9 +2169,17 @@ def collect_snapshot(
             "policy_supervision_low",
             "low actor policy supervision: " + ",".join(low_policy_workers),
         )
+    configured_cpu_actors = orchestration.get("cpu_actors")
     actor_throughput = _actor_throughput_window(
         root / "metrics",
         now_ns=now,
+        cpu_actor_ids=tuple(
+            actor_id
+            for cpu in (
+                configured_cpu_actors if isinstance(configured_cpu_actors, list) else []
+            )
+            if isinstance((actor_id := _mapping(cpu).get("actor_id")), str)
+        ),
     )
     if (
         active_actor_rows

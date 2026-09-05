@@ -88,3 +88,35 @@ A stopped in-flight legacy arena is retained byte-for-byte in the rollback
 bundle and the run. Switching to balanced evaluation uses a distinct versioned
 result namespace and records `evaluation_contract_transition` in the migration
 journal. Other in-place arena-contract changes still require a terminal boundary.
+
+## Deployment outcome
+
+- Training release: `variant-efficiency-20260905`, source commit
+  `17f69736b1bf155a5fcf6e696448d4ca0da93588`, root-owned and read-only with406
+  source hashes and the compiled native artifact hash recorded.
+- Graceful stop: step39,249, coordinator exit0, no forced kill. Restart:
+  September5 07:17UTC from the same verified recovery checkpoint, with zero
+  uncheckpointed updates discarded. Original release and unit files remain in
+  `/home/ubuntu/edgeconnect-rollbacks/variant-20260905`.
+- Active profile: `/home/ubuntu/edgeconnect-runs/variant-network/profile-efficiency-20260905.yaml`.
+  Equal-six-mode StageB, equal ring allocation, prospective UTD1.5, shared GPU
+  inference/cohorts, bounded caches and pinned buffers, one reserved CPU actor,
+  and bounded exact tails are enabled.
+- At07:48UTC: learner step39,687 (+438);149,517 newly committed positions
+  include all six mode categories. No service/worker restarts. GPU7's actor is
+  intentionally paused while its balanced measurement arena uses the GPU.
+- Replay backup and disaster snapshot both succeeded; the latter was verified
+  with a source cutoff approximately three minutes old at07:50UTC. Strength
+  reports run every15minutes; the first balanced ladder measurement is pending.
+- Final local full suite:1,084 passed,5 hardware-specific skips. Host targeted
+  suite:59 passed. Additional counter-isolation, native seed parity, padding,
+  and monitor tests passed. No Elo/hour gain is claimed from these checks.
+- The legacy256-search screen completed120games: pre-rollout champion19,532
+  won2 and lost118 against legacychampion864,090. This establishes a weak
+  starting baseline, not the strength of the latest training weights, and does
+  not certify legacy-strength recovery.
+- The monitor-only follow-up counts configured CPU workers separately and
+  checks shared cohorts against parent liveness and their own ring evidence.
+  It is deployed as a separately pinned script so the training runtime does not
+  need another restart. No proactive user-notification channel is configured;
+  server health checks and configured recoveries are automatic.

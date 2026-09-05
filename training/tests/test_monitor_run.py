@@ -1002,17 +1002,19 @@ def test_actor_throughput_uses_completed_counters_and_merged_wall_intervals(
     assert throughput["by_gpu"]["1"]["wall_seconds"] == 10
 
 
+@pytest.mark.parametrize("worker", ["actor-gpu-1-lane-0", "small-ring-worker"])
 def test_actor_throughput_handles_window_baseline_and_process_restart(
     tmp_path,
+    worker,
 ) -> None:
     metrics = tmp_path / "metrics"
     metrics.mkdir()
-    (metrics / "actor-gpu-1-lane-0.jsonl").write_text(
+    (metrics / f"{worker}.jsonl").write_text(
         "\n".join(
             json.dumps(row)
             for row in [
                 {
-                    "worker": "actor-gpu-1-lane-0",
+                    "worker": worker,
                     "gpu_id": 1,
                     "process_started_ns": 1,
                     "batch_started_ns": 50_000_000_000,
@@ -1022,7 +1024,7 @@ def test_actor_throughput_handles_window_baseline_and_process_restart(
                     "cumulative_evaluator_rows": 1_000,
                 },
                 {
-                    "worker": "actor-gpu-1-lane-0",
+                    "worker": worker,
                     "gpu_id": 1,
                     "process_started_ns": 1,
                     "batch_started_ns": 110_000_000_000,
@@ -1032,7 +1034,7 @@ def test_actor_throughput_handles_window_baseline_and_process_restart(
                     "cumulative_evaluator_rows": 3_000,
                 },
                 {
-                    "worker": "actor-gpu-1-lane-0",
+                    "worker": worker,
                     "gpu_id": 1,
                     "process_started_ns": 90_000_000_000,
                     "batch_started_ns": 100_000_000_000,
@@ -1051,12 +1053,225 @@ def test_actor_throughput_handles_window_baseline_and_process_restart(
         metrics,
         now_ns=120_000_000_000,
         window_seconds=60,
+        cpu_actor_ids=("small-ring-worker",),
     )
 
     assert throughput["fleet"]["wall_seconds"] == 60
     assert throughput["fleet"]["samples"] == 250
     assert throughput["fleet"]["samples_per_second"] == pytest.approx(250 / 60)
     assert throughput["partial_processes"] == []
+    if worker == "small-ring-worker":
+        assert throughput["by_cpu"][worker]["samples"] == 250
+        assert throughput["by_gpu"] == {}
+    else:
+        assert throughput["by_cpu"] == {}
+
+
+@pytest.mark.parametrize("explicit_device", [False, True])
+def test_actor_throughput_separates_cpu_cohorts_from_real_gpu_zero(
+    tmp_path,
+    explicit_device,
+) -> None:
+    metrics = tmp_path / "metrics"
+    metrics.mkdir()
+    for worker, samples in (
+        ("actor-gpu-0", 100),
+        ("small-ring-worker-cohort-0", 200),
+        ("small-ring-worker-cohort-1", 300),
+    ):
+        row = {
+            "worker": worker,
+            "gpu_id": 0,
+            "batch_started_ns": 10_000_000_000,
+            "batch_completed_ns": 20_000_000_000,
+            "games": 10,
+            "samples": samples,
+            "evaluator_rows": samples * 10,
+        }
+        if explicit_device and worker != "actor-gpu-0":
+            row["compute_device"] = "cpu"
+        (metrics / f"{worker}.jsonl").write_text(json.dumps(row) + "\n")
+    (metrics / "coordinator.jsonl").write_text(
+        json.dumps({"event": "worker_started", "worker": "small-ring-worker"}) + "\n"
+    )
+
+    throughput: Any = monitor._actor_throughput_window(
+        metrics,
+        now_ns=20_000_000_000,
+        window_seconds=60,
+        cpu_actor_ids=() if explicit_device else ("small-ring-worker",),
+    )
+
+    assert throughput["record_count"] == 3
+    assert throughput["fleet"]["samples"] == 600
+    assert throughput["fleet"]["samples_per_second"] == 60
+    assert throughput["by_gpu"]["0"]["samples"] == 100
+    assert throughput["by_gpu"]["0"]["workers"] == ["actor-gpu-0"]
+    if explicit_device:
+        # Without a configured parent, these may be two independent CPU IDs.
+        assert set(throughput["by_cpu"]) == {
+            "small-ring-worker-cohort-0",
+            "small-ring-worker-cohort-1",
+        }
+        assert throughput["by_cpu"]["small-ring-worker-cohort-0"]["samples"] == 200
+        assert throughput["by_cpu"]["small-ring-worker-cohort-1"]["samples"] == 300
+    else:
+        assert throughput["by_cpu"]["small-ring-worker"]["samples"] == 500
+        assert throughput["by_cpu"]["small-ring-worker"]["samples_per_second"] == 50
+        assert throughput["by_cpu"]["small-ring-worker"]["workers"] == [
+            "small-ring-worker-cohort-0",
+            "small-ring-worker-cohort-1",
+        ]
+
+
+def test_snapshot_discovers_custom_cpu_actor_and_ignores_non_actor_metrics(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    now_ns = 20_000_000_000
+    root = _fixture(tmp_path, now_ns=now_ns)
+    profile_path = root / "profile.yaml"
+    profile = yaml.safe_load(profile_path.read_text())
+    profile["orchestration"]["cpu_actors"] = [{"actor_id": "small-ring-worker"}]
+    profile_path.write_text(yaml.safe_dump(profile))
+    metric_path = root / "metrics" / "actor-gpu-1.jsonl"
+    gpu_metric = json.loads(metric_path.read_text())
+    gpu_metric.update(
+        gpu_id=1,
+        samples=100,
+        policy_samples=90,
+        games=10,
+        batch_started_ns=10_000_000_000,
+        batch_completed_ns=now_ns,
+    )
+    metric_path.write_text(json.dumps(gpu_metric) + "\n")
+    cpu_metric = dict(gpu_metric, worker="small-ring-worker", gpu_id=0)
+    (root / "metrics" / "small-ring-worker.jsonl").write_text(
+        json.dumps(cpu_metric)
+        + "\n"
+        + json.dumps({"event": "worker_stopped", "worker": "small-ring-worker"})
+        + "\n"
+    )
+    (root / "metrics" / "coordinator.jsonl").write_text(
+        json.dumps({"event": "worker_started", "worker": "actor-gpu-1"}) + "\n"
+    )
+    (root / "metrics" / "arena.jsonl").write_text(
+        json.dumps({"games": 10, "samples": 1_000, "worker": "arena"}) + "\n"
+    )
+    _healthy_dependencies(monkeypatch)
+
+    snapshot: Any = monitor.collect_snapshot(root, now_ns=now_ns)
+
+    actors = snapshot["actors"]
+    assert actors["workers"] == 2
+    assert {row["worker"] for row in actors["latest"]} == {
+        "actor-gpu-1",
+        "small-ring-worker",
+    }
+    assert actors["policy_supervision_rate"] == 0.9
+    assert actors["throughput"]["fleet"]["samples"] == 200
+    assert actors["throughput"]["by_cpu"]["small-ring-worker"]["samples"] == 100
+    assert set(actors["throughput"]["by_gpu"]) == {"1"}
+
+
+@pytest.mark.parametrize("child_evidence", ["metric", "healthy", "mismatch"])
+def test_snapshot_checks_active_cohort_with_child_ring_evidence(
+    tmp_path,
+    monkeypatch,
+    child_evidence,
+) -> None:
+    now_ns = 20_000_000_000
+    root = _fixture(tmp_path, now_ns=now_ns)
+    weights = [0.15, 0.15, 0.15, 0.55]
+    profile_path = root / "profile.yaml"
+    profile = yaml.safe_load(profile_path.read_text())
+    profile["orchestration"]["ring_mixture"] = {
+        "step_weights": [{"from_step": 0, "weights": weights}]
+    }
+    profile["selfplay"] = {"record_fast_policy_targets": True}
+    profile_path.write_text(yaml.safe_dump(profile))
+    parent_heartbeat_path = root / "status" / "actor-gpu-1.heartbeat.json"
+    parent_heartbeat = json.loads(parent_heartbeat_path.read_text())
+    parent_heartbeat["phase"] = "shared_cohorts"
+    _write_json(parent_heartbeat_path, parent_heartbeat)
+    if child_evidence != "metric":
+        _write_json(
+            root / "status" / "actor-gpu-1.heartbeat-cohort-0.json",
+            dict(
+                parent_heartbeat,
+                phase="selfplay",
+                active_ring_weights=(
+                    weights if child_evidence == "healthy" else [1.0, 0.0, 0.0, 0.0]
+                ),
+            ),
+        )
+    metric_path = root / "metrics" / "actor-gpu-1.jsonl"
+    metric = json.loads(metric_path.read_text())
+    metric.update(
+        worker="actor-gpu-1-cohort-0",
+        samples=100,
+        policy_samples=10,
+        active_ring_weights=weights,
+    )
+    metric_path.unlink()
+    (root / "metrics" / "actor-gpu-1-cohort-0.jsonl").write_text(
+        json.dumps(metric) + "\n"
+    )
+    _healthy_dependencies(monkeypatch)
+
+    snapshot: Any = monitor.collect_snapshot(root, now_ns=now_ns)
+
+    codes = {warning["code"] for warning in snapshot["warnings"]}
+    assert "policy_supervision_low" in codes
+    assert ("actor_ring_weight_mismatch" in codes) == (child_evidence == "mismatch")
+    assert snapshot["actors"]["low_policy_workers"] == ["actor-gpu-1-cohort-0"]
+
+
+def test_snapshot_prefers_exact_cpu_worker_name_to_inferred_cohort_parent(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    now_ns = 20_000_000_000
+    root = _fixture(tmp_path, now_ns=now_ns)
+    profile_path = root / "profile.yaml"
+    profile = yaml.safe_load(profile_path.read_text())
+    cpu_name = "small-ring-worker-cohort-0"
+    profile["orchestration"]["cpu_actors"] = [
+        {"actor_id": "small-ring-worker"},
+        {"actor_id": cpu_name},
+    ]
+    profile["orchestration"]["ring_mixture"] = {
+        "step_weights": [{"from_step": 0, "weights": [0.0, 0.0, 0.0, 1.0]}]
+    }
+    profile_path.write_text(yaml.safe_dump(profile))
+    coordinator_path = root / "status" / "coordinator.json"
+    coordinator = json.loads(coordinator_path.read_text())
+    actor = coordinator["workers"].pop("actor-gpu-1")
+    coordinator["workers"]["small-ring-worker"] = actor
+    coordinator["workers"][cpu_name] = dict(actor, state="paused")
+    _write_json(coordinator_path, coordinator)
+    metric_path = root / "metrics" / "actor-gpu-1.jsonl"
+    metric = json.loads(metric_path.read_text())
+    metric.update(
+        worker=cpu_name,
+        gpu_id=0,
+        samples=100,
+        games=10,
+        batch_started_ns=10_000_000_000,
+        batch_completed_ns=now_ns,
+        active_ring_weights=[1.0, 0.0, 0.0, 0.0],
+    )
+    metric_path.unlink()
+    (root / "metrics" / f"{cpu_name}.jsonl").write_text(json.dumps(metric) + "\n")
+    _healthy_dependencies(monkeypatch)
+
+    snapshot: Any = monitor.collect_snapshot(root, now_ns=now_ns)
+
+    assert "actor_ring_weight_mismatch" not in {
+        warning["code"] for warning in snapshot["warnings"]
+    }
+    assert snapshot["actors"]["ring_weight_variants"] == []
+    assert set(snapshot["actors"]["throughput"]["by_cpu"]) == {cpu_name}
 
 
 def test_latest_jsonl_ignores_partial_tail(tmp_path) -> None:
