@@ -110,3 +110,38 @@ computation, preservation of the paused CUDA graph and counter, and clean proces
 shutdown. Native search and SQLite transaction tests additionally validate the
 cooperative checkpoints and release handshake; the CUDA canaries alone do not
 establish shared-lock safety.
+
+## Final deployment evidence
+
+- Runtime source: `6a8cee7ebe3d774a63badb233ba6a804003d95ff`, frozen with 416
+  source-file hashes and the unchanged native artifact hash. The release includes
+  the monitor corrections; it no longer depends on a separately pinned monitor.
+- Active profile:
+  `/home/ubuntu/edgeconnect-runs/variant-network/profile-cooperative-evaluation-20260905.yaml`.
+  Its SHA-256 is `55d2cd5fc8515d1156bbe27aa61374ead284196b59944504e75864620578e56b`.
+  The final migration changed only the actor pause strategy, from terminate to
+  cooperative suspend.
+- The preceding runtime stopped cleanly at 22:08:15 UTC, with every worker exit
+  code zero. Restart preserved step 57,387, all pinned learner/arena files, and the
+  existing UTD segment, with zero discarded updates. The learner subsequently
+  advanced to step 57,388.
+- The first cooperative pause parked both cohorts and proved empty inference
+  work plus synchronized CUDA. A write transaction against the shared replay
+  database remained available during the pause (0.00025 seconds; rolled back
+  without data changes).
+- The live arena lease ended after 300.372 seconds with 48 complete games,
+  24 complete pairs, and 2,505 searched moves retained. The same actor PID 662788
+  confirmed release of the matching token and resumed both cohorts, with zero
+  actor or service restarts and no coordinator failure.
+- Final validation: 1,257 local tests passed, five hardware-specific skips;
+  331 target-host tests passed. Lint, formatting, type checking, and both CUDA
+  canaries passed. Backups and report/monitor timers are active with valid current
+  disaster-recovery evidence.
+- Rollback units, profile authority, migration outputs, source pins, and live
+  handoff evidence are retained under
+  `/home/ubuntu/edgeconnect-rollouts/cooperative-evaluation-20260905`.
+
+The monitor still reports the existing high gradient-clipping frequency and the
+absence of complete connected balanced strength measurements. This rollout fixes
+evaluation scheduling and discarded self-play work; it does not establish a
+measured Elo-per-hour improvement.
