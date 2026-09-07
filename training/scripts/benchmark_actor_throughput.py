@@ -552,6 +552,7 @@ def _child(args, arm: Arm) -> dict[str, object]:
         max_pending_requests=max(inference.max_pending_requests, arm.cohorts),
         max_wait_seconds=inference.max_wait_seconds,
     ) as broker:
+        inference_before = asdict(evaluator.metrics_snapshot())
         measured = time.monotonic()
         task_results = run_tasks(
             native,
@@ -567,6 +568,7 @@ def _child(args, arm: Arm) -> dict[str, object]:
         )
         torch.cuda.synchronize(args.device)
         elapsed = time.monotonic() - measured
+        inference_after = asdict(evaluator.metrics_snapshot())
         metrics = broker.metrics_snapshot()
     ownership_after = _gpu_ownership(gpu_uuid)
     report = {
@@ -591,6 +593,14 @@ def _child(args, arm: Arm) -> dict[str, object]:
         "persisted_positions": 0,
         "tasks": task_results,
         "broker": metrics,
+        "inference_delta": {
+            name: value - inference_before[name]
+            for name, value in inference_after.items()
+        },
+        "effective_model_cache": {
+            "max_entries": evaluator.config.cache_max_entries,
+            "max_bytes": evaluator.config.cache_max_bytes,
+        },
         "requested_neural_rows": metrics["requested_rows"],
         "peak_cuda_allocated_bytes": torch.cuda.max_memory_allocated(args.device),
         "model_identity": manifest.model_identity,
