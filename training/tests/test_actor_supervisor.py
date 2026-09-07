@@ -427,11 +427,25 @@ def test_actor_supervisor_records_interrupted_cohort_metrics(
     assert metric["dropped_decisions"] == 7
 
 
+@pytest.mark.parametrize("preserve_broadcast_topology", (False, True))
 def test_manifest_provider_reuses_compiled_evaluator_and_refreshes_weights(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, preserve_broadcast_topology
 ) -> None:
     experiment = load_config(Path(__file__).parents[1] / "configs" / "small.yaml")
     experiment = replace(experiment, train=replace(experiment.train, compile=True))
+    experiment = replace(
+        experiment,
+        orchestration=replace(
+            experiment.orchestration,
+            model_refresh=replace(
+                experiment.orchestration.model_refresh,
+                inference=replace(
+                    experiment.orchestration.model_refresh.inference,
+                    preserve_broadcast_topology=preserve_broadcast_topology,
+                ),
+            ),
+        ),
+    )
     identity = RunIdentity(
         tmp_path / "run.json",
         "run-provider",
@@ -562,6 +576,10 @@ def test_manifest_provider_reuses_compiled_evaluator_and_refreshes_weights(
         run_identity=identity,
     )
     first_evaluator = provider.refresh()
+    assert (
+        first_evaluator.config.preserve_broadcast_topology
+        is preserve_broadcast_topology
+    )
     compiled_model = first_evaluator.model
     topology_cache = first_evaluator._topology_cache
     topology_cache[(4, 1, 1, 1)] = (torch.zeros(1),) * 4

@@ -1809,16 +1809,16 @@ fn max_degree(board: &Board) -> usize {
 
 /// Shared node planes of both schemas plus the schema-v3 global scalars.
 fn legacy_node_planes(
-    board: &Board,
-    stones: [BitBoard; 2],
-    current: usize,
-    terminal: bool,
+    state: &GameState,
     score: &ScoreResult,
     node: u16,
+    max_degree: usize,
 ) -> ([f32; LEGACY_NODE_FEATURE_DIM], bool, i8, bool) {
+    let board = state.board();
+    let stones = state.stones();
+    let current = state.to_move().index();
     let node_index = usize::from(node);
     let opponent = 1 - current;
-    let max_degree = max_degree(board);
     let current_stone = stones[current].contains(node);
     let opponent_stone = stones[opponent].contains(node);
     let empty = !current_stone && !opponent_stone;
@@ -1827,7 +1827,7 @@ fn legacy_node_planes(
     let ring = board.ring(node);
     let position = board.position(node);
     let arm_distance = position.min(ring - position);
-    let legal = empty && !terminal;
+    let legal = empty && !state.is_terminal();
     let planes = [
         binary_feature(empty),
         binary_feature(current_stone),
@@ -1893,13 +1893,14 @@ fn pack_legacy_feature_row(state: &GameState, score: &ScoreResult) -> PackedFeat
     let current = state.to_move().index();
     let terminal = state.is_terminal();
     let node_count = usize::from(board.node_count());
+    // Board topology is invariant across nodes; scan it once per feature row.
+    let max_degree = max_degree(board);
     let mut node_features = Vec::with_capacity(node_count * LEGACY_NODE_FEATURE_DIM);
     let mut legal_nodes = Vec::with_capacity(node_count);
     let mut node_owner = Vec::with_capacity(node_count);
     let mut alive_stones = Vec::with_capacity(node_count);
     for node in 0..board.node_count() {
-        let (planes, legal, owner, alive) =
-            legacy_node_planes(board, stones, current, terminal, score, node);
+        let (planes, legal, owner, alive) = legacy_node_planes(state, score, node, max_degree);
         node_features.extend(planes);
         legal_nodes.push(u8::from(legal));
         node_owner.push(owner);
@@ -1937,6 +1938,7 @@ fn pack_feature_row(
     let current = state.to_move().index();
     let terminal = state.is_terminal();
     let node_count = usize::from(board.node_count());
+    let max_degree = max_degree(board);
     let current_turn = state.current_turn_set();
     let own_previous = state.own_previous_turn_set();
     let opponent_previous = state.previous_turn_set();
@@ -1946,8 +1948,7 @@ fn pack_feature_row(
     let mut node_owner = Vec::with_capacity(node_count);
     let mut alive_stones = Vec::with_capacity(node_count);
     for node in 0..board.node_count() {
-        let (planes, legal, owner, alive) =
-            legacy_node_planes(board, stones, current, terminal, score, node);
+        let (planes, legal, owner, alive) = legacy_node_planes(state, score, node, max_degree);
         node_features.extend(planes);
         node_features.extend([
             binary_feature(current_turn.contains(node)),

@@ -15,7 +15,7 @@ def priority_profile():
     return load_config(CONFIGS / "h100-8gpu-largest-board-priority.yaml")
 
 
-def test_priority_profile_changes_only_requested_training_and_promotion_objective():
+def test_priority_profile_changes_only_objective_and_opted_in_inference():
     before = load_config(CONFIGS / "h100-8gpu-variant-efficiency-stage-b.yaml")
     after = priority_profile()
     validate_continuous_config(before)
@@ -28,6 +28,9 @@ def test_priority_profile_changes_only_requested_training_and_promotion_objectiv
     expected["selfplay"]["rings"] = 10
     expected["arena"]["rings"] = (10,)
     expected["arena"]["required_regression_rings"] = ()
+    expected["orchestration"]["model_refresh"]["inference"][
+        "preserve_broadcast_topology"
+    ] = True
     assert after.as_dict() == expected
     assert model_parameter_count(after.model) == 17_402_775
     assert after.learner.target_updates_per_new_sample == 1.5

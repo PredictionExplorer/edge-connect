@@ -486,7 +486,7 @@ def encode_native_feature_data(
         raise NativeCompatibilityError("native feature schema is incompatible")
 
     rings_u8 = _buffer_tensor("rings", data.rings, dtype=np.uint8, shape=(batch_size,))
-    ring_values = [int(value) for value in rings_u8]
+    ring_values = rings_u8.tolist()
     topologies = {rings: get_topology(rings) for rings in set(ring_values)}
     if max(topology.n for topology in topologies.values()) != max_nodes:
         raise NativeCompatibilityError("native max_nodes disagrees with ring metadata")

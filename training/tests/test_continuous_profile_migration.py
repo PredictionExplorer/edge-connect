@@ -591,10 +591,11 @@ def test_additive_default_field_accepts_legacy_chain_hash(tmp_path: Path) -> Non
                 *(path for bit, path in enumerate(additive) if mask >> bit & 1)
             )
         )
-    # Session scheduling and actor pause strategy retain all existing efficiency
-    # representations and every supported additive-default combination.
+    # Scheduling, actor pause and disabled topology preservation retain every
+    # supported epoch. Removing the whole disabled inference service collapses
+    # the otherwise independent pre/post-topology representations.
     assert expected <= compatible
-    assert len(compatible) == 8 * len(expected)
+    assert len(compatible) == 12 * len(expected)
     # A profile that opts into a new field no longer matches releases that
     # never had it, but keeps the variants for the other additive fields.
     opted = yaml.safe_load(fixture.old_profile.read_text(encoding="utf-8"))
@@ -603,7 +604,7 @@ def test_additive_default_field_accepts_legacy_chain_hash(tmp_path: Path) -> Non
     opted_path = tmp_path / "opted.yaml"
     opted_path.write_text(yaml.safe_dump(opted, sort_keys=False), encoding="utf-8")
     opted_config = load_config(opted_path)
-    assert len(migration._compatible_source_config_sha256s(opted_config)) == 64
+    assert len(migration._compatible_source_config_sha256s(opted_config)) == 96
 
     opted.setdefault("selfplay", {}).setdefault("variants", {})[
         "handicap_classic_share"
@@ -611,7 +612,7 @@ def test_additive_default_field_accepts_legacy_chain_hash(tmp_path: Path) -> Non
     opted.setdefault("arena", {})["segment_handicap_classic_share"] = 0.5
     opted_path.write_text(yaml.safe_dump(opted, sort_keys=False), encoding="utf-8")
     assert (
-        len(migration._compatible_source_config_sha256s(load_config(opted_path))) == 16
+        len(migration._compatible_source_config_sha256s(load_config(opted_path))) == 24
     )
 
     # The head a release without scheduling or plateau additions recorded.
@@ -1395,3 +1396,70 @@ def test_same_scope_guard_change_still_requires_terminal_evidence(tmp_path):
     with pytest.raises(migration.MigrationError, match="terminal arena boundary"):
         migration.plan_migration(fixture.request)
     assert _snapshot(fixture.root) == before
+
+
+def test_broadcast_topology_cutover_is_reversible_and_preserves_pending_work(tmp_path):
+    from dataclasses import replace
+
+    from startrain.balanced_evaluation import evaluation_contract
+
+    fixture = _fixture(tmp_path, "h100-8gpu-largest-board-priority.yaml")
+    original = load_config(fixture.old_profile)
+    evidence = {
+        "arena/promotion-status.json": {"terminal": False, "candidate_step": 90},
+        "arena/pending-balanced.json": {
+            "terminal": False,
+            "result_kind": "promotion",
+            "evaluation_contract": evaluation_contract(original.arena),
+            "pairs": [{"ring": 10, "pair": 0}],
+        },
+        "arena/pending-balanced.resume.json": {
+            "arena_state": {"game_states": [{"actions": [1, 2, 3]}]}
+        },
+    }
+    for name, payload in evidence.items():
+        _write_json(fixture.root / name, payload)
+    retained = [fixture.root / name for name in evidence]
+    retained.extend(
+        fixture.root / name
+        for name in ("run.json", "learner/recovery.json", "learner/champion.json")
+    )
+    retained.append(fixture.checkpoint)
+    before = {path: path.read_bytes() for path in retained}
+    source_profile = fixture.old_profile
+    source_commit = fixture.request.from_source_commit
+    for index, enabled in enumerate((False, True)):
+        raw = yaml.safe_load(source_profile.read_text())
+        raw["orchestration"]["model_refresh"]["inference"][
+            "preserve_broadcast_topology"
+        ] = enabled
+        fixture.candidate_profile.write_text(yaml.safe_dump(raw))
+        request = replace(
+            fixture.request,
+            old_profile=source_profile,
+            target_profile_name=f"profile-broadcast-{index}.yaml",
+            from_source_commit=source_commit,
+            to_source_commit=str(index + 2) * 40,
+        )
+        plan = migration.plan_migration(request)
+        migration.apply_migration(plan)
+        changed = load_config(plan.target_profile)
+        assert changed.model == original.model
+        assert changed.game == original.game
+        assert changed.optimizer == original.optimizer
+        assert changed.train == original.train
+        assert changed.learner == original.learner
+        assert changed.selfplay == original.selfplay
+        assert changed.arena == original.arena
+        assert evaluation_contract(changed.arena) == evaluation_contract(original.arena)
+        assert {path: path.read_bytes() for path in retained} == before
+        record = json.loads(
+            (fixture.root / "continuous-migrations.jsonl").read_text().splitlines()[-1]
+        )
+        assert [change["path"] for change in record["changes"]] == [
+            "orchestration.model_refresh.inference.preserve_broadcast_topology"
+        ]
+        assert "utd_segment" not in record
+        assert "evaluation_contract_transition" not in record
+        source_profile = plan.target_profile
+        source_commit = request.to_source_commit

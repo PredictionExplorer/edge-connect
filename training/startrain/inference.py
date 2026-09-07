@@ -76,6 +76,8 @@ class InferenceConfig:
     deduplicate: bool = False
     pinned_transfers: bool = False
     pinned_buffer_slots: int = 2
+    # Opt in after throughput validation; this changes storage, not key identity.
+    preserve_broadcast_topology: bool = False
 
     def __post_init__(self) -> None:
         if self.precision not in ("fp32", "bf16", "auto"):
@@ -98,7 +100,7 @@ class InferenceConfig:
             raise ValueError(
                 "cache entry and byte limits must both be positive or zero"
             )
-        for name in ("deduplicate", "pinned_transfers"):
+        for name in ("deduplicate", "pinned_transfers", "preserve_broadcast_topology"):
             if type(getattr(self, name)) is not bool:
                 raise ValueError(f"{name} must be boolean")
         if (
@@ -171,6 +173,40 @@ def _integer_list(name: str, values: Sequence[int]) -> list[int]:
             raise ValueError(f"{name} must contain integers")
         output.append(int(value))
     return output
+
+
+def _clone_batch_tensor(tensor: torch.Tensor) -> torch.Tensor:
+    """Own a producer's storage without materializing broadcast topology."""
+
+    detached = tensor.detach()
+    if tensor.shape[0] > 1 and tensor.stride(0) == 0:
+        return detached[:1].clone().expand_as(tensor)
+    return detached.clone()
+
+
+def _merge_batch_tensors(tensors: Sequence[torch.Tensor]) -> torch.Tensor:
+    """Keep identical broadcast rows shared; preserve arbitrary caller inputs."""
+
+    first = tensors[0]
+    if all(tensor.shape[0] == 1 or tensor.stride(0) == 0 for tensor in tensors) and all(
+        tensor.dtype == first.dtype
+        and tensor.device == first.device
+        and torch.equal(
+            tensor[:1].contiguous().view(torch.uint8),
+            first[:1].contiguous().view(torch.uint8),
+        )
+        for tensor in tensors[1:]
+    ):
+        return first[:1].expand(
+            sum(tensor.shape[0] for tensor in tensors), *first.shape[1:]
+        )
+    return torch.cat(tuple(tensors), dim=0)
+
+
+def _select_batch_tensor(tensor: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
+    if tensor.shape[0] > 1 and tensor.stride(0) == 0:
+        return tensor[:1].expand(len(indices), *tensor.shape[1:])
+    return tensor.index_select(0, indices)
 
 
 class GraphInferenceAdapter:
@@ -465,7 +501,11 @@ class GraphInferenceAdapter:
         with torch.inference_mode(False):
             owned = EncodedBatch(
                 **{
-                    field.name: getattr(host, field.name).detach().clone()
+                    field.name: (
+                        _clone_batch_tensor(getattr(host, field.name))
+                        if self.config.preserve_broadcast_topology
+                        else getattr(host, field.name).detach().clone()
+                    )
                     for field in dataclasses.fields(host)
                 }
             )
@@ -500,24 +540,32 @@ class GraphInferenceAdapter:
         """Complete bytes, not a lossy state hash: includes every model input."""
 
         prefix = repr(namespace).encode("utf-8") + b"\0"
-        serialized: list[tuple[bytes, bytes, int]] = []
+        serialized: list[tuple[bytes, bytes, int, bool]] = []
         for field in dataclasses.fields(encoded):
-            tensor = getattr(encoded, field.name).detach().contiguous()
+            tensor = getattr(encoded, field.name).detach()
             row_shape = tuple(tensor.shape[1:])
             header = f"{field.name}:{tensor.dtype}:{row_shape}".encode("ascii")
             row_bytes = tensor.element_size()
             for dimension in row_shape:
                 row_bytes *= dimension
-            payload = tensor.reshape(-1).view(torch.uint8).numpy().tobytes()
+            broadcast = tensor.shape[0] > 1 and tensor.stride(0) == 0
+            payload = (
+                (tensor[:1] if broadcast else tensor)
+                .contiguous()
+                .reshape(-1)
+                .view(torch.uint8)
+                .numpy()
+                .tobytes()
+            )
             framing = (
                 struct.pack("<I", len(header)) + header + struct.pack("<I", row_bytes)
             )
-            serialized.append((framing, payload, row_bytes))
+            serialized.append((framing, payload, row_bytes, broadcast))
         keys: list[bytes] = []
         for row in range(encoded.batch_size):
             parts = [prefix]
-            for framing, payload, row_bytes in serialized:
-                offset = row * row_bytes
+            for framing, payload, row_bytes, broadcast in serialized:
+                offset = 0 if broadcast else row * row_bytes
                 parts.extend((framing, payload[offset : offset + row_bytes]))
             keys.append(b"".join(parts))
         return keys
@@ -658,23 +706,7 @@ class GraphInferenceAdapter:
                 raise ValueError(
                     "prediction caching requires an immutable model identity"
                 )
-            host = (
-                first.encoded
-                if len(requests) == 1
-                else EncodedBatch(
-                    **{
-                        field.name: torch.cat(
-                            [
-                                getattr(request.encoded, field.name)
-                                for request in requests
-                            ],
-                            dim=0,
-                        )
-                        for field in dataclasses.fields(first.encoded)
-                    }
-                )
-            )
-            rows = host.batch_size
+            rows = sum(request.rows for request in requests)
             keyed = self._prediction_cache.enabled or self.config.deduplicate
             keys: list[bytes] = []
             if keyed:
@@ -728,6 +760,21 @@ class GraphInferenceAdapter:
                 if self.config.deduplicate:
                     pending_keys[keys[row]] = row
             if misses:
+                host = (
+                    first.encoded
+                    if len(requests) == 1
+                    else EncodedBatch(
+                        **{
+                            field.name: _merge_batch_tensors(
+                                [
+                                    getattr(request.encoded, field.name)
+                                    for request in requests
+                                ]
+                            )
+                            for field in dataclasses.fields(first.encoded)
+                        }
+                    )
+                )
                 physical_rows = self._inference_batch_rows(len(misses))
                 indices = torch.tensor(
                     misses + [misses[-1]] * (physical_rows - len(misses)),
@@ -738,8 +785,8 @@ class GraphInferenceAdapter:
                     if len(misses) == rows and physical_rows == rows
                     else EncodedBatch(
                         **{
-                            field.name: getattr(host, field.name).index_select(
-                                0, indices
+                            field.name: _select_batch_tensor(
+                                getattr(host, field.name), indices
                             )
                             for field in dataclasses.fields(host)
                         }
@@ -772,7 +819,7 @@ class GraphInferenceAdapter:
                     ]
                 )
             )
-            nodes = host.max_nodes
+            nodes = first.encoded.max_nodes
             outcome = torch.softmax(raw[:, nodes : nodes + 2], dim=-1)
             outcome_values = outcome[:, 1] - outcome[:, 0]
             score_probability = torch.softmax(raw[:, nodes + 2 :], dim=-1)

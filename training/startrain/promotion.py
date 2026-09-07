@@ -186,6 +186,7 @@ def load_manifest_evaluator(
             deduplicate=refresh.inference.deduplicate,
             pinned_transfers=refresh.inference.pinned_transfers,
             pinned_buffer_slots=refresh.inference.pinned_buffer_slots,
+            preserve_broadcast_topology=refresh.inference.preserve_broadcast_topology,
         ),
         model_version=manifest.model_version,
         model_step=manifest.model_step,

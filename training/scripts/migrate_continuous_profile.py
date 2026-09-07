@@ -123,6 +123,7 @@ _ALLOWED_PROFILE_PATHS = {
             "pinned_transfers",
             "pinned_buffer_slots",
             "homogeneous_relational_bias",
+            "preserve_broadcast_topology",
             "shared_batching",
             "max_batch_rows",
             "max_pending_requests",

@@ -286,6 +286,7 @@ class ManifestModelProvider:
                     deduplicate=refresh.inference.deduplicate,
                     pinned_transfers=refresh.inference.pinned_transfers,
                     pinned_buffer_slots=refresh.inference.pinned_buffer_slots,
+                    preserve_broadcast_topology=refresh.inference.preserve_broadcast_topology,
                 ),
                 homogeneous_relational_bias=refresh.inference.homogeneous_relational_bias,
                 model_version=manifest.model_version,

@@ -101,7 +101,8 @@ def test_session_epoch_preserves_evaluation_and_efficiency_contracts():
         before["orchestration"]["model_refresh"]
         == payload["orchestration"]["model_refresh"]
     )
-    assert len(compatible_config_epoch_payloads(payload)) == 4
+    assert payload in compatible_config_epoch_payloads(payload)
+    assert before in compatible_config_epoch_payloads(payload)
 
 
 @pytest.mark.parametrize(

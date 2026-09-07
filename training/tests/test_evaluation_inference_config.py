@@ -22,6 +22,7 @@ def test_promotion_evaluator_receives_explicit_inference_flags(tmp_path, monkeyp
         deduplicate=True,
         pinned_transfers=True,
         pinned_buffer_slots=3,
+        preserve_broadcast_topology=True,
         homogeneous_relational_bias=True,
     )
     experiment = replace(
@@ -54,6 +55,7 @@ def test_promotion_evaluator_receives_explicit_inference_flags(tmp_path, monkeyp
         "deduplicate",
         "pinned_transfers",
         "pinned_buffer_slots",
+        "preserve_broadcast_topology",
     ):
         assert getattr(evaluator.config, name) == getattr(flags, name)
     assert evaluator.homogeneous_relational_bias is True

@@ -59,24 +59,51 @@ def without_evaluation_session_defaults(
 def compatible_config_epoch_payloads(
     payload: Mapping[str, Any],
 ) -> tuple[dict[str, Any], ...]:
-    """Preserve existing guards across scheduling and actor-pause releases.
+    """Preserve existing guards across additive performance/scheduling releases.
 
-    Existing independent compatibility guards for older additions can operate
-    on each representation. The new scheduling fields strip as one release
-    block, without multiplying by every newly added field or dropping a
-    previously accepted representation that retained scheduling defaults.
+    The pre-broadcast representation receives the same scheduling, pause and
+    efficiency omissions as the current one. Older independent guards can
+    operate on every representation without losing any previously accepted
+    epoch or searching arbitrary subsets of newly added fields.
     """
 
-    pre_session = without_evaluation_session_defaults(payload)
-    variants = (
-        deepcopy(dict(payload)),
-        without_efficiency_defaults(payload),
-        pre_session,
-        without_efficiency_defaults(pre_session),
-    )
-    if without_pause_strategy_default(payload) == payload:
-        return variants
-    return (*variants, *(without_pause_strategy_default(row) for row in variants))
+    sources = [deepcopy(dict(payload))]
+    pre_broadcast = without_broadcast_topology_default(payload)
+    if pre_broadcast != payload:
+        sources.append(pre_broadcast)
+    variants: list[dict[str, Any]] = []
+    for source in sources:
+        pre_session = without_evaluation_session_defaults(source)
+        previous = (
+            source,
+            without_efficiency_defaults(source),
+            pre_session,
+            without_efficiency_defaults(pre_session),
+        )
+        variants.extend(previous)
+        if without_pause_strategy_default(source) != source:
+            variants.extend(without_pause_strategy_default(row) for row in previous)
+    return tuple(variants)
+
+
+def without_broadcast_topology_default(
+    payload: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Represent releases predating the opt-in shared-topology optimization.
+
+    Only the exact disabled boolean is additive. Enabling the optimization
+    requires an explicit profile migration even when other services are active.
+    """
+
+    result = deepcopy(dict(payload))
+    parent: object = result
+    for name in ("orchestration", "model_refresh", "inference"):
+        if not isinstance(parent, dict):
+            return result
+        parent = parent.get(name)
+    if isinstance(parent, dict) and parent.get("preserve_broadcast_topology") is False:
+        del parent["preserve_broadcast_topology"]
+    return result
 
 
 def without_efficiency_defaults(payload: Mapping[str, Any]) -> dict[str, Any]:
@@ -121,6 +148,16 @@ def without_efficiency_defaults(payload: Mapping[str, Any]) -> dict[str, Any]:
                 "max_pending_requests": 16,
                 "max_wait_seconds": 0.002,
             }
+            inference = refresh.get("inference")
+            if (
+                isinstance(inference, dict)
+                and inference.get("preserve_broadcast_topology") is False
+            ):
+                omit(
+                    refresh,
+                    "inference",
+                    {**defaults, "preserve_broadcast_topology": False},
+                )
             omit(refresh, "inference", defaults)
     arena = result.get("arena", {})
     omit(arena, "balanced_cells", False)

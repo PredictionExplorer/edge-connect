@@ -622,6 +622,7 @@ class ActorInferenceConfig:
     pinned_transfers: bool = False
     pinned_buffer_slots: int = 2
     homogeneous_relational_bias: bool = False
+    preserve_broadcast_topology: bool = False
     shared_batching: bool = False
     max_batch_rows: int = 256
     max_pending_requests: int = 16
@@ -642,6 +643,7 @@ class ActorInferenceConfig:
             "deduplicate",
             "pinned_transfers",
             "homogeneous_relational_bias",
+            "preserve_broadcast_topology",
             "shared_batching",
         ):
             if type(getattr(self, name)) is not bool:
