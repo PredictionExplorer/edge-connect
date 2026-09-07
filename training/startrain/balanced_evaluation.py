@@ -1,4 +1,4 @@
-"""A fixed equal-cell objective for paired variant evaluation.
+"""A fixed equal-cell objective on the configured boards for paired evaluation.
 
 One observation is a complete handicap-severity cycle across every cell. Its
 score gives each mode/rule/board cell exactly the same weight, irrespective of
@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Sequence
 
 from .selfplay import GameVariant
 from .contracts import RULES_SCHEMA_ID, RULES_HASH_WIRE
+from .topology import SUPPORTED_RINGS
 
 if TYPE_CHECKING:
     from .arena import ArenaPair
@@ -139,6 +140,17 @@ def balanced_cells(config: ArenaConfig) -> tuple[str, ...]:
     )
 
 
+def balanced_observation_model(config: ArenaConfig) -> str:
+    """Keep the original all-board contract while naming subsets truthfully."""
+    if config.rings == SUPPORTED_RINGS:
+        return BALANCED_OBSERVATION_MODEL
+    rings = "-".join(str(ring) for ring in config.rings)
+    return (
+        f"equal-{len(balanced_cells(config))}-cells-rings-{rings}"
+        "-complete-severity-cycle-v1"
+    )
+
+
 def cell_variant(name: str, pair_index: int, config: ArenaConfig) -> GameVariant:
     mode, rule = name.split("-", 1)
     severity = config.handicap_severity_cycle
@@ -157,7 +169,7 @@ def evaluation_contract(config: ArenaConfig) -> dict[str, object]:
     """A budget-specific immutable contract; candidate-dependent seeds are separate."""
     contract: dict[str, object] = {
         "schema_version": 1,
-        "objective": BALANCED_OBSERVATION_MODEL,
+        "objective": balanced_observation_model(config),
         "rules_schema": RULES_SCHEMA_ID,
         "rules_hash": RULES_HASH_WIRE,
         "cells": list(balanced_cells(config)),
@@ -348,7 +360,7 @@ def summarize_balanced_pairs(
         elif state == "accept_null":
             decision = "reject"
     aggregate = {
-        "observation_model": BALANCED_OBSERVATION_MODEL,
+        "observation_model": balanced_observation_model(config),
         "status": "missing"
         if not pairs
         else "incomplete"
@@ -388,7 +400,7 @@ def summarize_balanced_pairs(
         "promotion": {
             "decision": decision,
             "sequential_state": state,
-            "pair_model": BALANCED_OBSERVATION_MODEL,
+            "pair_model": balanced_observation_model(config),
             "minimum_ready": minimum_ready,
             "cell_vetoes": vetoes,
             "ring_floors": {},
@@ -396,7 +408,7 @@ def summarize_balanced_pairs(
             "confidence_sequence": [lower, upper],
             "statistical_test": {
                 "name": "complete-cycle-paired-hoeffding-mixture-e-process",
-                "observation_unit": BALANCED_OBSERVATION_MODEL,
+                "observation_unit": balanced_observation_model(config),
                 "promotion": {
                     "log_e_value": promotion_e,
                     "e_value": _reported_e_value(promotion_e),

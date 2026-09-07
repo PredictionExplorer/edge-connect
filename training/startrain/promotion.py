@@ -73,6 +73,31 @@ def _persisted_pair_key(pair: ArenaPair) -> tuple[int, str, int]:
     return pair_key(pair)
 
 
+def _balanced_round_plan(
+    accumulated: list[ArenaPair], config: ArenaConfig
+) -> tuple[dict[int, int], dict[int, int]]:
+    """Finish one fixed round across every cell before extending its budget.
+
+    A prefix counts indices completed in all six modes on one board. Choosing
+    the next boundary from the slowest prefix keeps partial sessions from
+    extending faster boards on each restart. The runner skips already complete
+    cell/index pairs inside these ranges, including sparse or frontloaded work.
+    """
+    starts = completed_counts_by_ring(accumulated, config)
+    slowest = min(starts.values())
+    if slowest < config.minimum_pairs_per_ring:
+        target = min(
+            config.minimum_pairs_per_ring,
+            (slowest // config.pairs_per_ring + 1) * config.pairs_per_ring,
+        )
+    else:
+        continuation = config.continuation_pairs_per_ring or config.pairs_per_ring
+        completed_rounds = (slowest - config.minimum_pairs_per_ring) // continuation
+        target = config.minimum_pairs_per_ring + (completed_rounds + 1) * continuation
+    target = min(target, config.max_pairs_per_ring)
+    return starts, {ring: max(0, target - count) for ring, count in starts.items()}
+
+
 def _merge_game_records(previous: object, current: object) -> list[object]:
     if not isinstance(previous, list) or not isinstance(current, list):
         raise ValueError("persisted arena games are invalid")
@@ -1036,19 +1061,16 @@ class PromotionSupervisor:
                         for ring in arena_config.rings
                     }
                     if arena_config.balanced_cells:
-                        starts = completed_counts_by_ring(accumulated, arena_config)
-                    counts = {
-                        ring: min(
-                            configured.pairs_per_ring,
-                            configured.max_pairs_per_ring
-                            - (
-                                starts[ring]
-                                if arena_config.balanced_cells
-                                else sum(pair.ring == ring for pair in accumulated)
-                            ),
-                        )
-                        for ring in arena_config.rings
-                    }
+                        starts, counts = _balanced_round_plan(accumulated, arena_config)
+                    else:
+                        counts = {
+                            ring: min(
+                                configured.pairs_per_ring,
+                                configured.max_pairs_per_ring
+                                - sum(pair.ring == ring for pair in accumulated),
+                            )
+                            for ring in arena_config.rings
+                        }
                     if all(count <= 0 for count in counts.values()):
                         return waves
                     if progress is not None:
@@ -1470,7 +1492,21 @@ class PromotionSupervisor:
         evaluation_metrics["peak_cuda_reserved_bytes"] = (
             peak_reserved if collect_cuda_metrics else None
         )
-        evaluation_metrics["requested_pairs"] = sum(pair_counts.values())
+        if arena_config.balanced_cells:
+            from .balanced_evaluation import BALANCED_CATEGORIES
+
+            finished = {_persisted_pair_key(pair) for pair in accumulated}
+            evaluation_metrics["requested_pairs"] = sum(
+                (ring, name, index) not in finished
+                for ring in arena_config.rings
+                for index in range(
+                    int(pair_starts.get(ring, 0)),
+                    int(pair_starts.get(ring, 0)) + int(pair_counts.get(ring, 0)),
+                )
+                for name in BALANCED_CATEGORIES
+            )
+        else:
+            evaluation_metrics["requested_pairs"] = sum(pair_counts.values())
         evaluation_metrics["completed_pairs"] = len(completed_pairs)
         previous_history = (
             previous.get("wave_history", []) if previous is not None else []
@@ -1787,6 +1823,8 @@ class PromotionSupervisor:
         self,
         accumulated: list[ArenaPair],
     ) -> tuple[dict[int, int], dict[int, int]]:
+        if self.experiment.arena.balanced_cells:
+            return _balanced_round_plan(accumulated, self.experiment.arena)
         existing_counts = self._ring_pair_counts(accumulated)
         starts = {
             ring: (
@@ -1802,8 +1840,6 @@ class PromotionSupervisor:
             )
             for ring in self.experiment.arena.rings
         }
-        if self.experiment.arena.balanced_cells:
-            starts = dict(existing_counts)
         pair_ratios = self.experiment.arena.promotion_pair_ratios
         if pair_ratios:
             complete_blocks = self._complete_blocks(existing_counts, pair_ratios)

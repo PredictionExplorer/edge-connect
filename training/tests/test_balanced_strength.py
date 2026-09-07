@@ -17,9 +17,16 @@ from startrain.config import ArenaConfig
 
 
 def measurement(
-    candidate: str, baseline: str, timestamp: int, *, saturated=False, simulations=1024
+    candidate: str,
+    baseline: str,
+    timestamp: int,
+    *,
+    saturated=False,
+    simulations=1024,
+    rings=(4, 6, 8, 10),
 ):
     cfg = ArenaConfig(
+        rings=rings,
         balanced_cells=True,
         simulations=simulations,
         pairs_per_ring=4,
@@ -82,6 +89,7 @@ def test_balanced_report_uses_champion_frontier_and_total_wall_time(tmp_path):
         report["rating"] / 80
     )
     assert len(report["per_cell"]) == 24
+    assert report["expected_cells"] == 24
     assert report["status"] == "measured"
     assert (
         0
@@ -185,3 +193,71 @@ def test_new_shortcut_measurement_does_not_reuse_the_first_path_edges_alpha(tmp_
     assert len(shortcut["path"]) == 1
     assert original["path"][0]["error_probability_per_side"] == 0.05 / 4
     assert shortcut["path"][0]["error_probability_per_side"] == 0.05 / 24
+
+
+def test_largest_board_report_has_six_cells_and_never_connects_old_board_evidence(
+    tmp_path,
+):
+    frontier(tmp_path, "champion-2")
+    first = measurement("champion-1", "anchor", 100)
+    second = measurement("champion-2", "champion-1", 200, rings=(10,))
+    report = balanced_strength_summary(
+        tmp_path,
+        [first, second],
+        wall_seconds=3600,
+        provisioned_gpus=8,
+        evaluation_config=ArenaConfig(balanced_cells=True, rings=(10,)),
+    )
+    assert report["expected_cells"] == 6
+    assert report["anchor_identity"] == "champion-1"
+    assert len(report["path"]) == 1
+    assert set(report["per_cell"]) == {f"r10/{name}" for name in BALANCED_CATEGORIES}
+    assert report["rating"] == pytest.approx(400 * 0.47712125471966244)
+    assert report["objective"] == "equal-6-cells-rings-10-complete-severity-cycle-v1"
+    assert report["contract_selection"] == "active_profile"
+    assert report["excluded_results"][0]["reason"] == (
+        "strength measurement belongs to another evaluation contract"
+    )
+
+
+def test_active_largest_board_contract_does_not_fall_back_to_completed_old_ladder(
+    tmp_path,
+):
+    frontier(tmp_path, "champion")
+    report = balanced_strength_summary(
+        tmp_path,
+        [measurement("champion", "anchor", 100)],
+        wall_seconds=3600,
+        provisioned_gpus=8,
+        evaluation_config=ArenaConfig(balanced_cells=True, rings=(10,)),
+    )
+    assert report["expected_cells"] == 6
+    assert report["status"] == "missing"
+    assert report["available"] is False
+    assert report["rating"] is None
+    assert report["elo_per_wall_hour"] is None
+    assert report["evaluation_contract"]["cells"] == [
+        f"r10/{name}" for name in BALANCED_CATEGORIES
+    ]
+
+
+@pytest.mark.parametrize("mutation", ["board", "category", "missing", "duplicate"])
+def test_largest_board_contract_cells_must_match_the_canonical_contract(
+    tmp_path, mutation
+):
+    frontier(tmp_path, "champion")
+    result = measurement("champion", "anchor", 100, rings=(10,))
+    cells = result["evaluation_contract"]["cells"]
+    if mutation == "board":
+        cells[0] = "r100/classic-standard"
+    elif mutation == "category":
+        cells[0] = "r10/nonexistent-standard"
+    elif mutation == "missing":
+        cells.pop()
+    else:
+        cells.append(cells[0])
+    report = balanced_strength_summary(
+        tmp_path, [result], wall_seconds=3600, provisioned_gpus=8
+    )
+    assert report["status"] == "missing"
+    assert len(report["excluded_results"]) == 1

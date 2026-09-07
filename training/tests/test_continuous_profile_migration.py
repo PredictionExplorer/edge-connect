@@ -1315,3 +1315,83 @@ def test_apply_rolls_back_all_partial_writes_on_failure(
     assert not (fixture.root / "continuous-migrations.jsonl").exists()
     assert not (fixture.root / "migration-backups").exists()
     assert not (fixture.root / "coordinator.lock").exists()
+
+
+def test_largest_board_cutover_preserves_pending_evidence_and_training_state(tmp_path):
+    from startrain.balanced_evaluation import evaluation_contract
+
+    fixture = _fixture(tmp_path, "h100-8gpu-variant-efficiency-stage-b.yaml")
+    old = load_config(fixture.old_profile)
+    target = yaml.safe_load(fixture.old_profile.read_text())
+    target["orchestration"]["training_objective"] = "ring10_priority"
+    target["orchestration"]["ring_mixture"]["step_weights"] = [
+        {"from_step": 0, "weights": [0.05, 0.05, 0.05, 0.85]}
+    ]
+    target["selfplay"]["rings"] = 10
+    target["arena"].update(rings=[10], required_regression_rings=[])
+    fixture.candidate_profile.write_text(yaml.safe_dump(target))
+    evidence = {
+        "promotion-status.json": {"terminal": False, "candidate_step": 90},
+        "pending-balanced.json": {
+            "terminal": False,
+            "result_kind": "promotion",
+            "evaluation_contract": evaluation_contract(old.arena),
+            "pairs": [{"ring": 4, "pair": 0}],
+        },
+        "pending-balanced.resume.json": {
+            "arena_state": {"game_states": [{"actions": [1, 2, 3]}]}
+        },
+        "historical-old-champion.json": {
+            "result_kind": "historical_crossplay",
+            "terminal": False,
+        },
+        "orphan.resume.json": {"arena_state": {"game_states": []}},
+    }
+    for name, value in evidence.items():
+        _write_json(fixture.root / "arena" / name, value)
+    pinned = [fixture.root / "arena" / name for name in evidence]
+    pinned.extend(
+        fixture.root / name
+        for name in ("run.json", "learner/recovery.json", "learner/champion.json")
+    )
+    before = {path: path.read_bytes() for path in pinned}
+    checkpoint_before = fixture.checkpoint.read_bytes()
+
+    plan = migration.plan_migration(fixture.request)
+    migration.apply_migration(plan)
+
+    assert {path: path.read_bytes() for path in pinned} == before
+    assert fixture.checkpoint.read_bytes() == checkpoint_before
+    active = load_config(plan.target_profile)
+    assert active.model == old.model
+    assert active.optimizer == old.optimizer
+    assert active.learner == old.learner
+    assert active.arena.rings == (10,)
+    assert active.orchestration.ring_mixture.weights_for_step(100) == (
+        0.05,
+        0.05,
+        0.05,
+        0.85,
+    )
+    record = json.loads((fixture.root / "continuous-migrations.jsonl").read_text())
+    transition = record["evaluation_contract_transition"]
+    assert transition["kind"] == "balanced_scope_change"
+    assert transition["from"]["identity"] != transition["to"]["identity"]
+    assert len(transition["from"]["cells"]) == 24
+    assert len(transition["to"]["cells"]) == 6
+    assert set(transition["retained_evidence"]) == {
+        f"arena/{name}" for name in evidence
+    }
+    assert "utd_segment" not in record
+
+
+def test_same_scope_guard_change_still_requires_terminal_evidence(tmp_path):
+    fixture = _fixture(tmp_path, "h100-8gpu-variant-efficiency-stage-b.yaml")
+    raw = yaml.safe_load(fixture.old_profile.read_text())
+    raw["arena"]["cell_regression_floor_elo"] = -80.0
+    fixture.candidate_profile.write_text(yaml.safe_dump(raw))
+    _write_json(fixture.root / "arena/promotion-status.json", {"terminal": False})
+    before = _snapshot(fixture.root)
+    with pytest.raises(migration.MigrationError, match="terminal arena boundary"):
+        migration.plan_migration(fixture.request)
+    assert _snapshot(fixture.root) == before

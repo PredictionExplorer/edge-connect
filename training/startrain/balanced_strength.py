@@ -10,6 +10,8 @@ from typing import Any, Mapping, Sequence
 
 from .arena import ArenaPair
 from .balanced_evaluation import (
+    balanced_cells,
+    balanced_observation_model,
     evaluation_contract,
     summarize_balanced_pairs,
     cycle_confidence_sequence,
@@ -32,7 +34,19 @@ def _validated_measurement(
     contract = result.get("evaluation_contract")
     if not isinstance(contract, dict) or contract.get("simulations") != simulations:
         raise ValueError("missing balanced strength-budget contract")
+    cells = contract.get("cells")
+    if (
+        not isinstance(cells, list)
+        or not cells
+        or any(not isinstance(cell, str) for cell in cells)
+    ):
+        raise ValueError("balanced contract must name its board/rule cells")
+    try:
+        rings = tuple(sorted({int(cell.split("/", 1)[0][1:]) for cell in cells}))
+    except ValueError as error:
+        raise ValueError("balanced contract has invalid board/rule cells") from error
     cfg = ArenaConfig(
+        rings=rings,
         balanced_cells=True,
         pairs_per_ring=4,
         minimum_pairs_per_ring=4,
@@ -76,6 +90,7 @@ def balanced_strength_summary(
     wall_seconds: float,
     provisioned_gpus: int,
     strength_simulations: int = 1024,
+    evaluation_config: ArenaConfig | None = None,
 ) -> dict[str, Any]:
     """Keep latest rejected candidates and cheap screens out of the headline.
 
@@ -83,6 +98,16 @@ def balanced_strength_summary(
     measurement path to the persisted champion. It is descriptive and assumes
     additive Elo across that path; it is not a promotion test or absolute Elo.
     """
+    if evaluation_config is not None and (
+        not evaluation_config.balanced_cells
+        or evaluation_config.simulations != strength_simulations
+    ):
+        raise ValueError("strength evaluation config must match the balanced budget")
+    expected_contract = (
+        evaluation_contract(evaluation_config)
+        if evaluation_config is not None
+        else None
+    )
     frontier = None
     try:
         pointer = json.loads((root / "learner" / "champion.json").read_text())
@@ -99,7 +124,15 @@ def balanced_strength_summary(
         "rating": None,
         "confidence_interval": [None, None],
         "simulations": strength_simulations,
-        "expected_cells": 24,
+        "expected_cells": len(balanced_cells(evaluation_config))
+        if evaluation_config is not None
+        else None,
+        "objective": balanced_observation_model(evaluation_config)
+        if evaluation_config is not None
+        else None,
+        "contract_selection": "active_profile"
+        if evaluation_config is not None
+        else "latest_champion_measurement",
         "method": "sum-of-paired-equal-cell-elo-contrasts-on-connected-champion-path",
         "statistical_role": "descriptive_only",
         "absolute_elo": False,
@@ -123,6 +156,13 @@ def balanced_strength_summary(
         else:
             try:
                 measurement = _validated_measurement(result, strength_simulations)
+                if (
+                    expected_contract is not None
+                    and measurement["contract"] != expected_contract
+                ):
+                    raise ValueError(
+                        "strength measurement belongs to another evaluation contract"
+                    )
                 candidate, baseline = result.get("candidate"), result.get("baseline")
                 if (
                     not isinstance(candidate, str)
@@ -136,8 +176,13 @@ def balanced_strength_summary(
         if reason:
             exclusions.append({"path": result.get("_path"), "reason": reason})
     output["excluded_results"] = exclusions
+    if expected_contract is not None:
+        output["evaluation_contract"] = expected_contract
     if not measurements:
-        output["reason"] = "no complete 1024-simulation balanced strength measurements"
+        output["reason"] = (
+            f"no complete {strength_simulations}-simulation balanced strength "
+            "measurements for the selected evaluation contract"
+        )
         return output
     # A changed evaluation contract starts a distinct rating epoch. Never mix
     # search budgets, severity schedules, or rule-cell definitions in one graph.
@@ -156,6 +201,8 @@ def balanced_strength_summary(
     for ordinal, item in enumerate(measurements):
         item["error_probability_per_side"] = 0.05 / (2 * (ordinal + 1) * (ordinal + 2))
     output["evaluation_contract"] = contract
+    output["expected_cells"] = len(contract["cells"])
+    output["objective"] = contract["objective"]
     anchor = measurements[0]["result"]["baseline"]
     output["anchor_identity"] = anchor
     if not isinstance(frontier, str):

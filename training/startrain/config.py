@@ -1141,7 +1141,9 @@ class RetentionConfig:
 @dataclass(frozen=True, slots=True)
 class OrchestrationConfig:
     enabled: bool = False
-    training_objective: Literal["generalist", "ring10_only"] = "generalist"
+    training_objective: Literal["generalist", "ring10_only", "ring10_priority"] = (
+        "generalist"
+    )
     run_id: str | None = None
     gpus: tuple[GPUWorkerConfig, ...] = ()
     cpu_actors: tuple[CPUActorConfig, ...] = ()
@@ -1164,9 +1166,14 @@ class OrchestrationConfig:
     def __post_init__(self) -> None:
         if type(self.enabled) is not bool:
             raise ConfigError("orchestration.enabled must be boolean")
-        if self.training_objective not in ("generalist", "ring10_only"):
+        if self.training_objective not in (
+            "generalist",
+            "ring10_only",
+            "ring10_priority",
+        ):
             raise ConfigError(
-                "orchestration.training_objective must be generalist or ring10_only"
+                "orchestration.training_objective must be generalist, ring10_only, "
+                "or ring10_priority"
             )
         if type(self.allow_colocated_workers) is not bool:
             raise ConfigError("allow_colocated_workers must be boolean")
@@ -1394,14 +1401,11 @@ class ArenaConfig:
                 "arena handicap severity cycle requires unique values in 2..9"
             )
         if self.balanced_cells and (
-            self.rings != SUPPORTED_RINGS
-            or self.promotion_pair_ratios
+            self.promotion_pair_ratios
             or self.segment_pairs_per_ring
             or self.segment_regression_floor_elo
         ):
-            raise ConfigError(
-                "balanced arena requires all rings and no legacy segment/ratio schedules"
-            )
+            raise ConfigError("balanced arena forbids legacy segment/ratio schedules")
         if (
             not self.rings
             or any(
@@ -1643,6 +1647,8 @@ class ExperimentConfig:
                     "ring10_only objective requires a single-ring unguarded "
                     "legacy arena"
                 )
+        if self.orchestration.training_objective == "ring10_priority":
+            self._validate_ring10_priority()
         if (
             self.orchestration.plateau.enabled
             and self.orchestration.plateau.max_learner_champion_lag_steps
@@ -1672,6 +1678,72 @@ class ExperimentConfig:
                 raise ConfigError(
                     "plateau lag must allow every reset-triggering candidate"
                 )
+
+    def _validate_ring10_priority(self) -> None:
+        """Keep training coverage separate from the largest-board promotion gate."""
+
+        mixture = self.orchestration.ring_mixture
+        if (
+            not mixture.step_weights
+            or mixture.step_weights[0].from_step != 0
+            or any(
+                any(weight <= 0 for weight in stage.weights)
+                or abs(sum(stage.weights) - 1.0) > 1e-9
+                or stage.weights[mixture.rings.index(10)] <= 0.5
+                for stage in mixture.step_weights
+            )
+        ):
+            raise ConfigError(
+                "ring10_priority objective requires positive normalized weights "
+                "for all four rings from step 0, with a ring-10 majority"
+            )
+        if (
+            self.selfplay.rings != 10
+            or not self.data.ring_stratified
+            or not self.learner.use_ring_mixture_curriculum
+        ):
+            raise ConfigError(
+                "ring10_priority objective requires ring-10 default self-play "
+                "and ring-stratified curriculum replay"
+            )
+        variants = self.selfplay.variants
+        fractions = {
+            "standard": 1 / 6,
+            "classic": 1 / 6,
+            "handicap": 1 / 3,
+            "pie": 1 / 3,
+        }
+        if (
+            not variants.enabled
+            or any(
+                abs(variants.segment_fractions[name] - fraction) > 1e-9
+                for name, fraction in fractions.items()
+            )
+            or abs(variants.pie_classic_share - 0.5) > 1e-9
+            or abs(variants.handicap_classic_share - 0.5) > 1e-9
+            or self.learner.segment_quotas is None
+            or any(
+                abs(self.learner.segment_quotas.get(name, 0.0) - fraction) > 1e-9
+                for name, fraction in fractions.items()
+            )
+        ):
+            raise ConfigError(
+                "ring10_priority objective requires all six modes equally "
+                "weighted in self-play and replay"
+            )
+        if (
+            self.arena.rings != (10,)
+            or not self.arena.balanced_cells
+            or self.arena.required_regression_rings != ()
+            or self.arena.per_ring_regression_floor_elo
+            or self.arena.promotion_pair_ratios
+            or self.arena.segment_pairs_per_ring
+            or self.arena.segment_regression_floor_elo
+        ):
+            raise ConfigError(
+                "ring10_priority objective requires balanced ring-10 promotion "
+                "without legacy ring or segment guards"
+            )
 
     def _validate_variant_family(self) -> None:
         """Self-play may only draw variants the game family admits."""

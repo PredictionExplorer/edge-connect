@@ -1,9 +1,14 @@
 # Balanced variant strength
 
-When `arena.balanced_cells` is enabled, promotion measures 24 equally weighted
-cells: classic and double, each with standard, pie, and handicap rules, on rings
-4, 6, 8, and 10. The model architecture and its weights are unchanged by enabling
-this objective. Legacy arena behavior remains the default.
+When `arena.balanced_cells` is enabled, promotion measures six equally weighted
+cells on each configured board: classic and double, each with standard, pie, and
+handicap rules. The largest-board profile sets `arena.rings: [10]`, producing six
+cells. Smaller-board regressions cannot veto this promotion gate because their
+results are outside its objective. Training still allocates 5% to each smaller
+board and 85% to ring 10, with all six modes equally weighted within each board.
+The original all-board objective uses rings 4, 6, 8, and 10 and retains its exact
+24-cell contract identity. The model architecture and its weights are unchanged
+by changing the evaluation objective. Legacy arena behavior remains the default.
 
 Each cell receives role-reversed game pairs. A pair is one observation with a
 score of 0, 0.5, or 1; its two games can be arbitrarily correlated. Handicap
@@ -31,8 +36,9 @@ completed pairs remain role-reversed. Result metrics expose shared inference
 requests, neural batches, queue wait, and failures. Custom/fake evaluators and
 `parallel_variant_groups=1` retain the serialized path.
 
-The statistical boundary is a complete severity cycle across all cells: normally
-96 pairs, or 192 games. Incomplete cells, interrupted cycles, and oversampled
+The statistical boundary is a complete severity cycle across all configured
+cells: 24 pairs, or 48 games, for the largest board; 96 pairs, or 192 games, for
+all four boards. Incomplete cells, interrupted cycles, and oversampled
 cells do not enter the promotion objective. Four initial pairs per cell and
 four-pair continuation waves align with this cycle. Budget fields retain their
 legacy names but mean pairs **per cell** when balanced evaluation is enabled.
@@ -62,7 +68,14 @@ paths and continuation checks prevent a legacy single-mode result, another searc
 budget, or another allocation from entering the same evaluation. Changing the
 contract starts a distinct measurement epoch.
 
-`strength_efficiency_report.py` adds `balanced_strength`. Its frontier is the
+`strength_efficiency_report.py` adds `balanced_strength`. The report reads and
+verifies the active profile registered in `profile.sha256` and selects that
+profile's historical contract before looking at completed measurements. A move
+to the six-cell objective therefore reports missing new evidence until it is
+measured, even if the retained 24-cell ladder has completed results. The report's
+`objective`, `expected_cells`, and contract describe the selected board scope.
+An optional `--profile` must agree with the registered active file when present.
+Its frontier is the
 persisted champion, never the most recently rejected candidate. It accepts only
 complete separate strength measurements with matching 1024-simulation contracts,
 revalidates the raw paired outcomes, and reports missing cells, disconnected

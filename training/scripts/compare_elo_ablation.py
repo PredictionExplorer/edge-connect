@@ -25,9 +25,15 @@ from startrain.arena import (
 from startrain.config import load_config
 
 if __package__:
-    from .strength_efficiency_report import build_strength_efficiency_report
+    from .strength_efficiency_report import (
+        ProfileChecksumError,
+        build_strength_efficiency_report,
+    )
 else:
-    from strength_efficiency_report import build_strength_efficiency_report
+    from strength_efficiency_report import (
+        ProfileChecksumError,
+        build_strength_efficiency_report,
+    )
 
 SCHEMA_VERSION = 1
 REPORT_NAME = "startrain-elo-ablation-comparison"
@@ -2787,6 +2793,11 @@ def _analyze_treatment(
     except (OSError, TypeError, ValueError) as error:
         message = f"{type(error).__name__}: {error}"
         payload["error"] = message
+        if isinstance(error, ProfileChecksumError):
+            payload["parse_failures"] = [
+                _failure(error.path, "profile SHA-256 mismatch")
+            ]
+            _add_reason(reasons, "parse_failure", "profile SHA-256 mismatch")
         _add_reason(reasons, "report_error", message)
         return _Treatment(label, payload, None, None, None, reasons)
 

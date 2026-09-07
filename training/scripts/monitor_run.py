@@ -17,7 +17,7 @@ import subprocess
 import sys
 import time
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -1311,6 +1311,7 @@ def _strength_efficiency_status(
     *,
     now_ns: int,
     balanced: bool = False,
+    expected_balanced_contract: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     path = run_root / "strength-efficiency.json"
     report = _read_json(path, attempts=1)
@@ -1386,6 +1387,24 @@ def _strength_efficiency_status(
     )
     aggregate = _mapping(autonomous.get("aggregate"))
     balanced_strength = _mapping(report.get("balanced_strength"))
+    contract_matches = (
+        expected_balanced_contract is None
+        or balanced_strength.get("evaluation_contract") == expected_balanced_contract
+    )
+    if balanced and not contract_matches:
+        # A report from the preceding objective remains diagnostic history,
+        # never current strength. The report timer will refresh this scope.
+        assert expected_balanced_contract is not None
+        cells = expected_balanced_contract.get("cells")
+        balanced_strength = {
+            "available": False,
+            "status": "missing",
+            "reason": "active_evaluation_contract_changed",
+            "evaluation_contract": dict(expected_balanced_contract),
+            "expected_cells": len(cells) if isinstance(cells, list) else None,
+            "rating": None,
+            "confidence_interval": [None, None],
+        }
     if balanced:
         # A valid report with insufficient balanced evidence is different from
         # a corrupt report. Never substitute standard-only/latest-candidate Elo.
@@ -1414,6 +1433,7 @@ def _strength_efficiency_status(
         "statistical_role": aggregate.get("statistical_role"),
         "adoption_ranking_authorized": aggregate.get("adoption_ranking_authorized"),
         "balanced_strength": dict(balanced_strength) if balanced else None,
+        "contract_matches_active_profile": contract_matches,
     }
 
 
@@ -1557,6 +1577,7 @@ def collect_snapshot(
         "error": None,
         "profile": str(profile_source),
     }
+    validated_profile = None
     if "training_objective" in orchestration:
         try:
             validated_profile = load_config(profile_source)
@@ -2077,16 +2098,21 @@ def collect_snapshot(
         # metric under the broker's own name belongs to its earlier standalone
         # actor; retain that history for throughput, but check current allocation
         # using the cohorts' own evidence rather than missing broker weights.
-        if health.get("state") == "running" and not (
-            coordinator_name == worker_name
+        if (
+            health.get("state") == "running"
             and health.get("phase")
-            in (
-                "shared_cohorts",
-                "arena_gpu_quiescing",
-                "arena_gpu_pause",
-                "arena_gpu_resume",
-                "arena_gpu_resuming",
-                "cohort_draining",
+            not in ("starting", "initializing", "replay_reconciliation")
+            and not (
+                coordinator_name == worker_name
+                and health.get("phase")
+                in (
+                    "shared_cohorts",
+                    "arena_gpu_quiescing",
+                    "arena_gpu_pause",
+                    "arena_gpu_resume",
+                    "arena_gpu_resuming",
+                    "cohort_draining",
+                )
             )
         ):
             active_actor_rows.append(row)
@@ -2601,17 +2627,44 @@ def collect_snapshot(
                     "supersede completed evaluation work",
                 )
     balanced_objective = arena_config.get("balanced_cells") is True
+    expected_balanced_contract = None
+    if (
+        balanced_objective
+        and validated_profile is not None
+        and objective_contract["validated"] is True
+    ):
+        from startrain.balanced_evaluation import evaluation_contract
+
+        _, max_considered = (
+            validated_profile.orchestration.historical_evaluation.search_budget(
+                validated_profile.arena
+            )
+        )
+        expected_balanced_contract = evaluation_contract(
+            replace(
+                validated_profile.arena,
+                simulations=validated_profile.arena.strength_simulations,
+                max_considered=max_considered,
+            )
+        )
     strength_efficiency = _strength_efficiency_status(
-        root, now_ns=now, balanced=balanced_objective
+        root,
+        now_ns=now,
+        balanced=balanced_objective,
+        expected_balanced_contract=expected_balanced_contract,
     )
     if balanced_objective and strength_efficiency.get("available") is True:
         balanced_evidence = _mapping(strength_efficiency.get("balanced_strength"))
         if balanced_evidence.get("available") is not True:
+            configured_rings = arena_config.get("rings", [4, 6, 8, 10])
+            cell_count = (
+                len(configured_rings) * 6 if isinstance(configured_rings, list) else 24
+            )
             _add_warning(
                 warnings,
                 "WARN",
                 "balanced_strength_unmeasured",
-                "balanced champion strength awaits complete connected 24-cell measurement evidence",
+                f"balanced champion strength awaits complete connected {cell_count}-cell measurement evidence",
             )
     strength_age = _number(strength_efficiency.get("age_seconds"))
     run_created_ns = run_identity.get("created_ns")

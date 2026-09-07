@@ -1449,6 +1449,16 @@ class ArenaRunner:
                     "balanced continuation requires persisted previous pairs"
                 )
             finished = {pair_key(pair) for pair in prior}
+            requested_pairs = sum(
+                (ring, name, index) not in finished
+                for ring in self.config.rings
+                for index in range(
+                    int((pair_starts or {}).get(ring, 0)),
+                    int((pair_starts or {}).get(ring, 0))
+                    + int((pair_counts or {}).get(ring, self.config.pairs_per_ring)),
+                )
+                for name in BALANCED_CATEGORIES
+            )
         # Dynamo/Inductor compiled models are not thread-safe. Keep the two
         # GIL-releasing native search groups parallel, but route both models
         # through one stable inference thread for the entire arena run.
@@ -1629,14 +1639,28 @@ class ArenaRunner:
                     else "legacy-batch-coupled-v1"
                 ),
                 **self.candidate_search.metadata(),
-                "pie_rule": "pie" in self.config.segment_pairs_per_ring,
+                "pie_rule": self.config.balanced_cells
+                or "pie" in self.config.segment_pairs_per_ring,
                 "segments": {
+                    "standard": self.config.pairs_per_ring,
+                    "classic": self.config.pairs_per_ring,
+                    "pie": 2 * self.config.pairs_per_ring,
+                    "handicap": 2 * self.config.pairs_per_ring,
+                }
+                if self.config.balanced_cells
+                else {
                     SEGMENT_STANDARD: self.config.pairs_per_ring,
                     **dict(sorted(self.config.segment_pairs_per_ring.items())),
                 },
-                "segment_handicaps": list(self.config.segment_handicaps),
+                "segment_handicaps": list(
+                    self.config.handicap_severity_cycle
+                    if self.config.balanced_cells
+                    else self.config.segment_handicaps
+                ),
                 "segment_handicap_classic_share": (
-                    self.config.segment_handicap_classic_share
+                    0.5
+                    if self.config.balanced_cells
+                    else self.config.segment_handicap_classic_share
                 ),
                 "segment_handicap_pda": list(self.config.segment_handicap_pda),
                 "swap_dead_zone": self.config.swap_dead_zone,

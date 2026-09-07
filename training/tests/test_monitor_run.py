@@ -2087,6 +2087,78 @@ def test_strength_report_requires_exact_run_root_and_allows_small_clock_skew(
     assert rejected["reason"] == "report_contract_invalid"
 
 
+def test_changed_balanced_objective_cannot_reuse_previous_report_headline(tmp_path):
+    from startrain.balanced_evaluation import evaluation_contract
+    from startrain.config import ArenaConfig
+
+    now_ns = 20_000_000_000
+    root = _fixture(tmp_path, now_ns=now_ns)
+    old = evaluation_contract(ArenaConfig(balanced_cells=True))
+    current = evaluation_contract(ArenaConfig(rings=(10,), balanced_cells=True))
+    report = {
+        "report": "startrain-strength-efficiency",
+        "schema_version": 1,
+        "status": "complete",
+        "run_id": "monitor-run",
+        "generation_family": "monitor-family",
+        "run_root": str(root),
+        "started_ns": now_ns - 1_000_000_000,
+        "observed_until_ns": now_ns,
+        "balanced_strength": {
+            "available": True,
+            "rating": 300.0,
+            "confidence_interval": [200.0, 400.0],
+            "evaluation_contract": old,
+        },
+    }
+    _write_json(root / "strength-efficiency.json", report)
+    status = monitor._strength_efficiency_status(
+        root, now_ns=now_ns, balanced=True, expected_balanced_contract=current
+    )
+    assert status["available"] is True
+    assert status["headline_elo"] is None
+    assert status["headline_confidence_interval"] is None
+    assert status["contract_matches_active_profile"] is False
+    assert status["balanced_strength"]["expected_cells"] == 6
+
+    report["balanced_strength"]["evaluation_contract"] = current
+    _write_json(root / "strength-efficiency.json", report)
+    refreshed = monitor._strength_efficiency_status(
+        root, now_ns=now_ns, balanced=True, expected_balanced_contract=current
+    )
+    assert refreshed["headline_elo"] == 300.0
+    assert refreshed["contract_matches_active_profile"] is True
+
+
+def test_starting_actor_does_not_inherit_old_ring_allocation_alarm(
+    tmp_path, monkeypatch
+):
+    now_ns = 20_000_000_000
+    root = _fixture(tmp_path, now_ns=now_ns)
+    profile = yaml.safe_load((root / "profile.yaml").read_text())
+    profile["orchestration"]["ring_mixture"] = {
+        "step_weights": [{"from_step": 0, "weights": [0.05, 0.05, 0.05, 0.85]}]
+    }
+    (root / "profile.yaml").write_text(yaml.safe_dump(profile))
+    heartbeat_path = root / "status/actor-gpu-1.heartbeat.json"
+    heartbeat = json.loads(heartbeat_path.read_text())
+    heartbeat.update(phase="starting")
+    heartbeat.pop("active_ring_weights", None)
+    _write_json(heartbeat_path, heartbeat)
+    _healthy_dependencies(monkeypatch)
+    starting = monitor.collect_snapshot(root, now_ns=now_ns)
+    assert "actor_ring_weight_mismatch" not in {
+        warning["code"] for warning in starting["warnings"]
+    }
+
+    heartbeat.update(phase="selfplay", active_ring_weights=[0.25, 0.25, 0.25, 0.25])
+    _write_json(heartbeat_path, heartbeat)
+    active = monitor.collect_snapshot(root, now_ns=now_ns)
+    assert "actor_ring_weight_mismatch" in {
+        warning["code"] for warning in active["warnings"]
+    }
+
+
 def test_monitor_surfaces_optimizer_ema_and_training_health(
     tmp_path,
     monkeypatch,

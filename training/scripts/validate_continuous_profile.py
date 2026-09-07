@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import argparse
 
-from startrain.config import ExperimentConfig, load_config
+from startrain.config import SUPPORTED_RINGS, ExperimentConfig, load_config
 
 
 def _validate_learner_shared_promotion(config: ExperimentConfig) -> None:
@@ -351,8 +351,19 @@ def validate_continuous_config(config: ExperimentConfig) -> None:
         raise ValueError("continuous service requires bounded active retention")
     _validate_learner_shared_promotion(config)
     objective = config.orchestration.training_objective
+    if (
+        objective == "generalist"
+        and config.arena.balanced_cells
+        and config.arena.rings != SUPPORTED_RINGS
+    ):
+        raise ValueError("generalist balanced promotion requires all four rings")
     if objective == "ring10_only":
         _validate_ring10_only_config(config)
+    elif objective == "ring10_priority":
+        _validate_autonomous_config(
+            config, require_scratch=config.orchestration.autonomous.enabled
+        )
+        _validate_variant_lineage_config(config)
     elif config.orchestration.autonomous.enabled:
         _validate_autonomous_config(config)
     elif _is_variant_lineage_profile(config):

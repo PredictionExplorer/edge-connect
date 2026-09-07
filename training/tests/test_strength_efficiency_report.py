@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+import hashlib
 
 from startrain.arena import ARENA_RESULT_SCHEMA_VERSION
 from pathlib import Path
 
 import pytest
+import yaml
 
 from scripts import strength_efficiency_report as report_module
 from scripts.strength_efficiency_report import (
@@ -1194,3 +1196,65 @@ def test_report_ignores_migration_records_for_another_run(tmp_path) -> None:
 
     assert report["migrations"]["record_count"] == 0
     assert report["migrations"]["ignored_record_count"] == 1
+
+
+def _registered_largest_board_profile(root: Path) -> Path:
+    payload = yaml.safe_load(
+        (Path(__file__).parents[1] / "configs" / "small.yaml").read_text()
+    )
+    payload["game"]["variants"] = {
+        "modes": ["classic", "double"],
+        "handicap_min": 1,
+        "handicap_max": 9,
+        "pie_allowed": True,
+    }
+    payload["arena"] = {
+        "rings": [10],
+        "balanced_cells": True,
+        "simulations": 256,
+        "strength_simulations": 1024,
+        "max_considered": 16,
+    }
+    payload["orchestration"] = {"historical_evaluation": {"max_considered": 48}}
+    active = root / "profile-largest.yaml"
+    active.write_text(yaml.safe_dump(payload))
+    checksum = hashlib.sha256(active.read_bytes()).hexdigest()
+    (root / "profile.sha256").write_text(f"{checksum}  {active.name}\n")
+    return active
+
+
+def test_report_pins_six_cell_contract_from_registered_profile_before_new_evidence(
+    tmp_path,
+) -> None:
+    (tmp_path / "run.json").write_text(
+        json.dumps({"created_ns": 1, "run_id": "largest-board"})
+    )
+    active = _registered_largest_board_profile(tmp_path)
+    # The original profile survives migration, so it must not remain the
+    # report's source just because it uses the conventional filename.
+    (tmp_path / "profile.yaml").write_text("invalid stale profile")
+    report = build_strength_efficiency_report(tmp_path)
+    strength = report["balanced_strength"]
+    assert strength["status"] == "missing"
+    assert strength["expected_cells"] == 6
+    assert strength["evaluation_contract"]["simulations"] == 1024
+    assert strength["evaluation_contract"]["max_considered"] == 48
+    assert strength["objective"] == "equal-6-cells-rings-10-complete-severity-cycle-v1"
+    assert report["strength_profile"]["path"] == str(active)
+    assert report["strength_profile"]["source"] == "registered_profile"
+
+
+@pytest.mark.parametrize("corruption", ["checksum", "profile", "explicit_path"])
+def test_report_rejects_stale_or_corrupted_active_profile(tmp_path, corruption) -> None:
+    (tmp_path / "run.json").write_text(json.dumps({"created_ns": 1}))
+    active = _registered_largest_board_profile(tmp_path)
+    profile = None
+    if corruption == "checksum":
+        (tmp_path / "profile.sha256").write_text("invalid\n")
+    elif corruption == "profile":
+        active.write_text(active.read_text() + "\n# changed since registration\n")
+    else:
+        profile = tmp_path / "profile.yaml"
+        profile.write_bytes(active.read_bytes())
+    with pytest.raises(ValueError, match="profile"):
+        build_strength_efficiency_report(tmp_path, profile_path=profile)

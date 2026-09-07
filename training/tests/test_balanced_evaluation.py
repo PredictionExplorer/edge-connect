@@ -12,6 +12,7 @@ from startrain.balanced_evaluation import (
     BALANCED_CATEGORIES,
     BALANCED_OBSERVATION_MODEL,
     balanced_cells,
+    balanced_observation_model,
     balanced_opening_seed,
     cell_variant,
     completed_counts_by_ring,
@@ -168,6 +169,61 @@ def test_contract_separates_search_budgets_and_rejects_severity_drift() -> None:
         summarize_balanced_pairs([wrong], cfg)
 
 
+def test_largest_board_objective_keeps_equal_modes_without_small_board_vetoes() -> None:
+    all_boards = config(cell_regression_floor_elo=-50)
+    evidence = pairs_for(
+        all_boards,
+        160,
+        lambda ring, name, index: (1, 1) if ring == 10 else (-1, -1),
+    )
+    previous = summarize_balanced_pairs(evidence, all_boards)
+    assert previous["promotion"]["decision"] == "reject_ring_regression"
+
+    largest = replace(all_boards, rings=(10,))
+    result = summarize_balanced_pairs(
+        [pair for pair in evidence if pair.ring == 10], largest
+    )
+    assert result["promotion"]["decision"] == "promote"
+    assert result["promotion"]["cell_vetoes"] == []
+    assert set(result["per_ring"]) == {"10"}
+    aggregate = result["balanced_aggregate"]
+    assert aggregate["cell_weights"] == {
+        f"r10/{name}": 1 / 6 for name in BALANCED_CATEGORIES
+    }
+    assert aggregate["pairs_per_cycle"] == 24
+    assert aggregate["observation_model"] == balanced_observation_model(largest)
+    assert "24-cells" not in aggregate["observation_model"]
+    with pytest.raises(ValueError, match="unconfigured cell"):
+        summarize_balanced_pairs(evidence, largest)
+
+
+def test_largest_board_still_vetoes_a_proven_regression_in_one_of_six_modes() -> None:
+    largest = config(rings=(10,), cell_regression_floor_elo=-50)
+    evidence = pairs_for(
+        largest,
+        160,
+        lambda ring, name, index: (-1, -1) if name == "classic-handicap" else (1, 1),
+    )
+    result = summarize_balanced_pairs(evidence, largest)
+    assert result["promotion"]["decision"] == "reject_ring_regression"
+    assert result["promotion"]["cell_vetoes"] == ["r10/classic-handicap"]
+
+
+def test_subset_contracts_are_distinct_and_legacy_contract_hash_is_unchanged() -> None:
+    legacy = ArenaConfig(balanced_cells=True)
+    assert evaluation_contract(legacy)["identity"] == (
+        "sha256-b7814ca5e96b14ce9392d26791870a2dd4aeed83bea6230a0ed68ebbe0848a20"
+    )
+    contracts = [
+        evaluation_contract(replace(legacy, rings=rings))
+        for rings in ((4,), (10,), (6, 10), (4, 6, 8, 10))
+    ]
+    assert len({contract["identity"] for contract in contracts}) == 4
+    assert len({contract["objective"] for contract in contracts}) == 4
+    assert contracts[1]["cell_weight"] == 1 / 6
+    assert contracts[1]["cells"] == [f"r10/{name}" for name in BALANCED_CATEGORIES]
+
+
 def test_paired_cycle_test_controls_sequential_null_error_and_has_screen_power() -> (
     None
 ):
@@ -314,7 +370,10 @@ def test_balanced_promotion_persists_and_recovers_all_cell_pairs(
 
 
 @pytest.mark.native
-def test_native_balanced_runner_plays_all_24_cells_with_role_reversal() -> None:
+@pytest.mark.parametrize("rings", [(4, 6, 8, 10), (10,)])
+def test_native_balanced_runner_plays_configured_cells_with_role_reversal(
+    rings,
+) -> None:
     from startrain.inference import GraphInferenceAdapter, InferenceConfig
     from startrain.model import GraphResTNet, ModelConfig
 
@@ -326,12 +385,22 @@ def test_native_balanced_runner_plays_all_24_cells_with_role_reversal() -> None:
         model_step=0,
         model_identity="sha256-" + "c" * 64,
     )
-    cfg = replace(config(), simulations=2, max_considered=2)
+    cfg = replace(config(rings=rings), simulations=2, max_considered=2)
     result = ArenaRunner(
         native_module=native, candidate=evaluator, baseline=evaluator, config=cfg
     ).run(pair_counts={ring: 1 for ring in cfg.rings})
-    assert len(result["pairs"]) == 24 and len(result["games"]) == 48
-    assert len({(game["ring"], game["variant"]) for game in result["games"]}) == 24
+    cells = len(rings) * len(BALANCED_CATEGORIES)
+    assert len(result["pairs"]) == cells and len(result["games"]) == 2 * cells
+    assert len({(game["ring"], game["variant"]) for game in result["games"]}) == cells
+    assert result["evaluation_metrics"]["requested_pairs"] == cells
+    assert result["search"]["pie_rule"] is True
+    assert set(result["search"]["segments"]) == {
+        "standard",
+        "classic",
+        "pie",
+        "handicap",
+    }
+    assert result["search"]["segment_handicap_classic_share"] == 0.5
     assert all(
         {
             game["candidate_player"]

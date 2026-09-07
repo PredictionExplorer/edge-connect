@@ -98,6 +98,10 @@ _ALLOWED_PROFILE_PATHS = {
     ("arena", "segment_handicap_classic_share"),
     # Explicit board-size allocation, validated as a complete typed schedule.
     ("orchestration", "ring_mixture", "step_weights"),
+    ("orchestration", "training_objective"),
+    ("selfplay", "rings"),
+    ("arena", "rings"),
+    ("arena", "required_regression_rings"),
     ("orchestration", "cpu_actors"),
     ("orchestration", "promotion", "cpu_affinity"),
     ("selfplay", "exact_endgame_max_empty"),
@@ -505,6 +509,8 @@ def _profile_diffs(
         ("orchestration", "ring_mixture", "step_weights"),
         ("orchestration", "cpu_actors"),
         ("arena", "handicap_severity_cycle"),
+        ("arena", "rings"),
+        ("arena", "required_regression_rings"),
     }:
         if old != new:
             yield path, old, new
@@ -1303,6 +1309,7 @@ def _validate_variant_arena_boundary(
     *,
     champion_identity: str,
     legacy_to_balanced: bool = False,
+    balanced_scope_change: bool = False,
 ) -> tuple[Path, ...]:
     """Keep a new variant allocation from resuming evidence under an old one."""
 
@@ -1318,16 +1325,27 @@ def _validate_variant_arena_boundary(
             "arena.simulations",
             "arena.strength_simulations",
             "arena.pairs_per_ring",
+            "arena.rings",
+            "arena.required_regression_rings",
         }
         for path in changed_paths
     ):
         return ()
     arena_root = run_root / "arena"
+    isolated_transition = legacy_to_balanced or balanced_scope_change
+    if balanced_scope_change:
+        # A changed balanced cell set has a distinct immutable result and
+        # resume namespace. Preserve and pin every old record, including
+        # sidecars and historical links against older champions.
+        retained = tuple(sorted(arena_root.glob("*.json")))
+        for path in retained:
+            _read_json(path, "retained arena evidence")
+        return retained
     status_path = arena_root / "promotion-status.json"
     inspected: list[Path] = []
     if status_path.exists():
         status, _ = _read_json(status_path, "promotion status")
-        if status.get("terminal") is not True and not legacy_to_balanced:
+        if status.get("terminal") is not True and not isolated_transition:
             raise MigrationError(
                 "arena variant allocation changes require a terminal arena boundary; "
                 "finish the in-flight evaluation before migrating"
@@ -1347,7 +1365,7 @@ def _validate_variant_arena_boundary(
             kind == "historical_crossplay" and path.name.startswith(crossplay_prefix)
         ):
             continue
-        if result.get("terminal") is not True and not legacy_to_balanced:
+        if result.get("terminal") is not True and not isolated_transition:
             raise MigrationError(
                 "arena variant allocation changes require a terminal arena boundary; "
                 f"resumable arena evidence remains in {path.name}"
@@ -1472,12 +1490,27 @@ def plan_migration(request: MigrationRequest) -> MigrationPlan:
             generation_family=generation_family,
         )
     )
+    balanced_scope_change = (
+        old_config.arena.balanced_cells
+        and new_config.arena.balanced_cells
+        and old_config.arena.rings != new_config.arena.rings
+    )
+    if balanced_scope_change:
+        from startrain.balanced_evaluation import evaluation_contract
+
+        if evaluation_contract(old_config.arena) == evaluation_contract(
+            new_config.arena
+        ):
+            raise MigrationError(
+                "changed balanced scope must isolate evaluation evidence"
+            )
     arena_boundary_paths = _validate_variant_arena_boundary(
         run_root,
         [path for path, _, _ in changes],
         champion_identity=champion_identity,
         legacy_to_balanced=not old_config.arena.balanced_cells
         and new_config.arena.balanced_cells,
+        balanced_scope_change=balanced_scope_change,
     )
     recovery_interval = old_config.learner.recovery_interval_steps
     if recovery_interval is None:
@@ -1581,6 +1614,18 @@ def plan_migration(request: MigrationRequest) -> MigrationPlan:
     if not old_config.arena.balanced_cells and new_config.arena.balanced_cells:
         migration_record["evaluation_contract_transition"] = {
             "kind": "legacy_to_balanced",
+            "policy": "retain old evidence unchanged; use distinct balanced contract paths",
+            "retained_evidence": [
+                str(path.relative_to(run_root)) for path in arena_boundary_paths
+            ],
+        }
+    elif balanced_scope_change:
+        from startrain.balanced_evaluation import evaluation_contract
+
+        migration_record["evaluation_contract_transition"] = {
+            "kind": "balanced_scope_change",
+            "from": evaluation_contract(old_config.arena),
+            "to": evaluation_contract(new_config.arena),
             "policy": "retain old evidence unchanged; use distinct balanced contract paths",
             "retained_evidence": [
                 str(path.relative_to(run_root)) for path in arena_boundary_paths
@@ -1899,7 +1944,7 @@ def _assert_inputs_unchanged(plan: MigrationPlan, *, check_lock: bool) -> None:
     if check_lock:
         _coordinator_lock_status(plan.run_root)
     transition = plan.migration_record.get("evaluation_contract_transition")
-    _validate_variant_arena_boundary(
+    retained = _validate_variant_arena_boundary(
         plan.run_root,
         [path for path, _, _ in plan.changes],
         champion_identity=str(plan.migration_record["champion_model_identity"]),
@@ -1907,7 +1952,19 @@ def _assert_inputs_unchanged(plan: MigrationPlan, *, check_lock: bool) -> None:
             isinstance(transition, Mapping)
             and transition.get("kind") == "legacy_to_balanced"
         ),
+        balanced_scope_change=(
+            isinstance(transition, Mapping)
+            and transition.get("kind") == "balanced_scope_change"
+        ),
     )
+    if (
+        isinstance(transition, Mapping)
+        and transition.get("kind") == "balanced_scope_change"
+    ):
+        if {str(path.relative_to(plan.run_root)) for path in retained} != set(
+            transition["retained_evidence"]
+        ):
+            raise MigrationError("arena evidence changed before objective cutover")
     for expected in plan.input_fingerprints:
         path = expected.path
         if path.is_symlink() or not path.is_file():

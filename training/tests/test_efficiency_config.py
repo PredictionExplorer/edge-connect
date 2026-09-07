@@ -75,12 +75,11 @@ def test_prior_epoch_compatibility_does_not_erase_enabled_features():
     assert old["arena"]["strength_simulations"] == 1024
 
 
-def test_balanced_arena_requires_complete_rule_family_and_all_rings():
+def test_balanced_arena_requires_complete_rule_family_for_configured_rings():
     config = profile()
     arena = replace(config.arena, balanced_cells=True)
     replace(config, arena=arena)
-    with pytest.raises(ConfigError, match="balanced"):
-        replace(arena, rings=(10,))
+    assert replace(arena, rings=(10,)).rings == (10,)
     with pytest.raises(ConfigError, match="game family"):
         replace(
             config,

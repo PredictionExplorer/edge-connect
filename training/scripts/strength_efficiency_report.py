@@ -4,18 +4,23 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import sys
 import time
 from collections import defaultdict
 from collections.abc import Iterable, Mapping
+from dataclasses import replace
 from pathlib import Path
 from typing import cast
+
+import yaml
 
 from startrain.autonomous_elo import DecisiveMatch, fit_bradley_terry_elo
 from startrain.runtime import atomic_json
 from startrain.balanced_strength import balanced_strength_summary
+from startrain.config import ArenaConfig, load_config
 
 SCHEMA_VERSION = 1
 REPORT_NAME = "startrain-strength-efficiency"
@@ -26,9 +31,22 @@ MIGRATION_SCHEMA_VERSION = 1
 ARENA_RESULT_KINDS = ("promotion", "crossplay", "historical_crossplay")
 
 
+class ProfileChecksumError(ValueError):
+    """A registered profile changed; retain its path for caller diagnostics."""
+
+    def __init__(self, path: Path) -> None:
+        super().__init__("active report profile disagrees with its checksum")
+        self.path = path
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run-root", type=Path, required=True)
+    parser.add_argument(
+        "--profile",
+        type=Path,
+        help="active profile; defaults to the run's registered profile checksum",
+    )
     parser.add_argument("--provisioned-gpus", type=int, default=8)
     parser.add_argument("--output", type=Path)
     parser.add_argument(
@@ -2192,10 +2210,69 @@ def _coordinator_summary(records: list[dict[str, object]]) -> dict[str, object]:
     }
 
 
+def _active_strength_config(
+    root: Path, profile_path: str | Path | None
+) -> tuple[ArenaConfig | None, dict[str, object]]:
+    """Pin the headline to the active contract even before its first result.
+
+    Continuous profile migrations register the current file in profile.sha256.
+    Reading that registration avoids silently using an old profile.yaml or
+    selecting a completed measurement from the previous training objective.
+    """
+    profile = Path(profile_path).expanduser().resolve() if profile_path else None
+    registration = root / "profile.sha256"
+    expected_sha256 = None
+    if registration.is_file():
+        fields = registration.read_text(encoding="utf-8").strip().split(maxsplit=1)
+        if (
+            len(fields) != 2
+            or len(fields[0]) != 64
+            or any(character not in "0123456789abcdef" for character in fields[0])
+        ):
+            raise ValueError("active profile checksum is malformed")
+        expected_sha256, registered_name = fields
+        registered = Path(registered_name.removeprefix("*"))
+        registered = (root / registered).resolve()
+        if profile is not None and profile != registered:
+            raise ValueError(
+                "report profile differs from the registered active profile"
+            )
+        profile = registered
+    if profile is None and (root / "profile.yaml").is_file():
+        profile = root / "profile.yaml"
+    if profile is None:
+        return None, {"source": "unavailable", "path": None}
+    actual_sha256 = hashlib.sha256(profile.read_bytes()).hexdigest()
+    if expected_sha256 is not None and actual_sha256 != expected_sha256:
+        raise ProfileChecksumError(profile)
+    config = load_config(profile)
+    provenance: dict[str, object] = {
+        "source": "registered_profile" if expected_sha256 is not None else "profile",
+        "path": str(profile),
+        "sha256": actual_sha256,
+        "training_objective": config.orchestration.training_objective,
+        "balanced_cells": config.arena.balanced_cells,
+    }
+    if not config.arena.balanced_cells:
+        return None, provenance
+    _, max_considered = config.orchestration.historical_evaluation.search_budget(
+        config.arena
+    )
+    return (
+        replace(
+            config.arena,
+            simulations=config.arena.strength_simulations,
+            max_considered=max_considered,
+        ),
+        provenance,
+    )
+
+
 def build_strength_efficiency_report(
     run_root: str | Path,
     *,
     provisioned_gpus: int = 8,
+    profile_path: str | Path | None = None,
 ) -> dict[str, object]:
     root = Path(run_root).expanduser().resolve()
     if provisioned_gpus <= 0:
@@ -2276,6 +2353,7 @@ def build_strength_efficiency_report(
         observed_until_ns=observed_until_ns,
         provisioned_gpus=provisioned_gpus,
     )
+    strength_config, strength_profile = _active_strength_config(root, profile_path)
     return {
         "schema_version": SCHEMA_VERSION,
         "report": REPORT_NAME,
@@ -2312,7 +2390,12 @@ def build_strength_efficiency_report(
             arenas,
             wall_seconds=wall_seconds,
             provisioned_gpus=provisioned_gpus,
+            strength_simulations=strength_config.simulations
+            if strength_config is not None
+            else 1024,
+            evaluation_config=strength_config,
         ),
+        "strength_profile": strength_profile,
         "parse_failure_count": len(failures),
         "parse_failures": failures,
     }
@@ -2324,8 +2407,9 @@ def main(argv: list[str] | None = None) -> int:
         report = build_strength_efficiency_report(
             arguments.run_root,
             provisioned_gpus=arguments.provisioned_gpus,
+            profile_path=arguments.profile,
         )
-    except (OSError, ValueError, json.JSONDecodeError) as error:
+    except (OSError, ValueError, yaml.YAMLError) as error:
         print(
             json.dumps(
                 {

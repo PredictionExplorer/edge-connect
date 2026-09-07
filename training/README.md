@@ -52,7 +52,7 @@ the legacy champion's soft targets so a fresh rules-v3 run distils it (see
 `docs/variant-capable-network-plan.md`).
 
 The self-play mixture is configured under `selfplay.variants` (default off, i.e.
-standard Double *Star only). The Stage B profile targets all six rule categories
+standard Double *Star only). The Stage B profiles target all six rule categories
 equally: standard double and classic each get 1/6 of batches; handicap and pie each
 get 1/3, split equally between classic and double. Both handicap modes draw sizes
 2..9 independently. Handicap games give the second player a playout-doubling
@@ -60,13 +60,17 @@ advantage, the learner stratifies every ring's replay window by
 segment (`learner.segment_quotas`), and the arena plays extra classic, handicap, and
 pie pairs that veto a promotion only when the candidate provably regressed below the
 segment floor (`arena.segment_pairs_per_ring`, `arena.segment_regression_floor_elo`).
-Stage B targets all four ring counts equally throughout the run. These are batch
+The original variant Stage B profile targets all four ring counts equally. These are batch
 and replay-position targets, not equal wall-clock compute: larger boards and extra
 search budgets take more time. The six-way balance within handicap and pie is an
 expected sampling share; replay quotas are enforced at the four aggregate segments.
 The legacy arena promotes on standard double with variant regression guards.
-`arena.balanced_cells` instead enables an equal 24-cell promotion objective and
-separate strength ladder; see [balanced evaluation](docs/balanced-strength-evaluation.md).
+`arena.balanced_cells` instead gives all six modes equal weight on the configured
+arena boards and enables a separate strength ladder. The largest-board efficiency
+profile uses six ring-10 cells for promotion and strength, with 85% of training on
+ring 10 and 5% on each smaller board; smaller-board regressions cannot veto its
+promotions. The original all-board objective retains its 24-cell contract. See
+[balanced evaluation](docs/balanced-strength-evaluation.md).
 
 Shipped self-play profiles set `clinch_finalization: loser-fill`. Before each search
 wave, the actor applies the same extremal-completion proof used by the web client. A
