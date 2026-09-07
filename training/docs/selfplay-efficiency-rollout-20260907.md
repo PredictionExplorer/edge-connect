@@ -103,7 +103,7 @@ remain unchanged.
 
 ## Shutdown incident and recovery
 
-The checkpointed deployment stop exposed a shutdown ordering failure: data-loader
+The controlled deployment stop exposed a shutdown ordering failure: data-loader
 cleanup ran before the final recovery checkpoint could be secured. The last
 learner heartbeat reported step **114,179**, while the latest durable recovery
 checkpoint is **113,309**. Restarting from that checkpoint discards **870 learner
@@ -111,9 +111,56 @@ updates**. Generated replay remains intact; this is lost optimizer progress,
 not lost self-play data.
 
 The corrective change saves the recovery checkpoint before loader cleanup and
-retries an interrupted checkpoint once after cleanup while propagating errors. The planned restart is from
-step **113,309**, preserving its model and optimizer state and the existing
-replay. This incident must not be reported as a lossless graceful stop.
+retries an interrupted checkpoint once after cleanup while propagating errors.
+Failed or partially completed training cannot replace the valid recovery state.
+Tests restore exact model, optimizer, scheduler, step, and consumed-example state
+after injected teardown failures. This incident must not be reported as a
+lossless graceful stop.
 
-Final service, resume-step, worker-health, and backup verification will be added
-after the restart.
+## Deployment and validation
+
+The immutable runtime is
+`/home/ubuntu/edgeconnect-releases/variant-selfplay-efficiency-20260907`, pinned to
+source commit `585a54a821ff7cbeba553af154b4218585a5b7a5`. All 427 source files
+were verified against their recorded checksums. The native artifact SHA-256 is
+`8ac6163f61a8299d4fdbc1112746f2509dd48f341bb89450ba07e7bd9a19901a`.
+
+The only profile change enables `preserve_broadcast_topology`; the applied
+migration retains the existing UTD segment and evaluation contract. All 75
+captured learner, run, status, and arena control files remained byte-identical
+through migration. The new profile SHA-256 is
+`65be57c66dedd2648879f95202a006cd69efb7b3543e411253d7b04228abd292`.
+
+Validation passed: **1,489 tests, five hardware-dependent skips**, Ruff formatting
+and lint, and Pyright. Target-host checks included 246 tests with one skip,
+63 learner pipeline/durability tests, and the CUDA pinned-transfer test. A direct
+CUDA parity check covered all 24 board/mode combinations and 6,144 positions
+using candidate 112,309's real EMA model in BF16. Both flag values produced exact
+cache keys, CUDA input bytes/shapes/strides/dtypes, and detailed predictions.
+This used the eager model to isolate layout semantics from asynchronous batching.
+
+The service became active at **21:26:28 UTC**, resumed verified recovery step
+**113,309**, and reached **114,233 at 21:34:30 UTC**, beyond the old stopped step.
+This repeats training work; it does not restore the exact discarded optimizer
+trajectory. Runtime metrics confirm 17,402,775 parameters, 85/5/5/5 board weights,
+the six-mode quotas, and UTD 1.5. Monitoring and all report/backup timers are
+active. Fresh local and disaster-recovery backups completed successfully; the
+temporary deployment recovery timer was removed from the active schedule.
+
+One existing startup cost became visible during verification: each actor cohort
+serially verifies all ready replay shard checksums under the reconciliation
+lock. Stack inspection confirmed workers were progressing through these checks,
+not blocked in GPU compilation. These integrity checks were left intact.
+By 21:39:58 UTC, the CPU actor completed 16 games and persisted 619 new positions
+after restart; a full largest-board production throughput comparison is still pending.
+The existing high gradient-clipping and incomplete balanced-strength warnings
+remain; no Elo/hour gain is claimed from this rollout.
+
+At **21:39:45 UTC**, the learner was at **114,234**, all workers retained their
+initial launch PIDs with zero restarts, and all twelve cohorts on GPUs 1–6 were
+searching without failed inference requests. GPU 7 completed initialization and
+was safely parked for its scheduled evaluation: both cohorts acknowledged
+quiescence, inference was idle, and CUDA synchronization was complete. The same
+candidate 97,660 versus champion 19,532 evaluation continued under the existing
+largest-board contract. GPU 7's post-restart self-play throughput has not yet
+been observed; its normal evaluation handoff remains automatic.
