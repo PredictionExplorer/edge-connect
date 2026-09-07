@@ -51,3 +51,28 @@ After a checkpointed stop, apply the validated migration, switch immutable
 release/profile paths in the training and support services, and verify actual
 85/5 learner sampling, ring-10 six-mode evaluation, automatic handoffs, and current
 backups. Keep the old release and saved profile authority available for rollback.
+
+## Deployment evidence
+
+- Runtime commit: `8425b5b38237b6f6094b6b4588c44bda30181cf5`, frozen with 420
+  source hashes and the unchanged native artifact hash.
+- Active profile:
+  `/home/ubuntu/edgeconnect-runs/variant-network/profile-ring10-priority-20260907.yaml`.
+  SHA-256: `fc5cf07c3ae06f3fc444714856b5bf6a6c4dd848bc65faba4873fa6da3dbb1df`.
+- The old runtime stopped cleanly at 08:43:48 UTC. Every worker exited zero;
+  checkpoint step 103,066 was retained with zero uncheckpointed updates lost.
+  The migration preserved pinned learner state, the UTD segment, and old arena
+  results/sidecars, and recorded the 24-cell to six-cell contract transition.
+- Live learner metrics at step 103,080 reported weights 0.05/0.05/0.05/0.85,
+  batch size 512, and exactly 17,402,775 optimizer parameters. The new window
+  allocated 556 batches, reflecting available unique shard groups.
+- Candidate 97,660 was selected against champion 19,532 under the new ring-10
+  contract. Its first bounded lease saved 578 moves in 300.716 seconds; actor
+  PID 988353 resumed through the matching cooperative release acknowledgement.
+- The live strength report validates the active profile and reports six ring-10
+  cells. Old 24-cell results cannot become its headline. A completed measurement
+  under the new objective is still pending.
+- Validation: 1,331 local tests passed with five hardware-specific skips;
+  255 target-host tests passed. Lint, formatting, and type checks passed. Reports,
+  replay backups, and disaster-recovery snapshots completed successfully, with no
+  worker restarts or coordinator failure after activation.
