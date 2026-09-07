@@ -1599,10 +1599,10 @@ class LearnerLoop:
                 if window is not None:
                     refresh_reason = self._window_refresh_reason(window, target=target)
                     if refresh_reason is not None:
-                        close_active_window(refresh_reason)
                         if refresh_reason == "target":
                             exit_reason = "target"
                             break
+                        close_active_window(refresh_reason)
                         continue
 
                 window_reused = window is not None
@@ -1662,10 +1662,10 @@ class LearnerLoop:
                         target=target,
                     )
                     if refresh_reason is not None:
-                        close_active_window(refresh_reason)
                         if refresh_reason == "target":
                             exit_reason = "target"
                             break
+                        close_active_window(refresh_reason)
                         continue
                     spin_window.utd_wait_spins += 1
                     if progress is not None and self.rank == 0:
@@ -2070,10 +2070,10 @@ class LearnerLoop:
                         target=target,
                     )
                     if refresh_reason is not None:
-                        close_active_window(refresh_reason)
                         if refresh_reason == "target":
                             exit_reason = "target"
                             break
+                        close_active_window(refresh_reason)
             else:
                 exit_reason = "target"
         except BaseException as exc:
@@ -2081,6 +2081,14 @@ class LearnerLoop:
             run_failure = exc
             raise
         finally:
+            checkpoint_failure: BaseException | None = None
+            if run_failure is None and self.rank == 0:
+                try:
+                    # A worker failure during teardown must not discard healthy
+                    # completed updates. Never save a partially failed run.
+                    self._maybe_write_recovery_checkpoint(force=True)
+                except BaseException as exc:
+                    checkpoint_failure = exc
             cleanup_failure: BaseException | None = None
             try:
                 if window is not None:
@@ -2092,6 +2100,18 @@ class LearnerLoop:
                 pool_failure = self._shutdown_loader_pool()
                 if cleanup_failure is None and pool_failure is not None:
                     cleanup_failure = pool_failure
+            if checkpoint_failure is not None:
+                # A DataLoader SIGCHLD handler can interrupt checkpoint I/O.
+                # Retry once after workers are gone, retaining the original
+                # failure so the supervisor still reports the unhealthy exit.
+                try:
+                    self._maybe_write_recovery_checkpoint(force=True)
+                except BaseException as exc:
+                    checkpoint_failure.add_note(
+                        "Recovery checkpoint retry after loader cleanup failed: "
+                        f"{type(exc).__name__}: {exc}"
+                    )
+                raise checkpoint_failure
             if cleanup_failure is not None and run_failure is None:
                 raise cleanup_failure
         if self.rank == 0:
@@ -2109,8 +2129,6 @@ class LearnerLoop:
                         "completed_ns": time.time_ns(),
                     },
                 )
-            else:
-                self._maybe_write_recovery_checkpoint(force=True)
         self._distributed_barrier()
         return self.step
 
@@ -2364,7 +2382,7 @@ class LearnerLoop:
             except BaseException as exc:
                 if failure is None:
                     failure = exc
-            if failure is None:
+            if failure is None and reason != "error":
                 self._maybe_write_recovery_checkpoint()
                 self._maybe_collect_replay_garbage()
         if failure is not None:
