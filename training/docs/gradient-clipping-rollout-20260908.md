@@ -63,7 +63,7 @@ under `/home/ubuntu/edgeconnect-rollouts/gradient-clipping-20260908`.
 The initial full suite passed 1,588 tests with seven hardware-dependent skips.
 Additional focused tests cover exact adaptive continuation, explicit cold start,
 corrupt history rejection, diagnostic equivalence, and safe profile migration.
-Live trial and deployment results will be recorded after verification.
+The completed trial and deployment results are recorded below.
 
 ## Demonstrated underlying defect
 
@@ -106,3 +106,65 @@ Monitoring now distinguishes measured severe global clipping (retaining less
 than 10% of the original norm) from routine clipping frequency. Older metrics
 without severity retain a clearly labeled fallback warning. Nonfinite failures
 remain errors, and the underlying diagnostic values stay visible.
+
+## Corrected screen and deployment decision
+
+The corrected 240-step global/AdaGC comparison passed all strict checks: matching
+raw model, optimizer, scheduler, EMA, parameter identities, all RNG families,
+source/config/data/batch pins, and isolated GPU ownership. Both arms completed
+without errors. Six-ring norms remained below 3.80 during this screen.
+
+| Held-out composite loss | Global | AdaGC |
+| --- | ---: | ---: |
+| Objective-weighted raw model | 5.9412 | 6.2487 |
+| Objective-weighted EMA | 4.9248 | 4.9258 |
+| Largest-board raw model | 6.1851 | 6.5384 |
+| Largest-board EMA | 5.0223 | 5.0234 |
+
+AdaGC's raw loss was worse in five of six largest-board modes. EMA differences
+were tiny. The observed 140 steady steps took 70.894 seconds with global clipping
+and 71.307 seconds with AdaGC; this small timing difference is not a throughput
+claim. The screen did not support enabling AdaGC. Production retains global
+clipping at 1.0 with the corrected gradient calculation and named diagnostics.
+AdaGC remains an opt-in, checkpointed, tested implementation for future studies.
+The accepted comparison is `corrected-screen/comparison.json` in the rollout
+directory; the original defective-backward screens remain separately preserved.
+
+## Deployment verification
+
+Production runs immutable commit
+`637d49cbb26fd637225ce7bd850583fab937986b` from
+`/home/ubuntu/edgeconnect-releases/variant-gradient-correction-20260908`.
+All 438 source files and the unchanged native artifact were checksum verified.
+The frozen profile is `profile-gradient-diagnostics-20260908.yaml`, SHA-256
+`a6a542c9cb276b2e4393969e8a73cb78373e7879952b26912ea47b3769708ff8`.
+Its only changed setting enables diagnostics. The UTD segment, all pending arena
+control/result/resume files, checkpoint, and champion remained unchanged through
+migration; the model size, learning rates, and training/promotion objectives are
+unchanged.
+
+The controlled stop saved learner step **126,960**, exactly matching its stopped
+heartbeat: **zero uncheckpointed learner updates were lost**. The service became
+active at **11:27:52 UTC**, resumed that checkpoint, and advanced to **127,030**
+by 11:37:51 UTC. Six fresh sampled records showed largest-board norms 1.445–2.207,
+exact original variant labels, and zero nonfinite loss/gradient counts. Natural
+six-ring sampling had not yet occurred in these records; the frozen GPU checks
+provide that board's correctness evidence. The learner then waited normally for
+fresh self-play data under UTD 1.5.
+
+The final full local suite passed **1,629 tests with eight hardware-dependent
+skips**. Target-host validation included 118 corrected-code tests with CUDA,
+the complete 24-cell production-size diagnostic, and final loader/ONNX/browser
+publication checks. An earlier macOS subprocess cleanup-warning race passed its
+isolated rerun and the Linux server check; a subsequent full run was clean.
+Ruff formatting/lint and Pyright passed. Training, monitor, report and backup
+timers are active, fresh local/disaster backups are valid, and the temporary
+deployment recovery timer is no longer scheduled.
+
+Independent worker verification at **11:42:15 UTC** confirmed all twelve cohorts
+on GPUs 1–6 searching, zero worker restarts/inference failures/newly discarded
+cohorts, and both GPU 7 cohorts safely parked for the scheduled evaluation. The
+CPU actor completed 24 games and persisted 864 positions. The same candidate
+112,309 versus champion 97,660 continued under the unchanged largest-board-only
+contract, advancing from 16 to 18 completed pairs and adding 240 saved moves.
+The final evidence is `production-worker-final.json` in the rollout directory.
