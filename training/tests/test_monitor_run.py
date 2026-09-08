@@ -2202,6 +2202,38 @@ def test_monitor_surfaces_optimizer_ema_and_training_health(
     assert snapshot["status"] == "ERROR"
 
 
+@pytest.mark.parametrize(
+    ("coefficient", "expected"),
+    [
+        (0.5, set()),
+        (0.01, {"gradient_clipping_severe"}),
+        (None, {"gradient_clipping_high"}),
+    ],
+)
+def test_clipping_alert_uses_observed_severity_not_frequency_alone(
+    tmp_path, monkeypatch, coefficient, expected
+):
+    now_ns = 10_000_000_000
+    root = _fixture(tmp_path, now_ns=now_ns)
+    path = root / "learner" / "metrics.jsonl"
+    metric = json.loads(path.read_text().splitlines()[-1])
+    metric.update(
+        gradient_clipping_frequency=1.0,
+        gradient_clip_coefficient=coefficient,
+        gradient_clip_threshold=1.0,
+    )
+    path.write_text(json.dumps(metric) + "\n")
+    _healthy_dependencies(monkeypatch)
+    snapshot = monitor.collect_snapshot(root, now_ns=now_ns)
+    clipping_codes = {
+        warning["code"]
+        for warning in snapshot["warnings"]
+        if warning["code"].startswith("gradient_clipping_")
+    }
+    assert clipping_codes == expected
+    assert snapshot["learner"]["gradient_clip_coefficient"] == coefficient
+
+
 def test_disaster_recovery_status_verifies_lambda_snapshot(tmp_path) -> None:
     now_ns = 200_000_000_000
     run_id = "run-1"

@@ -1921,12 +1921,26 @@ def collect_snapshot(
             "learner reported non-finite loss or gradient events",
         )
     clipping_frequency = _number(learner_metric.get("gradient_clipping_frequency"))
-    if clipping_frequency is not None and clipping_frequency > 0.5:
+    clipping_coefficient = _number(learner_metric.get("gradient_clip_coefficient"))
+    if clipping_coefficient is not None and 0 <= clipping_coefficient < 0.1:
+        _add_warning(
+            warnings,
+            "WARN",
+            "gradient_clipping_severe",
+            "latest sampled gradient retained "
+            f"{clipping_coefficient:.2%} of its pre-clip norm",
+        )
+    elif (
+        clipping_coefficient is None
+        and clipping_frequency is not None
+        and clipping_frequency > 0.5
+    ):
         _add_warning(
             warnings,
             "WARN",
             "gradient_clipping_high",
-            f"gradient clipping frequency={clipping_frequency:.1%}",
+            f"gradient clipping frequency={clipping_frequency:.1%}; "
+            "uniform clipping severity is unavailable",
         )
     # A running learner whose last training step is far older than any UTD wait
     # can explain is stalled, whatever its heartbeat says. On 2026-09-03 the
@@ -1998,6 +2012,11 @@ def collect_snapshot(
         "active_ring_weights": learner_heartbeat.get("active_ring_weights"),
         "losses": losses,
         "gradient_norm": learner_metric.get("gradient_norm"),
+        "gradient_clip_threshold": learner_metric.get("gradient_clip_threshold"),
+        "gradient_clip_coefficient": learner_metric.get("gradient_clip_coefficient"),
+        "gradient_clip_ratio": learner_metric.get("gradient_clip_ratio"),
+        "gradient_clipping": learner_metric.get("gradient_clipping"),
+        "gradient_diagnostics": learner_metric.get("gradient_diagnostics"),
         "gradient_clipped": learner_metric.get("gradient_clipped"),
         "gradient_clipped_steps": learner_metric.get("gradient_clipped_steps"),
         "gradient_clipping_frequency": learner_metric.get(

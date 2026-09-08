@@ -405,6 +405,24 @@ def rng_fingerprints(device) -> dict[str, str]:
     return result
 
 
+def seed_trial_rngs(seed: int, device) -> dict[str, str]:
+    """Reset Python/NumPy/CPU and only the CUDA generator owned by this arm."""
+    import numpy as np
+    import torch
+
+    if type(seed) is not int or not 0 <= seed < 2**32:
+        raise ValueError("trial seed must be an integer in 0..2**32-1")
+    random.seed(seed)
+    np.random.seed(seed)
+    # torch.manual_seed also seeds every CUDA device. Use the CPU generator
+    # directly, then explicitly seed only our already-owned CUDA device.
+    torch.default_generator.manual_seed(seed)
+    if device.type == "cuda":
+        with torch.cuda.device(device):
+            torch.cuda.manual_seed(seed)
+    return rng_fingerprints(device)
+
+
 def restore_training_state(config, document, *, device, arm: str):
     from startrain.checkpoint import ExponentialMovingAverage, load_checkpoint
     from startrain.gradient_clipping import GradientClipper
@@ -412,6 +430,9 @@ def restore_training_state(config, document, *, device, arm: str):
     from startrain.optim import build_optimizer
     from startrain.training import build_scheduler
 
+    rng_before_model_init = seed_trial_rngs(
+        document.get("seed", config.train.seed), device
+    )
     model = GraphResTNet(config.model).to(device)
     optimizer = build_optimizer(model, config.optimizer)
     scheduler = build_scheduler(optimizer, config.train.scheduler)
@@ -467,6 +488,7 @@ def restore_training_state(config, document, *, device, arm: str):
         allow_gradient_clipping_cold_start=arm == "adagc",
     )
     initial = {
+        "rng_before_model_init": rng_before_model_init,
         "model": state_fingerprint(model.state_dict()),
         "optimizer": state_fingerprint(optimizer.state_dict()),
         "scheduler": state_fingerprint(scheduler.state_dict()),
@@ -599,7 +621,7 @@ def run_child(args) -> dict[str, object]:
     import torch
     from startrain.checkpoint import save_checkpoint, sha256_file
     from startrain.config import load_config
-    from startrain.device import enable_fast_math, seed_all
+    from startrain.device import enable_fast_math
     from startrain.training import maybe_compile_model, train_step
     from startrain.runtime import atomic_json
 
@@ -638,7 +660,6 @@ def run_child(args) -> dict[str, object]:
         )
     torch.set_num_threads(threads)
     enable_fast_math(device)
-    seed_all(document["seed"])
     source_pin = _runtime_source_pin()
     arm = args.arms[0]
     model, optimizer, scheduler, ema, clipper, metadata, initial = (
@@ -717,7 +738,11 @@ def run_child(args) -> dict[str, object]:
             batches=args.validation_batches,
         )
     report["validation_seconds"] = time.monotonic() - validation_started
-    report["rng_before_training"] = rng_fingerprints(device)
+    report["rng_seed"] = document["seed"]
+    report["rng_reset_policy"] = (
+        "python-numpy-cpu-owned-cuda-before-model-and-before-training-v1"
+    )
+    report["rng_before_training"] = seed_trial_rngs(document["seed"], device)
     report["gradient_clipping_config"] = (
         asdict(clipper.config)
         if clipper is not None
@@ -860,6 +885,10 @@ def run_child(args) -> dict[str, object]:
                 "frozen_manifest_sha256": report["frozen_manifest_sha256"],
                 "arm": arm,
                 "batch_schedule_sha256": report["batch_schedule_sha256"],
+                "trial_rng_seed": report["rng_seed"],
+                "trial_rng_reset_policy": report["rng_reset_policy"],
+                "trial_rng_before_model_init": initial["rng_before_model_init"],
+                "trial_rng_before_training": report["rng_before_training"],
             },
         )
         report["trial_checkpoint"] = {

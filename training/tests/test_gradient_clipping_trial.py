@@ -1,6 +1,7 @@
 from collections import Counter
 from dataclasses import replace
 import json
+import random
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -103,6 +104,9 @@ def test_full_recovery_restores_raw_weights_optimizer_scheduler_and_ema_for_both
     }
     recovered = []
     for arm in ("global", "adagc"):
+        random.seed(901 if arm == "global" else 902)
+        np.random.seed(903 if arm == "global" else 904)
+        torch.default_generator.manual_seed(905 if arm == "global" else 906)
         restored = trial.restore_training_state(
             config, document, device=torch.device("cpu"), arm=arm
         )
@@ -435,6 +439,56 @@ def test_rng_fingerprints_read_only_selected_cuda_device(monkeypatch):
         "torch_cpu",
         "cuda_selected",
     } and calls == [device]
+
+
+def test_trial_rng_reset_matches_after_different_validation_work():
+    device = torch.device("cpu")
+    snapshots = []
+    draws = []
+    for seed, consumed in ((900, 3), (1000, 19)):
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.default_generator.manual_seed(seed)
+        for _ in range(consumed):
+            random.random()
+        np.random.rand(consumed)
+        torch.rand(consumed)
+        snapshots.append(trial.seed_trial_rngs(17, device))
+        draws.append((random.random(), float(np.random.rand()), float(torch.rand(()))))
+    assert snapshots[0] == snapshots[1] and draws[0] == draws[1]
+
+
+def test_trial_rng_seeding_does_not_touch_other_cuda_generators(monkeypatch):
+    from contextlib import contextmanager
+
+    calls = []
+
+    @contextmanager
+    def selected(device):
+        calls.append(("device", str(device)))
+        yield
+
+    monkeypatch.setattr(torch.cuda, "device", selected)
+    monkeypatch.setattr(
+        torch.cuda, "manual_seed", lambda seed: calls.append(("seed", seed))
+    )
+    monkeypatch.setattr(
+        torch.cuda,
+        "manual_seed_all",
+        lambda _: pytest.fail("must not seed unowned GPUs"),
+    )
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_rng_state_all",
+        lambda: pytest.fail("must not read unowned GPUs"),
+    )
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_rng_state",
+        lambda device: torch.tensor([1, 2], dtype=torch.uint8),
+    )
+    trial.seed_trial_rngs(17, torch.device("cuda:3"))
+    assert calls == [("device", "cuda:3"), ("seed", 17)]
 
 
 def test_owned_timeout_is_reported_and_other_arm_does_not_start(tmp_path, monkeypatch):

@@ -16,7 +16,8 @@ from typing import Literal, NamedTuple, cast
 import torch
 import torch.nn.functional as functional
 from torch import Tensor, nn
-from torch.utils.checkpoint import checkpoint
+
+from .attention_bias_autograd import relation_bias_gradient_carrier
 
 from .contracts import (
     FEATURE_SCHEMA_VERSION,
@@ -371,23 +372,18 @@ def _relation_bias_gradient_carrier(
 
     ``query``, ``key``, and ``value`` are detached, so the explicit fp32
     softmax attention contributes gradient only to the additive mask (and
-    through it to the relation-bias table). Its value is subtracted from
-    itself, so the forward result is unchanged. The explicit attention runs
-    under activation checkpointing: nothing of its ``[batch, heads, length,
-    length]`` intermediates survives the forward pass, and the backward pass
-    recomputes one layer at a time.
+    through it to the relation-bias table). An opaque operator returns zero
+    and recomputes the mask VJP in backward, outside Inductor's lowering.
+    No ``[batch, heads, length, length]`` intermediates survive forward.
     """
 
-    explicit = checkpoint(
-        _explicit_attention_in_fp32,
+    return relation_bias_gradient_carrier(
         query,
         key,
         value,
         attn_mask,
         groups,
-        use_reentrant=False,
     )
-    return explicit - explicit.detach()
 
 
 class GlobalGQABlock(nn.Module):
