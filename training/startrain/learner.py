@@ -59,6 +59,7 @@ from .device import (
     synchronize_device,
 )
 from .losses import LossWeights
+from .gradient_clipping import GradientClipper
 from .lr_governor import (
     LEARNING_RATE_GOVERNOR_KEY,
     LearningRateGovernorState,
@@ -960,6 +961,7 @@ class ImmutableModelPublisher:
         optimizer: torch.optim.Optimizer,
         scheduler: torch.optim.lr_scheduler.LRScheduler,
         ema: ExponentialMovingAverage,
+        gradient_clipper: GradientClipper | None = None,
         step: int,
         epoch: int,
         config: dict[str, object],
@@ -1003,6 +1005,7 @@ class ImmutableModelPublisher:
             optimizer=optimizer,
             scheduler=scheduler,
             ema=ema,
+            gradient_clipper=gradient_clipper,
             step=step,
             epoch=epoch,
             config=config,
@@ -1162,6 +1165,15 @@ class LearnerLoop:
             workers=resolve_loader_workers(data_config.workers),
         )
         self.train_config = train_config
+        self.gradient_clipper = (
+            GradientClipper(
+                self.model.named_parameters(),
+                config=train_config.gradient_clipping,
+                max_norm=train_config.gradient_clip_norm,
+            )
+            if train_config.gradient_clipping.mode == "adagc"
+            else None
+        )
         self.data_config = data_config
         self.loss_weights = loss_weights
         self.seed = seed
@@ -1317,6 +1329,11 @@ class LearnerLoop:
             optimizer=self.optimizer,
             scheduler=self.scheduler,
             ema=self.ema,
+            gradient_clipper=self.gradient_clipper,
+            # Selecting AdaGC in the frozen profile explicitly starts warmup
+            # when continuing a legacy global-clipping checkpoint. Missing
+            # state in an already-adaptive checkpoint remains a fatal error.
+            allow_gradient_clipping_cold_start=self.gradient_clipper is not None,
             map_location=self.learner_config.device,
             expected_model_config=(
                 model_config if isinstance(model_config, Mapping) else None
@@ -1743,6 +1760,11 @@ class LearnerLoop:
                             ema=self.ema,
                             trusted_batch=True,
                             collect_diagnostics=collect_step_diagnostics,
+                            gradient_clipper=self.gradient_clipper,
+                            collect_gradient_diagnostics=(
+                                collect_step_diagnostics
+                                and self.train_config.gradient_diagnostics
+                            ),
                         )
                     except NonFiniteTrainingError as error:
                         if self.rank == 0:
@@ -1855,6 +1877,8 @@ class LearnerLoop:
                                 "world_size": self.world_size,
                                 "losses": host_metrics.losses,
                                 "gradient_norm": host_metrics.gradient_norm,
+                                "gradient_clipping": host_metrics.gradient_clipping,
+                                "gradient_diagnostics": host_metrics.gradient_diagnostics,
                                 "gradient_pre_clip_norm": (
                                     host_metrics.gradient_pre_clip_norm
                                 ),
@@ -2638,6 +2662,7 @@ class LearnerLoop:
             optimizer=self.optimizer,
             scheduler=self.scheduler,
             ema=self.ema,
+            gradient_clipper=self.gradient_clipper,
             step=self.step,
             epoch=self.epoch,
             config=self.serialized_config,
@@ -2916,6 +2941,8 @@ class LearnerLoop:
 
     def _clear_optimizer_state(self) -> None:
         self.optimizer.state.clear()
+        if self.gradient_clipper is not None:
+            self.gradient_clipper.reset()
 
     def _active_ring_weights(self) -> dict[int, float] | None:
         weights = self.ring_mixture_config.weights_for_step(self.step)
@@ -2942,6 +2969,7 @@ class LearnerLoop:
             optimizer=self.optimizer,
             scheduler=self.scheduler,
             ema=self.ema,
+            gradient_clipper=self.gradient_clipper,
             step=self.step,
             epoch=self.epoch,
             config=self.serialized_config,

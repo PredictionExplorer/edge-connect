@@ -45,6 +45,11 @@ _IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _MISSING = object()
 
 _ALLOWED_PROFILE_PATHS = {
+    ("train", "gradient_diagnostics"),
+    *(
+        ("train", "gradient_clipping", name)
+        for name in ("mode", "beta", "multiplier", "warmup_steps")
+    ),
     ("train", "per_rank_batch_size"),
     ("learner", "candidate_interval"),
     ("learner", "max_replay_lag_steps"),

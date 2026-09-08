@@ -35,6 +35,7 @@ from .contracts import (
     RULES_SCHEMA_ID,
 )
 from .model import MODEL_SCHEMA_VERSION, ModelConfig
+from .gradient_clipping import GradientClipper
 from .runtime import append_jsonl, atomic_json, validate_identifier
 
 CHECKPOINT_FORMAT = "startrain.checkpoint"
@@ -329,6 +330,7 @@ def save_checkpoint(
     optimizer: torch.optim.Optimizer | None = None,
     scheduler: torch.optim.lr_scheduler.LRScheduler | None = None,
     ema: ExponentialMovingAverage | None = None,
+    gradient_clipper: GradientClipper | None = None,
     config: Mapping[str, Any] | None = None,
     extra: Mapping[str, Any] | None = None,
 ) -> Path:
@@ -358,6 +360,9 @@ def save_checkpoint(
         "optimizer_routing": optimizer_routing,
         "scheduler": scheduler.state_dict() if scheduler is not None else None,
         "ema": ema.state_dict() if ema is not None else None,
+        "gradient_clipping": (
+            gradient_clipper.state_dict() if gradient_clipper is not None else None
+        ),
         "config": dict(config or {}),
         "extra": dict(extra or {}),
     }
@@ -393,6 +398,8 @@ def load_checkpoint(
     optimizer: torch.optim.Optimizer | None = None,
     scheduler: torch.optim.lr_scheduler.LRScheduler | None = None,
     ema: ExponentialMovingAverage | None = None,
+    gradient_clipper: GradientClipper | None = None,
+    allow_gradient_clipping_cold_start: bool = False,
     map_location: torch.device | str = "cpu",
     strict: bool = True,
     use_ema_weights: bool = False,
@@ -406,6 +413,8 @@ def load_checkpoint(
     metadata_validator: Callable[[Mapping[str, Any]], object] | None = None,
 ) -> dict[str, Any]:
     checkpoint_path = Path(source)
+    if type(allow_gradient_clipping_cold_start) is not bool:
+        raise ValueError("allow_gradient_clipping_cold_start must be boolean")
     if (use_ema_weights or require_ema) and not strict:
         raise ValueError("EMA checkpoint loading must be strict")
     if expected_sha256 is not None or expected_bytes is not None:
@@ -432,6 +441,30 @@ def load_checkpoint(
         "extra": payload["extra"],
         "optimizer_routing": payload.get("optimizer_routing"),
     }
+    clipping_state = payload.get("gradient_clipping")
+    saved_train = payload["config"].get("train", {})
+    saved_clipping = (
+        saved_train.get("gradient_clipping", {})
+        if isinstance(saved_train, Mapping)
+        else {}
+    )
+    saved_adaptive = (
+        isinstance(saved_clipping, Mapping) and saved_clipping.get("mode") == "adagc"
+    )
+    if optimizer is not None or gradient_clipper is not None:
+        if clipping_state is None:
+            if saved_adaptive:
+                raise ValueError(
+                    "adaptive checkpoint is missing gradient clipping state"
+                )
+            if gradient_clipper is not None and not allow_gradient_clipping_cold_start:
+                raise ValueError(
+                    "gradient clipping cold start requires explicit opt-in"
+                )
+        elif gradient_clipper is None:
+            raise ValueError("resuming this optimizer requires its gradient clipper")
+        else:
+            gradient_clipper.validate_state_dict(clipping_state)
     if metadata_validator is not None:
         validator = metadata_validator
     else:
@@ -481,6 +514,12 @@ def load_checkpoint(
         if payload["ema"] is None:
             raise ValueError("checkpoint has no EMA state")
         ema.load_state_dict(payload["ema"], expected_decay=ema.decay)
+    if gradient_clipper is not None and clipping_state is not None:
+        gradient_clipper.load_state_dict(clipping_state)
+    if gradient_clipper is not None and clipping_state is None:
+        # A caller must explicitly opt in to a fresh adaptation warmup. It must
+        # never inherit history from a previously used controller.
+        gradient_clipper.reset()
     return metadata
 
 
@@ -963,6 +1002,7 @@ def write_recovery_checkpoint(
     optimizer: torch.optim.Optimizer,
     scheduler: torch.optim.lr_scheduler.LRScheduler,
     ema: ExponentialMovingAverage,
+    gradient_clipper: GradientClipper | None = None,
     step: int,
     epoch: int,
     config: Mapping[str, Any],
@@ -979,6 +1019,7 @@ def write_recovery_checkpoint(
         optimizer=optimizer,
         scheduler=scheduler,
         ema=ema,
+        gradient_clipper=gradient_clipper,
         step=step,
         epoch=epoch,
         config=config,
@@ -1003,6 +1044,7 @@ def create_recovery_checkpoint_artifact(
     optimizer: torch.optim.Optimizer,
     scheduler: torch.optim.lr_scheduler.LRScheduler,
     ema: ExponentialMovingAverage,
+    gradient_clipper: GradientClipper | None = None,
     step: int,
     epoch: int,
     config: Mapping[str, Any],
@@ -1044,6 +1086,7 @@ def create_recovery_checkpoint_artifact(
         optimizer=optimizer,
         scheduler=scheduler,
         ema=ema,
+        gradient_clipper=gradient_clipper,
         step=step,
         epoch=epoch,
         config=config,

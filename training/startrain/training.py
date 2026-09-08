@@ -21,6 +21,11 @@ from .config import SchedulerConfig
 from .contracts import SCORE_MARGIN_MAX, SCORE_MARGIN_MIN
 from .device import resolve_compile
 from .features import EncodedBatch
+from .gradient_clipping import GradientClipper, GradientClipResult
+from .gradient_diagnostics import (
+    GradientDiagnostics,
+    collect_gradient_diagnostics as capture_gradient_diagnostics,
+)
 from .losses import LossWeights, compute_losses
 from .optim import (
     OptimizerGroupDiagnostics,
@@ -240,6 +245,8 @@ class HostTrainStepMetrics:
     gradient_clip_coefficient: float | None = None
     gradient_clip_severity: float | None = None
     gradient_clip_ratio: float | None = None
+    gradient_clipping: dict[str, object] | None = None
+    gradient_diagnostics: dict[str, object] | None = None
 
     @property
     def gradient_pre_clip_norm(self) -> float:
@@ -392,6 +399,8 @@ class TrainStepResult:
     scheduler_diagnostics: SchedulerDiagnostics | None = None
     ema_diagnostics: _EMADiagnosticTensors | None = None
     gradient_clip_threshold: float | None = None
+    gradient_clip_result: GradientClipResult | None = None
+    gradient_diagnostics: GradientDiagnostics | None = None
 
     def to_host(self) -> HostTrainStepMetrics:
         names = tuple(self.loss_tensors)
@@ -404,7 +413,10 @@ class TrainStepResult:
         ]
         post_clip_index: int | None = None
         coefficient_index: int | None = None
-        if self.gradient_clip_threshold is not None:
+        if self.gradient_clip_result is not None:
+            post_clip_index = len(tensors)
+            tensors.append(self.gradient_clip_result.post_clip_norm.detach().float())
+        elif self.gradient_clip_threshold is not None:
             # Match torch.nn.utils.clip_grad_norm_ exactly. Deriving the norm avoids
             # a second reduction over gradients and cannot perturb the optimizer.
             coefficient = torch.clamp(
@@ -452,6 +464,34 @@ class TrainStepResult:
         )
         if clip_ratio is not None and not math.isfinite(clip_ratio):
             clip_ratio = None
+        clipping: dict[str, object] = {"mode": "global"}
+        if self.gradient_clip_result is not None:
+            result = self.gradient_clip_result
+            summaries = (
+                torch.stack(
+                    (
+                        result.parameter_clip_fraction.detach().float(),
+                        result.minimum_coefficient.detach().float(),
+                        result.median_coefficient.detach().float(),
+                    )
+                )
+                .cpu()
+                .tolist()
+            )
+            clipping = {
+                "mode": result.mode,
+                "warmup": result.warmup,
+                "steps": result.steps,
+                "parameter_clip_fraction": float(summaries[0]),
+                "minimum_coefficient": float(summaries[1]),
+                "median_coefficient": float(summaries[2]),
+                "global_norm_ratio": (
+                    post_clip_norm / gradient_norm
+                    if post_clip_norm is not None and gradient_norm > 0
+                    else None
+                ),
+                "coefficient_scope": "per_tensor",
+            }
         return HostTrainStepMetrics(
             losses=dict(zip(names, host_values[:loss_count], strict=True)),
             gradient_norm=gradient_norm,
@@ -475,6 +515,12 @@ class TrainStepResult:
             gradient_clip_coefficient=clip_coefficient,
             gradient_clip_severity=clip_severity,
             gradient_clip_ratio=clip_ratio,
+            gradient_clipping=clipping,
+            gradient_diagnostics=(
+                self.gradient_diagnostics.to_host()
+                if self.gradient_diagnostics is not None
+                else None
+            ),
         )
 
     @property
@@ -708,6 +754,7 @@ class DeviceBatchPrefetcher(Iterator[ReplayBatch]):
             inputs=encoded,
             targets=source.targets.to(self.device, non_blocking=True),
             feature_path=source.feature_path,
+            variant_labels=source.variant_labels,
         )
 
 
@@ -888,6 +935,8 @@ def train_step(
     ema: ExponentialMovingAverage | None = None,
     trusted_batch: bool = False,
     collect_diagnostics: bool = False,
+    gradient_clipper: GradientClipper | None = None,
+    collect_gradient_diagnostics: bool = False,
 ) -> TrainStepResult:
     if precision not in ("fp32", "bf16"):
         raise ValueError("precision must be fp32 or bf16")
@@ -921,9 +970,25 @@ def train_step(
         )
     total = losses["total"]
     total.backward()
-    gradient_norm = torch.nn.utils.clip_grad_norm_(
-        original_model.parameters(), gradient_clip_norm, error_if_nonfinite=False
+    measurement = gradient_clipper.measure() if gradient_clipper is not None else None
+    gradient_diagnostics = (
+        capture_gradient_diagnostics(
+            original_model,
+            batch,
+            optimizer,
+            parameter_norms=measurement.parameter_norms if measurement else None,
+            total_norm=measurement.total_norm if measurement else None,
+        )
+        if collect_gradient_diagnostics
+        else None
     )
+    if measurement is None:
+        # Preserve the production global path exactly when AdaGC is disabled.
+        gradient_norm = torch.nn.utils.clip_grad_norm_(
+            original_model.parameters(), gradient_clip_norm, error_if_nonfinite=False
+        )
+    else:
+        gradient_norm = measurement.total_norm
     gradient_clipped = gradient_norm > gradient_clip_norm
     loss_is_finite = torch.isfinite(total).all()
     gradient_is_finite = torch.isfinite(gradient_norm).all()
@@ -942,6 +1007,13 @@ def train_step(
             nonfinite_loss_count=int(nonfinite_counts[0].item()),
             nonfinite_gradient_count=int(nonfinite_counts[1].item()),
         )
+    clipping_result = None
+    if gradient_clipper is not None:
+        assert measurement is not None
+        # All ranks have passed the existing finite check before adaptation
+        # history or optimizer state can change.
+        clipping_result = gradient_clipper.apply_(measurement, finite_checked=True)
+        gradient_clipped = clipping_result.parameter_clip_fraction > 0
     optimizer_snapshot = (
         capture_optimizer_diagnostic_snapshot(optimizer)
         if collect_diagnostics
@@ -974,5 +1046,9 @@ def train_step(
             scheduler_diagnostics(scheduler) if scheduler is not None else None
         ),
         ema_diagnostics=ema_diagnostics,
-        gradient_clip_threshold=float(gradient_clip_norm),
+        gradient_clip_threshold=(
+            float(gradient_clip_norm) if gradient_clipper is None else None
+        ),
+        gradient_clip_result=clipping_result,
+        gradient_diagnostics=gradient_diagnostics,
     )

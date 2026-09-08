@@ -1157,6 +1157,9 @@ class ReplayBatch:
     inputs: EncodedBatch
     targets: TrainingTargets
     feature_path: str = "python"
+    # Original rules survive resolved pie openings, whose encoded features no
+    # longer distinguish them from standard play. This is diagnostic metadata.
+    variant_labels: tuple[str, ...] | None = None
 
     def to(
         self,
@@ -1173,6 +1176,7 @@ class ReplayBatch:
             ),
             targets=self.targets.to(device, non_blocking=non_blocking),
             feature_path=self.feature_path,
+            variant_labels=self.variant_labels,
         )
 
     def pin_memory(self) -> "ReplayBatch":
@@ -1180,6 +1184,7 @@ class ReplayBatch:
             inputs=self.inputs.pin_memory(pin_topology=False),
             targets=self.targets.pin_memory(),
             feature_path=self.feature_path,
+            variant_labels=self.variant_labels,
         )
 
     def record_stream(self, stream: torch.Stream) -> None:
@@ -1326,4 +1331,5 @@ def collate_replay_samples(
             teacher_mask=teacher_mask,
         ),
         feature_path=feature_path,
+        variant_labels=tuple(sample.variant_label for sample in samples),
     )

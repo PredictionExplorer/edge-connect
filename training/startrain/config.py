@@ -18,6 +18,7 @@ from .contracts import MAX_HANDICAP, MODES, SEGMENTS
 from .losses import LossWeights
 from .model import ModelConfig
 from .optim import OptimizerConfig
+from .gradient_clipping import GradientClippingConfig
 from .selfplay import SelfPlayConfig, VariantMixtureConfig
 from .topology import SUPPORTED_RINGS
 
@@ -167,9 +168,15 @@ class TrainConfig:
     ema_decay: float = 0.999
     ema_half_life_examples: float | None = None
     gradient_clip_norm: float = 1.0
+    gradient_clipping: GradientClippingConfig = GradientClippingConfig()
+    gradient_diagnostics: bool = False
     scheduler: SchedulerConfig = SchedulerConfig()
 
     def __post_init__(self) -> None:
+        if not isinstance(self.gradient_clipping, GradientClippingConfig):
+            raise ConfigError("gradient_clipping must be a GradientClippingConfig")
+        if type(self.gradient_diagnostics) is not bool:
+            raise ConfigError("gradient_diagnostics must be boolean")
         if self.per_rank_batch_size <= 0 or self.gradient_clip_norm <= 0:
             raise ConfigError(
                 "per_rank_batch_size and gradient_clip_norm must be positive"
@@ -1953,6 +1960,9 @@ def load_config(path: str | Path) -> ExperimentConfig:
     train_values = _mapping("train", raw["train"])
     train_values["scheduler"] = _construct(
         SchedulerConfig, train_values.get("scheduler", {})
+    )
+    train_values["gradient_clipping"] = _construct(
+        GradientClippingConfig, train_values.get("gradient_clipping", {})
     )
     game_values = _mapping("game", raw["game"])
     game_values["rings"] = tuple(game_values.get("rings", SUPPORTED_RINGS))

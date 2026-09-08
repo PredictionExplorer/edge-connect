@@ -3113,6 +3113,7 @@ def _governed_learner(
 
     learner = object.__new__(LearnerLoop)
     learner.optimizer = optimizer
+    learner.gradient_clipper = None
     learner.scheduler = scheduler
     learner._lr_governor = LearningRateGovernorState.from_scheduler(scheduler)
     learner.serialized_config = {
@@ -3297,6 +3298,7 @@ def test_plateau_recovery_preserves_weights_and_creates_durable_cutover(
     learner.world_size = 1
     learner.step = 100
     learner.optimizer = optimizer
+    learner.gradient_clipper = None
     learner.scheduler = scheduler
     learner._lr_governor = LearningRateGovernorState.from_scheduler(scheduler)
     learner._last_recovery_step = 90
@@ -3657,6 +3659,7 @@ def test_plateau_scale_restores_after_promotion(tmp_path, monkeypatch) -> None:
     learner.world_size = 1
     learner.step = 120
     learner.optimizer = optimizer
+    learner.gradient_clipper = None
     learner.scheduler = scheduler
     learner._lr_governor = LearningRateGovernorState.from_scheduler(scheduler)
     learner.metrics = SimpleNamespace(append=events.append)

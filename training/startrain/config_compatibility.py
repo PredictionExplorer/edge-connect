@@ -67,10 +67,17 @@ def compatible_config_epoch_payloads(
     epoch or searching arbitrary subsets of newly added fields.
     """
 
-    sources = [deepcopy(dict(payload))]
-    pre_broadcast = without_broadcast_topology_default(payload)
-    if pre_broadcast != payload:
-        sources.append(pre_broadcast)
+    current = deepcopy(dict(payload))
+    representations = [current]
+    pre_clipping = without_gradient_clipping_defaults(payload)
+    if pre_clipping != current:
+        representations.append(pre_clipping)
+    sources: list[dict[str, Any]] = []
+    for representation in representations:
+        sources.append(representation)
+        pre_broadcast = without_broadcast_topology_default(representation)
+        if pre_broadcast != representation:
+            sources.append(pre_broadcast)
     variants: list[dict[str, Any]] = []
     for source in sources:
         pre_session = without_evaluation_session_defaults(source)
@@ -84,6 +91,39 @@ def compatible_config_epoch_payloads(
         if without_pause_strategy_default(source) != source:
             variants.extend(without_pause_strategy_default(row) for row in previous)
     return tuple(variants)
+
+
+def without_gradient_clipping_defaults(
+    payload: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Represent the release before opt-in clipping and diagnostic settings.
+
+    Every non-default, unknown field, and untyped lookalike remains authoritative.
+    Diagnostics are deliberately an explicit profile change when enabled.
+    """
+    result = deepcopy(dict(payload))
+    train = result.get("train")
+    if not isinstance(train, dict):
+        return result
+    defaults = {
+        "mode": "global",
+        "beta": 0.99,
+        "multiplier": 1.04,
+        "warmup_steps": 100,
+    }
+    value = train.get("gradient_clipping")
+    if (
+        isinstance(value, dict)
+        and value.keys() == defaults.keys()
+        and all(
+            type(value[key]) is type(default) and value[key] == default
+            for key, default in defaults.items()
+        )
+    ):
+        del train["gradient_clipping"]
+    if train.get("gradient_diagnostics") is False:
+        del train["gradient_diagnostics"]
+    return result
 
 
 def without_broadcast_topology_default(
