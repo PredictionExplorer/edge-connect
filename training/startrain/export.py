@@ -97,16 +97,19 @@ def export_onnx(
         {0: batch},
     )
     try:
-        torch.onnx.export(
-            wrapper,
-            example_batch.model_args(),
-            str(destination),
-            input_names=list(ONNX_INPUT_NAMES),
-            output_names=list(ONNX_OUTPUT_NAMES),
-            dynamic_shapes=dynamic_shapes,
-            opset_version=opset_version,
-            dynamo=True,
-        )
+        # This artifact is inference-only. Do not capture the training-only
+        # additive-mask gradient carrier or change parameter trainability.
+        with torch.no_grad():
+            torch.onnx.export(
+                wrapper,
+                example_batch.model_args(),
+                str(destination),
+                input_names=list(ONNX_INPUT_NAMES),
+                output_names=list(ONNX_OUTPUT_NAMES),
+                dynamic_shapes=dynamic_shapes,
+                opset_version=opset_version,
+                dynamo=True,
+            )
     except (ImportError, ModuleNotFoundError) as exc:
         raise RuntimeError("ONNX export requires the optional onnx package") from exc
     finally:
