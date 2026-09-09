@@ -170,15 +170,77 @@ def test_live_entries_must_have_distinct_exclusive_streams():
         )
 
     adapter = SimpleNamespace(
-        _graphs=SimpleNamespace(_entries={1: entry(64, 10), 2: entry(32, 11)})
+        _graphs=SimpleNamespace(
+            _entries={
+                ("first", (), ()): entry(64, 10),
+                ("second", (), ()): entry(32, 11),
+            }
+        )
     )
     assert [record["physical_rows"] for record in probe.entry_records(adapter)] == [
         64,
         32,
     ]
-    adapter._graphs._entries[2] = entry(32, 10)
+    adapter._graphs._entries[("second", (), ())] = entry(32, 10)
     with pytest.raises(RuntimeError, match="share a capture stream"):
         probe.entry_records(adapter)
+
+
+def test_entry_inventory_preserves_original_signatures_and_runtime_memory_accounting(
+    monkeypatch,
+):
+    input_tensor, output = torch.zeros(64, 1), torch.ones(64, 1)
+    original_args = (("tensor", (64, 1), (2, 1), "torch.float32", "cuda:7"),)
+    original_kwargs = (
+        ("mask", ("tensor", (64, 1), (1, 1), "torch.float32", "cuda:7")),
+    )
+    entry = SimpleNamespace(
+        args=(input_tensor,),
+        kwargs={"mask": input_tensor},
+        output=output,
+        graph=SimpleNamespace(pool=lambda: (9, 2)),
+        device=torch.device("cuda:7"),
+        retained_bytes=5000,
+        stream_lease=SimpleNamespace(stream=SimpleNamespace(cuda_stream=10)),
+    )
+    snapshot = [
+        {"device": 7, "segment_pool_id": (9, 2), "total_size": 4096, "address": 0}
+    ]
+    for tensor in (input_tensor, output):
+        storage = tensor.untyped_storage()
+        snapshot.append(
+            {
+                "device": 7,
+                "segment_pool_id": (0, 0),
+                "address": storage.data_ptr(),
+                "total_size": storage.nbytes(),
+                "blocks": [{"address": storage.data_ptr(), "size": storage.nbytes()}],
+            }
+        )
+    monkeypatch.setattr(torch.cuda, "memory_snapshot", lambda **kwargs: snapshot)
+    adapter = SimpleNamespace(
+        _graphs=SimpleNamespace(
+            _entries={("model", original_args, original_kwargs): entry}
+        )
+    )
+    (record,) = probe.entry_records(adapter, include_memory=True)
+    assert record["original_argument_signatures"] == original_args
+    assert record["original_keyword_signatures"] == original_kwargs
+    assert record["graph_pool_id"] == (9, 2)
+    assert record["private_pool_bytes"] == 4096
+    assert (
+        record["external_static_block_bytes"] == 512
+    )  # The aliased mask is charged once.
+    assert record["current_accounted_bytes"] == 4608
+    assert record["retained_bytes"] == 5000 and record["retained_bytes_delta"] == -392
+
+
+def test_shape_order_accepts_only_a_permutation_of_existing_buckets():
+    order = (1, 128, 96, 192, 256, 64, 32, 16, 8, 4, 2)
+    assert probe.parse_shape_order(",".join(map(str, order))) == order
+    for value in ("1,2", ",".join(map(str, (*probe.SHAPES[:-1], 1))), "not-an-integer"):
+        with pytest.raises(probe.argparse.ArgumentTypeError):
+            probe.parse_shape_order(value)
 
 
 def test_native_identity_hashes_loaded_binary_not_just_python_wrapper(tmp_path):
@@ -268,9 +330,17 @@ def test_cli_forwards_initialization_order_to_child_probe(monkeypatch, order):
         "report.json",
     ]
     if order is not None:
-        command += ["--capture-initialization-order", order]
+        command += [
+            "--capture-initialization-order",
+            order,
+            "--shape-order",
+            ",".join(map(str, reversed(probe.SHAPES))),
+        ]
     assert probe.main(command) == 0
     assert observed[0].capture_initialization_order == (order or "graph-first")
+    assert observed[0].shape_order == (
+        tuple(reversed(probe.SHAPES)) if order else probe.SHAPES
+    )
 
 
 def test_source_identity_uses_imported_runtime_when_probe_is_outside_release(

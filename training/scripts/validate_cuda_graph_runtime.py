@@ -36,6 +36,18 @@ MEMORY_FRACTION = 0.20
 FORMAT = "startrain.cuda-graph-runtime-validation"
 
 
+def parse_shape_order(value: str) -> tuple[int, ...]:
+    try:
+        shapes = tuple(int(item) for item in value.split(","))
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("shape order must contain integers") from error
+    if len(shapes) != len(SHAPES) or set(shapes) != set(SHAPES):
+        raise argparse.ArgumentTypeError(
+            "shape order must be a permutation of " + ",".join(map(str, SHAPES))
+        )
+    return shapes
+
+
 def _control():
     from scripts import benchmark_actor_throughput
 
@@ -195,23 +207,67 @@ def compare_predictions(expected, actual) -> dict[str, float]:
     return differences
 
 
-def entry_records(adapter) -> list[dict[str, int]]:
+def entry_records(adapter, *, include_memory: bool = False) -> list[dict[str, Any]]:
+    import torch
+    from startrain.inference_graphs import _account_graph_storage, _tensors
+
     graphs = adapter._graphs
     if graphs is None:
         raise RuntimeError("probe graph backend is absent")
     records = []
-    for entry in graphs._entries.values():
+    snapshot = (
+        torch.cuda.memory_snapshot(include_traces=False) if include_memory else None
+    )
+    for key, entry in graphs._entries.items():
         lease = entry.stream_lease
         if lease is None:
             raise RuntimeError("live graph does not own an exclusive capture stream")
-        records.append(
-            {
-                "physical_rows": int(entry.args[0].shape[0]),
-                "retained_bytes": entry.retained_bytes,
-                "capture_stream": int(lease.stream.cuda_stream),
-                "entry_identity": id(entry),
-            }
-        )
+        record = {
+            "physical_rows": int(entry.args[0].shape[0]),
+            "retained_bytes": entry.retained_bytes,
+            "capture_stream": int(lease.stream.cuda_stream),
+            "entry_identity": id(entry),
+            # These are the original request signatures used as cache keys,
+            # before cloning potentially changes the static buffers' strides.
+            "original_argument_signatures": key[1],
+            "original_keyword_signatures": key[2],
+        }
+        if snapshot is not None:
+            pool = tuple(int(item) for item in entry.graph.pool())
+            device_index = entry.device.index
+            if device_index is None:
+                raise RuntimeError("live graph has no explicit CUDA device index")
+            private = sum(
+                segment["total_size"]
+                for segment in snapshot
+                if segment.get("device") == device_index
+                and tuple(segment.get("segment_pool_id", ())) == pool
+            )
+            owned = [
+                *_tensors(entry.args),
+                *_tensors(tuple(entry.kwargs.values())),
+                entry.output,
+            ]
+            accounted = _account_graph_storage(
+                snapshot,
+                pool=cast(tuple[int, int], pool),
+                device_index=device_index,
+                storages=[
+                    (
+                        tensor.untyped_storage().data_ptr(),
+                        tensor.untyped_storage().nbytes(),
+                    )
+                    for tensor in owned
+                ],
+            )
+            record.update(
+                graph_pool_id=pool,
+                private_pool_bytes=private,
+                external_static_block_bytes=accounted - private,
+                current_accounted_bytes=accounted,
+                retained_bytes_delta=accounted - entry.retained_bytes,
+            )
+        records.append(record)
     if len({record["capture_stream"] for record in records}) != len(records):
         raise RuntimeError("simultaneously live graphs share a capture stream")
     return records
@@ -387,6 +443,7 @@ def run_probe(args) -> dict[str, object]:
         "production_config": source_config.as_dict(),
         "probe_inference": asdict(config.orchestration.model_refresh.inference),
         "capture_initialization_order": args.capture_initialization_order,
+        "shape_order": list(args.shape_order),
         "model": {
             "identity": manifest.model_identity,
             "step": manifest.model_step,
@@ -410,7 +467,7 @@ def run_probe(args) -> dict[str, object]:
     }
     atomic_json(args.output, report)
     try:
-        for rows in SHAPES:
+        for rows in args.shape_order:
             for version, variant in enumerate(VARIANTS):
                 checked_request(
                     native,
@@ -423,7 +480,7 @@ def run_probe(args) -> dict[str, object]:
                     expected_captures=1 if version == 0 else 0,
                     capture_initialization_order=args.capture_initialization_order,
                 )
-            entries = entry_records(graph)
+            entries = entry_records(graph, include_memory=True)
             entry = next(
                 record for record in entries if record["physical_rows"] == rows
             )
@@ -454,7 +511,7 @@ def run_probe(args) -> dict[str, object]:
             expected_captures=1,
             capture_initialization_order=args.capture_initialization_order,
         )
-        hot = entry_records(graph)[0]
+        hot = entry_records(graph, include_memory=True)[0]
         before = graph.metrics_snapshot()
         for index in range(args.stress_captures):
             variant = VARIANTS[index % len(VARIANTS)]
@@ -515,7 +572,7 @@ def run_probe(args) -> dict[str, object]:
                 report["stress"] = {
                     "completed_cold_captures": index + 1,
                     "hot_graph": hot,
-                    "live_entries": entry_records(graph),
+                    "live_entries": entry_records(graph, include_memory=True),
                     "counters": check_health(graph),
                 }
                 atomic_json(args.output, report)
@@ -566,6 +623,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--stress-captures", type=int, default=96)
     parser.add_argument("--timeout-seconds", type=float, default=1200)
+    parser.add_argument(
+        "--shape-order",
+        type=parse_shape_order,
+        default=SHAPES,
+        help="comma-separated permutation of the eleven supported physical shapes",
+    )
     parser.add_argument(
         "--capture-initialization-order",
         choices=("graph-first", "reference-first"),
@@ -618,6 +681,8 @@ def main(argv: list[str] | None = None) -> int:
         str(args.timeout_seconds),
         "--capture-initialization-order",
         args.capture_initialization_order,
+        "--shape-order",
+        ",".join(map(str, args.shape_order)),
     ]
     control = _control()
     with control._controller_signals(), isolated_compile_cache(cache) as provenance:
@@ -644,6 +709,9 @@ def main(argv: list[str] | None = None) -> int:
         or len(result.get("shapes", [])) != len(SHAPES)
         or result.get("capture_initialization_order")
         != args.capture_initialization_order
+        or result.get("shape_order") != list(args.shape_order)
+        or [record.get("physical_rows") for record in result.get("shapes", [])]
+        != list(args.shape_order)
     ):
         raise RuntimeError("child did not complete graph validation")
     print(
