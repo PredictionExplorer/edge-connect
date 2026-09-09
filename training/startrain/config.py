@@ -389,6 +389,46 @@ class LearnerConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class ActorPipelineConfig:
+    """Explicit per-GPU rollout settings for the self-play pipeline."""
+
+    compatible_work: bool = False
+    stream_completed_games: bool = False
+    rolling_game_slots: bool = False
+    seed_contract: Literal["cohort-v1", "game-v1"] = "cohort-v1"
+    games_per_task: int | None = None
+    cuda_graphs: bool = False
+    max_model_pin_seconds: float = 3600.0
+
+    def __post_init__(self) -> None:
+        for name in (
+            "compatible_work",
+            "stream_completed_games",
+            "rolling_game_slots",
+            "cuda_graphs",
+        ):
+            if type(getattr(self, name)) is not bool:
+                raise ConfigError(f"actor_pipeline.{name} must be boolean")
+        if self.seed_contract not in ("cohort-v1", "game-v1"):
+            raise ConfigError("actor_pipeline.seed_contract is invalid")
+        if self.games_per_task is not None and (
+            type(self.games_per_task) is not int or self.games_per_task <= 0
+        ):
+            raise ConfigError("actor_pipeline.games_per_task must be positive or null")
+        if (
+            isinstance(self.max_model_pin_seconds, bool)
+            or not isinstance(self.max_model_pin_seconds, int | float)
+            or not math.isfinite(self.max_model_pin_seconds)
+            or self.max_model_pin_seconds <= 0
+        ):
+            raise ConfigError("actor_pipeline.max_model_pin_seconds must be positive")
+        if self.rolling_game_slots and (
+            not self.stream_completed_games or self.seed_contract != "game-v1"
+        ):
+            raise ConfigError("rolling slots require streaming and game-v1 seeds")
+
+
+@dataclass(frozen=True, slots=True)
 class GPUWorkerConfig:
     """One physical GPU assignment visible to exactly one worker job."""
 
@@ -401,8 +441,14 @@ class GPUWorkerConfig:
     actor_cohorts: int = 1
     native_threads: int | None = None
     blas_threads: int | None = None
+    actor_pipeline: ActorPipelineConfig | None = None
 
     def __post_init__(self) -> None:
+        if self.actor_pipeline is not None and (
+            not isinstance(self.actor_pipeline, ActorPipelineConfig)
+            or self.role != "actor"
+        ):
+            raise ConfigError("actor_pipeline requires an actor GPU and typed settings")
         if type(self.actor_cohorts) is not int or not 1 <= self.actor_cohorts <= 32:
             raise ConfigError("actor_cohorts must be an integer in 1..32")
         for name in ("native_threads", "blas_threads"):
@@ -634,6 +680,9 @@ class ActorInferenceConfig:
     max_batch_rows: int = 256
     max_pending_requests: int = 16
     max_wait_seconds: float = 0.002
+    cuda_graphs: bool = False
+    cuda_graph_max_entries: int = 8
+    cuda_graph_max_bytes: int = 2 * 1024**3
 
     def __post_init__(self) -> None:
         for name in ("cache_max_entries", "cache_max_bytes"):
@@ -641,17 +690,26 @@ class ActorInferenceConfig:
                 raise ConfigError(f"inference.{name} must be a non-negative integer")
         if (self.cache_max_entries == 0) != (self.cache_max_bytes == 0):
             raise ConfigError("inference cache requires both entry and byte limits")
-        for name in ("pinned_buffer_slots", "max_batch_rows", "max_pending_requests"):
+        for name in (
+            "pinned_buffer_slots",
+            "max_batch_rows",
+            "max_pending_requests",
+            "cuda_graph_max_entries",
+            "cuda_graph_max_bytes",
+        ):
             if type(getattr(self, name)) is not int or getattr(self, name) <= 0:
                 raise ConfigError(f"inference.{name} must be a positive integer")
         if self.pinned_buffer_slots > 8:
             raise ConfigError("inference.pinned_buffer_slots must be in [1, 8]")
+        if self.cuda_graph_max_entries > 64:
+            raise ConfigError("inference.cuda_graph_max_entries must be in [1, 64]")
         for name in (
             "deduplicate",
             "pinned_transfers",
             "homogeneous_relational_bias",
             "preserve_broadcast_topology",
             "shared_batching",
+            "cuda_graphs",
         ):
             if type(getattr(self, name)) is not bool:
                 raise ConfigError(f"inference.{name} must be boolean")
@@ -682,12 +740,14 @@ class ModelRefreshConfig:
     candidate_probability: float = 0.8
     history_probability: float = 0.0
     history_pool_size: int = 8
+    compatible_cohort_work: bool = False
     inference: ActorInferenceConfig = ActorInferenceConfig()
 
     def __post_init__(self) -> None:
         if (
             type(self.refresh_only_between_batches) is not bool
             or type(self.inference_compile_dynamic) is not bool
+            or type(self.compatible_cohort_work) is not bool
         ):
             raise ConfigError("model refresh compile settings must use booleans")
         if self.manifest_poll_seconds <= 0 or self.startup_timeout_seconds <= 0:
@@ -1973,10 +2033,15 @@ def load_config(path: str | Path) -> ExperimentConfig:
     host = _HostInventory()
     orchestration_values = _mapping("orchestration", raw.get("orchestration", {}))
     orchestration_values = _resolve_auto_orchestration(orchestration_values, host)
-    orchestration_values["gpus"] = tuple(
-        _construct(GPUWorkerConfig, value)
-        for value in orchestration_values.get("gpus", ())
-    )
+    gpu_values = []
+    for value in orchestration_values.get("gpus", ()):
+        gpu = _mapping("GPU worker", value)
+        if gpu.get("actor_pipeline") is not None:
+            gpu["actor_pipeline"] = _construct(
+                ActorPipelineConfig, gpu["actor_pipeline"]
+            )
+        gpu_values.append(_construct(GPUWorkerConfig, gpu))
+    orchestration_values["gpus"] = tuple(gpu_values)
     cpu_actor_values = orchestration_values.get("cpu_actors", ())
     if not isinstance(cpu_actor_values, list | tuple):
         raise ConfigError("orchestration.cpu_actors must be a list")

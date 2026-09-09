@@ -45,6 +45,10 @@ _IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _MISSING = object()
 
 _ALLOWED_PROFILE_PATHS = {
+    ("selfplay", "stream_completed_games"),
+    ("selfplay", "rolling_game_slots"),
+    ("selfplay", "seed_contract"),
+    ("orchestration", "model_refresh", "compatible_cohort_work"),
     ("train", "gradient_diagnostics"),
     *(
         ("train", "gradient_clipping", name)
@@ -133,6 +137,9 @@ _ALLOWED_PROFILE_PATHS = {
             "max_batch_rows",
             "max_pending_requests",
             "max_wait_seconds",
+            "cuda_graphs",
+            "cuda_graph_max_entries",
+            "cuda_graph_max_bytes",
         )
     ),
     *(
@@ -146,6 +153,20 @@ _ALLOWED_PROFILE_PATHS = {
             "actor_lanes",
             "actor_cohorts",
             "actor_batch_size",
+            "actor_pipeline",
+        )
+    ),
+    *(
+        ("orchestration", "gpus", str(index), "actor_pipeline", name)
+        for index in range(8)
+        for name in (
+            "compatible_work",
+            "stream_completed_games",
+            "rolling_game_slots",
+            "seed_contract",
+            "games_per_task",
+            "cuda_graphs",
+            "max_model_pin_seconds",
         )
     ),
     *(

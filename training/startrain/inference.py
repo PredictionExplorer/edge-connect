@@ -8,6 +8,7 @@ from contextlib import nullcontext
 import numbers
 import struct
 import threading
+import time
 from dataclasses import dataclass
 from typing import Protocol, Sequence, runtime_checkable
 
@@ -26,6 +27,7 @@ from .device import resolve_precision
 from .features import EncodedBatch
 from .features_v3 import encode_legacy_batch
 from .inference_cache import BoundedPredictionCache, PinnedTransferPool, RawPrediction
+from .inference_graphs import BoundedInferenceGraphs, CudaBackend
 from .native import (
     NativeStateDataProtocol,
     encode_native_feature_data,
@@ -78,6 +80,9 @@ class InferenceConfig:
     pinned_buffer_slots: int = 2
     # Opt in after throughput validation; this changes storage, not key identity.
     preserve_broadcast_topology: bool = False
+    cuda_graphs: bool = False
+    cuda_graph_max_entries: int = 8
+    cuda_graph_max_bytes: int = 2 * 1024**3
 
     def __post_init__(self) -> None:
         if self.precision not in ("fp32", "bf16", "auto"):
@@ -100,9 +105,21 @@ class InferenceConfig:
             raise ValueError(
                 "cache entry and byte limits must both be positive or zero"
             )
-        for name in ("deduplicate", "pinned_transfers", "preserve_broadcast_topology"):
+        for name in (
+            "deduplicate",
+            "pinned_transfers",
+            "preserve_broadcast_topology",
+            "cuda_graphs",
+        ):
             if type(getattr(self, name)) is not bool:
                 raise ValueError(f"{name} must be boolean")
+        if (
+            type(self.cuda_graph_max_entries) is not int
+            or not 1 <= self.cuda_graph_max_entries <= 64
+        ):
+            raise ValueError("cuda_graph_max_entries must be in [1, 64]")
+        if type(self.cuda_graph_max_bytes) is not int or self.cuda_graph_max_bytes <= 0:
+            raise ValueError("cuda_graph_max_bytes must be positive")
         if (
             type(self.pinned_buffer_slots) is not int
             or not 1 <= self.pinned_buffer_slots <= 8
@@ -129,6 +146,8 @@ class PreparedInferenceRequest:
     score_utility_weight: float
     prepared_keys: tuple[bytes, ...] | None = None
     key_tensor_stamps: tuple[tuple[int, int, int], ...] | None = None
+    prepare_seconds: float = 0.0
+    key_seconds: float = 0.0
 
     @property
     def rows(self) -> int:
@@ -144,7 +163,12 @@ class PreparedInferenceRequest:
 
 @dataclass(frozen=True, slots=True)
 class InferenceMetrics:
-    """Monotonic evaluator counters suitable for batch-boundary deltas."""
+    """Monotonic evaluator counters suitable for batch-boundary deltas.
+
+    Neural calls/rows count serving work; graph warmups are separate overhead.
+    Timings use the CPU clock. H2D enqueue is a subset of the synchronized
+    neural round trip, not a measurement of CUDA kernel execution time.
+    """
 
     evaluator_calls: int = 0
     evaluator_rows: int = 0
@@ -155,6 +179,18 @@ class InferenceMetrics:
     cache_misses: int = 0
     cache_evictions: int = 0
     deduplicated_rows: int = 0
+    graph_captures: int = 0
+    graph_replays: int = 0
+    graph_evictions: int = 0
+    graph_fallbacks: int = 0
+    graph_warmup_calls: int = 0
+    graph_warmup_rows: int = 0
+    graph_validation_failures: int = 0
+    graph_validation_replays: int = 0
+    cache_seconds: float = 0.0
+    h2d_enqueue_seconds: float = 0.0
+    neural_round_trip_seconds: float = 0.0
+    return_seconds: float = 0.0
 
     def delta(self, previous: "InferenceMetrics") -> "InferenceMetrics":
         differences = {
@@ -259,6 +295,20 @@ class GraphInferenceAdapter:
             tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
         ] = OrderedDict()
         self._score_support: torch.Tensor | None = None
+        self._graphs = (
+            BoundedInferenceGraphs(
+                backend=CudaBackend(self.device),
+                max_entries=config.cuda_graph_max_entries,
+                max_bytes=config.cuda_graph_max_bytes,
+            )
+            if config.cuda_graphs and self.device.type == "cuda"
+            else None
+        )
+        self._graph_weight_stamps: tuple[tuple[int, int, int], ...] | None = None
+        self._cache_seconds = 0.0
+        self._h2d_enqueue_seconds = 0.0
+        self._neural_round_trip_seconds = 0.0
+        self._return_seconds = 0.0
 
     @property
     def evaluator_calls(self) -> int:
@@ -269,6 +319,7 @@ class GraphInferenceAdapter:
         return self._evaluator_rows
 
     def metrics_snapshot(self) -> InferenceMetrics:
+        graphs = self._graphs.snapshot() if self._graphs is not None else {}
         return InferenceMetrics(
             evaluator_calls=self._evaluator_calls,
             evaluator_rows=self._evaluator_rows,
@@ -279,6 +330,23 @@ class GraphInferenceAdapter:
             cache_misses=self._cache_misses,
             cache_evictions=self._prediction_cache.evictions,
             deduplicated_rows=self._deduplicated_rows,
+            **{
+                name: graphs.get(name, 0)
+                for name in (
+                    "graph_captures",
+                    "graph_replays",
+                    "graph_evictions",
+                    "graph_fallbacks",
+                    "graph_warmup_calls",
+                    "graph_warmup_rows",
+                    "graph_validation_failures",
+                    "graph_validation_replays",
+                )
+            },
+            cache_seconds=self._cache_seconds,
+            h2d_enqueue_seconds=self._h2d_enqueue_seconds,
+            neural_round_trip_seconds=self._neural_round_trip_seconds,
+            return_seconds=self._return_seconds,
         )
 
     @property
@@ -292,7 +360,7 @@ class GraphInferenceAdapter:
             RULES_HASH,
         )
 
-    def efficiency_snapshot(self) -> dict[str, int]:
+    def efficiency_snapshot(self) -> dict[str, int | float]:
         """Monotonic counters plus current resident-cache/staging gauges."""
 
         metrics = dataclasses.asdict(self.metrics_snapshot())
@@ -308,10 +376,15 @@ class GraphInferenceAdapter:
                 pinned_waits=self._pinned_pool.waits,
                 transferred_bytes=self._pinned_pool.transferred_bytes,
             )
+        if self._graphs is not None:
+            metrics.update(self._graphs.snapshot())
         return metrics
 
     def clear_inference_cache(self) -> None:
         with self._evaluation_lock:
+            if self._graphs is not None:
+                self._graphs.clear()
+                self._graph_weight_stamps = None
             self._prediction_cache.clear()
             self._cache_namespace = None
             raw_model = getattr(self.model, "_orig_mod", self.model)
@@ -436,6 +509,7 @@ class GraphInferenceAdapter:
         No GPU operations or prediction-cache accesses happen in this method.
         """
 
+        preparation_started = time.perf_counter()
         namespace = self.namespace
         weight = (
             self.config.score_utility_weight
@@ -510,13 +584,24 @@ class GraphInferenceAdapter:
                 }
             )
         keyed = self._prediction_cache.enabled or self.config.deduplicate
+        key_started = time.perf_counter()
         keys = tuple(self._row_keys(owned, namespace)) if keyed else None
+        key_seconds = time.perf_counter() - key_started if keyed else 0.0
         stamps = self._tensor_stamps(owned) if keyed else None
         with self._stats_lock:
             self.last_feature_path = feature_path
             self.feature_path_counts[feature_path] += 1
         return PreparedInferenceRequest(
-            owned, tokens, offsets, actions, namespace, float(weight), keys, stamps
+            owned,
+            tokens,
+            offsets,
+            actions,
+            namespace,
+            float(weight),
+            keys,
+            stamps,
+            time.perf_counter() - preparation_started,
+            key_seconds,
         )
 
     @staticmethod
@@ -576,7 +661,9 @@ class GraphInferenceAdapter:
         requested_rows = host.batch_size if logical_rows is None else logical_rows
         if not 0 < requested_rows <= host.batch_size:
             raise ValueError("logical inference rows must fit the physical batch")
+        neural_started = time.perf_counter()
         encoded = self._to_device(host)
+        self._h2d_enqueue_seconds += time.perf_counter() - neural_started
         was_training = self.model.training
         self.model.eval()
         kwargs: dict[str, object] = {}
@@ -606,26 +693,58 @@ class GraphInferenceAdapter:
                     enabled=self.config.precision == "bf16",
                 ),
             ):
-                output = self.model(*encoded.model_args(), **kwargs)
-                bins = SCORE_MARGIN_MAX - SCORE_MARGIN_MIN + 1
-                rows = host.batch_size
-                if (
-                    output.policy_logits.shape != (rows, host.max_nodes)
-                    or output.outcome_logits.shape != (rows, 2)
-                    or output.score_margin_logits.shape != (rows, bins)
-                    or output.ownership_logits.shape != (rows, host.max_nodes, 3)
-                    or output.alive_logits.shape != (rows, host.max_nodes)
-                    or output.soft_policy_logits.shape != (rows, host.max_nodes)
-                ):
-                    raise ValueError("model output shapes violate inference schema")
-                packed = torch.cat(
-                    (
-                        output.policy_logits.float(),
-                        output.outcome_logits.float(),
-                        output.score_margin_logits.float(),
-                    ),
-                    dim=1,
-                ).cpu()
+
+                def forward(
+                    *arguments: torch.Tensor, **options: object
+                ) -> torch.Tensor:
+                    output = self.model(*arguments, **options)
+                    bins = SCORE_MARGIN_MAX - SCORE_MARGIN_MIN + 1
+                    rows = host.batch_size
+                    if (
+                        output.policy_logits.shape != (rows, host.max_nodes)
+                        or output.outcome_logits.shape != (rows, 2)
+                        or output.score_margin_logits.shape != (rows, bins)
+                        or output.ownership_logits.shape != (rows, host.max_nodes, 3)
+                        or output.alive_logits.shape != (rows, host.max_nodes)
+                        or output.soft_policy_logits.shape != (rows, host.max_nodes)
+                    ):
+                        raise ValueError("model output shapes violate inference schema")
+                    return torch.cat(
+                        (
+                            output.policy_logits.float(),
+                            output.outcome_logits.float(),
+                            output.score_margin_logits.float(),
+                        ),
+                        dim=1,
+                    )
+
+                pins: tuple[torch.Tensor, ...] = ()
+                if self._graphs is not None:
+                    pins = (*self.model.parameters(), *self.model.buffers())
+                    stamps = tuple(
+                        (id(value), value.data_ptr(), value._version) for value in pins
+                    )
+                    if (
+                        self._graph_weight_stamps is not None
+                        and stamps != self._graph_weight_stamps
+                    ):
+                        self._graphs.clear()
+                    self._graph_weight_stamps = stamps
+                packed_device = (
+                    self._graphs.run(
+                        self.namespace,
+                        forward,
+                        encoded.model_args(),
+                        kwargs,
+                        lifetime_pins=pins,
+                    )
+                    if self._graphs is not None
+                    else forward(*encoded.model_args(), **kwargs)
+                )
+                # Graph outputs are borrowed static buffers. Finish the copy
+                # before releasing the owner lock or replaying another request.
+                packed = packed_device.cpu()
+                self._neural_round_trip_seconds += time.perf_counter() - neural_started
                 if not torch.isfinite(packed[:, host.max_nodes :]).all():
                     raise ValueError("non-finite neural value predictions")
                 if not torch.isfinite(
@@ -633,8 +752,8 @@ class GraphInferenceAdapter:
                 ).all():
                     raise ValueError("non-finite legal neural policy predictions")
                 self._neural_calls += 1
-                self._neural_rows += rows
-                self._neural_padding_rows += rows - requested_rows
+                self._neural_rows += host.batch_size
+                self._neural_padding_rows += host.batch_size - requested_rows
         finally:
             if was_training:
                 self.model.train()
@@ -701,12 +820,17 @@ class GraphInferenceAdapter:
                 raise ValueError("batched inference shapes are incompatible")
             if self._cache_namespace != namespace:
                 self._prediction_cache.clear()
+                if self._graphs is not None:
+                    self._graphs.clear()
                 self._cache_namespace = namespace
-            if self._prediction_cache.enabled and self.model_identity == "unversioned":
+            if (
+                self._prediction_cache.enabled or self._graphs is not None
+            ) and self.model_identity == "unversioned":
                 raise ValueError(
-                    "prediction caching requires an immutable model identity"
+                    "cached inference requires an immutable model identity"
                 )
             rows = sum(request.rows for request in requests)
+            cache_started = time.perf_counter()
             keyed = self._prediction_cache.enabled or self.config.deduplicate
             keys: list[bytes] = []
             if keyed:
@@ -759,6 +883,7 @@ class GraphInferenceAdapter:
                 misses.append(row)
                 if self.config.deduplicate:
                     pending_keys[keys[row]] = row
+            self._cache_seconds += time.perf_counter() - cache_started
             if misses:
                 host = (
                     first.encoded
@@ -810,6 +935,7 @@ class GraphInferenceAdapter:
                 raise RuntimeError("incomplete neural prediction batch")
             # Cache records own compact bytes. Stacking creates writable CPU
             # storage and never exposes a mutable view of cache contents.
+            return_started = time.perf_counter()
             raw = torch.from_numpy(
                 np.stack(
                     [
@@ -862,6 +988,7 @@ class GraphInferenceAdapter:
                 )
                 results.append((response, detail))
                 start = end
+            self._return_seconds += time.perf_counter() - return_started
             return results
 
     def _evaluate(
@@ -873,6 +1000,7 @@ class GraphInferenceAdapter:
         if len(requests) and (
             self._prediction_cache.enabled
             or self.config.deduplicate
+            or self.config.cuda_graphs
             or self.homogeneous_relational_bias
         ):
             prepared = self.prepare_requests(requests)

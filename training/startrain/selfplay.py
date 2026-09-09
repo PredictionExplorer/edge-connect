@@ -6,6 +6,11 @@ that seat searches with more simulations and both networks see the advantage
 as an input, so the network learns to evaluate positions under a strength
 asymmetry (the KataGo remedy for lopsided handicap games). In pie games the
 responder swaps exactly when its root value is below a small dead zone.
+
+Streaming publishes complete games before their siblings finish. Optional
+rolling slots refill only after publication, within one finite, pinned-model
+task. The default cohort-v1 seed contract is unchanged; game-v1 gives each
+logical game independent mode, search and PDA streams across slot packings.
 """
 
 from __future__ import annotations
@@ -274,6 +279,9 @@ class SelfPlayConfig:
     rings: int = 4
     batch_size: int = 1
     games: int = 1
+    stream_completed_games: bool = False
+    rolling_game_slots: bool = False
+    seed_contract: Literal["cohort-v1", "game-v1"] = "cohort-v1"
     # The variant played by this cohort; the actor replaces these per batch
     # from ``variants.draw`` exactly like ``rings``.
     mode: str = "double"
@@ -306,8 +314,24 @@ class SelfPlayConfig:
     def __post_init__(self) -> None:
         if type(self.rings) is not int or self.rings not in SUPPORTED_RINGS:
             raise ValueError("self-play rings must be one of (4, 6, 8, 10)")
-        if self.batch_size <= 0 or self.games <= 0:
-            raise ValueError("batch_size and games must be positive")
+        if (
+            type(self.batch_size) is not int
+            or type(self.games) is not int
+            or self.batch_size <= 0
+            or self.games <= 0
+        ):
+            raise ValueError("batch_size and games must be positive integers")
+        for name in ("stream_completed_games", "rolling_game_slots"):
+            if type(getattr(self, name)) is not bool:
+                raise ValueError(f"{name} must be boolean")
+        if self.seed_contract not in ("cohort-v1", "game-v1"):
+            raise ValueError("seed_contract must be cohort-v1 or game-v1")
+        if self.rolling_game_slots and (
+            not self.stream_completed_games or self.seed_contract != "game-v1"
+        ):
+            raise ValueError(
+                "rolling_game_slots requires streaming and the game-v1 seed contract"
+            )
         if min(self.fast_probability, self.full_probability) < 0 or not np.isclose(
             self.fast_probability + self.full_probability, 1.0
         ):
@@ -457,6 +481,9 @@ class SelfPlayMetrics:
     ``completed_decisions`` and ``dropped_decisions`` partition attempts.
     """
 
+    started_games: int = 0
+    completed_games: int = 0
+    refilled_games: int = 0
     completed_decisions: int = 0
     full_decisions: int = 0
     fast_decisions: int = 0
@@ -568,6 +595,8 @@ class SelfPlayActor:
             raise ValueError("self-play source_role is invalid")
         self.source_role = source_role
         self.pause_checkpoint = pause_checkpoint
+        self._stop_observed = False
+        self._refill_stopped = False
         self.model_identity = str(
             getattr(evaluator, "model_identity", evaluator.model_version)
         )
@@ -575,6 +604,9 @@ class SelfPlayActor:
         self.pending_samples: list[ReplaySample] = []
         self.pending_phases: list[int] = []
         self.persisted_decisions = 0
+        self.started_games = 0
+        self.completed_games = 0
+        self.refilled_games = 0
         self.completed_decisions = 0
         self.full_decisions = 0
         self.fast_decisions = 0
@@ -611,6 +643,9 @@ class SelfPlayActor:
 
     def metrics_snapshot(self) -> SelfPlayMetrics:
         return SelfPlayMetrics(
+            started_games=self.started_games,
+            completed_games=self.completed_games,
+            refilled_games=self.refilled_games,
             completed_decisions=self.completed_decisions,
             full_decisions=self.full_decisions,
             fast_decisions=self.fast_decisions,
@@ -650,6 +685,7 @@ class SelfPlayActor:
         self,
         *,
         stop_requested: Callable[[], bool] = lambda: False,
+        stop_refill_requested: Callable[[], bool] = lambda: False,
         progress: Callable[..., None] | None = None,
     ) -> list[GameSummary]:
         summaries: list[GameSummary] = []
@@ -666,7 +702,11 @@ class SelfPlayActor:
                     cohort=cohort,
                     first_game=len(summaries),
                     stop_requested=stop_requested,
+                    stop_refill_requested=stop_refill_requested,
                     progress=progress,
+                    game_quota=(
+                        self.config.games if self.config.rolling_game_slots else None
+                    ),
                 )
             )
             cohort += 1
@@ -678,12 +718,16 @@ class SelfPlayActor:
                     requested_games=self.config.games,
                     persisted_decisions=self.persisted_decisions,
                 )
+            if self._stop_observed or self._refill_stopped:
+                break
         self._flush()
         completed_decisions = sum(summary.samples for summary in summaries)
         if len({summary.game_id for summary in summaries}) != len(summaries):
             raise RuntimeError("self-play generated duplicate game identifiers")
         if (
             self.pending_samples
+            or self.started_games != len(summaries) + self.dropped_games
+            or self.completed_games != len(summaries)
             or self.persisted_decisions != completed_decisions
             or self.completed_decisions != completed_decisions
             or self.full_decisions + self.fast_decisions
@@ -694,7 +738,13 @@ class SelfPlayActor:
             )
         return summaries
 
-    def _draw_pda_seats(self, cohort: int, cohort_size: int) -> list[tuple[int, int]]:
+    def _draw_pda_seats(
+        self,
+        cohort: int,
+        cohort_size: int,
+        *,
+        game_ids: Sequence[str] | None = None,
+    ) -> list[tuple[int, int]]:
         """Playout-doubling advantages ``(seat 0, seat 1)`` for every game.
 
         Handicap games hand the second player the configured advantage; a
@@ -713,7 +763,12 @@ class SelfPlayActor:
             if not mixture.enabled or mixture.asymmetric_pda_fraction <= 0:
                 seats.append((0, 0))
                 continue
-            roll = self._seed("pda", cohort, row)
+            if self.config.seed_contract == "game-v1":
+                if game_ids is None or len(game_ids) != cohort_size:
+                    raise ValueError("game-v1 PDA selection requires logical game IDs")
+                roll = self._seed("pda-game-v1", game_ids[row])
+            else:
+                roll = self._seed("pda", cohort, row)
             unit = (roll & 0xFFFFFFFF) / float(1 << 32)
             if unit >= mixture.asymmetric_pda_fraction:
                 seats.append((0, 0))
@@ -732,16 +787,26 @@ class SelfPlayActor:
         pda_seats: Sequence[tuple[int, int]],
         *,
         simulations: int,
+        simulations_by_row: Sequence[int] | None = None,
     ) -> list[int]:
         budgets: list[int] = []
         to_move = [int(value) for value in state_data.to_move]
+        if len(pda_seats) != len(to_move) or (
+            simulations_by_row is not None and len(simulations_by_row) != len(to_move)
+        ):
+            raise RuntimeError("per-game simulation budget rows are invalid")
         for row, seats in enumerate(pda_seats):
+            base = (
+                int(simulations_by_row[row])
+                if simulations_by_row is not None
+                else simulations
+            )
             advantage = seats[to_move[row]]
             if advantage == 0:
-                budgets.append(simulations)
+                budgets.append(base)
                 continue
             advantaged, disadvantaged = self.config.playout_budgets(
-                simulations=simulations, pda=abs(advantage)
+                simulations=base, pda=abs(advantage)
             )
             budgets.append(advantaged if advantage > 0 else disadvantaged)
         return budgets
@@ -753,7 +818,9 @@ class SelfPlayActor:
         cohort: int,
         first_game: int,
         stop_requested: Callable[[], bool],
+        stop_refill_requested: Callable[[], bool],
         progress: Callable[..., None] | None,
+        game_quota: int | None = None,
     ) -> list[GameSummary]:
         variant = self.config.variant
         states = self.native.StateBatch(
@@ -763,13 +830,15 @@ class SelfPlayActor:
             handicap=variant.handicap,
             pie=variant.pie,
         )
+        self.started_games += cohort_size
         node_count = int(states.node_count)
         trajectories: list[list[_Decision]] = [[] for _ in range(cohort_size)]
         clinch_finalizations: list[_ClinchFinalization | None] = [
             None for _ in range(cohort_size)
         ]
-        game_ids = [self._game_id(first_game + row) for row in range(cohort_size)]
-        pda_seats = self._draw_pda_seats(cohort, cohort_size)
+        game_ordinals = list(range(first_game, first_game + cohort_size))
+        game_ids = [self._game_id(index) for index in game_ordinals]
+        pda_seats = self._draw_pda_seats(cohort, cohort_size, game_ids=game_ids)
         swapped_rows = [False] * cohort_size
         pinned_versions = [
             (
@@ -780,7 +849,63 @@ class SelfPlayActor:
             for _ in range(cohort_size)
         ]
         iteration = 0
+        next_game = first_game + cohort_size
+        game_limit = first_game + (cohort_size if game_quota is None else game_quota)
+        published_rows: set[int] = set()
+        summaries: dict[int, GameSummary] = {}
+
+        def publish_finished(state_data: Any, *, force_flush: bool = False) -> None:
+            rows = [
+                row
+                for row, terminal in enumerate(state_data.terminal)
+                if terminal and row not in published_rows
+            ]
+            if not rows:
+                return
+            finished = self._finalize_rows(
+                states,
+                state_data,
+                trajectories,
+                pinned_versions,
+                rows,
+                game_ids,
+                clinch_finalizations,
+                pda_seats=pda_seats,
+                swapped_rows=swapped_rows,
+            )
+            # Do not reuse a slot until its complete game has reached replay.
+            if self.config.stream_completed_games or force_flush:
+                self._flush(
+                    model_version=pinned_versions[rows[0]][0],
+                    model_step=pinned_versions[rows[0]][1],
+                )
+            for row, summary in zip(rows, finished, strict=True):
+                ordinal = game_ordinals[row]
+                if ordinal in summaries:
+                    raise RuntimeError("completed self-play game was published twice")
+                summaries[ordinal] = summary
+                published_rows.add(row)
+                trajectories[row] = []
+            if progress is not None and self.config.stream_completed_games:
+                progress(
+                    phase="selfplay_completed",
+                    cohort=cohort,
+                    ply_wave=iteration,
+                    completed_games=self.completed_games,
+                    persisted_decisions=self.persisted_decisions,
+                    active_games=sum(not bool(value) for value in state_data.terminal),
+                )
+
         while True:
+            current_pin = (
+                self.evaluator.model_version,
+                self.evaluator.model_step,
+                str(getattr(self.evaluator, "model_identity", self.model_identity)),
+            )
+            if any(pin != current_pin for pin in pinned_versions):
+                raise RuntimeError(
+                    "model changed while an exact game cohort was active"
+                )
             if self.config.clinch_finalization == "loser-fill":
                 self._complete_clinches(states, clinch_finalizations)
             if self.config.exact_endgame_max_empty:
@@ -800,39 +925,107 @@ class SelfPlayActor:
                     solved.completions, clinch_finalizations, exact=True
                 )
             state_data = states.data()
-            if all(bool(terminal) for terminal in state_data.terminal):
+            if self.config.stream_completed_games:
+                publish_finished(state_data)
+            all_terminal = all(bool(terminal) for terminal in state_data.terminal)
+            if all_terminal and (
+                not self.config.rolling_game_slots
+                or next_game >= game_limit
+                or self._refill_stopped
+            ):
+                publish_finished(state_data)
                 break
             if stop_requested():
-                dropped_decisions = sum(len(row) for row in trajectories)
+                publish_finished(state_data, force_flush=True)
+                unfinished = [
+                    row
+                    for row, terminal in enumerate(state_data.terminal)
+                    if not terminal
+                ]
+                dropped_decisions = sum(len(trajectories[row]) for row in unfinished)
+                self._stop_observed = True
                 self.interrupted_cohorts += 1
-                self.dropped_games += cohort_size
+                self.dropped_games += len(unfinished)
                 self.dropped_decisions += dropped_decisions
                 if progress is not None:
                     progress(
                         phase="selfplay_abort",
                         cohort=cohort,
                         ply_wave=iteration,
-                        dropped_games=cohort_size,
+                        dropped_games=len(unfinished),
                         dropped_decisions=dropped_decisions,
                     )
-                return []
-            current_pin = (
-                self.evaluator.model_version,
-                self.evaluator.model_step,
-                self.model_identity,
-            )
-            if any(pin != current_pin for pin in pinned_versions):
-                raise RuntimeError(
-                    "model changed while an exact game cohort was active"
+                return [summaries[index] for index in sorted(summaries)]
+            if self.config.rolling_game_slots:
+                if stop_refill_requested():
+                    self._refill_stopped = True
+                refill = (
+                    sorted(published_rows)[: max(0, game_limit - next_game)]
+                    if not self._refill_stopped
+                    else []
                 )
+                if refill:
+                    states.reset_many(refill)
+                    self.started_games += len(refill)
+                    self.refilled_games += len(refill)
+                    for row in refill:
+                        game_ordinals[row] = next_game
+                        game_ids[row] = self._game_id(next_game)
+                        pda_seats[row] = self._draw_pda_seats(
+                            0, 1, game_ids=[game_ids[row]]
+                        )[0]
+                        clinch_finalizations[row] = None
+                        swapped_rows[row] = False
+                        published_rows.remove(row)
+                        next_game += 1
+                    state_data = states.data()
+                    if progress is not None:
+                        progress(
+                            phase="selfplay_refill",
+                            cohort=cohort,
+                            ply_wave=iteration,
+                            started_games=self.started_games,
+                            refilled_games=self.refilled_games,
+                            completed_games=self.completed_games,
+                            persisted_decisions=self.persisted_decisions,
+                        )
+                elif all_terminal:
+                    break
             to_move = [int(value) for value in state_data.to_move]
             row_pdas = [pda_seats[row][to_move[row]] for row in range(cohort_size)]
             positions = positions_from_native(state_data, pda=row_pdas)
-            mode_seed = self._seed("mode", cohort, iteration, *game_ids)
-            full_search = mode_seed / float(1 << 64) < self.config.full_probability
-            simulations = self.config.simulation_budget(full=full_search)
-            budgets = self._root_budgets(state_data, pda_seats, simulations=simulations)
-            search_seed = self._seed("search", cohort, iteration, *game_ids)
+            full_by_row = None
+            seeds_by_row = None
+            simulations_by_row = None
+            if self.config.seed_contract == "game-v1":
+                full_threshold = int(self.config.full_probability * (1 << 64))
+                full_by_row = [
+                    self._seed("mode-game-v1", game_id, len(trajectories[row]))
+                    < full_threshold
+                    for row, game_id in enumerate(game_ids)
+                ]
+                seeds_by_row = [
+                    self._seed("search-game-v1", game_id, len(trajectories[row]))
+                    for row, game_id in enumerate(game_ids)
+                ]
+                simulations_by_row = [
+                    self.config.simulation_budget(full=full) for full in full_by_row
+                ]
+                full_search = True
+                simulations = self.config.simulation_budget(full=True)
+                search_seed = 0  # Each root has an explicit independent stream.
+            else:
+                mode_seed = self._seed("mode", cohort, iteration, *game_ids)
+                full_search = mode_seed / float(1 << 64) < self.config.full_probability
+                simulations = self.config.simulation_budget(full=full_search)
+                search_seed = self._seed("search", cohort, iteration, *game_ids)
+            budgets = self._root_budgets(
+                state_data,
+                pda_seats,
+                simulations=simulations,
+                simulations_by_row=simulations_by_row,
+            )
+            seed_options = {"seeds_per_root": seeds_by_row} if seeds_by_row else {}
             search = self.native.SearchBatch(
                 states,
                 simulations=simulations,
@@ -842,6 +1035,7 @@ class SelfPlayActor:
                 deterministic_seed=search_seed,
                 simulations_per_root=budgets,
                 pda_by_seat=pda_seats,
+                **seed_options,
             )
             roots = search.root_requests()
             root_response = self.evaluator.evaluate(roots)
@@ -881,6 +1075,8 @@ class SelfPlayActor:
                 search_seed=search_seed,
                 budgets=budgets,
                 swaps=swaps,
+                full_search_by_row=full_by_row,
+                search_seeds_by_row=seeds_by_row,
             )
             selected = [int(action) for action in results.selected_actions]
             active_rows = [
@@ -910,17 +1106,7 @@ class SelfPlayActor:
                     ply_wave=iteration,
                     active_games=len(active_rows),
                 )
-        return self._finalize_rows(
-            states,
-            states.data(),
-            trajectories,
-            pinned_versions,
-            list(range(cohort_size)),
-            game_ids,
-            clinch_finalizations,
-            pda_seats=pda_seats,
-            swapped_rows=swapped_rows,
-        )
+        return [summaries[index] for index in sorted(summaries)]
 
     def _complete_clinches(
         self,
@@ -985,6 +1171,8 @@ class SelfPlayActor:
         search_seed: int,
         budgets: Sequence[int] | None = None,
         swaps: Sequence[bool] | None = None,
+        full_search_by_row: Sequence[bool] | None = None,
+        search_seeds_by_row: Sequence[int] | None = None,
     ) -> None:
         offsets = [int(value) for value in results.action_offsets]
         actions = [int(value) for value in results.actions]
@@ -1002,13 +1190,26 @@ class SelfPlayActor:
             raise RuntimeError("native search selected-action rows are invalid")
         stones_placed = list(getattr(state_data, "stones_placed"))
         terminal = [bool(value) for value in results.terminal]
+        for values in (budgets, swaps, full_search_by_row, search_seeds_by_row):
+            if values is not None and len(values) != len(positions):
+                raise RuntimeError("per-game search metadata rows are invalid")
         for row, position in enumerate(positions):
             if terminal[row]:
                 continue
             policy = None
             policy_entropy = None
             policy_surprise = 0.0
-            if full_search or self.config.record_fast_policy_targets:
+            row_full_search = (
+                full_search_by_row[row]
+                if full_search_by_row is not None
+                else full_search
+            )
+            row_search_seed = (
+                search_seeds_by_row[row]
+                if search_seeds_by_row is not None
+                else search_seed
+            )
+            if row_full_search or self.config.record_fast_policy_targets:
                 start, end = offsets[row], offsets[row + 1]
                 if end <= start or end > probabilities.size:
                     raise RuntimeError("full-search policy target is missing")
@@ -1071,21 +1272,21 @@ class SelfPlayActor:
                 _Decision(
                     position=position,
                     policy=policy,
-                    full_search=full_search,
+                    full_search=row_full_search,
                     simulations=(
                         int(budgets[row]) if budgets is not None else simulations
                     ),
                     phase=int(stones_placed[row]),
-                    search_seed=search_seed,
+                    search_seed=row_search_seed,
                     ply=len(trajectories[row]),
                     policy_weight=(
-                        1.0 if full_search else self.config.fast_policy_weight
+                        1.0 if row_full_search else self.config.fast_policy_weight
                     ),
                     policy_surprise=policy_surprise,
                     swapped=bool(swaps[row]) if swaps is not None else False,
                 )
             )
-            if full_search:
+            if row_full_search:
                 self.full_decisions += 1
             else:
                 self.fast_decisions += 1
@@ -1093,7 +1294,7 @@ class SelfPlayActor:
                 self.policy_entropy_count += 1
                 self.policy_entropy_sum += policy_entropy
                 self.policy_weight_sum += (
-                    1.0 if full_search else self.config.fast_policy_weight
+                    1.0 if row_full_search else self.config.fast_policy_weight
                 )
                 self.policy_surprise_count += 1
                 self.policy_surprise_sum += policy_surprise
@@ -1172,6 +1373,11 @@ class SelfPlayActor:
                             f"final={'exact-endgame' if clinch and clinch.exact else 'clinch-loser-fill' if clinch else 'board-full'}:"
                             f"variant={variant.label}:pda={decision.position.pda}:"
                             f"swap={'taken' if decision.swapped else 'no'}"
+                            + (
+                                ":seed_contract=game-v1"
+                                if self.config.seed_contract == "game-v1"
+                                else ""
+                            )
                         ),
                         policy_provenance=(
                             (
@@ -1216,6 +1422,7 @@ class SelfPlayActor:
             if seats != (0, 0):
                 self.asymmetric_games += 1
             self._record_source_role(samples=len(decisions))
+            self.completed_games += 1
             summaries.append(
                 GameSummary(
                     row=row,

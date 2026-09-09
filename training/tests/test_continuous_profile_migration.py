@@ -595,8 +595,9 @@ def test_additive_default_field_accepts_legacy_chain_hash(tmp_path: Path) -> Non
     # supported epoch. Removing the whole disabled inference service collapses
     # the otherwise independent pre/post-topology representations.
     assert expected <= compatible
-    # The disabled clipping/diagnostic epoch preserves both representations.
-    assert len(compatible) == 24 * len(expected)
+    # Disabled clipping/diagnostic and self-play pipeline epochs each preserve
+    # their current and prior representations.
+    assert len(compatible) == 48 * len(expected)
     # A profile that opts into a new field no longer matches releases that
     # never had it, but keeps the variants for the other additive fields.
     opted = yaml.safe_load(fixture.old_profile.read_text(encoding="utf-8"))
@@ -605,7 +606,7 @@ def test_additive_default_field_accepts_legacy_chain_hash(tmp_path: Path) -> Non
     opted_path = tmp_path / "opted.yaml"
     opted_path.write_text(yaml.safe_dump(opted, sort_keys=False), encoding="utf-8")
     opted_config = load_config(opted_path)
-    assert len(migration._compatible_source_config_sha256s(opted_config)) == 192
+    assert len(migration._compatible_source_config_sha256s(opted_config)) == 384
 
     opted.setdefault("selfplay", {}).setdefault("variants", {})[
         "handicap_classic_share"
@@ -613,7 +614,7 @@ def test_additive_default_field_accepts_legacy_chain_hash(tmp_path: Path) -> Non
     opted.setdefault("arena", {})["segment_handicap_classic_share"] = 0.5
     opted_path.write_text(yaml.safe_dump(opted, sort_keys=False), encoding="utf-8")
     assert (
-        len(migration._compatible_source_config_sha256s(load_config(opted_path))) == 48
+        len(migration._compatible_source_config_sha256s(load_config(opted_path))) == 96
     )
 
     # The head a release without scheduling or plateau additions recorded.

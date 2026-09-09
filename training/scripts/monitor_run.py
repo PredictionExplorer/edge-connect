@@ -523,6 +523,61 @@ def _cpu_actor_id(
     return None
 
 
+def _actor_physical_inference(
+    workers: Mapping[str, object], *, now_ns: int
+) -> dict[str, object]:
+    """Expose actual NN work separately from logical broker dispatch counts."""
+    by_gpu = {}
+    for name, raw_worker in workers.items():
+        worker = _mapping(raw_worker)
+        gpu_ids = worker.get("gpu_ids")
+        path = worker.get("heartbeat")
+        if (
+            worker.get("role") != "actor"
+            or not isinstance(gpu_ids, list)
+            or len(gpu_ids) != 1
+            or not isinstance(path, str)
+            or worker.get("state") not in ("running", "paused", "pausing")
+        ):
+            continue
+        heartbeat = _read_json(Path(path)) or {}
+        age = _age_seconds(heartbeat.get("heartbeat_ns"), now_ns)
+        if heartbeat.get("pid") != worker.get("pid") or age is None or age > 120:
+            continue
+        broker = _mapping(heartbeat.get("inference"))
+        physical = _mapping(broker.get("physical_inference"))
+        if not physical:
+            continue
+        values = {
+            key: value
+            for key, value in physical.items()
+            if (numeric := _number(value)) is not None and numeric >= 0
+        }
+        calls = _number(values.get("neural_calls")) or 0.0
+        rows = _number(values.get("neural_rows")) or 0.0
+        padding = _number(values.get("neural_padding_rows")) or 0.0
+        hits = _number(values.get("cache_hits")) or 0.0
+        misses = _number(values.get("cache_misses")) or 0.0
+        by_gpu[str(gpu_ids[0])] = {
+            "worker": name,
+            "pid": worker.get("pid"),
+            "heartbeat_ns": heartbeat.get("heartbeat_ns"),
+            "counters_and_gauges": values,
+            "broker_dispatches": broker.get("neural_batches"),
+            "logical_requested_rows": broker.get("requested_rows"),
+            "mean_neural_batch_rows": rows / calls if calls else None,
+            "padding_fraction": padding / rows if rows else None,
+            "prediction_cache_hit_fraction": hits / (hits + misses)
+            if hits + misses
+            else None,
+        }
+    return {
+        "available": bool(by_gpu),
+        "scope": "current actor process cumulative counters; not interval rates",
+        "by_gpu": by_gpu,
+    }
+
+
 def _actor_throughput_window(
     metrics_root: Path,
     *,
@@ -547,6 +602,14 @@ def _actor_throughput_window(
         for row in _recent_jsonl(path):
             if not _is_actor_metric(row):
                 continue
+            if row.get("record_kind") == "publication":
+                # A durable counter observation is not a completed task. Use
+                # its actual publication time only inside the window reducer.
+                row = {
+                    **row,
+                    "batch_started_ns": row.get("task_started_ns"),
+                    "batch_completed_ns": row.get("timestamp_ns"),
+                }
             started = row.get("batch_started_ns")
             completed = row.get("batch_completed_ns")
             if (
@@ -632,6 +695,18 @@ def _actor_throughput_window(
                 name: required_int(end, f"cumulative_{name}") for name in counter_names
             }
             start_ns = process_started
+        elif any(row.get("record_kind") == "publication" for row in ordered):
+            # A truncated journal cannot establish a full-window baseline.
+            # Use its observed counter delta; never sum publication deltas
+            # alongside an overlapping final-task summary.
+            first = ordered[0]
+            values = {
+                name: required_int(end, f"cumulative_{name}")
+                - required_int(first, f"cumulative_{name}")
+                for name in counter_names
+            }
+            start_ns = max(cutoff_ns, required_int(first, "batch_completed_ns"))
+            partial_processes.append(worker)
         else:
             selected = [
                 row
@@ -2259,11 +2334,12 @@ def collect_snapshot(
             warnings,
             "WARN",
             "actor_throughput_stale",
-            "no completed actor batches are available in the throughput window",
+            "no durable actor progress is available in the throughput window",
         )
     actor_fleet = {
         "workers": len(actors),
         "throughput": actor_throughput,
+        "physical_inference": _actor_physical_inference(worker_map, now_ns=now),
         "policy_supervision_rate": policy_supervision_rate,
         "active_ring_weights": (
             list(next(iter(weight_variants))) if len(weight_variants) == 1 else None

@@ -68,10 +68,16 @@ def compatible_config_epoch_payloads(
     """
 
     current = deepcopy(dict(payload))
-    representations = [current]
-    pre_clipping = without_gradient_clipping_defaults(payload)
-    if pre_clipping != current:
-        representations.append(pre_clipping)
+    pipeline_representations = [current]
+    pre_pipeline = without_selfplay_pipeline_defaults(payload)
+    if pre_pipeline != current:
+        pipeline_representations.append(pre_pipeline)
+    representations = []
+    for representation in pipeline_representations:
+        representations.append(representation)
+        pre_clipping = without_gradient_clipping_defaults(representation)
+        if pre_clipping != representation:
+            representations.append(pre_clipping)
     sources: list[dict[str, Any]] = []
     for representation in representations:
         sources.append(representation)
@@ -91,6 +97,46 @@ def compatible_config_epoch_payloads(
         if without_pause_strategy_default(source) != source:
             variants.extend(without_pause_strategy_default(row) for row in previous)
     return tuple(variants)
+
+
+def without_selfplay_pipeline_defaults(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Represent the release before optional actor pipelines and CUDA graphs."""
+    result = deepcopy(dict(payload))
+
+    def omit_defaults(parent: object, defaults: Mapping[str, object]) -> None:
+        if not isinstance(parent, dict):
+            return
+        for name, default in defaults.items():
+            if type(parent.get(name)) is type(default) and parent[name] == default:
+                parent.pop(name, None)
+
+    omit_defaults(
+        result.get("selfplay"),
+        {
+            "stream_completed_games": False,
+            "rolling_game_slots": False,
+            "seed_contract": "cohort-v1",
+        },
+    )
+    orchestration = result.get("orchestration")
+    if isinstance(orchestration, dict):
+        gpus = orchestration.get("gpus", ())
+        if isinstance(gpus, (list, tuple)):
+            for gpu in gpus:
+                if isinstance(gpu, dict) and gpu.get("actor_pipeline") is None:
+                    gpu.pop("actor_pipeline", None)
+        refresh = orchestration.get("model_refresh")
+        omit_defaults(refresh, {"compatible_cohort_work": False})
+        if isinstance(refresh, dict):
+            omit_defaults(
+                refresh.get("inference"),
+                {
+                    "cuda_graphs": False,
+                    "cuda_graph_max_entries": 8,
+                    "cuda_graph_max_bytes": 2 * 1024**3,
+                },
+            )
+    return result
 
 
 def without_gradient_clipping_defaults(
@@ -189,16 +235,27 @@ def without_efficiency_defaults(payload: Mapping[str, Any]) -> dict[str, Any]:
                 "max_wait_seconds": 0.002,
             }
             inference = refresh.get("inference")
-            if (
-                isinstance(inference, dict)
-                and inference.get("preserve_broadcast_topology") is False
-            ):
-                omit(
-                    refresh,
-                    "inference",
-                    {**defaults, "preserve_broadcast_topology": False},
+            disabled_representations = (
+                defaults,
+                {**defaults, "preserve_broadcast_topology": False},
+            )
+            graph_defaults = {
+                "cuda_graphs": False,
+                "cuda_graph_max_entries": 8,
+                "cuda_graph_max_bytes": 2 * 1024**3,
+            }
+            disabled_representations += tuple(
+                {**previous, **graph_defaults} for previous in disabled_representations
+            )
+            if isinstance(inference, dict) and any(
+                inference.keys() == expected.keys()
+                and all(
+                    type(inference[name]) is type(value) and inference[name] == value
+                    for name, value in expected.items()
                 )
-            omit(refresh, "inference", defaults)
+                for expected in disabled_representations
+            ):
+                del refresh["inference"]
     arena = result.get("arena", {})
     omit(arena, "balanced_cells", False)
     omit(arena, "cell_regression_floor_elo", -100.0)

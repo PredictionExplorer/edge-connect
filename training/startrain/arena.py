@@ -1390,7 +1390,7 @@ class ArenaRunner:
         self.search_workers = search_workers
         self.parallel_variant_groups = parallel_variant_groups
         self._shared_broker: BoundedInferenceBroker | None = None
-        self._shared_inference_metrics: dict[str, int | float] | None = None
+        self._shared_inference_metrics: dict[str, object] | None = None
         self._inference_calls = 0
         self._inference_seconds = 0.0
         self._inference_queue_wait_seconds = 0.0

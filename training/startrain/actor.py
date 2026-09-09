@@ -11,6 +11,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_EXCEPTION
 from collections import OrderedDict
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import nullcontext
 from dataclasses import asdict, is_dataclass, replace
 from pathlib import Path
 from typing import Any, Literal, cast
@@ -18,6 +19,7 @@ from typing import Any, Literal, cast
 import torch
 
 from .actor_pause import ActorPauseGate
+from .actor_publication import PublicationProgress
 from .checkpoint import (
     ModelManifest,
     load_ema_checkpoint,
@@ -25,6 +27,7 @@ from .checkpoint import (
     load_resume_cutover,
 )
 from .config import ExperimentConfig, GPUWorkerConfig, RingMixtureConfig
+from .cohort_work import CompatibleWorkCoordinator, WorkBundle, WorkLease
 from .device import (
     empty_device_cache,
     peak_memory_stats,
@@ -35,7 +38,7 @@ from .inference_batching import CohortInferenceAdapter
 from .model import GraphResTNet
 from .replay_store import ReplayStore
 from .runtime import HeartbeatReporter, RunIdentity, append_jsonl
-from .selfplay import SelfPlayActor, SelfPlayIdentity, SelfPlayMetrics
+from .selfplay import GameVariant, SelfPlayActor, SelfPlayIdentity, SelfPlayMetrics
 from .training import maybe_compile_model
 
 
@@ -49,6 +52,33 @@ def _inference_metrics(evaluator) -> dict:
     if isinstance(value, Mapping):
         return dict(value)
     raise TypeError("inference metrics must be a dataclass or mapping")
+
+
+def resolve_actor_experiment(
+    experiment: ExperimentConfig, gpu: GPUWorkerConfig
+) -> ExperimentConfig:
+    """Apply only this GPU's explicit pipeline controls to an isolated copy."""
+    pipeline = gpu.actor_pipeline
+    if pipeline is None:
+        return experiment
+    refresh = experiment.orchestration.model_refresh
+    return replace(
+        experiment,
+        selfplay=replace(
+            experiment.selfplay,
+            stream_completed_games=pipeline.stream_completed_games,
+            rolling_game_slots=pipeline.rolling_game_slots,
+            seed_contract=pipeline.seed_contract,
+        ),
+        orchestration=replace(
+            experiment.orchestration,
+            model_refresh=replace(
+                refresh,
+                compatible_cohort_work=pipeline.compatible_work,
+                inference=replace(refresh.inference, cuda_graphs=pipeline.cuda_graphs),
+            ),
+        ),
+    )
 
 
 class SharedModelRegistry:
@@ -75,7 +105,8 @@ class SharedModelRegistry:
                     None,
                 )
                 if unused is not None:
-                    self._entries.pop(unused)[0].close()
+                    with getattr(self.broker, "device_lock", nullcontext()):
+                        self._entries.pop(unused)[0].close()
                     break
                 self._condition.wait(timeout=0.1)
             if key not in self._entries:
@@ -97,6 +128,10 @@ class SharedModelRegistry:
                                 inference,
                                 cache_max_entries=entries,
                                 cache_max_bytes=byte_limit,
+                                cuda_graph_max_bytes=max(
+                                    1,
+                                    inference.cuda_graph_max_bytes // self.max_entries,
+                                ),
                             ),
                         ),
                     ),
@@ -110,7 +145,8 @@ class SharedModelRegistry:
                         Literal["champion", "candidate", "direct"], direct.role
                     ),
                 )
-                self._entries[key] = [loader.refresh(), 0]
+                with getattr(self.broker, "device_lock", nullcontext()):
+                    self._entries[key] = [loader.refresh(), 0]
             entry = self._entries.pop(key)
             self._entries[key] = entry
             entry[1] += 1
@@ -128,8 +164,9 @@ class SharedModelRegistry:
         with self._condition:
             if any(entry[1] for entry in self._entries.values()):
                 raise RuntimeError("shared model registry still has pinned cohorts")
-            for entry in self._entries.values():
-                entry[0].close()
+            with getattr(self.broker, "device_lock", nullcontext()):
+                for entry in self._entries.values():
+                    entry[0].close()
             self._entries.clear()
 
 
@@ -175,6 +212,7 @@ class ManifestModelProvider:
         run_identity: RunIdentity,
         expected_role: Literal["champion", "candidate", "direct"] = "champion",
         registry: SharedModelRegistry | None = None,
+        pinned_manifest: ModelManifest | None = None,
     ) -> None:
         self.config = config
         self.manifest_path = Path(manifest_path)
@@ -182,6 +220,7 @@ class ManifestModelProvider:
         self.run_identity = run_identity
         self.expected_role = expected_role
         self.registry = registry
+        self._pinned_manifest = pinned_manifest
         self.manifest: ModelManifest | None = None
         self.evaluator: GraphInferenceAdapter | CohortInferenceAdapter | None = None
         self._raw_model: GraphResTNet | None = None
@@ -210,7 +249,7 @@ class ManifestModelProvider:
 
     def refresh(self) -> GraphInferenceAdapter | CohortInferenceAdapter:
         if self.registry is not None:
-            manifest = load_model_manifest(self.manifest_path)
+            manifest = self._pinned_manifest or load_model_manifest(self.manifest_path)
             if (
                 manifest.role != self.expected_role
                 or manifest.run_id != self.run_identity.run_id
@@ -287,6 +326,9 @@ class ManifestModelProvider:
                     pinned_transfers=refresh.inference.pinned_transfers,
                     pinned_buffer_slots=refresh.inference.pinned_buffer_slots,
                     preserve_broadcast_topology=refresh.inference.preserve_broadcast_topology,
+                    cuda_graphs=refresh.inference.cuda_graphs,
+                    cuda_graph_max_entries=refresh.inference.cuda_graph_max_entries,
+                    cuda_graph_max_bytes=refresh.inference.cuda_graph_max_bytes,
                 ),
                 homogeneous_relational_bias=refresh.inference.homogeneous_relational_bias,
                 model_version=manifest.model_version,
@@ -498,11 +540,17 @@ class ActorSupervisor:
         games_per_batch: int | None = None,
         gpu_pause_path: str | Path | None = None,
         pause_checkpoint: Callable[[], None] | None = None,
+        work_coordinator: CompatibleWorkCoordinator | None = None,
     ) -> None:
+        experiment = resolve_actor_experiment(experiment, gpu)
         if gpu.role != "actor" or gpu.actor_batch_size is None:
             raise ValueError("actor supervisor requires an actor GPU assignment")
         selected_games = (
-            experiment.orchestration.actor_games_per_batch
+            (
+                (gpu.actor_pipeline.games_per_task or gpu.actor_batch_size)
+                if gpu.actor_pipeline is not None
+                else experiment.orchestration.actor_games_per_batch
+            )
             if games_per_batch is None
             else games_per_batch
         )
@@ -511,6 +559,9 @@ class ActorSupervisor:
                 "actor games_per_batch must be an integer at least actor_batch_size"
             )
         self.games_per_batch = selected_games
+        self.work_coordinator = work_coordinator
+        self._continuation: tuple[WorkLease, int] | None = None
+        self._active_work_provider: ManifestModelProvider | None = None
         if gpu_pause_path is not None and (
             gpu.actor_cohorts <= 1
             or gpu.actor_lanes != 1
@@ -557,6 +608,8 @@ class ActorSupervisor:
         self.candidate_manifest_path = Path(candidate_manifest_path)
         self._candidate_manifest: ModelManifest | None = None
         self._candidate_signature: tuple[int, int, int] | None = None
+        self._champion_manifest: ModelManifest | None = None
+        self._champion_signature: tuple[int, int, int] | None = None
         self.provider = ManifestModelProvider(
             experiment,
             manifest_path,
@@ -661,90 +714,142 @@ class ActorSupervisor:
                 while not stop_requested():
                     # This is the sole model refresh point. The evaluator object is
                     # never mutated while SelfPlayActor owns active games.
-                    model_role, provider = self._select_model_provider()
-                    self._reset_peak_cuda_memory()
-                    refresh_started = time.perf_counter()
-                    evaluator = provider.refresh()
-                    model_refresh_latency_seconds = (
-                        time.perf_counter() - refresh_started
+                    work_lease = (
+                        self._acquire_cohort_work(store)
+                        if self.work_coordinator is not None
+                        or self._continuation is not None
+                        else None
                     )
-                    candidate = self._read_candidate()
-                    if (
-                        candidate.run_id != self.run_identity.run_id
-                        or candidate.generation_family
-                        != self.run_identity.generation_family
-                    ):
-                        raise ValueError(
-                            "candidate manifest does not belong to the active run"
+                    if work_lease is not None:
+                        provider, evaluator = work_lease.resource
+                        self._active_work_provider = provider
+                        model_role = work_lease.metadata["model_role"]
+                        candidate = self._read_candidate()
+                        scheduling_step = work_lease.metadata["scheduling_step"]
+                        scheduling_step_source = work_lease.metadata[
+                            "scheduling_step_source"
+                        ]
+                        ring = work_lease.metadata["ring"]
+                        active_ring_weights = (
+                            self.experiment.orchestration.ring_mixture.weights_for_step(
+                                scheduling_step
+                            )
                         )
-                    lag = candidate.model_step - evaluator.model_step
-                    plateau = self.experiment.orchestration.plateau
-                    if (
-                        model_role == "champion"
-                        and plateau.enabled
-                        and lag > plateau.max_learner_champion_lag_steps
-                    ):
-                        self.heartbeat.advance(
-                            phase="champion_selfplay_plateau",
-                            candidate_step=candidate.model_step,
-                            champion_step=evaluator.model_step,
-                            model_lag=lag,
+                        model_refresh_latency_seconds = 0.0
+                    else:
+                        model_role, provider = self._select_model_provider()
+                        self._reset_peak_cuda_memory()
+                        refresh_started = time.perf_counter()
+                        evaluator = provider.refresh()
+                        model_refresh_latency_seconds = (
+                            time.perf_counter() - refresh_started
                         )
-                    counts = store.sample_counts_by_ring(
-                        self.experiment.orchestration.ring_mixture.rings,
-                        run_id=self.run_identity.run_id,
-                        generation_family=self.run_identity.generation_family,
-                    )
-                    scheduling_step, scheduling_step_source = (
-                        self._read_learner_scheduling_step(
-                            fallback_step=candidate.model_step
+                        candidate = self._read_candidate()
+                        if (
+                            candidate.run_id != self.run_identity.run_id
+                            or candidate.generation_family
+                            != self.run_identity.generation_family
+                        ):
+                            raise ValueError(
+                                "candidate manifest does not belong to the active run"
+                            )
+                        lag = candidate.model_step - evaluator.model_step
+                        plateau = self.experiment.orchestration.plateau
+                        if (
+                            model_role == "champion"
+                            and plateau.enabled
+                            and lag > plateau.max_learner_champion_lag_steps
+                        ):
+                            self.heartbeat.advance(
+                                phase="champion_selfplay_plateau",
+                                candidate_step=candidate.model_step,
+                                champion_step=evaluator.model_step,
+                                model_lag=lag,
+                            )
+                        counts = store.sample_counts_by_ring(
+                            self.experiment.orchestration.ring_mixture.rings,
+                            run_id=self.run_identity.run_id,
+                            generation_family=self.run_identity.generation_family,
                         )
-                    )
-                    if (
-                        model_role == "champion"
-                        and self.candidate_provider is not None
-                        and self._champion_outside_replay_window(
-                            champion_step=evaluator.model_step,
+                        scheduling_step, scheduling_step_source = (
+                            self._read_learner_scheduling_step(
+                                fallback_step=candidate.model_step
+                            )
+                        )
+                        if (
+                            model_role == "champion"
+                            and self.candidate_provider is not None
+                            and self._champion_outside_replay_window(
+                                champion_step=evaluator.model_step,
+                                learner_step=scheduling_step,
+                            )
+                        ):
+                            # Champion games this far behind the learner would be
+                            # generated only for the replay window to discard them,
+                            # so the batch plays the candidate instead.
+                            stale_champion_step = evaluator.model_step
+                            if self.registry is not None:
+                                provider.release()
+                            model_role, provider = "candidate", self.candidate_provider
+                            evaluator = provider.refresh()
+                            self.heartbeat.advance(
+                                phase="champion_selfplay_stale",
+                                candidate_step=candidate.model_step,
+                                champion_step=stale_champion_step,
+                                scheduling_step=scheduling_step,
+                            )
+                        active_ring_weights = (
+                            self.experiment.orchestration.ring_mixture.weights_for_step(
+                                scheduling_step
+                            )
+                        )
+                        ring = self.scheduler.choose(
+                            counts,
                             learner_step=scheduling_step,
                         )
-                    ):
-                        # Champion games this far behind the learner would be
-                        # generated only for the replay window to discard them,
-                        # so the batch plays the candidate instead.
-                        stale_champion_step = evaluator.model_step
-                        if self.registry is not None:
-                            provider.release()
-                        model_role, provider = "candidate", self.candidate_provider
-                        evaluator = provider.refresh()
-                        self.heartbeat.advance(
-                            phase="champion_selfplay_stale",
-                            candidate_step=candidate.model_step,
-                            champion_step=stale_champion_step,
-                            scheduling_step=scheduling_step,
-                        )
-                    active_ring_weights = (
-                        self.experiment.orchestration.ring_mixture.weights_for_step(
-                            scheduling_step
-                        )
-                    )
-                    ring = self.scheduler.choose(
-                        counts,
-                        learner_step=scheduling_step,
-                    )
-                    if self.allowed_rings is not None:
-                        ring = self.scheduler.random.choice(self.allowed_rings)
+                        if self.allowed_rings is not None:
+                            ring = self.scheduler.random.choice(self.allowed_rings)
                     generation = store.lease_generation(
                         self.run_identity, self.actor_id
                     )
-                    variant = self.experiment.selfplay.variants.draw(
-                        self._variant_seed(batches, generation)
+                    variant = (
+                        work_lease.metadata["variant"]
+                        if work_lease is not None
+                        else self.experiment.selfplay.variants.draw(
+                            self._variant_seed(batches, generation)
+                        )
+                    )
+                    requested_games = (
+                        work_lease.metadata["games"]
+                        if work_lease is not None
+                        else self.games_per_batch
                     )
                     batch_config = replace(
                         self.experiment.selfplay,
                         rings=ring,
                         batch_size=self.gpu.actor_batch_size,
-                        games=self.games_per_batch,
+                        games=requested_games,
                     ).with_variant(variant)
+                    if work_lease is None and batch_config.rolling_game_slots:
+                        champion = self._read_champion()
+                        category = f"{variant.mode}-{'pie' if variant.pie else 'handicap' if variant.handicap > 1 else 'standard'}"
+                        work_lease = WorkLease(
+                            0,
+                            batches,
+                            {
+                                "requested_model_role": model_role,
+                                "model_role": model_role,
+                                "ring": ring,
+                                "mode_category": category,
+                                "variant": variant,
+                                "selection": (model_role, ring, category),
+                                "candidate_identity_at_start": candidate.model_identity,
+                                "champion_identity_at_start": champion.model_identity,
+                                "games": requested_games,
+                                "transient_provider": False,
+                            },
+                            (provider, evaluator),
+                        )
                     set_score_utility_weight = getattr(
                         evaluator, "set_score_utility_weight", None
                     )
@@ -765,6 +870,19 @@ class ActorSupervisor:
                         scheduling_step=scheduling_step,
                         scheduling_step_source=scheduling_step_source,
                         active_ring_weights=active_ring_weights,
+                        effective_coordinated_work=self.work_coordinator is not None,
+                        **(
+                            {
+                                "work_bundle": work_lease.bundle_id,
+                                "work_lease": work_lease.index,
+                                "requested_model_role": work_lease.metadata[
+                                    "requested_model_role"
+                                ],
+                                "requested_games": requested_games,
+                            }
+                            if work_lease is not None
+                            else {}
+                        ),
                     )
                     evaluator_calls_before = int(
                         getattr(evaluator, "evaluator_calls", 0)
@@ -786,14 +904,96 @@ class ActorSupervisor:
                     )
                     if self._pause_checkpoint is not None:
                         selfplay.pause_checkpoint = self._pause_checkpoint
+                    publication = (
+                        PublicationProgress(
+                            metadata={
+                                "schema_version": 1,
+                                "worker": self.actor_id,
+                                "process_started_ns": process_started_ns,
+                                "task_started_ns": batch_started_ns,
+                                "gpu_id": self.gpu.gpu_id,
+                                "physical_gpu_id": self.gpu.gpu_id
+                                if self.device.type == "cuda"
+                                else None,
+                                "compute_device": self.device.type,
+                                "lane_id": self.lane_id,
+                                "run_id": self.run_identity.run_id,
+                                "generation_family": self.run_identity.generation_family,
+                                "generation": generation,
+                                "batch": batches,
+                                "ring": ring,
+                                "variant": variant.label,
+                                "segment": variant.segment,
+                                "mode": variant.mode,
+                                "handicap": variant.handicap,
+                                "pie": variant.pie,
+                                "model_role": model_role,
+                                "model_version": evaluator.model_version,
+                                "model_identity": evaluator.model_identity,
+                                "model_step": evaluator.model_step,
+                                "scheduling_step": scheduling_step,
+                                "active_ring_weights": active_ring_weights,
+                                "effective_coordinated_work": self.work_coordinator
+                                is not None,
+                                **(
+                                    {
+                                        "work_bundle": work_lease.bundle_id,
+                                        "work_lease": work_lease.index,
+                                        "requested_model_role": work_lease.metadata[
+                                            "requested_model_role"
+                                        ],
+                                        "planned_task_games": requested_games,
+                                    }
+                                    if work_lease is not None
+                                    else {}
+                                ),
+                            },
+                            base_games=cumulative_games,
+                            base_samples=cumulative_samples,
+                            base_evaluator_rows=cumulative_evaluator_rows,
+                            base_wall_seconds=cumulative_batch_wall_seconds,
+                            task_started=started,
+                            evaluator_rows=lambda: (
+                                int(getattr(evaluator, "evaluator_rows", 0))
+                                - evaluator_rows_before
+                            ),
+                            heartbeat=self.heartbeat.advance,
+                            emit=lambda record: append_jsonl(self.metrics_path, record),
+                        )
+                        if batch_config.stream_completed_games
+                        else None
+                    )
                     try:
+                        run_options = (
+                            {
+                                "stop_refill_requested": self._stop_refill_gate(
+                                    work_lease.metadata
+                                )
+                            }
+                            if batch_config.rolling_game_slots
+                            and work_lease is not None
+                            else {}
+                        )
                         summaries = selfplay.run(
                             stop_requested=stop_requested,
-                            progress=self.heartbeat.advance,
+                            progress=publication.progress
+                            if publication is not None
+                            else self.heartbeat.advance,
+                            **run_options,
                         )
                     finally:
-                        if self.registry is not None:
-                            provider.release()
+                        try:
+                            if publication is not None:
+                                publication.finish()
+                        finally:
+                            if self.registry is not None:
+                                provider.release()
+                            elif work_lease is not None and work_lease.metadata.get(
+                                "transient_provider"
+                            ):
+                                assert isinstance(evaluator, GraphInferenceAdapter)
+                                evaluator.close()
+                            self._active_work_provider = None
                     elapsed = time.monotonic() - started
                     evaluator_calls = (
                         int(getattr(evaluator, "evaluator_calls", 0))
@@ -814,6 +1014,31 @@ class ActorSupervisor:
                         if isinstance(measured_metrics, SelfPlayMetrics)
                         else SelfPlayMetrics()
                     )
+                    started_games, remaining = 0, 0
+                    if work_lease is not None:
+                        started_games = len(summaries) + selfplay_metrics.dropped_games
+                        cancelling = (
+                            stop_requested() or selfplay_metrics.dropped_games > 0
+                        )
+                        if self.work_coordinator is not None:
+                            remaining = self.work_coordinator.record_outcome(
+                                work_lease,
+                                requested=requested_games,
+                                started=started_games,
+                                completed=len(summaries),
+                                dropped=selfplay_metrics.dropped_games,
+                                cancelling=cancelling,
+                            )
+                        else:
+                            remaining = (
+                                0 if cancelling else requested_games - started_games
+                            )
+                        if remaining:
+                            self._continuation = (
+                                replace(work_lease, resource=None),
+                                remaining,
+                            )
+
                     wins = sum(summary.winner == 0 for summary in summaries)
                     losses = sum(summary.winner == 1 for summary in summaries)
                     if wins + losses != len(summaries):
@@ -907,6 +1132,20 @@ class ActorSupervisor:
                             "generation": generation,
                             "batch": batches,
                             "record_sequence": batches,
+                            **(
+                                {
+                                    "work_bundle": work_lease.bundle_id,
+                                    "work_lease": work_lease.index,
+                                    "requested_model_role": work_lease.metadata[
+                                        "requested_model_role"
+                                    ],
+                                    "planned_games": requested_games,
+                                    "started_games": started_games,
+                                    "continuation_games": remaining,
+                                }
+                                if work_lease is not None
+                                else {}
+                            ),
                             "process_started_ns": process_started_ns,
                             "ring": ring,
                             "variant": variant.label,
@@ -1042,7 +1281,9 @@ class ActorSupervisor:
                                 0 if replay_eligible_at_commit else samples
                             ),
                             **(
-                                self.history_pool.last_selection_metrics
+                                work_lease.metadata.get("history_metrics", {})
+                                if work_lease is not None
+                                else self.history_pool.last_selection_metrics
                                 if self.history_pool is not None
                                 else {}
                             ),
@@ -1077,6 +1318,14 @@ class ActorSupervisor:
             final_phase = "failed"
             raise
         finally:
+            if self._active_work_provider is not None:
+                active = self._active_work_provider
+                self._active_work_provider = None
+                if active.registry is not None:
+                    active.release()
+                elif active.evaluator is not None:
+                    assert isinstance(active.evaluator, GraphInferenceAdapter)
+                    active.evaluator.close()
             if self.registry is not None:
                 self.provider.release()
                 if self.candidate_provider is not None:
@@ -1106,6 +1355,14 @@ class ActorSupervisor:
             max_wait_seconds=configuration.max_wait_seconds,
         )
         registry = SharedModelRegistry(broker, max_entries=self.gpu.actor_cohorts + 2)
+        work_coordinator = (
+            CompatibleWorkCoordinator(
+                cohort_count=self.gpu.actor_cohorts,
+                seed=self.experiment.selfplay.seed + self.gpu.gpu_id * 1_000_003,
+            )
+            if self.experiment.orchestration.model_refresh.compatible_cohort_work
+            else None
+        )
         gate: ActorPauseGate | None = None
         if self.gpu_pause_path is not None:
             gate = ActorPauseGate(
@@ -1144,6 +1401,7 @@ class ActorSupervisor:
                     lane_id=self.lane_id,
                     actor_id=f"{self.actor_id}-cohort-{cohort}",
                     registry=registry,
+                    work_coordinator=work_coordinator,
                     allowed_rings=self.allowed_rings,
                     games_per_batch=self.games_per_batch,
                     **paths,
@@ -1203,6 +1461,12 @@ class ActorSupervisor:
                             cohorts=len(children),
                             cohort_progress=progress,
                             inference=broker.metrics_snapshot(),
+                            effective_coordinated_work=work_coordinator is not None,
+                            **(
+                                {"compatible_work": work_coordinator.metrics_snapshot()}
+                                if work_coordinator is not None
+                                else {}
+                            ),
                         )
                         if gate is not None:
                             details.update(
@@ -1250,6 +1514,8 @@ class ActorSupervisor:
         finally:
             if gate is not None:
                 gate.close()
+            if work_coordinator is not None:
+                work_coordinator.close()
             broker.shutdown(wait=True, cancel_pending=False)
             registry.close()
             self.heartbeat.close(final_phase=phase)
@@ -1277,6 +1543,266 @@ class ActorSupervisor:
             )
         ).encode("utf-8")
         return int.from_bytes(hashlib.sha256(encoded).digest()[:8], "big")
+
+    def _work_ring_weights(
+        self, counts: Mapping[int, int], step: int
+    ) -> dict[int, float]:
+        if self.allowed_rings is not None:
+            return dict.fromkeys(self.allowed_rings, 1.0)
+        mixture = self.experiment.orchestration.ring_mixture
+        explicit = mixture.weights_for_step(step)
+        if explicit is not None:
+            return dict(zip(mixture.rings, explicit, strict=True))
+        eligible = mixture.active_rings(sum(counts.values()))
+        target = max((counts.get(ring, 0) for ring in eligible), default=0)
+        return {
+            ring: mixture.uniform_weight
+            + mixture.deficit_weights[mixture.rings.index(ring)]
+            * ((target - counts.get(ring, 0)) / target if target else 0.0)
+            for ring in eligible
+        }
+
+    def _new_work_bundle(
+        self,
+        coordinator: CompatibleWorkCoordinator | None,
+        store,
+        *,
+        selection: tuple[str, int, str] | None = None,
+        games: int | None = None,
+        preserved_variant: GameVariant | None = None,
+    ) -> WorkBundle:
+        refresh = self.experiment.orchestration.model_refresh
+        candidate = self._read_candidate()
+        champion = self._read_champion()
+        for manifest in (candidate, champion):
+            if (
+                manifest.run_id != self.run_identity.run_id
+                or manifest.generation_family != self.run_identity.generation_family
+            ):
+                raise ValueError("coordinated model manifest belongs to another run")
+        step, step_source = self._read_learner_scheduling_step(
+            fallback_step=candidate.model_step
+        )
+        if selection is None:
+            assert coordinator is not None
+            source = refresh.selfplay_source
+            if source in ("candidate", "champion"):
+                roles = {source: 1.0}
+            else:
+                historical = (
+                    refresh.history_probability
+                    if source == "candidate_champion_history_mix"
+                    else 0.0
+                )
+                roles = {
+                    "candidate": refresh.candidate_probability,
+                    "history": historical,
+                    "champion": 1 - refresh.candidate_probability - historical,
+                }
+            counts = store.sample_counts_by_ring(
+                self.experiment.orchestration.ring_mixture.rings,
+                run_id=self.run_identity.run_id,
+                generation_family=self.run_identity.generation_family,
+            )
+            rings = self._work_ring_weights(counts, step)
+            requested, ring = coordinator.choice.choose(
+                {
+                    (role, board): rw * bw
+                    for role, rw in roles.items()
+                    for board, bw in rings.items()
+                }
+            )
+        else:
+            requested, ring, _ = selection
+        variants = self.experiment.selfplay.variants
+        modes = (
+            {
+                "classic-standard": variants.classic,
+                "double-standard": variants.standard,
+                "classic-pie": variants.pie * variants.pie_classic_share,
+                "double-pie": variants.pie * (1 - variants.pie_classic_share),
+                "classic-handicap": variants.handicap * variants.handicap_classic_share,
+                "double-handicap": variants.handicap
+                * (1 - variants.handicap_classic_share),
+            }
+            if variants.enabled
+            else {self.experiment.selfplay.variant.label: 1.0}
+        )
+        lease_modes = []
+        count = (
+            coordinator.cohort_count
+            if selection is None and coordinator is not None
+            else 1
+        )
+        for _ in range(count):
+            if selection is None:
+                assert coordinator is not None
+                category = coordinator.choose_mode((requested, ring), modes)
+            else:
+                category = selection[2]
+            lease_selection = (requested, ring, category)
+            if preserved_variant is not None:
+                variant = preserved_variant
+            elif not variants.enabled:
+                variant = self.experiment.selfplay.variant
+            elif category.endswith("-standard"):
+                variant = GameVariant(mode=category.removesuffix("-standard"))
+            elif category.endswith("-pie"):
+                variant = GameVariant(mode=category.removesuffix("-pie"), pie=True)
+            else:
+                mode = category.removesuffix("-handicap")
+                severity = (
+                    coordinator.choose_severity(
+                        lease_selection, variants.handicap_min, variants.handicap_max
+                    )
+                    if coordinator is not None
+                    else self.model_random.randint(
+                        variants.handicap_min, variants.handicap_max
+                    )
+                )
+                variant = GameVariant(mode=mode, handicap=severity)
+            lease_modes.append(
+                {
+                    "mode_category": category,
+                    "variant": variant,
+                    "selection": lease_selection,
+                }
+            )
+        random_source = (
+            coordinator.random if coordinator is not None else self.model_random
+        )
+        actual = requested
+        selected = candidate if requested == "candidate" else champion
+        fallback = None
+        history_metrics = {}
+        if requested == "history":
+            assert self.history_pool is not None
+            historical = self.history_pool.select(
+                random_source=random_source,
+                minimum_model_step=max(
+                    0, step - self.experiment.learner.max_replay_lag_steps + 1
+                ),
+                maximum_model_step=step,
+                exclude={candidate.model_identity, champion.model_identity},
+            )
+            history_metrics = dict(self.history_pool.last_selection_metrics)
+            if historical is not None:
+                selected = load_model_manifest(historical.manifest_path)
+            else:
+                actual, fallback = "champion", "history_unavailable"
+        if (
+            actual == "champion"
+            and self.candidate_provider is not None
+            and self._champion_outside_replay_window(
+                champion_step=selected.model_step, learner_step=step
+            )
+        ):
+            selected, actual, fallback = (
+                candidate,
+                "candidate",
+                "champion_outside_replay_window",
+            )
+        immutable = selected.artifact_manifest or selected.path
+        direct = load_model_manifest(immutable)
+        metadata = {
+            "requested_model_role": requested,
+            "model_role": actual,
+            "ring": ring,
+            "model_identity": direct.model_identity,
+            "model_step": direct.model_step,
+            "model_manifest": str(immutable),
+            "candidate_identity_at_start": candidate.model_identity,
+            "champion_identity_at_start": champion.model_identity,
+            "scheduling_step": step,
+            "scheduling_step_source": step_source,
+            "fallback_reason": fallback,
+            "history_metrics": history_metrics,
+            "games": self.games_per_batch if games is None else games,
+            "transient_provider": True,
+        }
+
+        if coordinator is None:
+            metadata.update(lease_modes[0])
+
+        def provider():
+            return ManifestModelProvider(
+                self.experiment,
+                immutable,
+                device=str(self.device),
+                run_identity=self.run_identity,
+                registry=self.registry,
+                pinned_manifest=direct,
+                expected_role=cast(
+                    Literal["champion", "candidate", "direct"], direct.role
+                ),
+            )
+
+        reservation = provider()
+        if self.registry is not None:
+            reservation.refresh()
+
+        def acquire():
+            selected_provider = provider()
+            return selected_provider, selected_provider.refresh()
+
+        return WorkBundle(
+            metadata,
+            acquire,
+            reservation.release,
+            tuple(lease_modes) if coordinator is not None else None,
+        )
+
+    def _acquire_cohort_work(self, store) -> WorkLease:
+        if self._continuation is not None:
+            previous, games = self._continuation
+            # Continue the promised logical quota with fresh model weights. The
+            # new actor generation gives every newly started game a new seed.
+            bundle = self._new_work_bundle(
+                None,
+                store,
+                selection=previous.metadata["selection"],
+                games=games,
+                preserved_variant=previous.metadata["variant"],
+            )
+            metadata = dict(bundle.metadata)
+            try:
+                resource = bundle.acquire()
+            finally:
+                bundle.release_reservation()
+            self._continuation = None
+            return WorkLease(previous.bundle_id, previous.index, metadata, resource)
+        assert self.work_coordinator is not None
+        return self.work_coordinator.acquire(
+            lambda coordinator: self._new_work_bundle(coordinator, store)
+        )
+
+    def _stop_refill_gate(self, metadata: Mapping[str, Any]) -> Callable[[], bool]:
+        began = time.monotonic()
+        pipeline = self.gpu.actor_pipeline
+        maximum = pipeline.max_model_pin_seconds if pipeline is not None else 3600.0
+        next_check = began
+        stopping = False
+
+        def requested() -> bool:
+            nonlocal next_check, stopping
+            now = time.monotonic()
+            if stopping or now - began >= maximum:
+                stopping = True
+                return True
+            if now < next_check:
+                return False
+            next_check = now + max(
+                1.0, self.experiment.orchestration.model_refresh.manifest_poll_seconds
+            )
+            candidate = self._read_candidate()
+            champion = self._read_champion()
+            stopping = (
+                candidate.model_identity != metadata["candidate_identity_at_start"]
+                or champion.model_identity != metadata["champion_identity_at_start"]
+            )
+            return stopping
+
+        return requested
 
     def _select_model_provider(
         self,
@@ -1331,6 +1857,23 @@ class ActorSupervisor:
         manifest = load_model_manifest(self.candidate_manifest_path)
         self._candidate_signature = signature
         self._candidate_manifest = manifest
+        return manifest
+
+    def _read_champion(self) -> ModelManifest:
+        """Verify changed pointers; ordinary refill polls only inspect metadata."""
+        path = self.provider.manifest_path
+        stat = path.stat()
+        signature = (stat.st_mtime_ns, stat.st_size, stat.st_ino)
+        if (
+            self._champion_signature == signature
+            and self._champion_manifest is not None
+        ):
+            return self._champion_manifest
+        manifest = load_model_manifest(path)
+        # Update only after full verification succeeds. A failed replacement
+        # must never become a trusted signature on the next poll.
+        self._champion_signature = signature
+        self._champion_manifest = manifest
         return manifest
 
     def _champion_outside_replay_window(
