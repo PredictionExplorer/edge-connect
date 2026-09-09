@@ -6,8 +6,10 @@ import hashlib
 import fcntl
 import os
 import sqlite3
+import stat
 import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterator, Mapping, Sequence
@@ -73,6 +75,24 @@ class ReplayStoreCancelled(RuntimeError):
 def _check_cancelled(cancel_requested: Callable[[], bool] | None) -> None:
     if cancel_requested is not None and cancel_requested():
         raise ReplayStoreCancelled("replay store integrity initialization cancelled")
+
+
+@dataclass(frozen=True, slots=True)
+class _FileHash:
+    checksum: str
+    identity: tuple[int, int, int, int, int]
+    stable: bool
+
+
+def _stat_identity(stat: os.stat_result) -> tuple[int, int, int, int, int]:
+    return stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns
+
+
+def _file_identity(path: Path) -> tuple[int, int, int, int, int] | None:
+    try:
+        return _stat_identity(path.stat())
+    except FileNotFoundError:
+        return None
 
 
 @dataclass(frozen=True, slots=True)
@@ -291,6 +311,7 @@ class ReplayStore:
             self.manifest_path, timeout=30.0, isolation_level=None
         )
         try:
+            self._manifest_inode = _file_identity(self.manifest_path)
             self.connection.row_factory = sqlite3.Row
             self.connection.execute("PRAGMA foreign_keys=ON")
             self.connection.execute("PRAGMA busy_timeout=30000")
@@ -578,18 +599,14 @@ class ReplayStore:
             raise
         return generation
 
-    def reconcile_orphans(
-        self, *, cancel_requested: Callable[[], bool] | None = None
-    ) -> dict[str, int]:
-        if cancel_requested is not None and not callable(cancel_requested):
-            raise TypeError("cancel_requested must be callable or None")
-        try:
-            _check_cancelled(cancel_requested)
-        except ReplayStoreCancelled:
-            self.close()
-            raise
-        lock_path = self.root / ".reconcile.lock"
-        descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o640)
+    @contextmanager
+    def _reconciliation_lock(
+        self, cancel_requested: Callable[[], bool] | None
+    ) -> Iterator[None]:
+        _check_cancelled(cancel_requested)
+        descriptor = os.open(
+            self.root / ".reconcile.lock", os.O_CREAT | os.O_RDWR, 0o640
+        )
         locked = False
         try:
             if cancel_requested is None:
@@ -604,39 +621,138 @@ class ReplayStore:
                         time.sleep(0.05)
             locked = True
             _check_cancelled(cancel_requested)
-            return (
-                self._reconcile_orphans_locked()
-                if cancel_requested is None
-                else self._reconcile_orphans_locked(cancel_requested=cancel_requested)
-            )
-        except ReplayStoreCancelled:
-            self.close()
-            raise
+            self._assert_manifest_identity()
+            yield
         finally:
             if locked:
                 fcntl.flock(descriptor, fcntl.LOCK_UN)
             os.close(descriptor)
 
-    def _reconcile_orphans_locked(
+    def _assert_manifest_identity(self) -> None:
+        current = _file_identity(self.manifest_path)
+        if (
+            current is None
+            or self._manifest_inode is None
+            or current[:2] != self._manifest_inode[:2]
+        ):
+            raise RuntimeError(
+                "replay manifest was replaced during integrity reconciliation"
+            )
+
+    def reconcile_orphans(
         self, *, cancel_requested: Callable[[], bool] | None = None
+    ) -> dict[str, int]:
+        """Hash every ready-row snapshot outside the exclusive repair lock.
+
+        Concurrent successful opens never share or cache checksum verdicts.
+        After hashing, current metadata and file identities are revalidated;
+        only changed observations require a serialized rehash. Writers may
+        append after the snapshot, as with the previous SQLite cursor scan.
+        """
+        if cancel_requested is not None and not callable(cancel_requested):
+            raise TypeError("cancel_requested must be callable or None")
+        marker_path = self.root / "restore-marker.json"
+        try:
+            with self._reconciliation_lock(cancel_requested):
+                marker = _file_identity(marker_path)
+                metrics = self._clean_orphan_files_locked(
+                    restored_ledger=marker is not None,
+                    cancel_requested=cancel_requested,
+                )
+                self._assert_restore_marker(marker)
+                snapshot = [
+                    (
+                        int(row["id"]),
+                        str(row["relative_path"]),
+                        str(row["checksum_sha256"]),
+                    )
+                    for row in self.connection.execute(
+                        "SELECT id, relative_path, checksum_sha256 FROM shards WHERE state = 'ready'"
+                    )
+                ]
+            observations = []
+            for row in snapshot:
+                _check_cancelled(cancel_requested)
+                observations.append(
+                    (row, self._observe_file(self.root / row[1], cancel_requested))
+                )
+            # Only metadata/stat validation and exceptional repairs serialize.
+            with self._reconciliation_lock(cancel_requested):
+                self._assert_restore_marker(marker)
+                current = {
+                    int(row["id"]): (
+                        str(row["relative_path"]),
+                        str(row["checksum_sha256"]),
+                    )
+                    for row in self.connection.execute(
+                        "SELECT id, relative_path, checksum_sha256 FROM shards WHERE state = 'ready'"
+                    )
+                }
+                for row, observed in observations:
+                    _check_cancelled(cancel_requested)
+                    active = current.get(row[0])
+                    if active is None:
+                        continue  # GC or another reconciler retired this row.
+                    if (
+                        active == row[1:]
+                        and observed is not None
+                        and observed.stable
+                        and observed.checksum == row[2]
+                        and _file_identity(self.root / row[1]) == observed.identity
+                    ):
+                        continue
+                    kind = self._repair_observation_locked(
+                        row, observed, cancel_requested, restore_marker=marker
+                    )
+                    if kind is not None:
+                        metrics[kind] += 1
+                _check_cancelled(cancel_requested)
+                self._assert_manifest_identity()
+                self._assert_restore_marker(marker)
+                if marker is not None and _file_identity(marker_path) == marker:
+                    marker_path.unlink(missing_ok=True)
+            return metrics
+        except BaseException:
+            # A cancelled or incomplete integrity pass never exposes a usable
+            # store, including callers explicitly reconciling an existing one.
+            self.close()
+            raise
+
+    def _assert_restore_marker(
+        self, expected: tuple[int, int, int, int, int] | None
+    ) -> None:
+        current = _file_identity(self.root / "restore-marker.json")
+        if current is not None and current != expected:
+            raise RuntimeError(
+                "replay restore marker changed during integrity reconciliation"
+            )
+
+    def _clean_orphan_files_locked(
+        self, *, restored_ledger: bool, cancel_requested: Callable[[], bool] | None
     ) -> dict[str, int]:
         referenced = {
             str(row["relative_path"])
             for row in self.connection.execute("SELECT relative_path FROM shards")
         }
-        removed_files = 0
-        preserved_files = 0
-        restore_marker = self.root / "restore-marker.json"
-        restored_ledger = restore_marker.is_file()
+        metrics = {
+            "orphan_files": 0,
+            "post_restore_orphans": 0,
+            "missing_committed": 0,
+            "corrupt_committed": 0,
+        }
         now = time.time()
         for path in self.shard_directory.glob("*"):
             _check_cancelled(cancel_requested)
             relative = str(path.relative_to(self.root))
+            try:
+                details = path.stat()
+            except FileNotFoundError:
+                continue
             if (
-                path.is_file()
+                stat.S_ISREG(details.st_mode)
                 and (path.suffix == ".npz" or path.name.endswith(".tmp"))
                 and relative not in referenced
-                and (restored_ledger or now - path.stat().st_mtime >= 300.0)
+                and (restored_ledger or now - details.st_mtime >= 300.0)
             ):
                 if restored_ledger:
                     quarantine = self.quarantine_directory / (
@@ -646,87 +762,107 @@ class ReplayStore:
                         os.replace(path, quarantine)
                     except FileNotFoundError:
                         continue
-                    preserved_files += 1
+                    metrics["post_restore_orphans"] += 1
                 else:
                     path.unlink(missing_ok=True)
-                    removed_files += 1
-        missing: list[int] = []
-        corrupt: list[tuple[int, str, str]] = []
-        try:
-            for row in self.connection.execute(
-                """
-                SELECT id, relative_path, checksum_sha256 FROM shards
-                WHERE state = 'ready'
-                """
-            ):
-                _check_cancelled(cancel_requested)
-                source = self.root / str(row["relative_path"])
-                if not source.is_file():
-                    missing.append(int(row["id"]))
-                    continue
-                checksum = (
-                    _sha256(source)
-                    if cancel_requested is None
-                    else _sha256(source, cancel_requested=cancel_requested)
-                )
-                if checksum != str(row["checksum_sha256"]):
-                    quarantine = self.quarantine_directory / (
-                        f"corrupt-{int(row['id']):012d}-{source.name}"
-                    )
-                    os.replace(source, quarantine)
-                    corrupt.append(
-                        (
-                            int(row["id"]),
-                            str(quarantine.relative_to(self.root)),
-                            "checksum mismatch",
-                        )
-                    )
-        except ReplayStoreCancelled:
-            # Moves already made for verified corrupt files must be reflected
-            # in the manifest before abandoning the remaining integrity scan.
-            self._record_reconciliation_quarantines(missing, corrupt)
-            raise
-        self._record_reconciliation_quarantines(missing, corrupt)
-        _check_cancelled(cancel_requested)
-        if restored_ledger:
-            restore_marker.unlink(missing_ok=True)
-        return {
-            "orphan_files": removed_files,
-            "post_restore_orphans": preserved_files,
-            "missing_committed": len(missing),
-            "corrupt_committed": len(corrupt),
-        }
+                    metrics["orphan_files"] += 1
+        return metrics
 
-    def _record_reconciliation_quarantines(
-        self, missing: Sequence[int], corrupt: Sequence[tuple[int, str, str]]
-    ) -> None:
-        if missing or corrupt:
-            self.connection.execute("BEGIN IMMEDIATE")
-            try:
-                self.connection.executemany(
-                    """
-                    UPDATE shards
-                    SET state = 'quarantined', quarantine_reason = ?
-                    WHERE id = ?
-                    """,
-                    (("committed file missing", shard_id) for shard_id in missing),
-                )
-                self.connection.executemany(
-                    """
-                    UPDATE shards
-                    SET relative_path = ?, state = 'quarantined',
-                        quarantine_reason = ?
-                    WHERE id = ?
-                    """,
-                    (
-                        (relative_path, reason, shard_id)
-                        for shard_id, relative_path, reason in corrupt
-                    ),
-                )
+    @staticmethod
+    def _observe_file(
+        path: Path, cancel_requested: Callable[[], bool] | None
+    ) -> _FileHash | None:
+        _check_cancelled(cancel_requested)
+        try:
+            if not path.is_file():
+                return None
+            return _hash_file(path, cancel_requested=cancel_requested)
+        except FileNotFoundError:
+            return None  # Revalidated against the manifest while repairing.
+
+    def _repair_observation_locked(
+        self,
+        snapshot: tuple[int, str, str],
+        observed: _FileHash | None,
+        cancel_requested: Callable[[], bool] | None,
+        *,
+        restore_marker: tuple[int, int, int, int, int] | None,
+    ) -> str | None:
+        # GC/writers do not take the reconciliation flock. A short write
+        # transaction makes the current-row check and any repair indivisible
+        # with respect to their manifest changes.
+        self._assert_restore_marker(restore_marker)
+        self.connection.execute("BEGIN IMMEDIATE")
+        moved: tuple[Path, Path] | None = None
+        try:
+            current = self.connection.execute(
+                "SELECT relative_path, checksum_sha256 FROM shards WHERE id = ? AND state = 'ready'",
+                (snapshot[0],),
+            ).fetchone()
+            if current is None:
                 self.connection.execute("COMMIT")
-            except Exception:
-                self.connection.execute("ROLLBACK")
-                raise
+                return None
+            relative, expected = (
+                str(current["relative_path"]),
+                str(current["checksum_sha256"]),
+            )
+            source = self.root / relative
+            if snapshot[1:] != (relative, expected):
+                observed = None
+            for _ in range(3):
+                _check_cancelled(cancel_requested)
+                if (
+                    observed is not None
+                    and observed.stable
+                    and _file_identity(source) == observed.identity
+                ):
+                    break
+                observed = self._observe_file(source, cancel_requested)
+                if observed is None and not source.is_file():
+                    break
+                if (
+                    observed is not None
+                    and observed.stable
+                    and _file_identity(source) == observed.identity
+                ):
+                    break
+            else:
+                raise RuntimeError(
+                    "replay shard changed repeatedly during integrity reconciliation"
+                )
+            self._assert_restore_marker(restore_marker)
+            result = None
+            if observed is None:
+                self.connection.execute(
+                    "UPDATE shards SET state = 'quarantined', quarantine_reason = 'committed file missing' WHERE id = ?",
+                    (snapshot[0],),
+                )
+                result = "missing_committed"
+            elif observed.checksum != expected:
+                quarantine = (
+                    self.quarantine_directory
+                    / f"corrupt-{snapshot[0]:012d}-{source.name}"
+                )
+                if quarantine.exists():
+                    quarantine = quarantine.with_name(
+                        f"{quarantine.name}-{uuid.uuid4().hex}"
+                    )
+                os.replace(source, quarantine)
+                moved = (source, quarantine)
+                self.connection.execute(
+                    "UPDATE shards SET relative_path = ?, state = 'quarantined', quarantine_reason = 'checksum mismatch' WHERE id = ?",
+                    (str(quarantine.relative_to(self.root)), snapshot[0]),
+                )
+                result = "corrupt_committed"
+            self._assert_manifest_identity()
+            self._assert_restore_marker(restore_marker)
+            self.connection.execute("COMMIT")
+            return result
+        except BaseException:
+            self.connection.execute("ROLLBACK")
+            if moved is not None and not moved[0].exists():
+                os.replace(moved[1], moved[0])
+            raise
 
     def set_gc_watermark(self, name: str, selection: ReplaySelection) -> None:
         if not name or not selection.spans:
@@ -1690,9 +1826,16 @@ class ReplayStore:
 
 
 def _sha256(path: Path, *, cancel_requested: Callable[[], bool] | None = None) -> str:
+    return _hash_file(path, cancel_requested=cancel_requested).checksum
+
+
+def _hash_file(
+    path: Path, *, cancel_requested: Callable[[], bool] | None = None
+) -> _FileHash:
     digest = hashlib.sha256()
     _check_cancelled(cancel_requested)
     with path.open("rb") as stream:
+        before = _stat_identity(os.fstat(stream.fileno()))
         while True:
             _check_cancelled(cancel_requested)
             chunk = stream.read(1024 * 1024)
@@ -1700,4 +1843,5 @@ def _sha256(path: Path, *, cancel_requested: Callable[[], bool] | None = None) -
             if not chunk:
                 break
             digest.update(chunk)
-    return digest.hexdigest()
+        after = _stat_identity(os.fstat(stream.fileno()))
+    return _FileHash(digest.hexdigest(), after, before == after)

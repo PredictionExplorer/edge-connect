@@ -106,6 +106,9 @@ class ObservedReader:
         self.cancel.set()
         return data
 
+    def fileno(self):
+        return self.stream.fileno()
+
 
 def cancel_on_read(monkeypatch, path, cancellation, sizes):
     original_open = Path.open
@@ -132,7 +135,7 @@ def test_hash_cancellation_is_checked_between_bounded_chunks(tmp_path, monkeypat
     assert reads == [1024 * 1024]
 
 
-def test_cancelled_scan_closes_store_and_preserves_completed_quarantine_repairs(
+def test_cancelled_read_phase_closes_store_without_applying_partial_repairs(
     tmp_path, monkeypatch
 ):
     root, records = replay_files(tmp_path)
@@ -153,11 +156,12 @@ def test_cancelled_scan_closes_store_and_preserves_completed_quarantine_repairs(
         rows = connection.execute(
             "SELECT state, relative_path FROM shards ORDER BY id"
         ).fetchall()
-    assert rows[0][0] == "quarantined"
+    assert rows[0][0] == "ready"
     assert (root / rows[0][1]).read_bytes() == b"corrupt data"
     assert rows[1][0] == "ready"
     monkeypatch.undo()
     with ReplayStore(root, cancel_requested=lambda: False) as reopened:
+        assert reopened.reconciliation_metrics["corrupt_committed"] == 1
         assert (
             reopened.connection.execute(
                 "SELECT COUNT(*) FROM shards WHERE state='ready'"
@@ -173,14 +177,14 @@ def test_successful_open_still_hashes_every_ready_shard_and_quarantines_corrupti
 ):
     root, records = replay_files(tmp_path, count=3)
     records[1].path.write_bytes(b"changed after commit")
-    original_hash = replay_module._sha256
+    original_hash = replay_module._hash_file
     scanned = []
 
     def observe(path, **kwargs):
         scanned.append(path)
         return original_hash(path, **kwargs)
 
-    monkeypatch.setattr(replay_module, "_sha256", observe)
+    monkeypatch.setattr(replay_module, "_hash_file", observe)
     options = {"cancel_requested": lambda: False} if cancellable else {}
     with ReplayStore(root, **options) as store:
         assert set(scanned) == {record.path for record in records}
@@ -338,10 +342,10 @@ def test_shared_cohort_startup_never_parks_while_holding_or_waiting_on_reconcile
             thread_state.lock_held = True
         return result
 
-    original_hash = replay_module._sha256
+    original_hash = replay_module._hash_file
 
     def observed_hash(path, **kwargs):
-        assert getattr(thread_state, "lock_held", False)
+        assert not getattr(thread_state, "lock_held", False)
         hashing.set()
         return original_hash(path, **kwargs)
 
@@ -352,7 +356,7 @@ def test_shared_cohort_startup_never_parks_while_holding_or_waiting_on_reconcile
         lambda self, **kwargs: object(),
     )
     monkeypatch.setattr(fcntl, "flock", observed_flock)
-    monkeypatch.setattr(replay_module, "_sha256", observed_hash)
+    monkeypatch.setattr(replay_module, "_hash_file", observed_hash)
     supervisor = actor_module.ActorSupervisor(
         native_module=object(),
         experiment=config,
