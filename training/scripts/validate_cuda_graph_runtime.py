@@ -37,10 +37,8 @@ FORMAT = "startrain.cuda-graph-runtime-validation"
 
 
 def _control():
-    if __package__:
-        from . import benchmark_actor_throughput
-    else:
-        import benchmark_actor_throughput
+    from scripts import benchmark_actor_throughput
+
     return benchmark_actor_throughput
 
 
@@ -229,7 +227,12 @@ def checked_request(
     version: int,
     variant: str,
     expected_captures: int | None = None,
+    capture_initialization_order: Literal[
+        "graph-first", "reference-first"
+    ] = "graph-first",
 ):
+    if capture_initialization_order not in ("graph-first", "reference-first"):
+        raise ValueError("invalid capture initialization order")
     expected_rows = graph._inference_batch_rows(rows)
     if regular._inference_batch_rows(rows) != expected_rows:
         raise RuntimeError("reference and graph use different physical batch shapes")
@@ -238,8 +241,12 @@ def checked_request(
     )
     before_graph = graph.metrics_snapshot()
     before_reference = regular.metrics_snapshot()
-    expected = regular.evaluate(request)
-    actual = graph.evaluate(request)
+    if capture_initialization_order == "graph-first":
+        actual = graph.evaluate(request)
+        expected = regular.evaluate(request)
+    else:
+        expected = regular.evaluate(request)
+        actual = graph.evaluate(request)
     differences = compare_predictions(expected, actual)
     if (
         graph.metrics_snapshot().neural_rows - before_graph.neural_rows != expected_rows
@@ -288,9 +295,10 @@ def native_artifacts(native, modules=None) -> dict[str, str]:
 
 def _source_identity(native) -> dict[str, object]:
     import torch
+    import startrain
     from startrain.checkpoint import sha256_file
 
-    root = Path(__file__).resolve().parents[1]
+    root = Path(startrain.__file__).resolve().parent
     names = (
         "actor.py",
         "model.py",
@@ -300,8 +308,9 @@ def _source_identity(native) -> dict[str, object]:
         "native.py",
         "checkpoint.py",
     )
-    paths = [Path(__file__).resolve(), *(root / "startrain" / name for name in names)]
+    paths = [Path(__file__).resolve(), *(root / name for name in names)]
     return {
+        "startrain_source_root": str(root),
         "source_files": {str(path): sha256_file(path) for path in paths},
         "python": sys.version,
         "torch": str(torch.__version__),
@@ -377,6 +386,7 @@ def run_probe(args) -> dict[str, object]:
         "config_sha256": args.config_sha256,
         "production_config": source_config.as_dict(),
         "probe_inference": asdict(config.orchestration.model_refresh.inference),
+        "capture_initialization_order": args.capture_initialization_order,
         "model": {
             "identity": manifest.model_identity,
             "step": manifest.model_step,
@@ -411,6 +421,7 @@ def run_probe(args) -> dict[str, object]:
                     version=version,
                     variant=variant,
                     expected_captures=1 if version == 0 else 0,
+                    capture_initialization_order=args.capture_initialization_order,
                 )
             entries = entry_records(graph)
             entry = next(
@@ -441,6 +452,7 @@ def run_probe(args) -> dict[str, object]:
             version=50,
             variant="double",
             expected_captures=1,
+            capture_initialization_order=args.capture_initialization_order,
         )
         hot = entry_records(graph)[0]
         before = graph.metrics_snapshot()
@@ -455,6 +467,7 @@ def run_probe(args) -> dict[str, object]:
                 version=100 + index,
                 variant=variant,
                 expected_captures=0,
+                capture_initialization_order=args.capture_initialization_order,
             )
             cold_rows = COLD_SHAPES[index % len(COLD_SHAPES)]
             checked_request(
@@ -466,6 +479,7 @@ def run_probe(args) -> dict[str, object]:
                 version=200 + index,
                 variant=variant,
                 expected_captures=1,
+                capture_initialization_order=args.capture_initialization_order,
             )
             entries = entry_records(graph)
             current_hot = next(
@@ -496,6 +510,7 @@ def run_probe(args) -> dict[str, object]:
                     version=500 + index,
                     variant=variant,
                     expected_captures=0,
+                    capture_initialization_order=args.capture_initialization_order,
                 )
                 report["stress"] = {
                     "completed_cold_captures": index + 1,
@@ -551,6 +566,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--stress-captures", type=int, default=96)
     parser.add_argument("--timeout-seconds", type=float, default=1200)
+    parser.add_argument(
+        "--capture-initialization-order",
+        choices=("graph-first", "reference-first"),
+        default="graph-first",
+        help="graph-first matches actor startup; reference-first reproduces the original probe",
+    )
     parser.add_argument("--child", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--manifest-sha256", help=argparse.SUPPRESS)
     parser.add_argument("--config-sha256", help=argparse.SUPPRESS)
@@ -595,6 +616,8 @@ def main(argv: list[str] | None = None) -> int:
         str(args.stress_captures),
         "--timeout-seconds",
         str(args.timeout_seconds),
+        "--capture-initialization-order",
+        args.capture_initialization_order,
     ]
     control = _control()
     with control._controller_signals(), isolated_compile_cache(cache) as provenance:
@@ -616,7 +639,12 @@ def main(argv: list[str] | None = None) -> int:
     if child.returncode:
         return child.returncode
     result = json.loads(args.output.read_text())
-    if result.get("status") != "passed" or len(result.get("shapes", [])) != len(SHAPES):
+    if (
+        result.get("status") != "passed"
+        or len(result.get("shapes", [])) != len(SHAPES)
+        or result.get("capture_initialization_order")
+        != args.capture_initialization_order
+    ):
         raise RuntimeError("child did not complete graph validation")
     print(
         json.dumps(

@@ -202,6 +202,117 @@ def test_native_identity_hashes_loaded_binary_not_just_python_wrapper(tmp_path):
     assert identity["native_wrapper_sha256"] != identity["native_sha256"]
 
 
+@pytest.mark.parametrize(
+    "order,expected",
+    [
+        (None, ["graph", "regular"]),
+        ("graph-first", ["graph", "regular"]),
+        ("reference-first", ["regular", "graph"]),
+    ],
+)
+def test_checked_request_controls_actual_initialization_order(
+    monkeypatch, order, expected
+):
+    calls = []
+
+    class Adapter:
+        def __init__(self, name):
+            self.name = name
+            self.rows = 0
+            self.captures = 0
+
+        def _inference_batch_rows(self, rows):
+            return rows
+
+        def metrics_snapshot(self):
+            return SimpleNamespace(neural_rows=self.rows, graph_captures=self.captures)
+
+        def evaluate(self, request):
+            calls.append(self.name)
+            self.rows += request
+            self.captures += self.name == "graph"
+            return response()
+
+        def efficiency_snapshot(self):
+            return {}
+
+    monkeypatch.setattr(probe, "make_requests", lambda *args, rows, **kwargs: rows)
+    options = {} if order is None else {"capture_initialization_order": order}
+    assert probe.checked_request(
+        None,
+        None,
+        Adapter("graph"),
+        Adapter("regular"),
+        rows=64,
+        version=0,
+        variant="double",
+        expected_captures=1,
+        **options,
+    ) == {"policy_logits": 0.0, "values": 0.0}
+    assert calls == expected
+
+
+@pytest.mark.parametrize("order", [None, "reference-first"])
+def test_cli_forwards_initialization_order_to_child_probe(monkeypatch, order):
+    observed = []
+    monkeypatch.setattr(probe, "run_probe", lambda args: observed.append(args))
+    command = [
+        "--child",
+        "--config",
+        "profile.yaml",
+        "--manifest",
+        "model.json",
+        "--device",
+        "cuda:7",
+        "--output",
+        "report.json",
+    ]
+    if order is not None:
+        command += ["--capture-initialization-order", order]
+    assert probe.main(command) == 0
+    assert observed[0].capture_initialization_order == (order or "graph-first")
+
+
+def test_source_identity_uses_imported_runtime_when_probe_is_outside_release(
+    monkeypatch, tmp_path
+):
+    import startrain
+    from startrain.checkpoint import sha256_file
+
+    runtime = tmp_path / "release" / "startrain"
+    runtime.mkdir(parents=True)
+    for name in (
+        "__init__.py",
+        "actor.py",
+        "model.py",
+        "inference.py",
+        "inference_graphs.py",
+        "inference_cache.py",
+        "native.py",
+        "checkpoint.py",
+    ):
+        (runtime / name).write_text(name)
+    copied_probe = tmp_path / "rollout" / "probe.py"
+    copied_probe.parent.mkdir()
+    copied_probe.write_text("updated validation tool")
+    monkeypatch.setattr(startrain, "__file__", str(runtime / "__init__.py"))
+    monkeypatch.setattr(probe, "__file__", str(copied_probe))
+    monkeypatch.setattr(probe, "native_artifacts", lambda native: {})
+    native = SimpleNamespace(
+        native_rules_hash=lambda: 7, native_feature_schema_version=lambda: 4
+    )
+    identity = probe._source_identity(native)
+    assert identity["startrain_source_root"] == str(runtime)
+    sources = identity["source_files"]
+    assert sources[str(copied_probe)] == sha256_file(copied_probe)
+    assert sources[str(runtime / "inference.py")] == sha256_file(
+        runtime / "inference.py"
+    )
+    assert sources[str(runtime / "inference_graphs.py")] == sha256_file(
+        runtime / "inference_graphs.py"
+    )
+
+
 @pytest.mark.native
 @pytest.mark.parametrize("variant", probe.VARIANTS)
 def test_changed_inputs_cover_all_six_native_variants(variant):
