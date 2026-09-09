@@ -11,12 +11,16 @@ Streaming publishes complete games before their siblings finish. Optional
 rolling slots refill only after publication, within one finite, pinned-model
 task. The default cohort-v1 seed contract is unchanged; game-v1 gives each
 logical game independent mode, search and PDA streams across slot packings.
+Opt-in cohort search budgets correlate full/fast choices within each wave;
+their budget assignments intentionally depend on packing, while game search
+and PDA streams remain independent.
 """
 
 from __future__ import annotations
 
 import hashlib
 import math
+import random
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
@@ -282,6 +286,7 @@ class SelfPlayConfig:
     stream_completed_games: bool = False
     rolling_game_slots: bool = False
     seed_contract: Literal["cohort-v1", "game-v1"] = "cohort-v1"
+    cohort_search_budgets: bool = False
     # The variant played by this cohort; the actor replaces these per batch
     # from ``variants.draw`` exactly like ``rings``.
     mode: str = "double"
@@ -321,11 +326,17 @@ class SelfPlayConfig:
             or self.games <= 0
         ):
             raise ValueError("batch_size and games must be positive integers")
-        for name in ("stream_completed_games", "rolling_game_slots"):
+        for name in (
+            "stream_completed_games",
+            "rolling_game_slots",
+            "cohort_search_budgets",
+        ):
             if type(getattr(self, name)) is not bool:
                 raise ValueError(f"{name} must be boolean")
         if self.seed_contract not in ("cohort-v1", "game-v1"):
             raise ValueError("seed_contract must be cohort-v1 or game-v1")
+        if self.cohort_search_budgets and self.seed_contract != "game-v1":
+            raise ValueError("cohort_search_budgets requires the game-v1 seed contract")
         if self.rolling_game_slots and (
             not self.stream_completed_games or self.seed_contract != "game-v1"
         ):
@@ -849,6 +860,11 @@ class SelfPlayActor:
             for _ in range(cohort_size)
         ]
         iteration = 0
+        budget_random = (
+            random.Random(self._seed("cohort-budget-v1", cohort))
+            if self.config.cohort_search_budgets
+            else None
+        )
         next_game = first_game + cohort_size
         game_limit = first_game + (cohort_size if game_quota is None else game_quota)
         published_rows: set[int] = set()
@@ -999,11 +1015,19 @@ class SelfPlayActor:
             simulations_by_row = None
             if self.config.seed_contract == "game-v1":
                 full_threshold = int(self.config.full_probability * (1 << 64))
-                full_by_row = [
-                    self._seed("mode-game-v1", game_id, len(trajectories[row]))
-                    < full_threshold
-                    for row, game_id in enumerate(game_ids)
-                ]
+                if budget_random is not None:
+                    # A dedicated wave stream never advances any game's search
+                    # or PDA stream. Correlation keeps the shared search batch
+                    # fuller after its shorter-budget roots would have finished.
+                    full_by_row = [
+                        budget_random.getrandbits(64) < full_threshold
+                    ] * cohort_size
+                else:
+                    full_by_row = [
+                        self._seed("mode-game-v1", game_id, len(trajectories[row]))
+                        < full_threshold
+                        for row, game_id in enumerate(game_ids)
+                    ]
                 seeds_by_row = [
                     self._seed("search-game-v1", game_id, len(trajectories[row]))
                     for row, game_id in enumerate(game_ids)
@@ -1376,6 +1400,11 @@ class SelfPlayActor:
                             + (
                                 ":seed_contract=game-v1"
                                 if self.config.seed_contract == "game-v1"
+                                else ""
+                            )
+                            + (
+                                ":budget_schedule=cohort-v1"
+                                if self.config.cohort_search_budgets
                                 else ""
                             )
                         ),

@@ -68,10 +68,16 @@ def compatible_config_epoch_payloads(
     """
 
     current = deepcopy(dict(payload))
-    pipeline_representations = [current]
-    pre_pipeline = without_selfplay_pipeline_defaults(payload)
-    if pre_pipeline != current:
-        pipeline_representations.append(pre_pipeline)
+    budget_representations = [current]
+    pre_budget = without_cohort_search_budget_defaults(payload)
+    if pre_budget != current:
+        budget_representations.append(pre_budget)
+    pipeline_representations = []
+    for representation in budget_representations:
+        pipeline_representations.append(representation)
+        pre_pipeline = without_selfplay_pipeline_defaults(representation)
+        if pre_pipeline != representation:
+            pipeline_representations.append(pre_pipeline)
     representations = []
     for representation in pipeline_representations:
         representations.append(representation)
@@ -99,6 +105,28 @@ def compatible_config_epoch_payloads(
     return tuple(variants)
 
 
+def without_cohort_search_budget_defaults(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Represent the prior per-game-budget release without erasing opt-ins.
+
+    This separate epoch also preserves fully enabled per-GPU pipeline profiles.
+    Only an exact False at either configuration scope is additive.
+    """
+    result = deepcopy(dict(payload))
+    selfplay = result.get("selfplay")
+    if isinstance(selfplay, dict) and selfplay.get("cohort_search_budgets") is False:
+        del selfplay["cohort_search_budgets"]
+    orchestration = result.get("orchestration")
+    if isinstance(orchestration, dict):
+        for gpu in orchestration.get("gpus", ()):
+            pipeline = gpu.get("actor_pipeline") if isinstance(gpu, dict) else None
+            if (
+                isinstance(pipeline, dict)
+                and pipeline.get("cohort_search_budgets") is False
+            ):
+                del pipeline["cohort_search_budgets"]
+    return result
+
+
 def without_selfplay_pipeline_defaults(payload: Mapping[str, Any]) -> dict[str, Any]:
     """Represent the release before optional actor pipelines and CUDA graphs."""
     result = deepcopy(dict(payload))
@@ -116,6 +144,7 @@ def without_selfplay_pipeline_defaults(payload: Mapping[str, Any]) -> dict[str, 
             "stream_completed_games": False,
             "rolling_game_slots": False,
             "seed_contract": "cohort-v1",
+            "cohort_search_budgets": False,
         },
     )
     orchestration = result.get("orchestration")

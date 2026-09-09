@@ -69,6 +69,7 @@ def resolve_actor_experiment(
             stream_completed_games=pipeline.stream_completed_games,
             rolling_game_slots=pipeline.rolling_game_slots,
             seed_contract=pipeline.seed_contract,
+            cohort_search_budgets=pipeline.cohort_search_budgets,
         ),
         orchestration=replace(
             experiment.orchestration,
@@ -877,6 +878,7 @@ class ActorSupervisor:
                         )
                     self.heartbeat.advance(
                         phase="selfplay",
+                        cohort_search_budgets=batch_config.cohort_search_budgets,
                         batch=batches,
                         generation=generation,
                         ring=ring,
@@ -929,6 +931,7 @@ class ActorSupervisor:
                                 "worker": self.actor_id,
                                 "process_started_ns": process_started_ns,
                                 "task_started_ns": batch_started_ns,
+                                "cohort_search_budgets": batch_config.cohort_search_budgets,
                                 "gpu_id": self.gpu.gpu_id,
                                 "physical_gpu_id": self.gpu.gpu_id
                                 if self.device.type == "cuda"
@@ -1134,6 +1137,7 @@ class ActorSupervisor:
                             "timestamp_ns": batch_completed_ns,
                             "batch_started_ns": batch_started_ns,
                             "batch_completed_ns": batch_completed_ns,
+                            "cohort_search_budgets": batch_config.cohort_search_budgets,
                             "worker": self.actor_id,
                             "gpu_id": self.gpu.gpu_id,
                             "compute_device": str(self.device),

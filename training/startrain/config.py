@@ -396,6 +396,7 @@ class ActorPipelineConfig:
     stream_completed_games: bool = False
     rolling_game_slots: bool = False
     seed_contract: Literal["cohort-v1", "game-v1"] = "cohort-v1"
+    cohort_search_budgets: bool = False
     games_per_task: int | None = None
     cuda_graphs: bool = False
     max_model_pin_seconds: float = 3600.0
@@ -405,12 +406,17 @@ class ActorPipelineConfig:
             "compatible_work",
             "stream_completed_games",
             "rolling_game_slots",
+            "cohort_search_budgets",
             "cuda_graphs",
         ):
             if type(getattr(self, name)) is not bool:
                 raise ConfigError(f"actor_pipeline.{name} must be boolean")
         if self.seed_contract not in ("cohort-v1", "game-v1"):
             raise ConfigError("actor_pipeline.seed_contract is invalid")
+        if self.cohort_search_budgets and self.seed_contract != "game-v1":
+            raise ConfigError(
+                "cohort_search_budgets requires the game-v1 seed contract"
+            )
         if self.games_per_task is not None and (
             type(self.games_per_task) is not int or self.games_per_task <= 0
         ):

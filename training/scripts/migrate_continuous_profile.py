@@ -48,6 +48,7 @@ _ALLOWED_PROFILE_PATHS = {
     ("selfplay", "stream_completed_games"),
     ("selfplay", "rolling_game_slots"),
     ("selfplay", "seed_contract"),
+    ("selfplay", "cohort_search_budgets"),
     ("orchestration", "model_refresh", "compatible_cohort_work"),
     ("train", "gradient_diagnostics"),
     *(
@@ -164,6 +165,7 @@ _ALLOWED_PROFILE_PATHS = {
             "stream_completed_games",
             "rolling_game_slots",
             "seed_contract",
+            "cohort_search_budgets",
             "games_per_task",
             "cuda_graphs",
             "max_model_pin_seconds",
