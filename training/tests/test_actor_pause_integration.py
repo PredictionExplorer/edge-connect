@@ -53,7 +53,8 @@ def test_shared_actor_heartbeat_proves_parking_and_confirms_release(
     stop = threading.Event()
     counters = {}
 
-    def child_run(child, *, stop_requested):
+    def child_run(child, *, stop_requested, startup_cancel_requested):
+        assert startup_cancel_requested is not None
         counters[child.actor_id] = 0
         while not stop_requested():
             assert child._pause_checkpoint is not None

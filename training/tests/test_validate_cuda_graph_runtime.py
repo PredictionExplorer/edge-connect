@@ -1,0 +1,222 @@
+from copy import deepcopy
+from dataclasses import asdict, replace
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+import torch
+
+from scripts import validate_cuda_graph_runtime as probe
+from startrain.config import load_config
+from startrain.inference import GraphInferenceAdapter, InferenceConfig
+
+
+def production_config():
+    return load_config(
+        Path(__file__).parents[1] / "configs/h100-8gpu-largest-board-priority.yaml"
+    )
+
+
+def test_probe_changes_only_explicit_inference_controls():
+    source = production_config()
+    changed = probe.probe_config(source)
+    before = asdict(source.orchestration.model_refresh.inference)
+    after = asdict(changed.orchestration.model_refresh.inference)
+    allowed = {
+        "cache_max_entries",
+        "cache_max_bytes",
+        "deduplicate",
+        "cuda_graphs",
+        "cuda_graph_max_entries",
+        "cuda_graph_max_bytes",
+    }
+    assert {k for k in before if before[k] != after[k]} <= allowed
+    assert source.model == changed.model and source.train == changed.train
+    assert source.game == changed.game and source.selfplay == changed.selfplay
+    assert changed.orchestration.model_refresh.inference.cuda_graph_max_entries == 16
+    assert (
+        changed.orchestration.model_refresh.inference.cuda_graph_max_bytes
+        == 12 * 1024**3
+    )
+    assert not changed.orchestration.model_refresh.inference.deduplicate
+
+
+def test_production_contract_rejects_wrong_size_precision_and_compiler(monkeypatch):
+    from startrain import model
+
+    config = production_config()
+    monkeypatch.setattr(model, "model_parameter_count", lambda _: 17402775)
+    probe.validate_config(config)
+    for altered in (
+        replace(config, train=replace(config.train, precision="fp32")),
+        replace(config, train=replace(config.train, compile=False)),
+        replace(
+            config,
+            orchestration=replace(
+                config.orchestration,
+                model_refresh=replace(
+                    config.orchestration.model_refresh, inference_compile_dynamic=False
+                ),
+            ),
+        ),
+    ):
+        with pytest.raises(ValueError):
+            probe.validate_config(altered)
+    monkeypatch.setattr(model, "model_parameter_count", lambda _: 100)
+    with pytest.raises(ValueError, match="17,402,775"):
+        probe.validate_config(config)
+
+
+def test_probe_requires_memory_headroom_without_changing_fraction():
+    gib = 1024**3
+    assert probe.require_memory_headroom(70 * gib, 80 * gib) == 16 * gib
+    with pytest.raises(RuntimeError, match="free GPU memory"):
+        probe.require_memory_headroom(20 * gib, 80 * gib)
+    with pytest.raises(RuntimeError, match="20%"):
+        probe.require_memory_headroom(32 * gib, 32 * gib)
+
+
+def test_output_cannot_touch_production_or_existing_artifacts(tmp_path):
+    run = tmp_path / "run"
+    run.mkdir()
+    config = SimpleNamespace(
+        orchestration=SimpleNamespace(directories=SimpleNamespace(root=str(run)))
+    )
+    with pytest.raises(ValueError, match="outside"):
+        probe.validate_output(
+            run / "report.json", config, run / "profile", run / "manifest"
+        )
+    output = tmp_path / "report.json"
+    output.write_text("existing")
+    with pytest.raises(ValueError, match="new artifact"):
+        probe.validate_output(output, config, run / "profile", run / "manifest")
+
+
+def test_regular_reference_keeps_exact_graph_padding_policy(monkeypatch):
+    from startrain import inference
+
+    cleared = []
+
+    class Adapter:
+        def __init__(self, model, **kwargs):
+            self.model = model
+            self.__dict__.update(kwargs)
+            self._graphs = SimpleNamespace(clear=lambda: cleared.append(True))
+
+    source = SimpleNamespace(
+        model=object(),
+        device=torch.device("cuda:7"),
+        config=InferenceConfig(cuda_graphs=True),
+        homogeneous_relational_bias=True,
+        model_identity="pinned",
+        model_version="pinned",
+        model_step=123,
+    )
+    monkeypatch.setattr(inference, "GraphInferenceAdapter", Adapter)
+    regular = probe.regular_adapter(source)
+    assert (
+        regular._graphs is None
+        and regular.config is source.config
+        and cleared == [True]
+    )
+    assert [
+        GraphInferenceAdapter._inference_batch_rows(regular, n) for n in probe.SHAPES
+    ] == list(probe.SHAPES)
+    assert GraphInferenceAdapter._inference_batch_rows(regular, 80) == 96
+    assert GraphInferenceAdapter._inference_batch_rows(regular, 160) == 192
+
+
+def response():
+    return SimpleNamespace(
+        tokens=[1], policy_offsets=[0, 2], policy_logits=[0.5, -0.125], values=[0.25]
+    )
+
+
+@pytest.mark.parametrize(
+    "field", ["tokens", "policy_offsets", "policy_logits", "values"]
+)
+def test_prediction_comparison_is_exact_and_rejects_route_or_value_changes(field):
+    expected = response()
+    actual = deepcopy(expected)
+    assert probe.compare_predictions(expected, actual) == {
+        "policy_logits": 0.0,
+        "values": 0.0,
+    }
+    getattr(actual, field)[0] += 1
+    with pytest.raises(ValueError):
+        probe.compare_predictions(expected, actual)
+
+
+def test_nonfinite_predictions_and_graph_fallbacks_fail_closed():
+    actual = response()
+    actual.values = [float("nan")]
+    with pytest.raises(FloatingPointError):
+        probe.compare_predictions(response(), actual)
+    for field in (
+        "graph_fallbacks",
+        "graph_validation_failures",
+        "graph_negative_entries",
+    ):
+        with pytest.raises(RuntimeError, match=field):
+            probe.check_health(SimpleNamespace(efficiency_snapshot=lambda: {field: 1}))
+
+
+def test_live_entries_must_have_distinct_exclusive_streams():
+    def entry(rows, stream):
+        return SimpleNamespace(
+            args=(torch.zeros(rows, 1),),
+            retained_bytes=123,
+            stream_lease=SimpleNamespace(stream=SimpleNamespace(cuda_stream=stream)),
+        )
+
+    adapter = SimpleNamespace(
+        _graphs=SimpleNamespace(_entries={1: entry(64, 10), 2: entry(32, 11)})
+    )
+    assert [record["physical_rows"] for record in probe.entry_records(adapter)] == [
+        64,
+        32,
+    ]
+    adapter._graphs._entries[2] = entry(32, 10)
+    with pytest.raises(RuntimeError, match="share a capture stream"):
+        probe.entry_records(adapter)
+
+
+def test_native_identity_hashes_loaded_binary_not_just_python_wrapper(tmp_path):
+    from startrain.checkpoint import sha256_file
+
+    wrapper = tmp_path / "__init__.py"
+    wrapper.write_bytes(b"from .star_native import *")
+    binary = tmp_path / "star_native.abi3.so"
+    binary.write_bytes(b"compiled implementation")
+    module = SimpleNamespace(__name__="star_native", __file__=str(wrapper))
+    modules = {
+        "star_native": module,
+        "star_native.star_native": SimpleNamespace(__file__=str(binary)),
+        "unrelated": SimpleNamespace(__file__=str(tmp_path / "unrelated.so")),
+    }
+    identity = probe.native_artifacts(module, modules)
+    assert identity["native_path"] == str(binary) and identity[
+        "native_sha256"
+    ] == sha256_file(binary)
+    assert identity["native_wrapper_path"] == str(wrapper)
+    assert identity["native_wrapper_sha256"] != identity["native_sha256"]
+
+
+@pytest.mark.native
+@pytest.mark.parametrize("variant", probe.VARIANTS)
+def test_changed_inputs_cover_all_six_native_variants(variant):
+    from startrain.native import positions_from_native
+
+    native = pytest.importorskip("star_native")
+    config = production_config()
+    first = probe.make_requests(
+        native, config, rows=3, version=0, variant_label=variant
+    )
+    second = probe.make_requests(
+        native, config, rows=3, version=1, variant_label=variant
+    )
+    assert len(first) == len(second) == 3
+    assert not torch.equal(
+        positions_from_native(first.states)[0].stones,
+        positions_from_native(second.states)[0].stones,
+    )

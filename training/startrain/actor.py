@@ -36,7 +36,7 @@ from .device import (
 from .inference import GraphInferenceAdapter, InferenceConfig
 from .inference_batching import CohortInferenceAdapter
 from .model import GraphResTNet
-from .replay_store import ReplayStore
+from .replay_store import ReplayStore, ReplayStoreCancelled
 from .runtime import HeartbeatReporter, RunIdentity, append_jsonl
 from .selfplay import GameVariant, SelfPlayActor, SelfPlayIdentity, SelfPlayMetrics
 from .training import maybe_compile_model
@@ -675,9 +675,25 @@ class ActorSupervisor:
             ),
         )
 
-    def run(self, *, stop_requested: Callable[[], bool]) -> int:
+    def run(
+        self,
+        *,
+        stop_requested: Callable[[], bool],
+        startup_cancel_requested: Callable[[], bool] | None = None,
+    ) -> int:
+        # Cohort stop checks may park at an arena pause barrier. Integrity
+        # scanning needs a pure shutdown predicate: it must never park while
+        # holding or waiting for the replay store's cross-process lock.
+        cancel_startup = (
+            stop_requested
+            if startup_cancel_requested is None
+            else startup_cancel_requested
+        )
         if self.gpu.actor_cohorts > 1 and self.registry is None:
-            return self._run_cohorts(stop_requested=stop_requested)
+            return self._run_cohorts(
+                stop_requested=stop_requested,
+                startup_cancel_requested=cancel_startup,
+            )
         batches = 0
         process_started_ns = time.time_ns()
         cumulative_games = 0
@@ -704,7 +720,9 @@ class ActorSupervisor:
                     return batches
                 if self.registry is not None:
                     self.candidate_provider.release()
-            with ReplayStore(self.replay_directory) as store:
+            with ReplayStore(
+                self.replay_directory, cancel_requested=cancel_startup
+            ) as store:
                 if any(store.reconciliation_metrics.values()):
                     self.heartbeat.advance(
                         phase="replay_reconciliation",
@@ -1314,6 +1332,11 @@ class ActorSupervisor:
                         cumulative_batch_wall_seconds=cumulative_batch_wall_seconds,
                     )
             return batches
+        except ReplayStoreCancelled:
+            if not cancel_startup():
+                final_phase = "failed"
+                raise
+            return batches
         except Exception:
             final_phase = "failed"
             raise
@@ -1337,7 +1360,12 @@ class ActorSupervisor:
             if self.registry is None:
                 empty_device_cache(self.device)
 
-    def _run_cohorts(self, *, stop_requested: Callable[[], bool]) -> int:
+    def _run_cohorts(
+        self,
+        *,
+        stop_requested: Callable[[], bool],
+        startup_cancel_requested: Callable[[], bool] | None = None,
+    ) -> int:
         from .inference_batching import BoundedInferenceBroker
 
         configuration = self.experiment.orchestration.model_refresh.inference
@@ -1346,6 +1374,11 @@ class ActorSupervisor:
                 "multiple actor cohorts require shared batching and one process lane"
             )
         stopped = threading.Event()
+        cancel_startup = (
+            stop_requested
+            if startup_cancel_requested is None
+            else startup_cancel_requested
+        )
         children = []
         self.heartbeat.start()
         phase = "stopped"
@@ -1420,13 +1453,19 @@ class ActorSupervisor:
                 children.append(child)
 
             def run_child(child):
+                def startup_cancelled():
+                    return stopped.is_set() or cancel_startup()
+
                 def child_stopping():
                     if gate is not None:
                         gate.checkpoint(child.actor_id)
                     return stopped.is_set() or stop_requested()
 
                 try:
-                    return child.run(stop_requested=child_stopping)
+                    return child.run(
+                        stop_requested=child_stopping,
+                        startup_cancel_requested=startup_cancelled,
+                    )
                 except BaseException:
                     stopped.set()
                     raise

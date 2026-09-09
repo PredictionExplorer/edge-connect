@@ -766,12 +766,20 @@ class GraphInferenceAdapter:
         """Reuse a small set of CUDA backend plans as cache-miss counts vary.
 
         A new arbitrary CUDA batch shape has a measurable first-use planning
-        cost. Repeating the last valid row up to a power of two avoids it;
-        outputs of the repeated rows never become search results or cache data.
-        CPU inference retains its exact row count.
+        cost. Legacy inference retains power-of-two plans. Graph inference adds
+        intermediate 96/192-row plans (and their larger equivalents) to avoid
+        wasting most of a batch when independent searches have unequal budgets.
+        Repeated rows never become search results or cache data. CPU inference
+        retains its exact row count.
         """
 
-        return 1 << (rows - 1).bit_length() if self.device.type == "cuda" else rows
+        if self.device.type != "cuda":
+            return rows
+        upper = 1 << (rows - 1).bit_length()
+        intermediate = upper * 3 // 4
+        if self.config.cuda_graphs and rows > 64 and rows <= intermediate:
+            return intermediate
+        return upper
 
     def evaluate_prepared(
         self,

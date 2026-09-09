@@ -10,7 +10,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator, Mapping, Sequence
+from typing import Callable, Iterator, Mapping, Sequence
 
 from .contracts import (
     FEATURE_SCHEMA_HASH,
@@ -64,6 +64,15 @@ def _validated_optional_shard_id(name: str, value: int | None) -> int | None:
 
 class DuplicateGameError(ValueError):
     pass
+
+
+class ReplayStoreCancelled(RuntimeError):
+    """An explicitly cancellable integrity scan stopped before store readiness."""
+
+
+def _check_cancelled(cancel_requested: Callable[[], bool] | None) -> None:
+    if cancel_requested is not None and cancel_requested():
+        raise ReplayStoreCancelled("replay store integrity initialization cancelled")
 
 
 @dataclass(frozen=True, slots=True)
@@ -261,7 +270,16 @@ def prove_legacy_committed_sample_history(
 
 
 class ReplayStore:
-    def __init__(self, root: str | Path) -> None:
+    def __init__(
+        self,
+        root: str | Path,
+        *,
+        cancel_requested: Callable[[], bool] | None = None,
+    ) -> None:
+        if cancel_requested is not None and not callable(cancel_requested):
+            raise TypeError("cancel_requested must be callable or None")
+        self._startup_cancel_requested = cancel_requested
+        _check_cancelled(cancel_requested)
         self.root = Path(root)
         self.shard_directory = self.root / "shards"
         self.quarantine_directory = self.root / "quarantine"
@@ -272,17 +290,25 @@ class ReplayStore:
         self.connection = sqlite3.connect(
             self.manifest_path, timeout=30.0, isolation_level=None
         )
-        self.connection.row_factory = sqlite3.Row
-        self.connection.execute("PRAGMA foreign_keys=ON")
-        self.connection.execute("PRAGMA busy_timeout=30000")
-        self._execute_with_busy_retry("PRAGMA journal_mode=WAL")
-        self.connection.execute("PRAGMA synchronous=FULL")
-        self._initialize()
+        try:
+            self.connection.row_factory = sqlite3.Row
+            self.connection.execute("PRAGMA foreign_keys=ON")
+            self.connection.execute("PRAGMA busy_timeout=30000")
+            self._execute_with_busy_retry("PRAGMA journal_mode=WAL")
+            self.connection.execute("PRAGMA synchronous=FULL")
+            self._initialize()
+            _check_cancelled(cancel_requested)
+        except BaseException:
+            self.connection.close()
+            raise
+        finally:
+            self._startup_cancel_requested = None
 
     def _execute_with_busy_retry(self, statement: str) -> sqlite3.Cursor:
         deadline = time.monotonic() + 30.0
         delay = 0.01
         while True:
+            _check_cancelled(self._startup_cancel_requested)
             try:
                 return self.connection.execute(statement)
             except sqlite3.OperationalError as error:
@@ -293,6 +319,7 @@ class ReplayStore:
                 delay = min(0.5, delay * 2)
 
     def _initialize(self) -> None:
+        _check_cancelled(self._startup_cancel_requested)
         counter_table_preexisting = (
             self.connection.execute(
                 """
@@ -446,6 +473,7 @@ class ReplayStore:
             for row in self.connection.execute(
                 "SELECT run_id, generation_family FROM runs"
             ).fetchall():
+                _check_cancelled(self._startup_cancel_requested)
                 try:
                     proof = self.reconcile_legacy_committed_sample_history(
                         run_id=str(row["run_id"]),
@@ -455,7 +483,11 @@ class ReplayStore:
                     continue
                 if proof.complete:
                     legacy_history_reconciled += 1
-        self.reconciliation_metrics = self.reconcile_orphans()
+        self.reconciliation_metrics = (
+            self.reconcile_orphans()
+            if self._startup_cancel_requested is None
+            else self.reconcile_orphans(cancel_requested=self._startup_cancel_requested)
+        )
         self.reconciliation_metrics["legacy_history_reconciled"] = (
             legacy_history_reconciled
         )
@@ -546,17 +578,48 @@ class ReplayStore:
             raise
         return generation
 
-    def reconcile_orphans(self) -> dict[str, int]:
+    def reconcile_orphans(
+        self, *, cancel_requested: Callable[[], bool] | None = None
+    ) -> dict[str, int]:
+        if cancel_requested is not None and not callable(cancel_requested):
+            raise TypeError("cancel_requested must be callable or None")
+        try:
+            _check_cancelled(cancel_requested)
+        except ReplayStoreCancelled:
+            self.close()
+            raise
         lock_path = self.root / ".reconcile.lock"
         descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o640)
+        locked = False
         try:
-            fcntl.flock(descriptor, fcntl.LOCK_EX)
-            return self._reconcile_orphans_locked()
+            if cancel_requested is None:
+                fcntl.flock(descriptor, fcntl.LOCK_EX)
+            else:
+                while True:
+                    _check_cancelled(cancel_requested)
+                    try:
+                        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        break
+                    except BlockingIOError:
+                        time.sleep(0.05)
+            locked = True
+            _check_cancelled(cancel_requested)
+            return (
+                self._reconcile_orphans_locked()
+                if cancel_requested is None
+                else self._reconcile_orphans_locked(cancel_requested=cancel_requested)
+            )
+        except ReplayStoreCancelled:
+            self.close()
+            raise
         finally:
-            fcntl.flock(descriptor, fcntl.LOCK_UN)
+            if locked:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
             os.close(descriptor)
 
-    def _reconcile_orphans_locked(self) -> dict[str, int]:
+    def _reconcile_orphans_locked(
+        self, *, cancel_requested: Callable[[], bool] | None = None
+    ) -> dict[str, int]:
         referenced = {
             str(row["relative_path"])
             for row in self.connection.execute("SELECT relative_path FROM shards")
@@ -567,6 +630,7 @@ class ReplayStore:
         restored_ledger = restore_marker.is_file()
         now = time.time()
         for path in self.shard_directory.glob("*"):
+            _check_cancelled(cancel_requested)
             relative = str(path.relative_to(self.root))
             if (
                 path.is_file()
@@ -588,28 +652,54 @@ class ReplayStore:
                     removed_files += 1
         missing: list[int] = []
         corrupt: list[tuple[int, str, str]] = []
-        for row in self.connection.execute(
-            """
-            SELECT id, relative_path, checksum_sha256 FROM shards
-            WHERE state = 'ready'
-            """
-        ):
-            source = self.root / str(row["relative_path"])
-            if not source.is_file():
-                missing.append(int(row["id"]))
-                continue
-            if _sha256(source) != str(row["checksum_sha256"]):
-                quarantine = self.quarantine_directory / (
-                    f"corrupt-{int(row['id']):012d}-{source.name}"
+        try:
+            for row in self.connection.execute(
+                """
+                SELECT id, relative_path, checksum_sha256 FROM shards
+                WHERE state = 'ready'
+                """
+            ):
+                _check_cancelled(cancel_requested)
+                source = self.root / str(row["relative_path"])
+                if not source.is_file():
+                    missing.append(int(row["id"]))
+                    continue
+                checksum = (
+                    _sha256(source)
+                    if cancel_requested is None
+                    else _sha256(source, cancel_requested=cancel_requested)
                 )
-                os.replace(source, quarantine)
-                corrupt.append(
-                    (
-                        int(row["id"]),
-                        str(quarantine.relative_to(self.root)),
-                        "checksum mismatch",
+                if checksum != str(row["checksum_sha256"]):
+                    quarantine = self.quarantine_directory / (
+                        f"corrupt-{int(row['id']):012d}-{source.name}"
                     )
-                )
+                    os.replace(source, quarantine)
+                    corrupt.append(
+                        (
+                            int(row["id"]),
+                            str(quarantine.relative_to(self.root)),
+                            "checksum mismatch",
+                        )
+                    )
+        except ReplayStoreCancelled:
+            # Moves already made for verified corrupt files must be reflected
+            # in the manifest before abandoning the remaining integrity scan.
+            self._record_reconciliation_quarantines(missing, corrupt)
+            raise
+        self._record_reconciliation_quarantines(missing, corrupt)
+        _check_cancelled(cancel_requested)
+        if restored_ledger:
+            restore_marker.unlink(missing_ok=True)
+        return {
+            "orphan_files": removed_files,
+            "post_restore_orphans": preserved_files,
+            "missing_committed": len(missing),
+            "corrupt_committed": len(corrupt),
+        }
+
+    def _record_reconciliation_quarantines(
+        self, missing: Sequence[int], corrupt: Sequence[tuple[int, str, str]]
+    ) -> None:
         if missing or corrupt:
             self.connection.execute("BEGIN IMMEDIATE")
             try:
@@ -637,14 +727,6 @@ class ReplayStore:
             except Exception:
                 self.connection.execute("ROLLBACK")
                 raise
-        if restored_ledger:
-            restore_marker.unlink(missing_ok=True)
-        return {
-            "orphan_files": removed_files,
-            "post_restore_orphans": preserved_files,
-            "missing_committed": len(missing),
-            "corrupt_committed": len(corrupt),
-        }
 
     def set_gc_watermark(self, name: str, selection: ReplaySelection) -> None:
         if not name or not selection.spans:
@@ -1607,9 +1689,15 @@ class ReplayStore:
         )
 
 
-def _sha256(path: Path) -> str:
+def _sha256(path: Path, *, cancel_requested: Callable[[], bool] | None = None) -> str:
     digest = hashlib.sha256()
+    _check_cancelled(cancel_requested)
     with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+        while True:
+            _check_cancelled(cancel_requested)
+            chunk = stream.read(1024 * 1024)
+            _check_cancelled(cancel_requested)
+            if not chunk:
+                break
             digest.update(chunk)
     return digest.hexdigest()

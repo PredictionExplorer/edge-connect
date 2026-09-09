@@ -1,6 +1,9 @@
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 import gc
 import threading
+import traceback
+from types import SimpleNamespace
 import weakref
 
 import pytest
@@ -13,10 +16,14 @@ from startrain.inference_graphs import (
     BoundedInferenceGraphs,
     CaptureUnavailable,
     CudaBackend,
+    _CaptureStreamPool,
+    _CudaExecutable,
+    _OwnedCaptureStream,
     _account_graph_storage,
     _bitwise_equal,
     _clone,
     _copy,
+    _new_owned_capture_stream,
 )
 from test_inference_efficiency import ObservedNetwork, encoded_requests, position
 
@@ -254,6 +261,342 @@ def test_graph_execution_rejects_an_uncoordinated_second_owner():
             ).result()
 
 
+def test_capture_stream_leases_reuse_released_handles_across_adapters():
+    pool = _CaptureStreamPool(max_streams_per_device=3)
+    created = []
+
+    def factory():
+        stream = SimpleNamespace(cuda_stream=len(created) % 3 + 1)
+        created.append(stream)
+        return stream
+
+    first_backend = CudaBackend(torch.device("cuda:0"), stream_pool=pool)
+    second_backend = CudaBackend(torch.device("cuda:0"), stream_pool=pool)
+    hot = first_backend.stream_pool.acquire(0, factory)
+    cold = second_backend.stream_pool.acquire(0, factory)
+    assert hot.stream.cuda_stream != cold.stream.cuda_stream
+    cold_handle = cold.stream.cuda_stream
+    cold.release()
+    for _ in range(96):
+        reused = second_backend.stream_pool.acquire(0, factory)
+        assert reused.stream.cuda_stream == cold_handle
+        assert reused.stream.cuda_stream != hot.stream.cuda_stream
+        reused.release()
+    assert len(created) == 2
+    hot.release()
+
+
+def test_capture_stream_exhaustion_falls_back_without_aliasing_a_live_graph():
+    pool = _CaptureStreamPool(max_streams_per_device=2)
+    created = []
+
+    def factory():
+        stream = SimpleNamespace(cuda_stream=len(created) + 1)
+        created.append(stream)
+        return stream
+
+    first = pool.acquire(0, factory)
+    second = pool.acquire(0, factory)
+    with pytest.raises(CaptureUnavailable, match="exclusively leased"):
+        pool.acquire(0, factory)
+    assert len(created) == 2
+    first.release()
+    replacement = pool.acquire(0, factory)
+    first.release()  # A stale token cannot release the replacement lease.
+    with pytest.raises(CaptureUnavailable, match="exclusively leased"):
+        pool.acquire(0, factory)
+    replacement.release()
+    second.release()
+
+
+def test_stream_pool_skips_round_robin_wrappers_for_already_leased_handles():
+    pool = _CaptureStreamPool(max_streams_per_device=3)
+    handles = iter((7, 7, 8))
+
+    def factory():
+        return SimpleNamespace(cuda_stream=next(handles))
+
+    first = pool.acquire(0, factory)
+    second = pool.acquire(0, factory)
+    assert first.stream.cuda_stream == 7 and second.stream.cuda_stream == 8
+    first.release()
+    second.release()
+    assert (
+        CudaBackend(torch.device("cuda:0")).stream_pool
+        is CudaBackend(torch.device("cuda:0")).stream_pool
+    )
+
+
+def test_cuda_executable_releases_stream_only_after_reset_and_destruction(monkeypatch):
+    events = []
+    pool = _CaptureStreamPool(max_streams_per_device=1)
+    lease = pool.acquire(0, lambda: SimpleNamespace(cuda_stream=7))
+    original_release = pool.release
+
+    def release(selected):
+        events.append("release")
+        original_release(selected)
+
+    monkeypatch.setattr(pool, "release", release)
+    monkeypatch.setattr(
+        torch.cuda, "synchronize", lambda device: events.append("synchronize")
+    )
+
+    class Graph:
+        def reset(self):
+            events.append("reset")
+
+        def __del__(self):
+            events.append("destroy")
+
+    entry = _CudaExecutable(
+        Graph(), (), {}, torch.empty(0), torch.device("cuda:0"), 0, 0, None, lease
+    )
+    entry.close()
+    assert events == ["synchronize", "reset", "destroy", "release"]
+    entry.close()
+    assert events.count("release") == 1
+
+
+def test_failed_graph_reset_does_not_release_its_live_stream(monkeypatch):
+    pool = _CaptureStreamPool(max_streams_per_device=1)
+    lease = pool.acquire(0, lambda: SimpleNamespace(cuda_stream=7))
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda device: None)
+
+    class Graph:
+        def reset(self):
+            raise RuntimeError("poisoned CUDA context")
+
+    entry = _CudaExecutable(
+        Graph(), (), {}, torch.empty(0), torch.device("cuda:0"), 0, 0, None, lease
+    )
+    with pytest.raises(RuntimeError, match="poisoned"):
+        entry.close()
+    with pytest.raises(CaptureUnavailable, match="exclusively leased"):
+        pool.acquire(0, lambda: SimpleNamespace(cuda_stream=7))
+
+
+def test_owned_cuda_stream_uses_nonblocking_runtime_and_explicit_destruction(
+    monkeypatch,
+):
+    import startrain.inference_graphs as module
+
+    events = []
+    runtime = SimpleNamespace(
+        cudaStreamNonBlocking=1,
+        cudaStreamCreateWithFlags=lambda flags: (
+            events.append(("create", flags)) or (0, 7123)
+        ),
+        cudaStreamDestroy=lambda stream: events.append(("destroy", stream)) or (0,),
+    )
+    monkeypatch.setattr(module.importlib, "import_module", lambda name: runtime)
+    monkeypatch.setattr(torch.cuda, "device", lambda device: nullcontext())
+    monkeypatch.setattr(
+        torch.cuda,
+        "ExternalStream",
+        lambda handle, device: SimpleNamespace(cuda_stream=handle, device=device),
+    )
+    monkeypatch.setattr(
+        torch.cuda,
+        "Stream",
+        lambda **kwargs: pytest.fail(
+            "owned capture must not use PyTorch pooled streams"
+        ),
+    )
+    owned = _new_owned_capture_stream(3)
+    assert owned.stream.cuda_stream == 7123 and owned.stream.device == 3
+    owned.close()
+    owned.close()
+    assert events == [("create", 1), ("destroy", 7123)]
+
+
+def test_missing_runtime_bindings_never_fall_back_to_pooled_streams(monkeypatch):
+    import startrain.inference_graphs as module
+
+    def missing(name):
+        raise ImportError("no bindings")
+
+    monkeypatch.setattr(module.importlib, "import_module", missing)
+    monkeypatch.setattr(
+        torch.cuda, "Stream", lambda **kwargs: pytest.fail("unsafe pooled fallback")
+    )
+    with pytest.raises(CaptureUnavailable, match="cuda.bindings.runtime"):
+        _new_owned_capture_stream(0)
+
+
+def test_idle_external_streams_are_bounded_and_destroyed_on_pool_cleanup():
+    destroyed = []
+    pool = _CaptureStreamPool(max_idle_per_device=2)
+
+    def factory(index):
+        return lambda: _OwnedCaptureStream(
+            SimpleNamespace(cuda_stream=index), lambda: destroyed.append(index)
+        )
+
+    leases = [pool.acquire(0, factory(index)) for index in range(5)]
+    for lease in leases:
+        lease.release()
+    assert len(destroyed) == 3 and len(pool._known) == 2
+    pool.release_idle(0)
+    assert sorted(destroyed) == list(range(5))
+    assert not pool._known and not pool._leased
+
+
+def test_external_stream_destruction_follows_graph_reset_and_destruction(monkeypatch):
+    events = []
+    pool = _CaptureStreamPool(max_idle_per_device=0)
+    lease = pool.acquire(
+        0,
+        lambda: _OwnedCaptureStream(
+            SimpleNamespace(cuda_stream=7), lambda: events.append("stream_destroy")
+        ),
+    )
+    monkeypatch.setattr(
+        torch.cuda, "synchronize", lambda device: events.append("synchronize")
+    )
+
+    class Graph:
+        def reset(self):
+            events.append("graph_reset")
+
+        def __del__(self):
+            events.append("graph_destroy")
+
+    entry = _CudaExecutable(
+        Graph(), (), {}, torch.empty(0), torch.device("cuda:0"), 0, 0, None, lease
+    )
+    entry.close()
+    assert events == ["synchronize", "graph_reset", "graph_destroy", "stream_destroy"]
+
+
+def test_failed_external_stream_destroy_quarantines_handle():
+    pool = _CaptureStreamPool(max_streams_per_device=1, max_idle_per_device=0)
+
+    def fail():
+        raise RuntimeError("stream destroy failed")
+
+    lease = pool.acquire(
+        0, lambda: _OwnedCaptureStream(SimpleNamespace(cuda_stream=7), fail)
+    )
+    with pytest.raises(RuntimeError, match="destroy failed"):
+        lease.release()
+    with pytest.raises(CaptureUnavailable, match="exclusively leased"):
+        pool.acquire(0, lambda: SimpleNamespace(cuda_stream=7))
+
+
+def test_capture_exit_traceback_cannot_destroy_graph_after_stream_reuse(monkeypatch):
+    import startrain.inference_graphs as module
+
+    events = []
+    pool = _CaptureStreamPool(max_idle_per_device=0)
+
+    class Stream:
+        cuda_stream = 7123
+
+        def wait_stream(self, other):
+            pass
+
+        def synchronize(self):
+            events.append("stream_sync")
+
+    class Graph:
+        def reset(self):
+            events.append("graph_reset")
+
+        def __del__(self):
+            events.append("graph_destroy")
+
+    class CaptureContext:
+        def __init__(self, graph):
+            self.graph = graph
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *unused):
+            raise ValueError("capture end failed while retaining graph")
+
+    monkeypatch.setattr(
+        module,
+        "_new_owned_capture_stream",
+        lambda device: _OwnedCaptureStream(
+            Stream(), lambda: events.append("stream_destroy")
+        ),
+    )
+    monkeypatch.setattr(
+        module, "_tensors", lambda value: []
+    )  # CPU-only lifecycle test.
+    monkeypatch.setattr(module, "_uncached_autocast", lambda device: nullcontext())
+    monkeypatch.setattr(torch.cuda, "CUDAGraph", Graph)
+    monkeypatch.setattr(torch.cuda, "stream", lambda stream: nullcontext())
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda device: None)
+    monkeypatch.setattr(
+        torch.cuda, "graph", lambda graph, stream: CaptureContext(graph)
+    )
+    backend = CudaBackend(torch.device("cuda:0"), warmup_calls=1, stream_pool=pool)
+    with pytest.raises(ValueError, match="retaining graph") as captured:
+        backend.capture(lambda value: value + 1, (torch.ones(1),), {})
+    assert events == [
+        "stream_sync",
+        "graph_reset",
+        "graph_destroy",
+        "stream_sync",
+        "stream_destroy",
+    ]
+    assert not pool._leased and not pool._known
+    assert "__exit__" in [
+        frame.name for frame in traceback.extract_tb(captured.value.__traceback__)
+    ]
+
+
+def test_validation_error_traceback_releases_wrapper_before_external_stream(
+    monkeypatch,
+):
+    events = []
+    pool = _CaptureStreamPool(max_idle_per_device=0)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda device: events.append("sync"))
+
+    class Graph:
+        def replay(self):
+            raise ValueError("validation replay model error")
+
+        def reset(self):
+            events.append("graph_reset")
+
+        def __del__(self):
+            events.append("graph_destroy")
+
+    class Backend:
+        def capture(self, forward, args, kwargs):
+            lease = pool.acquire(
+                0,
+                lambda: _OwnedCaptureStream(
+                    SimpleNamespace(cuda_stream=7),
+                    lambda: events.append("stream_destroy"),
+                ),
+            )
+            return _CudaExecutable(
+                Graph(),
+                (torch.ones(1),),
+                {},
+                torch.empty(1),
+                torch.device("cuda:0"),
+                100,
+                0,
+                torch.ones(1),
+                lease,
+            )
+
+    graphs = cache(Backend())
+    with pytest.raises(ValueError, match="validation replay model error") as captured:
+        graphs.run(("a",), lambda value: value, (torch.ones(1),), {})
+    assert events == ["sync", "graph_reset", "graph_destroy", "stream_destroy"]
+    assert not pool._leased and not pool._known
+    assert "replay" in [
+        frame.name for frame in traceback.extract_tb(captured.value.__traceback__)
+    ]
+
+
 @pytest.fixture
 def feature_requests(monkeypatch):
     monkeypatch.setattr(
@@ -367,6 +710,7 @@ def test_broker_device_guard_serializes_capture_with_registry_work(feature_reque
 
 @pytest.mark.cuda
 def test_cuda_graph_reuse_keeps_inflight_inputs_and_outputs_isolated():
+    pytest.importorskip("cuda.bindings.runtime")
     device = torch.device("cuda:0")
     graphs = BoundedInferenceGraphs(
         backend=CudaBackend(device), max_entries=2, max_bytes=128 * 1024**2
@@ -392,8 +736,61 @@ def test_cuda_graph_reuse_keeps_inflight_inputs_and_outputs_isolated():
 
 
 @pytest.mark.cuda
+def test_cuda_graph_stream_lifetimes_survive_ninety_six_cross_adapter_evictions():
+    pytest.importorskip("cuda.bindings.runtime")
+    device = torch.device("cuda:0")
+    # Independent adapters must share the process-wide stream lease authority.
+    hot = BoundedInferenceGraphs(
+        backend=CudaBackend(device), max_entries=1, max_bytes=256 * 1024**2
+    )
+    cold = BoundedInferenceGraphs(
+        backend=CudaBackend(device), max_entries=1, max_bytes=256 * 1024**2
+    )
+    try:
+        with torch.inference_mode():
+            weight = torch.randn(640, 640, device=device, dtype=torch.bfloat16) * 0.01
+            hot_input = torch.randn(128, 640, device=device, dtype=torch.bfloat16)
+            cold_input = torch.randn_like(hot_input)
+
+            def forward(value):
+                return value @ weight
+
+            expected = forward(hot_input).clone()
+            hot.run(("hot",), forward, (hot_input,), {}, lifetime_pins=(weight,))
+            hot_entry = next(iter(hot._entries.values()))
+            for index in range(96):
+                cold_input.add_(0.0001)
+                result = cold.run(
+                    ("cold", index), forward, (cold_input,), {}, lifetime_pins=(weight,)
+                )
+                torch.testing.assert_close(result, forward(cold_input), rtol=0, atol=0)
+                cold_entry = next(iter(cold._entries.values()))
+                assert (
+                    hot_entry.stream_lease.stream.cuda_stream
+                    != cold_entry.stream_lease.stream.cuda_stream
+                )
+                # Force freed allocations to become unavailable; a surviving
+                # graph must not refer to a workspace retired by its neighbor.
+                if index % 8 == 0:
+                    torch.cuda.empty_cache()
+                torch.testing.assert_close(
+                    hot.run(("hot",), forward, (hot_input,), {}),
+                    expected,
+                    rtol=0,
+                    atol=0,
+                )
+            assert hot.captures == 1 and cold.captures == 96
+            assert cold.evictions == 95
+            assert hot.validation_failures == cold.validation_failures == 0
+    finally:
+        cold.clear()
+        hot.clear()
+
+
+@pytest.mark.cuda
 @pytest.mark.native
 def test_real_network_cuda_graphs_preserve_modes_boards_padding_and_cached_predictions():
+    pytest.importorskip("cuda.bindings.runtime")
     from startrain.model import GraphResTNet, ModelConfig
 
     native = pytest.importorskip("star_native")
