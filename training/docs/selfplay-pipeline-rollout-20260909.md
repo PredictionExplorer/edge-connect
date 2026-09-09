@@ -216,3 +216,90 @@ The graph allowance is bounded at 8 GiB per model (48 GiB over six registry
 entries), and residency telemetry will verify actual use. This is an allowance,
 not preallocated memory. Fleet rollout still requires completed-game and refill
 evidence and a review of the observed efficiency.
+
+## Uninterrupted actor canary
+
+Runtime `151f65a7c2969d134e44fc6e628963c4da49f92d` passed 1,890 tests with eleven
+hardware-dependent skips, Ruff and Pyright. Target-host checks passed 65 focused
+tests and six CUDA/helper checks. All 457 source checksums and the unchanged
+native artifact were verified before deployment.
+
+The GPU 6 canary became active at 07:01:25 UTC. Its saved learner step 144,102
+matched the stopped heartbeat exactly; all learner/arena control hashes were
+preserved. Profile `profile-selfplay-cohort-budget-canary-20260909.yaml` has SHA-256
+`690ef840dffb5b712e2a5b9652394620df4c725c46c4ab02dc20d5d9d3b7ad3b`.
+The four GPU 6 producers each have 64 slots and 128-game quotas, with explicit
+cohort search budgets. GPU 7 uses baseline actor settings and normal evaluation.
+
+All sixteen GPU cohorts entered self-play within 67–112 seconds of launch;
+GPU 6 cleared by 94 seconds. The earlier serialized startup took roughly fifteen
+minutes. These are observed startup latencies, not a matched steady-state or Elo
+benchmark. Per-process read totals were consistent with each cohort performing
+its own full checksum scan.
+
+In a clean 120-second window, GPU 6 served 3,956 useful neural rows/second with
+5.27% padding, within the range of the unmatched baseline actors. It performed
+4,053 graph replays without a new capture, eviction, fallback or validation
+failure in that window. Subsequent residency showed all eleven graph shapes
+cached at 5,209,882,112 bytes (4.85 GiB), with zero evictions. Exact key fingerprints
+match the probe after device normalization; the additional production footprint
+is in private graph-pool allocations, not different inputs or missing shared
+relation bias. Its underlying allocator/compiler cause is not established.
+The 8 GiB per-model allowance covers the observed live inventory with headroom.
+
+Completed-game publication and slot-refill acceptance remain recorded separately
+from these startup, inference and memory checks.
+
+## Accepted canary and completed fleet rollout
+
+The unchanged canary gate passed at 07:44:30 UTC: 24 durably published games,
+3,439 positions and 24 refills, with zero reported drops, worker failures,
+restarts, graph fallbacks or validation failures. Independent read-only ledger
+inspection confirmed ready shards for standard double and both handicap modes.
+The canary had 93,835 graph replays, eleven captures and zero evictions. Its
+accepted report is preserved as `cohort-budget-canary-accepted.json`.
+
+The fleet became active at 07:46:36 UTC on immutable runtime
+`151f65a7c2969d134e44fc6e628963c4da49f92d`, installed at
+`/home/ubuntu/edgeconnect-releases/variant-selfplay-production-20260909`.
+Profile `profile-selfplay-production-20260909.yaml` has SHA-256
+`8dc815f2f25790d882a690313857694b3c3c9d27ea58b5dcef64dd951e6a8a07`;
+its canonical configuration hash is
+`cef8e21f826199dfb00f06c292c10fb09d2e4f874743c73d2de4b8407310c78b`.
+
+The controlled stop saved learner step 144,393, exactly matching its stopped
+heartbeat: zero uncheckpointed learner updates were lost. All 42 captured learner
+and arena control-file hashes remained identical through migration. The UTD
+segment was unchanged. Completed streamed games were preserved; unfinished
+self-play games can still be discarded during a stop.
+
+All seven actor GPUs now use four 64-slot producers, 128-game quotas, compatible
+work, streaming publication, rolling slots, per-game search/PDA seeds, cohort
+budget draws and CUDA graphs. The graph allowance is 48 GiB per actor process,
+divided into 8 GiB per registry slot, with sixteen entries per adapter. GPU 7's
+maximum refill age is 7,200 seconds to accommodate its shared evaluation duty;
+the other actors use 3,600 seconds. These cutoffs stop issuing new games and let
+already-started games drain.
+
+All 28 current-process cohorts entered self-play. GPUs 1–6 cleared by 115 seconds
+after launch; GPU 7 entered after its normal evaluation pause at 07:52:32 UTC.
+Its four-cohort pause was fully quiescent and CUDA-synchronized, and it resumed
+the same lease cleanly. Every actor GPU recorded successful graph inference;
+there were no new failures, restarts, graph errors, fallbacks or reported drops.
+The learner advanced to 144,397. Independent evidence is saved in
+`fleet-worker-final.json`, `fleet-integrity-final.json` and
+`fleet-inference-final.json` under the rollout directory.
+
+The final profile preserves exactly 17,402,775 parameters, 85/5/5/5 training
+allocation, equal six-mode importance, largest-board-only promotion, optimizer
+and learning-rate settings, inference precision, search budgets and UTD 1.5.
+The rollout demonstrates working publication/refill, reduced startup latency and
+stable inference. It does not establish a measured Elo-per-hour improvement.
+
+Fresh local replay-manifest backup and strength-report runs finished successfully
+at 07:50:24 UTC. The disaster-recovery snapshot finished successfully at
+07:57:53 UTC, with snapshot SHA-256
+`16b0c02486e6e888180b7eb02a72d6ca4e444ba9528fd9daa923604fa3b4c5ed`.
+Training, the five-second monitor, and report/local-backup/disaster-backup timers
+remain active. No temporary deployment recovery timers remain scheduled.
+Backup completion evidence is retained in `fleet-backups-final.txt`.
