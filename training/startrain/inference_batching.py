@@ -311,10 +311,14 @@ class BoundedInferenceBroker:
                     "graph_negative_entries",
                 )
             }
+            graph_residency = []
             for adapter in tuple(self._adapters):
                 current = adapter.efficiency_snapshot()
                 for name in gauges:
                     gauges[name] += int(current.get(name, 0))
+                residency = adapter.graph_residency_snapshot()
+                if residency is not None:
+                    graph_residency.append(residency)
             return {
                 "submitted_requests": self._submitted,
                 "completed_requests": self._completed,
@@ -328,6 +332,7 @@ class BoundedInferenceBroker:
                 "queue_wait_seconds": self._queue_wait_seconds,
                 "worker_seconds": self._worker_seconds,
                 "worker_failures": self._worker_failures,
+                "graph_residency": graph_residency,
                 "physical_inference": {
                     **self._physical,
                     **gauges,

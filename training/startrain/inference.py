@@ -380,6 +380,21 @@ class GraphInferenceAdapter:
             metrics.update(self._graphs.snapshot())
         return metrics
 
+    def graph_residency_snapshot(self) -> dict[str, object] | None:
+        """Read owner-published metadata without touching CUDA or graph caches."""
+
+        if self._graphs is None:
+            return None
+        return {
+            "model_identity": self.model_identity,
+            "model_version": self.model_version,
+            "model_step": self.model_step,
+            "entries": [
+                dataclasses.asdict(record)
+                for record in self._graphs.residency_snapshot()
+            ],
+        }
+
     def clear_inference_cache(self) -> None:
         with self._evaluation_lock:
             if self._graphs is not None:

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from dataclasses import dataclass
+import hashlib
 import importlib
 import logging
 import threading
@@ -272,6 +273,21 @@ def _account_graph_storage(
     device_index: int,
     storages: Sequence[tuple[int, int]],
 ) -> int:
+    """Return the conservative retained charge used by admission and probes."""
+
+    private, external = _graph_storage_breakdown(
+        snapshot, pool=pool, device_index=device_index, storages=storages
+    )
+    return private + external
+
+
+def _graph_storage_breakdown(
+    snapshot: Sequence[Mapping[str, Any]],
+    *,
+    pool: tuple[int, int],
+    device_index: int,
+    storages: Sequence[tuple[int, int]],
+) -> tuple[int, int]:
     """Count private-pool segments plus owned blocks outside that pool.
 
     Unlike a global reserved-memory delta, this remains conservative when
@@ -329,7 +345,7 @@ def _account_graph_storage(
             raise CaptureUnavailable(
                 "CUDA graph buffer is absent from allocator ownership snapshot"
             )
-    return private + sum(outside.values())
+    return private, sum(outside.values())
 
 
 def _bitwise_equal(left: Tensor, right: Tensor) -> bool:
@@ -383,6 +399,8 @@ class _CudaExecutable:
     warmup_calls: int
     reference_output: Tensor | None
     stream_lease: _CaptureStreamLease | None = None
+    private_pool_bytes: int | None = None
+    external_static_bytes: int | None = None
 
     def replay(self, args: Sequence[Tensor], kwargs: Mapping[str, object]) -> Tensor:
         if self.graph is None:
@@ -492,7 +510,7 @@ class CudaBackend:
                 *_tensors(tuple(static_kwargs.values())),
                 output,
             ]
-            retained = _account_graph_storage(
+            private_bytes, external_bytes = _graph_storage_breakdown(
                 snapshot,
                 pool=(int(graph.pool()[0]), int(graph.pool()[1])),
                 device_index=device_index,
@@ -510,10 +528,12 @@ class CudaBackend:
                 static_kwargs,
                 output,
                 self.device,
-                retained,
+                private_bytes + external_bytes,
                 self.warmup_calls,
                 reference,
                 lease,
+                private_bytes,
+                external_bytes,
             )
         except BaseException as error:
             # A failed capture must be fully ended before eager inference is
@@ -570,6 +590,19 @@ class CudaBackend:
         self.stream_pool.release_idle(device_index)
 
 
+@dataclass(frozen=True, slots=True)
+class GraphResidency:
+    """Capture-time metadata only; no tensors, executable or allocator access."""
+
+    rows: int
+    nodes: int
+    key_sha256: str
+    kwarg_names: tuple[str, ...]
+    charged_bytes: int
+    private_pool_bytes: int | None
+    external_static_bytes: int | None
+
+
 class BoundedInferenceGraphs:
     """LRU graphs and bounded negative caching, called by one serialized owner."""
 
@@ -583,6 +616,9 @@ class BoundedInferenceGraphs:
         self.max_bytes = max_bytes
         self._entries: OrderedDict[tuple[object, ...], Executable] = OrderedDict()
         self._pins: dict[tuple[object, ...], tuple[Tensor, ...]] = {}
+        self._residency: dict[tuple[object, ...], GraphResidency] = {}
+        self._residency_lock = threading.Lock()
+        self._published_residency: tuple[GraphResidency, ...] = ()
         self._unsupported: OrderedDict[tuple[object, ...], str] = OrderedDict()
         self.retained_bytes = 0
         self.captures = 0
@@ -599,8 +635,28 @@ class BoundedInferenceGraphs:
         key, entry = self._entries.popitem(last=False)
         entry.close()
         self._pins.pop(key, None)
+        self._residency.pop(key, None)
         self.retained_bytes -= entry.retained_bytes
         self.evictions += 1
+        self._publish_residency()
+
+    def _publish_residency(self) -> None:
+        # Only the inference owner (or its quiescent cleanup) reads the mutable
+        # inventory. Heartbeats receive an independently immutable tuple.
+        records = tuple(
+            sorted(
+                self._residency.values(),
+                key=lambda record: (record.rows, record.nodes, record.key_sha256),
+            )
+        )
+        with self._residency_lock:
+            self._published_residency = records
+
+    def residency_snapshot(self) -> tuple[GraphResidency, ...]:
+        """Read cached CPU metadata without GPU locks or live-cache iteration."""
+
+        with self._residency_lock:
+            return self._published_residency
 
     def _reject(self, key: tuple[object, ...], reason: str) -> None:
         logging.getLogger(__name__).warning("CUDA graph inference fallback: %s", reason)
@@ -699,6 +755,16 @@ class BoundedInferenceGraphs:
             self._entries[key] = entry
             self._pins[key] = tuple(lifetime_pins)
             self.retained_bytes += entry.retained_bytes
+            self._residency[key] = GraphResidency(
+                rows=int(args[0].shape[0]),
+                nodes=int(args[0].shape[1]) if args[0].ndim > 1 else 0,
+                key_sha256=hashlib.sha256(repr(key).encode("utf-8")).hexdigest(),
+                kwarg_names=tuple(sorted(kwargs)),
+                charged_bytes=entry.retained_bytes,
+                private_pool_bytes=getattr(entry, "private_pool_bytes", None),
+                external_static_bytes=getattr(entry, "external_static_bytes", None),
+            )
+            self._publish_residency()
         self._entries.move_to_end(key)
         output = entry.replay(args, kwargs)
         self.replays += 1
