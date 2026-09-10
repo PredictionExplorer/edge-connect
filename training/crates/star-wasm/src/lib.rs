@@ -15,8 +15,8 @@ mod bindings {
         ScoringScratch, Symmetry, Variant, rules_hash,
     };
     use star_search::{
-        Evaluation, EvaluationRequest, GumbelParameters, GumbelSequentialHalving, SearchTree,
-        SimulationStart,
+        Evaluation, EvaluationRequest, GumbelParameters, GumbelSequentialHalving, SearchSession,
+        SearchTree, SessionConfig, SessionResult, SimulationStart,
     };
     use wasm_bindgen::prelude::*;
 
@@ -24,6 +24,12 @@ mod bindings {
     #[wasm_bindgen]
     pub fn search_algorithm_id() -> String {
         star_search::SEARCH_ALGORITHM_ID.to_owned()
+    }
+
+    /// Version of the optional batched and persistent search execution API.
+    #[wasm_bindgen]
+    pub fn search_execution_version() -> u32 {
+        1
     }
 
     /// Browser-owned *Star state for any rule variant.
@@ -448,6 +454,13 @@ mod bindings {
             })
         }
 
+        /// Next edge from the current phase, without transferring statistics.
+        /// Returns `None` at a phase boundary or after the budget is exhausted.
+        /// When not `done`, call `next` with current statistics to begin the next phase.
+        pub fn next_scheduled(&mut self) -> Option<usize> {
+            self.inner.next_scheduled_candidate()
+        }
+
         /// Next forced root edge, or `None` when complete.
         pub fn next(
             &mut self,
@@ -475,10 +488,268 @@ mod bindings {
         }
     }
 
+    /// Optional ordered first-visit batching and between-move subtree reuse.
+    #[wasm_bindgen]
+    pub struct WasmSearchSession {
+        inner: SearchSession,
+        pending: Vec<EvaluationRequest>,
+        completed: Option<SessionResult>,
+    }
+
+    #[wasm_bindgen]
+    impl WasmSearchSession {
+        /// Construct a fresh search; every supplied simulation is new work.
+        #[wasm_bindgen(constructor)]
+        #[allow(clippy::too_many_arguments)]
+        pub fn new(
+            state: &WasmState,
+            simulations: u32,
+            max_considered: usize,
+            c_visit: f32,
+            c_scale: f32,
+            seed: u64,
+            first_visit_batch_size: usize,
+        ) -> Result<WasmSearchSession, JsValue> {
+            Ok(Self {
+                inner: SearchSession::new(
+                    state.inner.clone(),
+                    SessionConfig {
+                        simulations,
+                        max_considered,
+                        parameters: GumbelParameters { c_visit, c_scale },
+                        seed,
+                        first_visit_batch_size,
+                    },
+                )
+                .map_err(js_error)?,
+                pending: Vec::new(),
+                completed: None,
+            })
+        }
+
+        /// Begin another root, reusing only eligible exact proper descendants.
+        #[allow(clippy::too_many_arguments)]
+        pub fn restart(
+            &mut self,
+            state: &WasmState,
+            simulations: u32,
+            max_considered: usize,
+            c_visit: f32,
+            c_scale: f32,
+            seed: u64,
+            first_visit_batch_size: usize,
+            allow_reuse: bool,
+            max_nodes: usize,
+        ) -> Result<(), JsValue> {
+            self.inner
+                .restart(
+                    state.inner.clone(),
+                    SessionConfig {
+                        simulations,
+                        max_considered,
+                        parameters: GumbelParameters { c_visit, c_scale },
+                        seed,
+                        first_visit_batch_size,
+                    },
+                    allow_reuse,
+                    max_nodes,
+                )
+                .map_err(js_error)?;
+            self.pending.clear();
+            self.completed = None;
+            Ok(())
+        }
+
+        /// Root inference is required for both a fresh and a reused root.
+        pub fn root_actions(&self) -> Result<Vec<u16>, JsValue> {
+            Ok(placement_nodes(
+                self.inner.root_request().map_err(js_error)?.legal_actions,
+            ))
+        }
+
+        /// Token for the current root prediction.
+        pub fn root_token(&self) -> Result<u64, JsValue> {
+            Ok(self.inner.root_request().map_err(js_error)?.token)
+        }
+
+        /// Supply root predictions, refreshing retained statistics when reused.
+        pub fn initialize_root(
+            &mut self,
+            token: u64,
+            value: f32,
+            logits: Vec<f32>,
+        ) -> Result<(), JsValue> {
+            self.inner
+                .initialize_root(Evaluation {
+                    token,
+                    value,
+                    policy_logits: logits,
+                })
+                .map_err(js_error)
+        }
+
+        /// Obtain the next owned batch; submit it before asking for another.
+        pub fn next_requests(&mut self) -> Result<usize, JsValue> {
+            self.pending = self.inner.next_requests().map_err(js_error)?;
+            Ok(self.pending.len())
+        }
+
+        /// Opaque tokens in pending row order.
+        pub fn pending_tokens(&self) -> Vec<u64> {
+            self.pending.iter().map(|request| request.token).collect()
+        }
+
+        /// Copy one pending state; the JavaScript caller owns the returned state.
+        pub fn pending_state(&self, index: usize) -> Result<WasmState, JsValue> {
+            Ok(WasmState {
+                inner: self
+                    .pending
+                    .get(index)
+                    .ok_or_else(|| JsValue::from_str("invalid pending row"))?
+                    .state
+                    .clone(),
+            })
+        }
+
+        /// Legal placements for one pending row.
+        pub fn pending_actions(&self, index: usize) -> Result<Vec<u16>, JsValue> {
+            Ok(placement_nodes(
+                self.pending
+                    .get(index)
+                    .ok_or_else(|| JsValue::from_str("invalid pending row"))?
+                    .legal_actions
+                    .iter()
+                    .copied(),
+            ))
+        }
+
+        /// Validate the whole flat response batch before any ordered backup.
+        pub fn submit(
+            &mut self,
+            tokens: Vec<u64>,
+            values: Vec<f32>,
+            offsets: Vec<usize>,
+            logits: Vec<f32>,
+        ) -> Result<(), JsValue> {
+            if tokens.len() != values.len()
+                || offsets.len() != tokens.len() + 1
+                || offsets.first() != Some(&0)
+                || offsets.last() != Some(&logits.len())
+                || offsets.windows(2).any(|pair| pair[0] > pair[1])
+            {
+                return Err(JsValue::from_str("invalid response batch layout"));
+            }
+            let responses = tokens
+                .into_iter()
+                .zip(values)
+                .enumerate()
+                .map(|(index, (token, value))| Evaluation {
+                    token,
+                    value,
+                    policy_logits: logits[offsets[index]..offsets[index + 1]].to_vec(),
+                })
+                .collect();
+            self.inner.submit(responses).map_err(js_error)?;
+            self.pending.clear();
+            Ok(())
+        }
+
+        /// Whether the new requested simulation budget is complete.
+        pub fn done(&self) -> bool {
+            self.inner.is_done()
+        }
+        /// New simulations completed during this root search.
+        pub fn simulations(&self) -> u32 {
+            self.inner.simulations()
+        }
+        /// Current tree size, for bounding retained browser memory.
+        pub fn unique_nodes(&self) -> usize {
+            self.inner.unique_state_count()
+        }
+        /// Freeze one complete result for subsequent flat getters.
+        pub fn complete(&mut self) -> Result<(), JsValue> {
+            self.completed = Some(self.inner.result().map_err(js_error)?);
+            Ok(())
+        }
+        /// Selected placement, absent only for a terminal root.
+        pub fn selected_action(&self) -> Result<Option<u16>, JsValue> {
+            Ok(self.result()?.search.selected_action.and_then(Action::node))
+        }
+        /// Selected keep-continuation value in root-player perspective.
+        pub fn selected_action_value(&self) -> Result<Option<f32>, JsValue> {
+            Ok(self.result()?.search.selected_action_value)
+        }
+        /// Diagnostic mean over inherited and new root edge evidence.
+        pub fn root_value(&self) -> Result<Option<f32>, JsValue> {
+            Ok(self.result()?.search.root_value)
+        }
+        /// Stable legal root action order.
+        pub fn actions(&self) -> Result<Vec<u16>, JsValue> {
+            Ok(placement_nodes(
+                self.result()?
+                    .search
+                    .root_stats
+                    .iter()
+                    .map(|row| row.action),
+            ))
+        }
+        /// New root edge visits, whose sum is the new requested budget.
+        pub fn visits(&self) -> Result<Vec<u32>, JsValue> {
+            Ok(self.result()?.visits.clone())
+        }
+        /// Work inherited before the new root prediction.
+        pub fn inherited_visits(&self) -> Result<Vec<u32>, JsValue> {
+            Ok(self.result()?.inherited_visits.clone())
+        }
+        /// Combined inherited and new root edge visits.
+        pub fn total_visits(&self) -> Result<Vec<u32>, JsValue> {
+            Ok(self.result()?.total_visits.clone())
+        }
+        /// Q estimates from inherited and new evidence.
+        pub fn q_values(&self) -> Result<Vec<f32>, JsValue> {
+            Ok(self
+                .result()?
+                .search
+                .root_stats
+                .iter()
+                .map(|row| row.q)
+                .collect())
+        }
+        /// Policy target with the new-budget sigma scale.
+        pub fn policy_target(&self) -> Result<Vec<f32>, JsValue> {
+            Ok(self
+                .result()?
+                .search
+                .policy_target
+                .iter()
+                .map(|(_, probability)| *probability)
+                .collect())
+        }
+        /// Retained root outgoing visits at restart.
+        pub fn reused_visits(&self) -> Result<u32, JsValue> {
+            Ok(self.result()?.reused_visits)
+        }
+        /// Retained node count at restart.
+        pub fn reused_nodes(&self) -> Result<usize, JsValue> {
+            Ok(self.result()?.reused_nodes)
+        }
+    }
+
+    impl WasmSearchSession {
+        fn result(&self) -> Result<&SessionResult, JsValue> {
+            self.completed
+                .as_ref()
+                .ok_or_else(|| JsValue::from_str("complete the session result first"))
+        }
+    }
+
     fn js_error(error: impl std::fmt::Display) -> JsValue {
         JsValue::from_str(&error.to_string())
     }
 }
 
 #[cfg(target_arch = "wasm32")]
-pub use bindings::{WasmGumbel, WasmSearchTree, WasmState, search_algorithm_id};
+pub use bindings::{
+    WasmGumbel, WasmSearchSession, WasmSearchTree, WasmState, search_algorithm_id,
+    search_execution_version,
+};

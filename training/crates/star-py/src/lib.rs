@@ -26,7 +26,7 @@ use star_engine::{
 };
 use star_search::{
     Evaluation, EvaluationRequest, GumbelParameters, GumbelSequentialHalving, RootSearchConfig,
-    SearchTree, SimulationStart,
+    SearchSession, SearchTree, SessionConfig, SimulationStart,
 };
 
 /// Schema v4 node planes.
@@ -1192,6 +1192,10 @@ struct PackedSearchRow {
     q_values: Vec<f32>,
     priors: Vec<f32>,
     policy_target: Vec<f32>,
+    inherited_visits: Vec<u32>,
+    total_visits: Vec<u32>,
+    reused_nodes: usize,
+    reused_simulations: u32,
 }
 
 #[pyclass(name = "SearchResults", frozen, skip_from_py_object)]
@@ -1208,6 +1212,10 @@ struct PySearchResults {
     q_values: Vec<f32>,
     priors: Vec<f32>,
     policy_target: Vec<f32>,
+    inherited_visits: Vec<u32>,
+    total_visits: Vec<u32>,
+    reused_nodes: Vec<usize>,
+    reused_simulations: Vec<u32>,
 }
 
 #[pymethods]
@@ -1273,6 +1281,37 @@ impl PySearchResults {
     fn policy_target(&self) -> Vec<f32> {
         self.policy_target.clone()
     }
+
+    /// Root visits inherited before this additional search budget.
+    #[getter]
+    fn inherited_visits(&self) -> Vec<u32> {
+        self.inherited_visits.clone()
+    }
+
+    /// Inherited plus new visits, using the normal action offsets.
+    #[getter]
+    fn total_visits(&self) -> Vec<u32> {
+        self.total_visits.clone()
+    }
+
+    /// Retained DAG nodes per root; zero means a fresh tree.
+    #[getter]
+    fn reused_nodes(&self) -> Vec<usize> {
+        self.reused_nodes.clone()
+    }
+
+    /// Retained outgoing visits per root, never charged to the new budget.
+    #[getter]
+    fn reused_simulations(&self) -> Vec<u32> {
+        self.reused_simulations.clone()
+    }
+}
+
+struct SessionBatch {
+    sessions: Vec<SearchSession>,
+    initialized: bool,
+    pending: Vec<(usize, Vec<u64>)>,
+    cursor: usize,
 }
 
 /// Ask/tell Gumbel MCTS over a full actor batch.
@@ -1285,6 +1324,9 @@ struct PySearchBatch {
     pda_by_seat: Vec<[i8; 2]>,
     seeds_per_root: Option<Vec<u64>>,
     pending: Vec<PendingRow>,
+    execution: Option<SessionBatch>,
+    model_context: Option<String>,
+    first_visit_batch_size: usize,
 }
 
 #[pymethods]
@@ -1305,10 +1347,12 @@ impl PySearchBatch {
         deterministic_seed=None,
         simulations_per_root=None,
         pda_by_seat=None,
-        seeds_per_root=None
+        seeds_per_root=None,
+        first_visit_batch_size=1,
+        model_context=None
     ))]
     #[allow(clippy::too_many_arguments)]
-    fn new(
+    fn new_with_execution(
         py: Python<'_>,
         states: PyRef<'_, PyStateBatch>,
         simulations: u32,
@@ -1319,7 +1363,22 @@ impl PySearchBatch {
         simulations_per_root: Option<Vec<u32>>,
         pda_by_seat: Option<Vec<(i8, i8)>>,
         seeds_per_root: Option<Vec<u64>>,
+        first_visit_batch_size: usize,
+        model_context: Option<String>,
     ) -> PyResult<Self> {
+        if !(1..=64).contains(&first_visit_batch_size) {
+            return Err(PyValueError::new_err(
+                "first_visit_batch_size must be in 1..64",
+            ));
+        }
+        if model_context
+            .as_ref()
+            .is_some_and(|value| value.trim().is_empty())
+        {
+            return Err(PyValueError::new_err(
+                "model_context must be nonempty when supplied",
+            ));
+        }
         if simulations == 0 {
             return Err(PyValueError::new_err("simulations must be positive"));
         }
@@ -1377,7 +1436,7 @@ impl PySearchBatch {
             || RootSearchConfig::fresh(simulations, max_considered, parameters),
             |seed| RootSearchConfig::deterministic(simulations, max_considered, parameters, seed),
         );
-        Ok(Self {
+        let mut batch = Self {
             trees,
             schedulers: None,
             config,
@@ -1385,7 +1444,174 @@ impl PySearchBatch {
             pda_by_seat,
             seeds_per_root,
             pending: Vec::new(),
-        })
+            execution: None,
+            model_context,
+            first_visit_batch_size,
+        };
+        if first_visit_batch_size > 1 || batch.model_context.is_some() {
+            let sessions = batch
+                .trees
+                .iter()
+                .enumerate()
+                .map(|(index, tree)| {
+                    SearchSession::new(
+                        tree.root_state().clone(),
+                        SessionConfig {
+                            simulations: batch.budgets[index],
+                            max_considered: batch.config.max_considered,
+                            parameters: batch.config.parameters,
+                            seed: scheduler_seed(&batch, index, tree.root_state().hash64()),
+                            first_visit_batch_size,
+                        },
+                    )
+                    .map_err(value_error)
+                })
+                .collect::<PyResult<Vec<_>>>()?;
+            batch.execution = Some(SessionBatch {
+                sessions,
+                initialized: false,
+                pending: Vec::new(),
+                cursor: 0,
+            });
+        }
+        Ok(batch)
+    }
+
+    /// Changes additional budgets only before any root prediction is submitted.
+    fn set_simulations_per_root(&mut self, budgets: Vec<u32>) -> PyResult<()> {
+        if self.schedulers.is_some()
+            || self
+                .execution
+                .as_ref()
+                .is_some_and(|value| value.initialized)
+        {
+            return Err(PyRuntimeError::new_err(
+                "budgets must be set before root initialization",
+            ));
+        }
+        if budgets.len() != self.trees.len() || budgets.contains(&0) {
+            return Err(PyValueError::new_err(
+                "budgets require one positive entry per root",
+            ));
+        }
+        if let Some(execution) = self.execution.as_mut() {
+            for (session, budget) in execution.sessions.iter_mut().zip(&budgets) {
+                session.set_simulations(*budget).map_err(value_error)?;
+            }
+        }
+        self.budgets = budgets;
+        Ok(())
+    }
+
+    /// Whether at least one proper descendant can retain compatible search work.
+    #[pyo3(signature=(states, model_context, pda_by_seat=None))]
+    fn can_reuse(
+        &self,
+        states: PyRef<'_, PyStateBatch>,
+        model_context: &str,
+        pda_by_seat: Option<Vec<(i8, i8)>>,
+    ) -> bool {
+        if !self.is_done()
+            || self.model_context.as_deref() != Some(model_context)
+            || states.states.len() != self.trees.len()
+        {
+            return false;
+        }
+        let Some(execution) = &self.execution else {
+            return false;
+        };
+        let pda = pda_by_seat.unwrap_or_else(|| vec![(0, 0); states.states.len()]);
+        if pda.len() != states.states.len() {
+            return false;
+        }
+        execution
+            .sessions
+            .iter()
+            .zip(&states.states)
+            .enumerate()
+            .any(|(i, (session, state))| {
+                self.pda_by_seat[i] == [pda[i].0, pda[i].1] && session.can_reuse_root(state)
+            })
+    }
+
+    /// Begins a new additional budget, retaining only exact compatible descendants.
+    #[pyo3(signature=(states,simulations=128,max_considered=16,c_visit=50.0,c_scale=1.0,
+        deterministic_seed=None,simulations_per_root=None,pda_by_seat=None,seeds_per_root=None,
+        first_visit_batch_size=1,model_context=None,reuse_tree=true,max_reused_nodes=4096))]
+    #[allow(clippy::too_many_arguments)]
+    fn advance(
+        &mut self,
+        py: Python<'_>,
+        states: PyRef<'_, PyStateBatch>,
+        simulations: u32,
+        max_considered: usize,
+        c_visit: f32,
+        c_scale: f32,
+        deterministic_seed: Option<u64>,
+        simulations_per_root: Option<Vec<u32>>,
+        pda_by_seat: Option<Vec<(i8, i8)>>,
+        seeds_per_root: Option<Vec<u64>>,
+        first_visit_batch_size: usize,
+        model_context: Option<String>,
+        reuse_tree: bool,
+        max_reused_nodes: usize,
+    ) -> PyResult<()> {
+        if !self.is_done() {
+            return Err(PyRuntimeError::new_err(
+                "only a completed search can advance",
+            ));
+        }
+        if !(1..=65_536).contains(&max_reused_nodes) {
+            return Err(PyValueError::new_err(
+                "max_reused_nodes must be in 1..65536",
+            ));
+        }
+        if reuse_tree && model_context.is_none() {
+            return Err(PyValueError::new_err(
+                "tree reuse requires an immutable model_context",
+            ));
+        }
+        let mut replacement = Self::new_with_execution(
+            py,
+            states,
+            simulations,
+            max_considered,
+            c_visit,
+            c_scale,
+            deterministic_seed,
+            simulations_per_root,
+            pda_by_seat,
+            seeds_per_root,
+            first_visit_batch_size,
+            model_context,
+        )?;
+        let compatible = reuse_tree
+            && self.model_context == replacement.model_context
+            && self.config.parameters == replacement.config.parameters
+            && self.trees.len() == replacement.trees.len();
+        if compatible
+            && let (Some(old), Some(new)) =
+                (self.execution.as_mut(), replacement.execution.as_mut())
+        {
+            py.detach(|| {
+                for (index, (previous, next)) in
+                    old.sessions.iter_mut().zip(&mut new.sessions).enumerate()
+                {
+                    previous
+                        .restart(
+                            next.root_state().clone(),
+                            next.config(),
+                            self.pda_by_seat[index] == replacement.pda_by_seat[index],
+                            max_reused_nodes,
+                        )
+                        .map_err(value_error)?;
+                    std::mem::swap(previous, next);
+                }
+                Ok::<_, PyErr>(())
+            })?;
+        }
+        *self = replacement;
+        Ok(())
     }
 
     fn __len__(&self) -> usize {
@@ -1396,6 +1622,26 @@ impl PySearchBatch {
     #[getter]
     fn budgets(&self) -> Vec<u32> {
         self.budgets.clone()
+    }
+
+    /// Current unique tree nodes per root, for bounded completed-search pools.
+    #[getter]
+    fn unique_state_counts(&self) -> Vec<usize> {
+        self.execution.as_ref().map_or_else(
+            || {
+                self.trees
+                    .iter()
+                    .map(SearchTree::unique_state_count)
+                    .collect()
+            },
+            |execution| {
+                execution
+                    .sessions
+                    .iter()
+                    .map(SearchSession::unique_state_count)
+                    .collect()
+            },
+        )
     }
 
     /// Effective Gumbel seeds. Explicit root streams ignore batch membership,
@@ -1412,6 +1658,22 @@ impl PySearchBatch {
     /// One inference row per active root; terminal roots are omitted.
     fn root_requests(&self, py: Python<'_>) -> PyResult<PyEvalBatch> {
         py.detach(|| {
+            if let Some(execution) = &self.execution {
+                if execution.initialized {
+                    return Err(PyRuntimeError::new_err(
+                        "root evaluations were already submitted",
+                    ));
+                }
+                let active = execution
+                    .sessions
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, s)| !s.root_state().is_terminal())
+                    .map(|(i, s)| s.root_request().map(|r| (i, r)).map_err(value_error))
+                    .collect::<PyResult<Vec<_>>>()?;
+                let (indices, requests) = active.into_iter().unzip();
+                return Ok(pack_requests(indices, requests, &self.pda_by_seat));
+            }
             if self.schedulers.is_some() {
                 return Err(PyRuntimeError::new_err(
                     "root evaluations were already submitted",
@@ -1433,6 +1695,37 @@ impl PySearchBatch {
         policy_logits: Vec<f32>,
     ) -> PyResult<()> {
         py.detach(|| {
+            if let Some(execution) = self.execution.as_mut() {
+                if execution.initialized {
+                    return Err(PyRuntimeError::new_err(
+                        "root evaluations were already submitted",
+                    ));
+                }
+                let responses = unpack_evaluations(tokens, values, policy_offsets, policy_logits)?;
+                let active = execution
+                    .sessions
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, s)| !s.root_state().is_terminal())
+                    .map(|(i, s)| s.root_request().map(|r| (i, r)).map_err(value_error))
+                    .collect::<PyResult<Vec<_>>>()?;
+                let requests: Vec<_> = active.iter().map(|(_, r)| r.clone()).collect();
+                let mut matched = match_evaluations(&requests, responses)?;
+                for (index, request) in &active {
+                    execution.sessions[*index]
+                        .validate_root_evaluation(
+                            matched.get(&request.token).expect("matched root"),
+                        )
+                        .map_err(value_error)?;
+                }
+                for (index, request) in active {
+                    execution.sessions[index]
+                        .initialize_root(matched.remove(&request.token).expect("validated root"))
+                        .expect("validated root initialization");
+                }
+                execution.initialized = true;
+                return Ok(());
+            }
             if self.schedulers.is_some() {
                 return Err(PyRuntimeError::new_err(
                     "root evaluations were already submitted",
@@ -1482,8 +1775,92 @@ impl PySearchBatch {
     }
 
     /// Selects at most one leaf per active tree and returns one packed batch.
-    fn next_requests(&mut self, py: Python<'_>) -> PyResult<PyEvalBatch> {
+    #[pyo3(name="next_requests", signature=(max_rows=None))]
+    fn next_requests_with_limit(
+        &mut self,
+        py: Python<'_>,
+        max_rows: Option<usize>,
+    ) -> PyResult<PyEvalBatch> {
         py.detach(|| {
+            if max_rows == Some(0) {
+                return Err(PyValueError::new_err("max_rows must be positive"));
+            }
+            if let Some(execution) = self.execution.as_mut() {
+                if !execution.initialized {
+                    return Err(PyRuntimeError::new_err("initialize roots first"));
+                }
+                if !execution.pending.is_empty() {
+                    return Err(PyRuntimeError::new_err(
+                        "submit the outstanding leaf batch first",
+                    ));
+                }
+                let count = execution.sessions.len();
+                let cap = max_rows
+                    .unwrap_or_else(|| count.saturating_mul(self.first_visit_batch_size).max(1));
+                if cap == 0 {
+                    return Err(PyValueError::new_err("max_rows must be positive"));
+                }
+                if count == 0 {
+                    return Ok(pack_requests(Vec::new(), Vec::new(), &self.pda_by_seat));
+                }
+                let mut quotas = vec![None; count];
+                let mut available = cap;
+                let mut examined = 0;
+                while examined < count && available > 0 {
+                    let index = (execution.cursor + examined) % count;
+                    examined += 1;
+                    let session = &execution.sessions[index];
+                    if session.is_done() {
+                        continue;
+                    }
+                    let cfg = session.config();
+                    let initial = cfg
+                        .max_considered
+                        .min(cfg.simulations as usize)
+                        .min(session.root_state().legal_actions().len());
+                    let width = if (session.simulations() as usize) < initial {
+                        cfg.first_visit_batch_size
+                    } else {
+                        1
+                    };
+                    let quota = width.min(available);
+                    quotas[index] = Some(quota);
+                    available -= quota;
+                }
+                execution.cursor = (execution.cursor + examined) % count;
+                let rows = execution
+                    .sessions
+                    .par_iter_mut()
+                    .enumerate()
+                    .map(|(index, session)| {
+                        let requests = match quotas[index] {
+                            Some(limit) => session
+                                .next_requests_with_limit(limit)
+                                .map_err(|e| e.to_string())?,
+                            None => Vec::new(),
+                        };
+                        Ok::<_, String>((index, requests))
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(PyValueError::new_err)?;
+                let mut indices = Vec::new();
+                let mut requests = Vec::new();
+                for (index, rows) in rows {
+                    if !rows.is_empty() {
+                        execution
+                            .pending
+                            .push((index, rows.iter().map(|r| r.token).collect()));
+                    }
+                    indices.extend(std::iter::repeat_n(index, rows.len()));
+                    requests.extend(rows);
+                }
+                return Ok(pack_requests(indices, requests, &self.pda_by_seat));
+            }
+            if max_rows.is_some_and(|cap| cap < self.trees.len()) {
+                return Err(PyValueError::new_err(
+                    "legacy search requires max_rows at least the root count",
+                ));
+            }
             if !self.pending.is_empty() {
                 return Err(PyRuntimeError::new_err(
                     "submit the outstanding leaf batch first",
@@ -1503,10 +1880,15 @@ impl PySearchBatch {
                         return Ok(None);
                     };
                     while !scheduler.is_done() {
-                        let candidate = scheduler
-                            .next_candidate(&tree.root_completed_q(), &tree.root_visits())
-                            .map_err(|error| error.to_string())?
-                            .expect("unfinished scheduler returns a candidate");
+                        let candidate =
+                            if let Some(candidate) = scheduler.next_scheduled_candidate() {
+                                candidate
+                            } else {
+                                scheduler
+                                    .next_candidate(&tree.root_completed_q(), &tree.root_visits())
+                                    .map_err(|error| error.to_string())?
+                                    .expect("unfinished scheduler returns a candidate")
+                            };
                         match tree
                             .start_simulation(Some(candidate), self.config.parameters)
                             .map_err(|error| error.to_string())?
@@ -1552,6 +1934,36 @@ impl PySearchBatch {
         policy_logits: Vec<f32>,
     ) -> PyResult<()> {
         py.detach(|| {
+            if let Some(execution) = self.execution.as_mut() {
+                if execution.pending.is_empty() {
+                    return Err(PyRuntimeError::new_err("no leaf batch is pending"));
+                }
+                let responses = unpack_evaluations(tokens, values, policy_offsets, policy_logits)?;
+                let expected: Vec<_> = execution
+                    .pending
+                    .iter()
+                    .flat_map(|(_, tokens)| tokens.iter().copied())
+                    .collect();
+                let mut matched = match_token_set(&expected, responses)?;
+                let mut jobs = Vec::new();
+                for (index, tokens) in &execution.pending {
+                    let responses = tokens
+                        .iter()
+                        .map(|token| matched.remove(token).expect("matched session token"))
+                        .collect::<Vec<_>>();
+                    execution.sessions[*index]
+                        .validate_responses(&responses)
+                        .map_err(value_error)?;
+                    jobs.push((*index, responses));
+                }
+                for (index, responses) in jobs {
+                    execution.sessions[index]
+                        .submit(responses)
+                        .expect("validated session response");
+                }
+                execution.pending.clear();
+                return Ok(());
+            }
             if self.pending.is_empty() {
                 return Err(PyRuntimeError::new_err("no leaf batch is pending"));
             }
@@ -1609,7 +2021,27 @@ impl PySearchBatch {
     }
 
     /// Whether every active root consumed its exact simulation budget.
+    fn cancel_pending(&mut self) {
+        if let Some(execution) = self.execution.as_mut() {
+            for session in &mut execution.sessions {
+                session.cancel_pending();
+            }
+            execution.pending.clear();
+        } else {
+            for tree in &mut self.trees {
+                tree.cancel_pending();
+            }
+            self.pending.clear();
+        }
+    }
+
+    /// Whether every active root consumed its exact simulation budget.
     fn is_done(&self) -> bool {
+        if let Some(execution) = &self.execution {
+            return execution.initialized
+                && execution.pending.is_empty()
+                && execution.sessions.iter().all(SearchSession::is_done);
+        }
         self.schedulers.as_ref().is_some_and(|schedulers| {
             schedulers
                 .iter()
@@ -1624,6 +2056,44 @@ impl PySearchBatch {
             if !self.is_done() {
                 return Err(PyRuntimeError::new_err("search is not complete"));
             }
+            if let Some(execution) = &self.execution {
+                let rows = execution
+                    .sessions
+                    .iter()
+                    .map(|session| {
+                        let result = session.result().map_err(value_error)?;
+                        let search = result.search;
+                        let node_count = session.root_state().board().node_count();
+                        Ok(PackedSearchRow {
+                            selected_action: search
+                                .selected_action
+                                .map_or(-2, |a| a.code(node_count)),
+                            terminal: search.terminal_value.is_some(),
+                            terminal_value: search.terminal_value.unwrap_or(0.0),
+                            root_value: search.root_value.unwrap_or(0.0),
+                            selected_action_value: search.selected_action_value.unwrap_or(0.0),
+                            actions: search
+                                .root_stats
+                                .iter()
+                                .map(|s| s.action.code(node_count))
+                                .collect(),
+                            visits: result.visits,
+                            q_values: search.root_stats.iter().map(|s| s.q).collect(),
+                            priors: search.root_stats.iter().map(|s| s.prior).collect(),
+                            policy_target: search
+                                .policy_target
+                                .into_iter()
+                                .map(|(_, p)| p)
+                                .collect(),
+                            inherited_visits: result.inherited_visits,
+                            total_visits: result.total_visits,
+                            reused_nodes: result.reused_nodes,
+                            reused_simulations: result.reused_visits,
+                        })
+                    })
+                    .collect::<PyResult<Vec<_>>>()?;
+                return Ok(pack_search_rows(rows));
+            }
             let schedulers = self
                 .schedulers
                 .as_ref()
@@ -1631,6 +2101,13 @@ impl PySearchBatch {
             pack_search_results(&self.trees, schedulers, self.config.parameters)
                 .map_err(PyValueError::new_err)
         })
+    }
+}
+
+#[cfg(test)]
+impl PySearchBatch {
+    fn next_requests(&mut self, py: Python<'_>) -> PyResult<PyEvalBatch> {
+        self.next_requests_with_limit(py, None)
     }
 }
 
@@ -1658,6 +2135,10 @@ fn pack_search_results(
                     q_values: Vec::new(),
                     priors: Vec::new(),
                     policy_target: Vec::new(),
+                    inherited_visits: Vec::new(),
+                    total_visits: Vec::new(),
+                    reused_nodes: 0,
+                    reused_simulations: 0,
                 });
             };
             let stats = tree.root_stats();
@@ -1682,10 +2163,17 @@ fn pack_search_results(
                     .into_iter()
                     .map(|(_, probability)| probability)
                     .collect(),
+                inherited_visits: vec![0; stats.len()],
+                total_visits: stats.iter().map(|row| row.visits).collect(),
+                reused_nodes: 0,
+                reused_simulations: 0,
             })
         })
         .collect();
-    let rows = rows?;
+    Ok(pack_search_rows(rows?))
+}
+
+fn pack_search_rows(rows: Vec<PackedSearchRow>) -> PySearchResults {
     let action_count: usize = rows.iter().map(|row| row.actions.len()).sum();
     let mut selected_actions = Vec::with_capacity(rows.len());
     let mut terminal = Vec::with_capacity(rows.len());
@@ -1698,6 +2186,10 @@ fn pack_search_results(
     let mut q_values = Vec::with_capacity(action_count);
     let mut priors = Vec::with_capacity(action_count);
     let mut policy_target = Vec::with_capacity(action_count);
+    let mut inherited_visits = Vec::with_capacity(action_count);
+    let mut total_visits = Vec::with_capacity(action_count);
+    let mut reused_nodes = Vec::with_capacity(rows.len());
+    let mut reused_simulations = Vec::with_capacity(rows.len());
     action_offsets.push(0);
     for row in rows {
         selected_actions.push(row.selected_action);
@@ -1710,9 +2202,13 @@ fn pack_search_results(
         q_values.extend(row.q_values);
         priors.extend(row.priors);
         policy_target.extend(row.policy_target);
+        inherited_visits.extend(row.inherited_visits);
+        total_visits.extend(row.total_visits);
+        reused_nodes.push(row.reused_nodes);
+        reused_simulations.push(row.reused_simulations);
         action_offsets.push(actions.len());
     }
-    Ok(PySearchResults {
+    PySearchResults {
         selected_actions,
         terminal,
         terminal_values,
@@ -1724,7 +2220,11 @@ fn pack_search_results(
         q_values,
         priors,
         policy_target,
-    })
+        inherited_visits,
+        total_visits,
+        reused_nodes,
+        reused_simulations,
+    }
 }
 
 fn score_states(states: &[GameState], node_count: u16) -> PyScoreData {
@@ -2792,6 +3292,12 @@ const fn native_search_algorithm_id() -> &'static str {
     star_search::SEARCH_ALGORITHM_ID
 }
 
+/// Opt-in prefetch/reuse session protocol version.
+#[pyfunction]
+const fn native_search_execution_version() -> u8 {
+    1
+}
+
 /// Production feature schema version.
 #[pyfunction]
 const fn native_feature_schema_version() -> u8 {
@@ -2855,6 +3361,7 @@ fn star_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(native_rules_hash_tag, module)?)?;
     module.add_function(wrap_pyfunction!(native_rules_schema, module)?)?;
     module.add_function(wrap_pyfunction!(native_search_algorithm_id, module)?)?;
+    module.add_function(wrap_pyfunction!(native_search_execution_version, module)?)?;
     module.add_function(wrap_pyfunction!(native_feature_schema_version, module)?)?;
     module.add_function(wrap_pyfunction!(native_feature_schema_hash, module)?)?;
     module.add_function(wrap_pyfunction!(native_legacy_feature_schema_hash, module)?)?;
@@ -3450,6 +3957,9 @@ mod tests {
                 pda_by_seat: vec![[0, 0], [2, -2], [-1, 1]],
                 seeds_per_root: None,
                 pending: Vec::new(),
+                execution: None,
+                model_context: None,
+                first_visit_batch_size: 1,
             };
             let roots = search.root_requests(py).unwrap();
             // Every root has player 1 to move: seat-1 advantages apply.
@@ -3562,6 +4072,9 @@ mod tests {
                     pda_by_seat: vec![[0, 0]; transformed.states.len()],
                     seeds_per_root: None,
                     pending: Vec::new(),
+                    execution: None,
+                    model_context: None,
+                    first_visit_batch_size: 1,
                 };
                 let roots = search.root_requests(py).unwrap();
                 let root_rows = roots.tree_indices.clone();
@@ -3633,6 +4146,9 @@ mod tests {
                             .collect()
                     }),
                     pending: Vec::new(),
+                    execution: None,
+                    model_context: None,
+                    first_visit_batch_size: 1,
                 };
                 let seeds = search.root_seeds();
                 let roots = search.root_requests(py).unwrap();

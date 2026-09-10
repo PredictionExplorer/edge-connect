@@ -115,6 +115,15 @@ pub struct RootActionStats {
     pub q: f32,
 }
 
+/// Search work retained by an exact-semantic root transition.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReuseStats {
+    /// Unique states reachable from the new root, including that root.
+    pub retained_nodes: usize,
+    /// Completed outgoing-edge visits at the new root.
+    pub retained_visits: u32,
+}
+
 #[derive(Clone, Debug)]
 struct Edge {
     action: Action,
@@ -173,6 +182,7 @@ pub struct SearchTree {
     pending: Option<PendingSimulation>,
     root_token: u64,
     pie_root_transform: bool,
+    selection_scratch: Vec<f64>,
 }
 
 impl SearchTree {
@@ -189,6 +199,7 @@ impl SearchTree {
             pending: None,
             root_token: fresh_evaluation_token(),
             pie_root_transform,
+            selection_scratch: Vec::new(),
         }
     }
 
@@ -261,6 +272,185 @@ impl SearchTree {
     #[must_use]
     pub fn has_pending_evaluation(&self) -> bool {
         self.pending.is_some()
+    }
+
+    /// Preview an unevaluated, unvisited root child without adding nodes or visits.
+    ///
+    /// The token belongs only to this prediction request. A later ordinary
+    /// simulation issues its own token and remains the sole pending simulation.
+    pub fn preview_root_child(
+        &self,
+        edge: usize,
+    ) -> Result<Option<EvaluationRequest>, SearchError> {
+        self.validate_refreshable_root()?;
+        let root_edge = self.nodes[0]
+            .edges
+            .get(edge)
+            .ok_or(SearchError::InvalidRootEdge(edge))?;
+        if root_edge.visits != 0 {
+            return Ok(None);
+        }
+        let mut state = if let Some(child) = root_edge.child {
+            let child = &self.nodes[child];
+            if child.expanded || child.terminal_value.is_some() {
+                return Ok(None);
+            }
+            child.state.clone()
+        } else {
+            let mut state = self.nodes[0].state.clone();
+            state.apply(root_edge.action)?;
+            state
+        };
+        if state.is_terminal() {
+            return Ok(None);
+        }
+        if let Some(&existing) = self.transpositions.get(&state.key()) {
+            let child = &self.nodes[existing];
+            if child.expanded || child.terminal_value.is_some() {
+                return Ok(None);
+            }
+            state = child.state.clone();
+        }
+        Ok(Some(EvaluationRequest {
+            token: fresh_evaluation_token(),
+            legal_actions: state.legal_actions().to_vec(),
+            state,
+        }))
+    }
+
+    /// Whether an exact, expanded nonterminal proper descendant is reusable.
+    ///
+    /// This tests full semantic-key equality, including observable history;
+    /// outstanding leaf evaluation makes every target ineligible.
+    #[must_use]
+    pub fn can_reuse_root(&self, target: &GameState) -> bool {
+        self.pending.is_none()
+            && !target.is_terminal()
+            && self
+                .transpositions
+                .get(&target.key())
+                .is_some_and(|&index| {
+                    index != 0
+                        && self.nodes[index].expanded
+                        && self.nodes[index].terminal_value.is_none()
+                })
+    }
+
+    /// Retain only the exact target's reachable DAG, preserving node-local values.
+    ///
+    /// The current root, ineligible targets and graphs larger than `max_nodes` return
+    /// `None` without changing the tree. The supplied state replaces the root's
+    /// equivalent stored history representation. Root expansion visits are
+    /// excluded from retained simulation counts; outgoing edge statistics stay.
+    pub fn reuse_root(
+        &mut self,
+        target: GameState,
+        max_nodes: usize,
+    ) -> Result<Option<ReuseStats>, SearchError> {
+        if self.pending.is_some() {
+            return Err(SearchError::PendingEvaluation);
+        }
+        if max_nodes == 0 || !self.can_reuse_root(&target) {
+            return Ok(None);
+        }
+        let old_root = self.transpositions[&target.key()];
+        let mut remap = HashMap::new();
+        let mut retained = Vec::new();
+        let mut stack = vec![old_root];
+        while let Some(old_index) = stack.pop() {
+            if remap.contains_key(&old_index) {
+                continue;
+            }
+            if retained.len() == max_nodes {
+                return Ok(None);
+            }
+            remap.insert(old_index, retained.len());
+            retained.push(old_index);
+            for edge in self.nodes[old_index].edges.iter().rev() {
+                if let Some(child) = edge.child {
+                    stack.push(child);
+                }
+            }
+        }
+        let mut nodes: Vec<_> = retained
+            .into_iter()
+            .map(|old_index| {
+                let mut node = self.nodes[old_index].clone();
+                for edge in &mut node.edges {
+                    edge.child = edge.child.map(|child| remap[&child]);
+                }
+                node
+            })
+            .collect();
+        let root = &mut nodes[0];
+        root.state = target;
+        root.visits = root.edges.iter().map(|edge| edge.visits).sum();
+        root.value_sum = root.edges.iter().map(|edge| edge.value_sum).sum();
+        let stats = ReuseStats {
+            retained_nodes: nodes.len(),
+            retained_visits: nodes[0].visits,
+        };
+        let transpositions = nodes
+            .iter()
+            .enumerate()
+            .map(|(index, node)| (node.state.key(), index))
+            .collect();
+        let root_token = fresh_evaluation_token();
+        self.pie_root_transform = nodes[0].state.is_pie_pending();
+        self.nodes = nodes;
+        self.transpositions = transpositions;
+        self.root_token = root_token;
+        self.selection_scratch = Vec::new();
+        Ok(Some(stats))
+    }
+
+    fn validate_refreshable_root(&self) -> Result<(), SearchError> {
+        if self.nodes[0].state.is_terminal() {
+            return Err(SearchError::TerminalRoot);
+        }
+        if !self.nodes[0].expanded {
+            return Err(SearchError::RootUninitialized);
+        }
+        if self.pending.is_some() {
+            return Err(SearchError::PendingEvaluation);
+        }
+        Ok(())
+    }
+
+    /// Request fresh root predictions while retaining existing search statistics.
+    pub fn root_refresh_request(&self) -> Result<EvaluationRequest, SearchError> {
+        self.validate_refreshable_root()?;
+        Ok(EvaluationRequest {
+            token: self.root_token,
+            state: self.nodes[0].state.clone(),
+            legal_actions: self.nodes[0].state.legal_actions().to_vec(),
+        })
+    }
+
+    /// Validate a root refresh without changing predictions or statistics.
+    pub fn validate_root_refresh(&self, evaluation: &Evaluation) -> Result<(), SearchError> {
+        self.validate_refreshable_root()?;
+        self.validate_token(self.root_token, evaluation.token)?;
+        self.validate_evaluation(0, evaluation)
+    }
+
+    /// Refresh network value, logits and priors without changing visits or children.
+    pub fn refresh_root_evaluation(&mut self, evaluation: Evaluation) -> Result<(), SearchError> {
+        self.validate_root_refresh(&evaluation)?;
+        let priors = softmax(&evaluation.policy_logits);
+        let root = &mut self.nodes[0];
+        root.evaluation_value = evaluation.value;
+        for ((edge, prior), logit) in root
+            .edges
+            .iter_mut()
+            .zip(priors)
+            .zip(evaluation.policy_logits)
+        {
+            edge.prior = prior;
+            edge.logit = logit;
+        }
+        self.root_token = fresh_evaluation_token();
+        Ok(())
     }
 
     /// Initial inference request for the root.
@@ -486,14 +676,65 @@ impl SearchTree {
         Ok(child_id)
     }
 
-    fn select_improved_policy(&self, node_id: usize, parameters: GumbelParameters) -> usize {
+    fn select_improved_policy(&mut self, node_id: usize, parameters: GumbelParameters) -> usize {
+        if self.selection_scratch.is_empty() {
+            // Shallow forced-root searches may never select inside the tree.
+            // Allocate only on first use, but size for a later root selection:
+            // every placement reduces the available interior action count.
+            self.selection_scratch = vec![0.0; self.nodes[0].edges.len()];
+        }
         let node = &self.nodes[node_id];
-        let improved_policy = self.improved_policy(node_id, parameters);
-        let total_visits: u32 = node.edges.iter().map(|edge| edge.visits).sum();
+        let transform = node_id == 0 && self.pie_root_transform;
+        let edge_q = |edge: &Edge| {
+            let mean = edge.value_sum / f64::from(edge.visits);
+            if transform { -mean.abs() } else { mean }
+        };
+        let mut total_visits = 0_u32;
+        let mut max_visits = 0_u32;
+        let mut prior_weighted_q = 0.0_f64;
+        let mut visited_prior = 0.0_f64;
+        for edge in &node.edges {
+            total_visits += edge.visits;
+            max_visits = max_visits.max(edge.visits);
+            if edge.visits > 0 {
+                prior_weighted_q += f64::from(edge.prior) * edge_q(edge);
+                visited_prior += f64::from(edge.prior);
+            }
+        }
+        let visited_estimate = if visited_prior > 0.0 {
+            prior_weighted_q / visited_prior
+        } else {
+            f64::from(node.evaluation_value)
+        };
+        let mixed = ((f64::from(node.evaluation_value)
+            + f64::from(total_visits) * visited_estimate)
+            / f64::from(total_visits + 1)) as f32;
+        let scale = parameters.sigma_scale(max_visits);
+        let weights = &mut self.selection_scratch[..node.edges.len()];
+        let mut max_logit = f32::NEG_INFINITY;
+        for (edge, weight) in node.edges.iter().zip(weights.iter_mut()) {
+            let q = if edge.visits == 0 {
+                mixed
+            } else {
+                edge_q(edge) as f32
+            };
+            let logit = edge.logit + scale * q;
+            // Preserve the legacy FP32 Q/logit rounding before the FP64 exp.
+            *weight = f64::from(logit);
+            max_logit = max_logit.max(logit);
+        }
+        let sum: f64 = weights
+            .iter_mut()
+            .map(|weight| {
+                *weight = f64::from(*weight as f32 - max_logit).exp();
+                *weight
+            })
+            .sum();
         let denominator = (total_visits + 1) as f32;
         let mut best = 0_usize;
         let mut best_score = f32::NEG_INFINITY;
-        for (index, (edge, probability)) in node.edges.iter().zip(improved_policy).enumerate() {
+        for (index, (edge, weight)) in node.edges.iter().zip(weights.iter()).enumerate() {
+            let probability = (*weight / sum) as f32;
             let score = probability - edge.visits as f32 / denominator;
             if score > best_score {
                 best = index;
@@ -666,7 +907,7 @@ fn softmax(values: &[f32]) -> Vec<f32> {
 mod tests {
     use std::sync::Arc;
 
-    use star_engine::{Board, Mode, Player, Variant};
+    use star_engine::{BitBoard, Board, Mode, Player, StateParts, Variant};
 
     use super::*;
 
@@ -681,6 +922,700 @@ mod tests {
     fn initialize_uniform(tree: &mut SearchTree, value: f32) {
         let request = tree.root_request().unwrap();
         tree.initialize_root(evaluation(&request, value)).unwrap();
+    }
+
+    fn evaluate_one_leaf(tree: &mut SearchTree, edge: usize, value: f32) -> EvaluationRequest {
+        let request = match tree
+            .start_simulation(Some(edge), GumbelParameters::PAPER)
+            .unwrap()
+        {
+            SimulationStart::NeedsEvaluation(request) => request,
+            SimulationStart::Terminal { .. } => panic!("expected a nonterminal leaf"),
+        };
+        tree.finish_simulation(evaluation(&request, value)).unwrap();
+        request
+    }
+
+    fn expand_child(tree: &mut SearchTree, parent: usize, action: Action) -> usize {
+        let edge = tree.nodes[parent]
+            .edges
+            .iter()
+            .position(|edge| edge.action == action)
+            .unwrap();
+        let child = tree.materialize_child(parent, edge).unwrap();
+        if !tree.nodes[child].expanded {
+            tree.expand_node_unchecked(
+                child,
+                Evaluation {
+                    token: 0,
+                    value: 0.2,
+                    policy_logits: vec![0.0; tree.nodes[child].state.legal_actions().len()],
+                },
+            );
+        }
+        child
+    }
+
+    #[test]
+    fn root_child_preview_does_not_materialize_or_back_up_a_simulation() {
+        let root = GameState::new(Arc::new(Board::new(4).unwrap()));
+        let mut tree = SearchTree::new(root);
+        assert!(matches!(
+            tree.preview_root_child(0),
+            Err(SearchError::RootUninitialized)
+        ));
+        initialize_uniform(&mut tree, 0.0);
+        let before = format!("{tree:?}");
+        let preview = tree.preview_root_child(0).unwrap().unwrap();
+        let repeated = tree.preview_root_child(0).unwrap().unwrap();
+        assert_ne!(preview.token, repeated.token);
+        assert_eq!(preview.state.key(), repeated.state.key());
+        assert_eq!(format!("{tree:?}"), before);
+        assert!(matches!(
+            tree.preview_root_child(usize::MAX),
+            Err(SearchError::InvalidRootEdge(_))
+        ));
+
+        let pending = match tree
+            .start_simulation(Some(0), GumbelParameters::PAPER)
+            .unwrap()
+        {
+            SimulationStart::NeedsEvaluation(request) => request,
+            SimulationStart::Terminal { .. } => panic!("unexpected terminal"),
+        };
+        assert_eq!(pending.state.key(), preview.state.key());
+        assert_eq!(pending.legal_actions, preview.legal_actions);
+        assert_ne!(pending.token, preview.token);
+        assert!(matches!(
+            tree.finish_simulation(evaluation(&preview, 0.3)),
+            Err(SearchError::TokenMismatch { .. })
+        ));
+        tree.cancel_pending();
+        assert!(tree.preview_root_child(0).unwrap().is_some());
+        evaluate_one_leaf(&mut tree, 0, 0.3);
+        assert_eq!(tree.simulations(), 1);
+        assert!(tree.preview_root_child(0).unwrap().is_none());
+
+        // An expanded transposition is skipped even when this edge has no
+        // linked child yet (as can happen after reaching it by another path).
+        let other = expand_child(&mut tree, 0, Action::Place(1));
+        let edge = tree.root_edge(Action::Place(1)).unwrap();
+        tree.nodes[0].edges[edge].child = None;
+        assert!(tree.nodes[other].expanded);
+        assert!(tree.preview_root_child(edge).unwrap().is_none());
+        assert!(tree.nodes[0].edges[edge].child.is_none());
+    }
+
+    #[test]
+    fn preview_skips_terminal_children_and_all_new_apis_reject_pending_work() {
+        let board = Arc::new(Board::new(4).unwrap());
+        let mut almost_full = GameState::new(Arc::clone(&board));
+        for node in 0..board.node_count() - 1 {
+            almost_full.apply(Action::Place(node)).unwrap();
+        }
+        let mut terminal_child = SearchTree::new(almost_full);
+        initialize_uniform(&mut terminal_child, 0.0);
+        assert!(terminal_child.preview_root_child(0).unwrap().is_none());
+        assert_eq!(terminal_child.unique_state_count(), 1);
+
+        let mut tree = SearchTree::new(GameState::new(board));
+        assert!(matches!(
+            tree.root_refresh_request(),
+            Err(SearchError::RootUninitialized)
+        ));
+        initialize_uniform(&mut tree, 0.0);
+        let refresh = tree.root_refresh_request().unwrap();
+        let target = tree.root_state().clone();
+        tree.start_simulation(Some(0), GumbelParameters::PAPER)
+            .unwrap();
+        let before = format!("{tree:?}");
+        assert!(!tree.can_reuse_root(&target));
+        assert!(matches!(
+            tree.reuse_root(target, 100),
+            Err(SearchError::PendingEvaluation)
+        ));
+        assert!(matches!(
+            tree.preview_root_child(1),
+            Err(SearchError::PendingEvaluation)
+        ));
+        assert!(matches!(
+            tree.root_refresh_request(),
+            Err(SearchError::PendingEvaluation)
+        ));
+        assert!(matches!(
+            tree.validate_root_refresh(&evaluation(&refresh, 0.0)),
+            Err(SearchError::PendingEvaluation)
+        ));
+        assert!(matches!(
+            tree.refresh_root_evaluation(evaluation(&refresh, 0.0)),
+            Err(SearchError::PendingEvaluation)
+        ));
+        assert_eq!(format!("{tree:?}"), before);
+    }
+
+    #[test]
+    fn root_reuse_prunes_and_remaps_a_shared_dag_atomically() {
+        let mut root = GameState::new(Arc::new(Board::new(4).unwrap()));
+        root.apply(Action::Place(0)).unwrap();
+        let mut tree = SearchTree::new(root);
+        initialize_uniform(&mut tree, 0.0);
+        let a = expand_child(&mut tree, 0, Action::Place(1));
+        let b = expand_child(&mut tree, 0, Action::Place(2));
+        let pair = expand_child(&mut tree, a, Action::Place(2));
+        assert_eq!(pair, expand_child(&mut tree, b, Action::Place(1)));
+        let c = expand_child(&mut tree, pair, Action::Place(3));
+        let d = expand_child(&mut tree, pair, Action::Place(4));
+        let shared = expand_child(&mut tree, c, Action::Place(4));
+        assert_eq!(shared, expand_child(&mut tree, d, Action::Place(3)));
+        expand_child(&mut tree, 0, Action::Place(5));
+        tree.nodes[pair].edges[0].visits = 3;
+        tree.nodes[pair].edges[0].value_sum = 1.5;
+        tree.nodes[pair].edges[1].visits = 2;
+        tree.nodes[pair].edges[1].value_sum = -0.5;
+        tree.nodes[pair].visits = 6; // Includes this node's original expansion.
+        tree.nodes[pair].value_sum = 1.2;
+        tree.select_improved_policy(0, GumbelParameters::PAPER);
+        let target = tree.nodes[pair].state.clone();
+        let token = tree.root_refresh_request().unwrap().token;
+        let shared_key = tree.nodes[shared].state.key();
+        let before = format!("{tree:?}");
+        assert!(tree.reuse_root(target.clone(), 0).unwrap().is_none());
+        assert!(tree.reuse_root(target.clone(), 3).unwrap().is_none());
+        assert_eq!(format!("{tree:?}"), before);
+
+        assert_eq!(
+            tree.reuse_root(target.clone(), 4).unwrap(),
+            Some(ReuseStats {
+                retained_nodes: 4,
+                retained_visits: 5,
+            })
+        );
+        assert_eq!(tree.root_state().key(), target.key());
+        assert_eq!(tree.simulations(), 5);
+        assert_eq!(tree.nodes[0].value_sum, 1.0);
+        assert_eq!(tree.selection_scratch.capacity(), 0);
+        assert_ne!(tree.root_refresh_request().unwrap().token, token);
+        assert_eq!(tree.transpositions.len(), 4);
+        let remapped_shared = tree.transpositions[&shared_key];
+        let incoming_shared = tree
+            .nodes
+            .iter()
+            .flat_map(|node| &node.edges)
+            .filter(|edge| edge.child == Some(remapped_shared))
+            .count();
+        assert_eq!(incoming_shared, 2);
+        assert!(
+            tree.nodes
+                .iter()
+                .flat_map(|node| &node.edges)
+                .all(|edge| edge.child.is_none_or(|child| child < 4))
+        );
+    }
+
+    #[test]
+    fn root_reuse_requires_exact_history_but_preserves_supplied_order() {
+        let mut root = GameState::new(Arc::new(Board::new(4).unwrap()));
+        root.apply(Action::Place(0)).unwrap();
+        let mut tree = SearchTree::new(root);
+        initialize_uniform(&mut tree, 0.0);
+        let a = expand_child(&mut tree, 0, Action::Place(1));
+        let pair = expand_child(&mut tree, a, Action::Place(2));
+        let target = tree.nodes[pair].state.clone();
+        let key = target.key();
+        let unknown_history = GameState::from_parts(
+            target.shared_board(),
+            StateParts {
+                variant: target.variant(),
+                stones: target.stones(),
+                to_move: target.to_move(),
+                moves_left: target.moves_left(),
+                opening: target.is_opening(),
+                swap_available: target.swap_available(),
+                swapped: target.swapped(),
+                current_turn: key.current_turn,
+                previous_turn: BitBoard::empty(),
+                own_previous_turn: key.own_previous_turn,
+                handicap_stones: key.handicap_stones,
+            },
+        )
+        .unwrap();
+        let before = format!("{tree:?}");
+        assert!(!tree.can_reuse_root(&unknown_history));
+        assert!(tree.reuse_root(unknown_history, 100).unwrap().is_none());
+        assert_eq!(format!("{tree:?}"), before);
+        let supplied = target.with_ordered_history(&[], &[2, 1], &[0]).unwrap();
+        assert!(tree.can_reuse_root(&supplied));
+        assert_eq!(
+            tree.reuse_root(supplied, 100)
+                .unwrap()
+                .unwrap()
+                .retained_nodes,
+            1
+        );
+        assert_eq!(tree.root_state().previous_turn_moves(), &[2, 1]);
+        assert_eq!(tree.simulations(), 0);
+    }
+
+    #[test]
+    fn root_reuse_rejects_same_root_and_unsearched_pie_swap_without_mutation() {
+        for pie in [false, true] {
+            let root = GameState::with_variant(
+                Arc::new(Board::new(4).unwrap()),
+                Variant::new(Mode::Double, 1, pie).unwrap(),
+            );
+            let mut tree = SearchTree::new(root);
+            initialize_uniform(&mut tree, 0.0);
+            let child = evaluate_one_leaf(&mut tree, 0, -0.75).state;
+            let original = tree.root_state().clone();
+            let before = format!("{tree:?}");
+            assert!(!tree.can_reuse_root(&original));
+            assert!(tree.reuse_root(original, 100).unwrap().is_none());
+            assert_eq!(format!("{tree:?}"), before);
+            if pie {
+                let mut swapped = child;
+                swapped.apply(Action::Swap).unwrap();
+                assert!(!tree.can_reuse_root(&swapped));
+                assert!(tree.reuse_root(swapped, 100).unwrap().is_none());
+                assert_eq!(format!("{tree:?}"), before);
+            }
+        }
+    }
+
+    #[test]
+    fn root_reuse_keeps_terminal_and_unexpanded_descendants_but_cannot_root_them() {
+        let board = Arc::new(Board::new(4).unwrap());
+        let mut root = GameState::new(Arc::clone(&board));
+        let a = board.node_count() - 3;
+        for action in 0..a {
+            root.apply(Action::Place(action)).unwrap();
+        }
+        let mut tree = SearchTree::new(root);
+        initialize_uniform(&mut tree, 0.0);
+        let target_index = expand_child(&mut tree, 0, Action::Place(a));
+        let branch = expand_child(&mut tree, target_index, Action::Place(a + 1));
+        let terminal = tree.materialize_child(branch, 0).unwrap();
+        let unexpanded_edge = tree.nodes[target_index]
+            .edges
+            .iter()
+            .position(|edge| edge.action == Action::Place(a + 2))
+            .unwrap();
+        let unexpanded = tree
+            .materialize_child(target_index, unexpanded_edge)
+            .unwrap();
+        assert!(tree.nodes[terminal].terminal_value.is_some());
+        assert!(!tree.nodes[unexpanded].expanded);
+        for index in [terminal, unexpanded] {
+            let target = tree.nodes[index].state.clone();
+            let before = format!("{tree:?}");
+            assert!(!tree.can_reuse_root(&target));
+            assert!(tree.reuse_root(target, 100).unwrap().is_none());
+            assert_eq!(format!("{tree:?}"), before);
+        }
+        let mut terminal_root = SearchTree::new(tree.nodes[terminal].state.clone());
+        assert!(matches!(
+            terminal_root.root_refresh_request(),
+            Err(SearchError::TerminalRoot)
+        ));
+        assert!(matches!(
+            terminal_root.preview_root_child(0),
+            Err(SearchError::TerminalRoot)
+        ));
+        assert!(
+            terminal_root
+                .reuse_root(terminal_root.root_state().clone(), 100)
+                .unwrap()
+                .is_none()
+        );
+
+        let target = tree.nodes[target_index].state.clone();
+        assert_eq!(
+            tree.reuse_root(target, 4).unwrap().unwrap().retained_nodes,
+            4
+        );
+        assert_eq!(
+            tree.nodes
+                .iter()
+                .filter(|node| node.terminal_value.is_some())
+                .count(),
+            1
+        );
+        assert_eq!(tree.nodes.iter().filter(|node| !node.expanded).count(), 2);
+        let exact = tree.root_edge(Action::Place(a + 1)).unwrap();
+        assert!(matches!(
+            tree.start_simulation(Some(exact), GumbelParameters::PAPER)
+                .unwrap(),
+            SimulationStart::Terminal { .. }
+        ));
+        let neural = tree.root_edge(Action::Place(a + 2)).unwrap();
+        assert!(matches!(
+            tree.start_simulation(Some(neural), GumbelParameters::PAPER)
+                .unwrap(),
+            SimulationStart::NeedsEvaluation(_)
+        ));
+    }
+
+    #[test]
+    fn root_reuse_and_continuation_keep_values_in_each_players_perspective() {
+        for (mode, handicap, pie, prefix) in [
+            (Mode::Classic, 1, false, 1),
+            (Mode::Double, 1, false, 1),
+            (Mode::Classic, 4, false, 0),
+            (Mode::Double, 4, false, 0),
+            (Mode::Classic, 4, false, 3),
+            (Mode::Double, 4, false, 3),
+            (Mode::Classic, 1, true, 0),
+            (Mode::Double, 1, true, 0),
+        ] {
+            let mut root = GameState::with_variant(
+                Arc::new(Board::new(4).unwrap()),
+                Variant::new(mode, handicap, pie).unwrap(),
+            );
+            for action in 0..prefix {
+                root.apply(Action::Place(action)).unwrap();
+            }
+            let mut tree = SearchTree::new(root);
+            initialize_uniform(&mut tree, 0.0);
+            let target = evaluate_one_leaf(&mut tree, 0, 0.2).state;
+            let leaf = evaluate_one_leaf(&mut tree, 0, 0.75).state;
+            let expected = if target.to_move() == leaf.to_move() {
+                0.75
+            } else {
+                -0.75
+            };
+            assert_eq!(
+                tree.reuse_root(target, 100)
+                    .unwrap()
+                    .unwrap()
+                    .retained_visits,
+                1
+            );
+            assert_eq!(tree.root_stats()[0].q, expected);
+            assert_eq!(tree.root_value(), Some(expected));
+            assert!(!tree.uses_pie_root_transform());
+            let next = evaluate_one_leaf(&mut tree, 0, 0.5);
+            let added = if tree.root_state().to_move() == next.state.to_move() {
+                0.5
+            } else {
+                -0.5
+            };
+            assert_eq!(tree.root_stats()[0].q, (expected + added) / 2.0);
+            assert_eq!(tree.simulations(), 2);
+        }
+    }
+
+    #[test]
+    fn root_refresh_validates_atomically_and_preserves_reused_search_statistics() {
+        let mut tree = SearchTree::new(GameState::new(Arc::new(Board::new(4).unwrap())));
+        initialize_uniform(&mut tree, 0.0);
+        let stale = tree.root_refresh_request().unwrap();
+        let target = evaluate_one_leaf(&mut tree, 0, 0.2).state;
+        evaluate_one_leaf(&mut tree, 0, 0.75);
+        tree.reuse_root(target, 100).unwrap().unwrap();
+        assert!(matches!(
+            tree.validate_root_refresh(&evaluation(&stale, 0.0)),
+            Err(SearchError::TokenMismatch { .. })
+        ));
+        let request = tree.root_refresh_request().unwrap();
+        let valid = Evaluation {
+            token: request.token,
+            value: -0.6,
+            policy_logits: (0..request.legal_actions.len())
+                .map(|index| index as f32 * 0.1)
+                .collect(),
+        };
+        let before = format!("{tree:?}");
+        for case in 0..5 {
+            let mut invalid = valid.clone();
+            match case {
+                0 => invalid.token = stale.token,
+                1 => {
+                    invalid.policy_logits.pop();
+                }
+                2 => invalid.value = f32::NAN,
+                3 => invalid.policy_logits[0] = f32::INFINITY,
+                _ => invalid.value = 1.1,
+            }
+            assert!(tree.refresh_root_evaluation(invalid).is_err());
+            assert_eq!(format!("{tree:?}"), before);
+        }
+        let visits = tree.root_visits();
+        let sums: Vec<_> = tree.nodes[0]
+            .edges
+            .iter()
+            .map(|edge| edge.value_sum.to_bits())
+            .collect();
+        let children: Vec<_> = tree.nodes[0].edges.iter().map(|edge| edge.child).collect();
+        let nodes = tree.unique_state_count();
+        let root_value = tree.root_value();
+        let priors = softmax(&valid.policy_logits);
+        tree.validate_root_refresh(&valid).unwrap();
+        tree.refresh_root_evaluation(valid.clone()).unwrap();
+        assert_eq!(tree.nodes[0].evaluation_value, -0.6);
+        assert_eq!(tree.root_logits(), valid.policy_logits);
+        assert_eq!(tree.root_visits(), visits);
+        assert_eq!(
+            tree.nodes[0]
+                .edges
+                .iter()
+                .map(|edge| edge.value_sum.to_bits())
+                .collect::<Vec<_>>(),
+            sums
+        );
+        assert_eq!(
+            tree.nodes[0]
+                .edges
+                .iter()
+                .map(|edge| edge.child)
+                .collect::<Vec<_>>(),
+            children
+        );
+        assert_eq!(
+            tree.nodes[0]
+                .edges
+                .iter()
+                .map(|edge| edge.prior)
+                .collect::<Vec<_>>(),
+            priors
+        );
+        assert_eq!(tree.unique_state_count(), nodes);
+        assert_eq!(tree.root_value(), root_value);
+        assert!(matches!(
+            tree.validate_root_refresh(&valid),
+            Err(SearchError::TokenMismatch { .. })
+        ));
+        assert!(matches!(
+            tree.root_request(),
+            Err(SearchError::RootAlreadyInitialized)
+        ));
+        assert!(matches!(
+            tree.initialize_root(evaluation(&request, 0.0)),
+            Err(SearchError::RootAlreadyInitialized)
+        ));
+    }
+
+    #[test]
+    fn forced_root_leaf_needs_no_selection_scratch_allocation() {
+        let root = GameState::new(Arc::new(Board::new(10).unwrap()));
+        let mut tree = SearchTree::new(root);
+        assert_eq!(tree.selection_scratch.capacity(), 0);
+        initialize_uniform(&mut tree, 0.0);
+        let request = match tree
+            .start_simulation(Some(0), GumbelParameters::PAPER)
+            .unwrap()
+        {
+            SimulationStart::NeedsEvaluation(request) => request,
+            SimulationStart::Terminal { .. } => panic!("unexpected terminal"),
+        };
+        tree.finish_simulation(evaluation(&request, 0.0)).unwrap();
+        assert_eq!(tree.selection_scratch.capacity(), 0);
+
+        // Revisiting the expanded child needs interior selection. Reserving
+        // root size on that first use also supports later unforced root moves.
+        tree.start_simulation(Some(0), GumbelParameters::PAPER)
+            .unwrap();
+        assert_eq!(tree.selection_scratch.len(), tree.nodes[0].edges.len());
+        let pointer = tree.selection_scratch.as_ptr();
+        tree.cancel_pending();
+        tree.start_simulation(None, GumbelParameters::PAPER)
+            .unwrap();
+        assert_eq!(tree.selection_scratch.as_ptr(), pointer);
+    }
+
+    /// Frozen allocation-based selection math from before scratch reuse.
+    fn legacy_selection(
+        node: &Node,
+        transform: bool,
+        parameters: GumbelParameters,
+    ) -> (Vec<f32>, usize) {
+        let edge_q = |edge: &Edge| {
+            let mean = edge.value_sum / f64::from(edge.visits);
+            if transform { -mean.abs() } else { mean }
+        };
+        let total_visits: u32 = node.edges.iter().map(|edge| edge.visits).sum();
+        let (weighted_q, visited_prior) = node.edges.iter().filter(|edge| edge.visits > 0).fold(
+            (0.0_f64, 0.0_f64),
+            |(weighted_q, prior_sum), edge| {
+                (
+                    weighted_q + f64::from(edge.prior) * edge_q(edge),
+                    prior_sum + f64::from(edge.prior),
+                )
+            },
+        );
+        let visited_estimate = if visited_prior > 0.0 {
+            weighted_q / visited_prior
+        } else {
+            f64::from(node.evaluation_value)
+        };
+        let mixed = ((f64::from(node.evaluation_value)
+            + f64::from(total_visits) * visited_estimate)
+            / f64::from(total_visits + 1)) as f32;
+        let completed_q: Vec<_> = node
+            .edges
+            .iter()
+            .map(|edge| {
+                if edge.visits == 0 {
+                    mixed
+                } else {
+                    edge_q(edge) as f32
+                }
+            })
+            .collect();
+        let max_visits = node.edges.iter().map(|edge| edge.visits).max().unwrap_or(0);
+        let scale = parameters.sigma_scale(max_visits);
+        let logits: Vec<_> = node
+            .edges
+            .iter()
+            .zip(completed_q)
+            .map(|(edge, q)| edge.logit + scale * q)
+            .collect();
+        let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let exponentials: Vec<f64> = logits
+            .iter()
+            .map(|value| f64::from(*value - max).exp())
+            .collect();
+        let sum: f64 = exponentials.iter().sum();
+        let probabilities: Vec<f32> = exponentials
+            .into_iter()
+            .map(|value| (value / sum) as f32)
+            .collect();
+        let denominator = (total_visits + 1) as f32;
+        let mut best = 0;
+        let mut best_score = f32::NEG_INFINITY;
+        for (index, (edge, probability)) in node.edges.iter().zip(&probabilities).enumerate() {
+            let score = probability - edge.visits as f32 / denominator;
+            if score > best_score {
+                best = index;
+                best_score = score;
+            }
+        }
+        (probabilities, best)
+    }
+
+    #[test]
+    fn scratch_selection_matches_legacy_bits_for_all_variants_and_statistics() {
+        let variants = [
+            (Mode::Classic, 1, false),
+            (Mode::Double, 1, false),
+            (Mode::Classic, 9, false),
+            (Mode::Double, 9, false),
+            (Mode::Classic, 1, true),
+            (Mode::Double, 1, true),
+        ];
+        let parameters = [
+            GumbelParameters::PAPER,
+            GumbelParameters {
+                c_visit: 0.25,
+                c_scale: 0.1,
+            },
+            GumbelParameters {
+                c_visit: 100.0,
+                c_scale: 10.0,
+            },
+        ];
+        let mut random_state = 0x483d_382d_193b_0771_u64;
+        let mut random = || {
+            random_state = random_state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (random_state >> 32) as u32
+        };
+        for rings in [4, 6, 8, 10] {
+            let board = Arc::new(Board::new(rings).unwrap());
+            for (mode, handicap, pie) in variants {
+                let mut tree = SearchTree::new(GameState::with_variant(
+                    Arc::clone(&board),
+                    Variant::new(mode, handicap, pie).unwrap(),
+                ));
+                initialize_uniform(&mut tree, 0.0);
+                let child = tree.materialize_child(0, 0).unwrap();
+                tree.expand_node_unchecked(
+                    child,
+                    Evaluation {
+                        token: 0,
+                        value: 0.0,
+                        policy_logits: vec![0.0; tree.nodes[child].state.legal_actions().len()],
+                    },
+                );
+                assert_eq!(tree.selection_scratch.capacity(), 0);
+                let mut scratch_pointer = None;
+                // Allocate from an interior selection first, then exercise the
+                // larger root with the same allocation.
+                for node_id in [child, 0] {
+                    let full_edges = tree.nodes[node_id].edges.clone();
+                    for pattern in 0..32 {
+                        let node = &mut tree.nodes[node_id];
+                        node.edges = full_edges.clone();
+                        let count = if matches!(pattern, 0 | 1 | 4) {
+                            full_edges.len()
+                        } else {
+                            [1, 2, 3, full_edges.len()][pattern % 4]
+                        };
+                        node.edges.truncate(count);
+                        node.evaluation_value = (random() % 2001) as f32 / 1000.0 - 1.0;
+                        for (index, edge) in node.edges.iter_mut().enumerate() {
+                            edge.visits =
+                                [0, 0, 1, 2, 7, 31, 1000, 1_000_000][(random() % 8) as usize];
+                            edge.logit = (random() % 3201) as f32 / 8.0 - 200.0;
+                            edge.value_sum = (f64::from(random() % 20001) / 10000.0 - 1.0)
+                                * f64::from(edge.visits);
+                            match pattern {
+                                0 | 1 => {
+                                    edge.visits = pattern as u32;
+                                    edge.logit = 0.0;
+                                    edge.value_sum = 0.0;
+                                }
+                                2 => {
+                                    edge.visits = u32::from(index % 2 == 0);
+                                    edge.value_sum = 0.25 * f64::from(edge.visits);
+                                }
+                                3 => edge.logit = if index % 2 == 0 { -1000.0 } else { 1000.0 },
+                                4 => {
+                                    edge.visits = 1;
+                                    edge.logit = -0.0;
+                                    edge.value_sum = -0.0;
+                                }
+                                _ => {}
+                            }
+                        }
+                        let priors =
+                            softmax(&node.edges.iter().map(|edge| edge.logit).collect::<Vec<_>>());
+                        for (edge, prior) in node.edges.iter_mut().zip(priors) {
+                            // Exercise the zero visited-prior fallback as well
+                            // as ordinary, very skewed and underflowed priors.
+                            edge.prior = if pattern == 2 { 0.0 } else { prior };
+                        }
+                        for parameter in parameters {
+                            let (expected_probabilities, expected_edge) = legacy_selection(
+                                &tree.nodes[node_id],
+                                node_id == 0 && pie,
+                                parameter,
+                            );
+                            let actual_edge = tree.select_improved_policy(node_id, parameter);
+                            let weights = &tree.selection_scratch[..expected_probabilities.len()];
+                            let sum: f64 = weights.iter().sum();
+                            let actual_bits: Vec<_> = weights
+                                .iter()
+                                .map(|weight| ((*weight / sum) as f32).to_bits())
+                                .collect();
+                            let expected_bits: Vec<_> = expected_probabilities
+                                .iter()
+                                .map(|probability| probability.to_bits())
+                                .collect();
+                            assert_eq!(
+                                actual_bits, expected_bits,
+                                "rings={rings} mode={mode:?} handicap={handicap} pie={pie} node={node_id} pattern={pattern}"
+                            );
+                            assert_eq!(actual_edge, expected_edge);
+                            let pointer = tree.selection_scratch.as_ptr();
+                            assert_eq!(pointer, *scratch_pointer.get_or_insert(pointer));
+                            if pattern <= 1 {
+                                assert_eq!(actual_edge, 0);
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]

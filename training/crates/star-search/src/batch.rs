@@ -297,12 +297,16 @@ pub fn gumbel_search_batch_with_budgets<E: BatchEvaluator>(
             if scheduler.is_done() {
                 continue;
             }
-            let completed_q = tree.root_completed_q();
-            let visits = tree.root_visits();
-            let candidate = scheduler
-                .next_candidate(&completed_q, &visits)
-                .map_err(SearchRunError::Gumbel)?
-                .expect("unfinished schedulers return a candidate");
+            let candidate = if let Some(candidate) = scheduler.next_scheduled_candidate() {
+                candidate
+            } else {
+                let completed_q = tree.root_completed_q();
+                let visits = tree.root_visits();
+                scheduler
+                    .next_candidate(&completed_q, &visits)
+                    .map_err(SearchRunError::Gumbel)?
+                    .expect("unfinished schedulers return a candidate")
+            };
             match tree
                 .start_simulation(Some(candidate), config.parameters)
                 .map_err(SearchRunError::Search)?

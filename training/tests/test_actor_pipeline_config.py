@@ -18,6 +18,7 @@ from startrain.config import (
 )
 from startrain.config_compatibility import (
     compatible_config_epoch_payloads,
+    without_search_execution_defaults,
     without_selfplay_pipeline_defaults,
 )
 from startrain.learner import UTDSegmentState
@@ -152,7 +153,7 @@ def test_pipeline_omission_matches_the_exact_previous_production_config_hash():
     assert payload == before
     assert old["model"] == payload["model"]
     assert old["train"] == payload["train"]
-    assert old["arena"] == payload["arena"]
+    assert old["arena"] == without_search_execution_defaults(payload)["arena"]
     assert (
         old["orchestration"]["model_refresh"]["inference"][
             "preserve_broadcast_topology"

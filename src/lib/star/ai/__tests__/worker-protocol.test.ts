@@ -339,4 +339,19 @@ describe('local worker protocol', () => {
       }),
     ).toThrow(/fields are invalid/i);
   });
+
+  it('accepts bounded optional execution fields without adding them to old manifests', () => {
+    expect(parseStarBrowserModelManifest(manifest).search).not.toHaveProperty('subtreeReuse');
+    expect(parseStarBrowserModelManifest({ ...manifest, recommended_local_search: {
+      ...manifest.recommended_local_search, first_visit_batch_size: 4,
+      subtree_reuse: true, subtree_reuse_max_nodes: 2048,
+    } }).search).toMatchObject({ firstVisitBatchSize: 4, subtreeReuse: true, subtreeReuseMaxNodes: 2048 });
+    for (const change of [{ first_visit_batch_size: 0 }, { first_visit_batch_size: 65 },
+      { first_visit_batch_size: true }, { subtree_reuse: 1 }, { subtree_reuse_max_nodes: 65537 },
+      { subtree_reuse_max_nodes: 0 }, { unknown: true }]) {
+      expect(() => parseStarBrowserModelManifest({ ...manifest,
+        recommended_local_search: { ...manifest.recommended_local_search, ...change },
+      })).toThrow(/fields are invalid/i);
+    }
+  });
 });

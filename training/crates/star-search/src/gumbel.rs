@@ -207,6 +207,23 @@ impl GumbelSequentialHalving {
         self.remaining == 0
     }
 
+    /// Returns an already scheduled root edge without reading search statistics.
+    ///
+    /// Repeated calls return the outstanding edge until it is recorded. `None`
+    /// means the phase ended or the budget is complete; when not [`Self::is_done`],
+    /// call [`Self::next_candidate`] with current statistics to rank the survivors.
+    pub fn next_scheduled_candidate(&mut self) -> Option<usize> {
+        if self.remaining == 0 {
+            return None;
+        }
+        if let Some(candidate) = self.requested {
+            return Some(candidate);
+        }
+        let candidate = self.phase_schedule.get(self.phase_cursor).copied()?;
+        self.requested = Some(candidate);
+        Some(candidate)
+    }
+
     /// Returns the next forced root edge.
     pub fn next_candidate(
         &mut self,
@@ -217,17 +234,13 @@ impl GumbelSequentialHalving {
         if self.remaining == 0 {
             return Ok(None);
         }
-        if let Some(candidate) = self.requested {
+        if let Some(candidate) = self.next_scheduled_candidate() {
             return Ok(Some(candidate));
         }
 
-        if self.phase_cursor == self.phase_schedule.len() {
-            self.finish_phase(completed_q, visits);
-            self.configure_phase();
-        }
-        let candidate = self.phase_schedule[self.phase_cursor];
-        self.requested = Some(candidate);
-        Ok(Some(candidate))
+        self.finish_phase(completed_q, visits);
+        self.configure_phase();
+        Ok(self.next_scheduled_candidate())
     }
 
     /// Records completion of the candidate most recently requested.
@@ -258,14 +271,18 @@ impl GumbelSequentialHalving {
             .map(|candidate| visits[*candidate])
             .max()
             .expect("the candidate set is non-empty");
+        let scale = self.parameters.sigma_scale(max_visit_count(visits));
+        let score = |candidate: usize| {
+            self.gumbels[candidate] + self.logits[candidate] + scale * completed_q[candidate]
+        };
         Ok(self
             .initial_candidates
             .iter()
             .copied()
             .filter(|candidate| visits[*candidate] == max_visits)
             .max_by(|left, right| {
-                self.score(*left, completed_q, visits)
-                    .total_cmp(&self.score(*right, completed_q, visits))
+                score(*left)
+                    .total_cmp(&score(*right))
                     .then_with(|| self.tie_breakers[*left].cmp(&self.tie_breakers[*right]))
             })
             .expect("at least one candidate has maximal visits"))
@@ -315,12 +332,6 @@ impl GumbelSequentialHalving {
                 .then_with(|| tie_breakers[*right].cmp(&tie_breakers[*left]))
         });
         self.active.truncate(self.active.len().div_ceil(2));
-    }
-
-    fn score(&self, candidate: usize, completed_q: &[f32], visits: &[u32]) -> f32 {
-        self.gumbels[candidate]
-            + self.logits[candidate]
-            + self.parameters.sigma_scale(max_visit_count(visits)) * completed_q[candidate]
     }
 
     fn validate_statistics(&self, completed_q: &[f32], visits: &[u32]) -> Result<(), GumbelError> {
@@ -532,5 +543,129 @@ mod tests {
             scheduler.record_simulation(candidate).unwrap();
         }
         assert_eq!(scheduler.selected(&q, &visits).unwrap(), 1);
+    }
+
+    #[test]
+    fn scheduled_fast_path_preserves_dynamic_search_traces_and_finalists() {
+        for action_count in [1, 2, 3, 7, 32, 275] {
+            let logits: Vec<_> = (0..action_count)
+                .map(|action| (action % 11) as f32 / 3.0 - 1.5)
+                .collect();
+            for budget in [1, 2, 5, 17, 128, 640] {
+                for max_considered in [1, 3, 16, 53] {
+                    for seed in [0, 5, 9_173] {
+                        let mut checked = GumbelSequentialHalving::new(
+                            &logits,
+                            budget,
+                            max_considered,
+                            GumbelParameters::PAPER,
+                            seed,
+                        )
+                        .unwrap();
+                        let mut scheduled = checked.clone();
+                        let mut q = vec![0.0; action_count];
+                        let mut visits = vec![0_u32; action_count];
+                        let mut statistics_refreshes = 0;
+                        for simulation in 0..budget {
+                            let expected = checked.next_candidate(&q, &visits).unwrap().unwrap();
+                            let actual =
+                                scheduled.next_scheduled_candidate().unwrap_or_else(|| {
+                                    statistics_refreshes += 1;
+                                    scheduled.next_candidate(&q, &visits).unwrap().unwrap()
+                                });
+                            assert_eq!(actual, expected);
+                            assert_eq!(scheduled.next_scheduled_candidate(), Some(actual));
+                            visits[actual] += 1;
+                            // Search changes observed and completed values as more
+                            // leaf evaluations arrive, including between halving phases.
+                            q[actual] = ((simulation * 17 + actual as u32 * 13) % 2001) as f32
+                                / 1000.0
+                                - 1.0;
+                            q[(actual + 1) % action_count] = -q[actual] * 0.5;
+                            checked.record_simulation(expected).unwrap();
+                            scheduled.record_simulation(actual).unwrap();
+                        }
+                        assert!(scheduled.is_done());
+                        assert_eq!(scheduled.simulations(), budget);
+                        assert_eq!(scheduled.next_scheduled_candidate(), None);
+                        assert_eq!(
+                            checked.selected(&q, &visits),
+                            scheduled.selected(&q, &visits)
+                        );
+                        assert!(statistics_refreshes <= ceil_log2(scheduled.candidates().len()));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn scheduled_boundaries_preserve_pending_validation_and_record_protocol() {
+        let mut scheduler =
+            GumbelSequentialHalving::new(&[0.0; 4], 16, 4, GumbelParameters::PAPER, 7).unwrap();
+        let mut visits = [0_u32; 4];
+        let mut q = [0.0; 4];
+        assert!(scheduler.record_simulation(0).is_err());
+        let pending = scheduler.next_scheduled_candidate().unwrap();
+        assert!(scheduler.record_simulation((pending + 1) % 4).is_err());
+        assert_eq!(scheduler.simulations(), 0);
+        assert!(scheduler.next_candidate(&[], &visits).is_err());
+        assert!(scheduler.next_candidate(&q, &[]).is_err());
+        q[0] = f32::NAN;
+        assert!(scheduler.next_candidate(&q, &visits).is_err());
+        q[0] = 0.0;
+        assert_eq!(scheduler.next_scheduled_candidate(), Some(pending));
+
+        while let Some(candidate) = scheduler.next_scheduled_candidate() {
+            visits[candidate] += 1;
+            scheduler.record_simulation(candidate).unwrap();
+        }
+        assert!(!scheduler.is_done());
+        assert_eq!(scheduler.simulations(), 8);
+        assert!(scheduler.record_simulation(pending).is_err());
+        q[0] = f32::INFINITY;
+        assert!(scheduler.next_candidate(&q, &visits).is_err());
+        assert_eq!(scheduler.next_scheduled_candidate(), None);
+        q[0] = 0.0;
+        while !scheduler.is_done() {
+            let candidate = scheduler.next_candidate(&q, &visits).unwrap().unwrap();
+            visits[candidate] += 1;
+            scheduler.record_simulation(candidate).unwrap();
+        }
+        assert_eq!(scheduler.next_scheduled_candidate(), None);
+        assert!(scheduler.record_simulation(pending).is_err());
+        // The existing checked API validates even when no candidate is needed.
+        assert!(scheduler.next_candidate(&[], &visits).is_err());
+        q[0] = f32::NAN;
+        assert!(scheduler.next_candidate(&q, &visits).is_err());
+        q[0] = 0.0;
+        assert_eq!(scheduler.next_candidate(&q, &visits).unwrap(), None);
+    }
+
+    #[test]
+    fn final_selection_scale_includes_visits_outside_sampled_candidates() {
+        let mut scheduler = GumbelSequentialHalving::new(
+            &[0.0, 2.0, -100.0],
+            4,
+            2,
+            GumbelParameters {
+                c_visit: 1.0,
+                c_scale: 1.0,
+            },
+            7,
+        )
+        .unwrap();
+        scheduler.gumbels.fill(0.0);
+        assert!(!scheduler.candidates().contains(&2));
+        assert_eq!(
+            scheduler
+                .selected(&[0.01, 0.0, 0.0], &[1, 1, 1000])
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            scheduler.selected(&[0.01, 0.0, 0.0], &[1, 1, 0]).unwrap(),
+            1
+        );
     }
 }

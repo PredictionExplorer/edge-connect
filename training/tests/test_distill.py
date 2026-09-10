@@ -21,7 +21,7 @@ from startrain.distill import (
     _teacher_kl_losses,
     sha256_file,
 )
-from startrain.features import DoubleStarPosition
+from startrain.features import DoubleStarPosition, encode_batch
 from startrain.model import ModelConfig, StarModelOutput
 from startrain.publish import WASM_ASSET_DIRECTORY, publish_browser_artifacts
 from startrain.replay import ReplaySample, write_replay_shard
@@ -40,6 +40,7 @@ def replay_sample() -> ReplaySample:
         opening=True,
         terminal=False,
     )
+
     policy = np.full(topology.n, 1.0 / topology.n, dtype=np.float32)
     return ReplaySample.from_position(
         position,
@@ -57,6 +58,34 @@ def replay_sample() -> ReplaySample:
         search_provenance="distill-test-search",
         policy_provenance="completed-q",
     )
+
+
+def test_browser_execution_options_are_validated_and_default_export_is_unchanged():
+    assert BrowserSearchConfig().manifest_fields() == {
+        "simulations": 64,
+        "max_considered": 16,
+        "c_visit": 50.0,
+        "c_scale": 1.0,
+        "swap_dead_zone": 0.02,
+    }
+    assert BrowserSearchConfig(
+        first_visit_batch_size=4, subtree_reuse=True, subtree_reuse_max_nodes=2048
+    ).manifest_fields() == {
+        **BrowserSearchConfig().manifest_fields(),
+        "first_visit_batch_size": 4,
+        "subtree_reuse": True,
+        "subtree_reuse_max_nodes": 2048,
+    }
+    for fields in (
+        {"first_visit_batch_size": 0},
+        {"first_visit_batch_size": 65},
+        {"first_visit_batch_size": True},
+        {"subtree_reuse": 1},
+        {"subtree_reuse_max_nodes": 0},
+        {"subtree_reuse_max_nodes": 65537},
+    ):
+        with pytest.raises(ValueError, match="experimental browser search"):
+            BrowserSearchConfig(**fields)
 
 
 def test_distillation_smoke_emits_checksum_verified_browser_manifest(
@@ -139,6 +168,48 @@ def test_distillation_smoke_emits_checksum_verified_browser_manifest(
     ]
     assert manifest["tensors"]["outputs"]["outcome_logits"]["shape"] == ["batch", 2]
     assert manifest["recommended_local_search"]["simulations"] == 8
+    assert set(manifest["recommended_local_search"]) == {
+        "simulations",
+        "max_considered",
+        "c_visit",
+        "c_scale",
+        "swap_dead_zone",
+    }
+    # The actual exported FP16 graph accepts a real two-row batch across all
+    # input fields and routes every head equivalently to separate forwards.
+    import onnxruntime as ort
+
+    first = replay_sample().to_position()
+    second = DoubleStarPosition.from_sequence(
+        rings=4,
+        stones=[0, *([-1] * 49)],
+        to_move=1,
+        moves_left=2,
+        opening=False,
+        terminal=False,
+    )
+    encoded = encode_batch([first, second])
+    inputs = {}
+    for name in manifest["tensors"]["inputs"]:
+        array = getattr(encoded, name).numpy()
+        inputs[name] = array.astype(np.float16) if array.dtype == np.float32 else array
+    session = ort.InferenceSession(
+        str(artifacts.onnx), providers=["CPUExecutionProvider"]
+    )
+    outputs = session.run(None, inputs)
+    for output, values in zip(session.get_outputs(), outputs, strict=True):
+        shape = manifest["tensors"]["outputs"][output.name]["shape"]
+        assert values.shape == tuple(
+            2 if value == "batch" else 50 if value == "nodes" else value
+            for value in shape
+        )
+        assert np.isfinite(values).all()
+    for row in range(2):
+        single = session.run(
+            None, {name: values[row : row + 1] for name, values in inputs.items()}
+        )
+        for together, alone in zip(outputs, single, strict=True):
+            np.testing.assert_allclose(together[row], alone[0], rtol=0.02, atol=0.02)
     assert artifacts.final_losses["total"] >= 0
     wasm_source = tmp_path / "wasm-build"
     wasm_source.mkdir()

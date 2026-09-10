@@ -25,6 +25,9 @@ export const STAR_BROWSER_MODEL_ARCHITECTURE_VERSION = 3 as const;
 export const STAR_BROWSER_MODEL_PRECISION = 'float16' as const;
 export const MAX_BROWSER_AI_SIMULATIONS = 1_024;
 export const MAX_BROWSER_AI_MAX_CONSIDERED = 128;
+export const MAX_BROWSER_AI_FIRST_VISIT_BATCH_SIZE = 64;
+export const DEFAULT_BROWSER_AI_SUBTREE_REUSE_MAX_NODES = 4_096;
+export const MAX_BROWSER_AI_SUBTREE_REUSE_NODES = 65_536;
 
 /** Deployment convention; intentionally absent until a trained model is published. */
 export const STAR_BROWSER_MODEL_MANIFEST_PATH = '/models/star/manifest.json' as const;
@@ -73,6 +76,9 @@ export interface StarBrowserModelManifest {
     cScale: number;
     /** A pie responder swaps when the selected keep continuation is below -deadZone. */
     swapDeadZone: number;
+    firstVisitBatchSize?: number;
+    subtreeReuse?: boolean;
+    subtreeReuseMaxNodes?: number;
   };
 }
 
@@ -317,6 +323,8 @@ export function parseStarBrowserModelManifest(payload: unknown): StarBrowserMode
       'c_visit',
       'c_scale',
       'swap_dead_zone',
+      ...['first_visit_batch_size', 'subtree_reuse', 'subtree_reuse_max_nodes']
+        .filter((key) => Object.hasOwn(search, key)),
     ]) ||
     !positiveInteger(search.simulations, MAX_BROWSER_AI_SIMULATIONS) ||
     !positiveInteger(search.max_considered, MAX_BROWSER_AI_MAX_CONSIDERED) ||
@@ -326,6 +334,11 @@ export function parseStarBrowserModelManifest(payload: unknown): StarBrowserMode
     !Number.isFinite(search.swap_dead_zone) ||
     search.swap_dead_zone < 0 ||
     search.swap_dead_zone >= 1 ||
+    (search.first_visit_batch_size !== undefined &&
+      !positiveInteger(search.first_visit_batch_size, MAX_BROWSER_AI_FIRST_VISIT_BATCH_SIZE)) ||
+    (search.subtree_reuse !== undefined && typeof search.subtree_reuse !== 'boolean') ||
+    (search.subtree_reuse_max_nodes !== undefined &&
+      !positiveInteger(search.subtree_reuse_max_nodes, MAX_BROWSER_AI_SUBTREE_REUSE_NODES)) ||
     !isRecord(payload.training)
   ) {
     throw new StarAiError('unavailable', 'Local AI model manifest fields are invalid.');
@@ -370,6 +383,11 @@ export function parseStarBrowserModelManifest(payload: unknown): StarBrowserMode
       cVisit: search.c_visit,
       cScale: search.c_scale,
       swapDeadZone: search.swap_dead_zone,
+      ...(search.first_visit_batch_size !== undefined
+        ? { firstVisitBatchSize: search.first_visit_batch_size as number } : {}),
+      ...(search.subtree_reuse !== undefined ? { subtreeReuse: search.subtree_reuse as boolean } : {}),
+      ...(search.subtree_reuse_max_nodes !== undefined
+        ? { subtreeReuseMaxNodes: search.subtree_reuse_max_nodes as number } : {}),
     },
   };
 }

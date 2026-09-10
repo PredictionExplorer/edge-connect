@@ -51,6 +51,13 @@ from .native import (
 )
 from .replay import ReplaySample
 from .runtime import validate_identifier
+from .search_options import (
+    SearchExecutionConfig,
+    require_search_execution,
+    root_policy_entropies,
+    search_batch_row_limit,
+    search_model_context,
+)
 from .topology import SUPPORTED_RINGS
 
 
@@ -316,8 +323,11 @@ class SelfPlayConfig:
     exact_endgame_max_nodes: int = 100_000
     shard_size: int = 512
     seed: int = 17
+    search_execution: SearchExecutionConfig = SearchExecutionConfig()
 
     def __post_init__(self) -> None:
+        if not isinstance(self.search_execution, SearchExecutionConfig):
+            raise ValueError("selfplay.search_execution requires typed settings")
         if type(self.rings) is not int or self.rings not in SUPPORTED_RINGS:
             raise ValueError("self-play rings must be one of (4, 6, 8, 10)")
         if (
@@ -411,7 +421,9 @@ class SelfPlayConfig:
             self.variant.segment, self.score_utility_weight
         )
 
-    def playout_budgets(self, *, simulations: int, pda: int) -> tuple[int, int]:
+    def playout_budgets(
+        self, *, simulations: int, pda: int, full_cap: int | None = None
+    ) -> tuple[int, int]:
         """Return (advantaged, disadvantaged) budgets for a doubling advantage.
 
         The ratio is exactly ``2 ** pda`` while both budgets stay inside the
@@ -420,7 +432,7 @@ class SelfPlayConfig:
         """
 
         low = self.simulation_budget(full=False)
-        high = self.simulation_budget(full=True)
+        high = self.simulation_budget(full=True) if full_cap is None else full_cap
         if pda <= 0:
             return simulations, simulations
         factor = 2**pda
@@ -571,6 +583,7 @@ class _Decision:
     policy_weight: float
     policy_surprise: float
     swapped: bool = False
+    search_evidence: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -602,6 +615,7 @@ class SelfPlayActor:
         self.evaluator = evaluator
         self.sink = replay_sink
         self.config = config
+        require_search_execution(native_module, config.search_execution)
         self.identity = identity or SelfPlayIdentity("manual", "manual", "manual", 0)
         if source_role not in ("champion", "candidate", "history", "unattributed"):
             raise ValueError("self-play source_role is invalid")
@@ -800,11 +814,17 @@ class SelfPlayActor:
         *,
         simulations: int,
         simulations_by_row: Sequence[int] | None = None,
+        full_caps_by_row: Sequence[int] | None = None,
     ) -> list[int]:
         budgets: list[int] = []
         to_move = [int(value) for value in state_data.to_move]
-        if len(pda_seats) != len(to_move) or (
-            simulations_by_row is not None and len(simulations_by_row) != len(to_move)
+        if (
+            len(pda_seats) != len(to_move)
+            or (
+                simulations_by_row is not None
+                and len(simulations_by_row) != len(to_move)
+            )
+            or (full_caps_by_row is not None and len(full_caps_by_row) != len(to_move))
         ):
             raise RuntimeError("per-game simulation budget rows are invalid")
         for row, seats in enumerate(pda_seats):
@@ -818,10 +838,60 @@ class SelfPlayActor:
                 budgets.append(base)
                 continue
             advantaged, disadvantaged = self.config.playout_budgets(
-                simulations=base, pda=abs(advantage)
+                simulations=base,
+                pda=abs(advantage),
+                full_cap=full_caps_by_row[row]
+                if full_caps_by_row is not None
+                else None,
             )
             budgets.append(advantaged if advantage > 0 else disadvantaged)
         return budgets
+
+    def _entropy_budgets(
+        self,
+        roots: Any,
+        response: InferenceResponse,
+        state_data: Any,
+        pda_seats: Sequence[tuple[int, int]],
+        planned_bases: Sequence[int],
+        planned_full: Sequence[bool],
+    ) -> tuple[list[int], list[str]]:
+        """Adjust full caps before deriving either seat's PDA budget."""
+        entropies = root_policy_entropies(roots, response)
+        active = {
+            row for row, terminal in enumerate(state_data.terminal) if not terminal
+        }
+        rows = len(state_data.to_move)
+        if set(entropies) != active or any(
+            len(values) != rows for values in (pda_seats, planned_bases, planned_full)
+        ):
+            raise ValueError("root entropy rows disagree with the active cohort")
+        fast = self.config.simulation_budget(full=False)
+        high = self.config.simulation_budget(full=True)
+        bases = list(planned_bases)
+        caps = [high] * rows
+        evidence = [""] * rows
+        for row, entropy in entropies.items():
+            if planned_full[row]:
+                factor = 2 ** max(abs(pda) for pda in pda_seats[row])
+                caps[row] = self.config.search_execution.full_budget.adjusted_cap(
+                    high, entropy, minimum_cap=fast * factor, quantum=factor
+                )
+                bases[row] = caps[row]
+            evidence[row] = (
+                f":root_entropy={entropy:.17g}:planned_base={planned_bases[row]}"
+                f":effective_base={bases[row]}:full_cap={caps[row]}"
+            )
+        return (
+            self._root_budgets(
+                state_data,
+                pda_seats,
+                simulations=high,
+                simulations_by_row=bases,
+                full_caps_by_row=caps,
+            ),
+            evidence,
+        )
 
     def _run_cohort(
         self,
@@ -870,6 +940,8 @@ class SelfPlayActor:
         game_limit = first_game + (cohort_size if game_quota is None else game_quota)
         published_rows: set[int] = set()
         summaries: dict[int, GameSummary] = {}
+        search: Any | None = None
+        execution = self.config.search_execution
 
         def publish_finished(state_data: Any, *, force_flush: bool = False) -> None:
             rows = [
@@ -1051,8 +1123,7 @@ class SelfPlayActor:
                 simulations_by_row=simulations_by_row,
             )
             seed_options = {"seeds_per_root": seeds_by_row} if seeds_by_row else {}
-            search = self.native.SearchBatch(
-                states,
+            options: dict[str, Any] = dict(
                 simulations=simulations,
                 max_considered=self.config.considered_actions(),
                 c_visit=self.config.c_visit,
@@ -1062,8 +1133,41 @@ class SelfPlayActor:
                 pda_by_seat=pda_seats,
                 **seed_options,
             )
+            if execution.first_visit_batch_size > 1:
+                options["first_visit_batch_size"] = execution.first_visit_batch_size
+            if execution.subtree_reuse:
+                options["model_context"] = search_model_context(
+                    self.evaluator, self.config.effective_score_utility_weight()
+                )
+            if search is not None and execution.subtree_reuse:
+                search.advance(
+                    states,
+                    **options,
+                    reuse_tree=True,
+                    max_reused_nodes=execution.subtree_reuse_max_nodes,
+                )
+            else:
+                search = self.native.SearchBatch(states, **options)
+            assert search is not None
             roots = search.root_requests()
             root_response = self.evaluator.evaluate(roots)
+            search_evidence = [execution.provenance()] * cohort_size
+            if execution.full_budget.mode != "fixed":
+                budgets, budget_evidence = self._entropy_budgets(
+                    roots,
+                    root_response,
+                    state_data,
+                    pda_seats,
+                    simulations_by_row or [simulations] * cohort_size,
+                    full_by_row or [full_search] * cohort_size,
+                )
+                search.set_simulations_per_root(budgets)
+                search_evidence = [
+                    prefix + evidence
+                    for prefix, evidence in zip(
+                        search_evidence, budget_evidence, strict=True
+                    )
+                ]
             search.initialize_roots(*root_response.submit_args())
             if self.pause_checkpoint is not None:
                 self.pause_checkpoint()
@@ -1073,7 +1177,16 @@ class SelfPlayActor:
                 guard += 1
                 if guard > guard_limit:
                     raise RuntimeError("native search failed to make progress")
-                requests = search.next_requests()
+                requests = (
+                    search.next_requests(
+                        max_rows=search_batch_row_limit(
+                            self.evaluator,
+                            max(cohort_size, execution.first_visit_batch_size),
+                        )
+                    )
+                    if execution.first_visit_batch_size > 1
+                    else search.next_requests()
+                )
                 if len(requests) == 0:
                     continue
                 response = self.evaluator.evaluate(requests)
@@ -1102,6 +1215,7 @@ class SelfPlayActor:
                 swaps=swaps,
                 full_search_by_row=full_by_row,
                 search_seeds_by_row=seeds_by_row,
+                search_evidence_by_row=search_evidence,
             )
             selected = [int(action) for action in results.selected_actions]
             active_rows = [
@@ -1198,6 +1312,7 @@ class SelfPlayActor:
         swaps: Sequence[bool] | None = None,
         full_search_by_row: Sequence[bool] | None = None,
         search_seeds_by_row: Sequence[int] | None = None,
+        search_evidence_by_row: Sequence[str] | None = None,
     ) -> None:
         offsets = [int(value) for value in results.action_offsets]
         actions = [int(value) for value in results.actions]
@@ -1215,7 +1330,30 @@ class SelfPlayActor:
             raise RuntimeError("native search selected-action rows are invalid")
         stones_placed = list(getattr(state_data, "stones_placed"))
         terminal = [bool(value) for value in results.terminal]
-        for values in (budgets, swaps, full_search_by_row, search_seeds_by_row):
+        reused_nodes: list[int] | None = None
+        reused_simulations: list[int] | None = None
+        inherited_visits: list[int] | None = None
+        if self.config.search_execution.subtree_reuse:
+            reused_nodes = list(results.reused_nodes)
+            reused_simulations = list(results.reused_simulations)
+            inherited_visits = list(results.inherited_visits)
+            if (
+                len(reused_nodes) != len(positions)
+                or len(reused_simulations) != len(positions)
+                or len(inherited_visits) != len(actions)
+                or any(
+                    value < 0
+                    for value in (*reused_nodes, *reused_simulations, *inherited_visits)
+                )
+            ):
+                raise RuntimeError("native reused-search statistics are invalid")
+        for values in (
+            budgets,
+            swaps,
+            full_search_by_row,
+            search_seeds_by_row,
+            search_evidence_by_row,
+        ):
             if values is not None and len(values) != len(positions):
                 raise RuntimeError("per-game search metadata rows are invalid")
         for row, position in enumerate(positions):
@@ -1309,6 +1447,22 @@ class SelfPlayActor:
                     ),
                     policy_surprise=policy_surprise,
                     swapped=bool(swaps[row]) if swaps is not None else False,
+                    search_evidence=(
+                        (
+                            search_evidence_by_row[row]
+                            if search_evidence_by_row is not None
+                            else ""
+                        )
+                        + (
+                            f":reused_nodes={reused_nodes[row]}"
+                            f":reused_simulations={reused_simulations[row]}"
+                            f":inherited_root_visits={sum(inherited_visits[offsets[row] : offsets[row + 1]])}"
+                            if reused_nodes is not None
+                            and reused_simulations is not None
+                            and inherited_visits is not None
+                            else ""
+                        )
+                    ),
                 )
             )
             if row_full_search:
@@ -1399,6 +1553,7 @@ class SelfPlayActor:
                             f"variant={variant.label}:pda={decision.position.pda}:"
                             f"swap={'taken' if decision.swapped else 'no'}:"
                             f"algorithm={SEARCH_ALGORITHM_ID}"
+                            + decision.search_evidence
                             + (
                                 ":seed_contract=game-v1"
                                 if self.config.seed_contract == "game-v1"

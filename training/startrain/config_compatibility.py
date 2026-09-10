@@ -11,6 +11,9 @@ from copy import deepcopy
 from collections.abc import Mapping
 from typing import Any
 
+from .search_options import SearchExecutionConfig
+from dataclasses import asdict
+
 
 def without_pause_strategy_default(payload: Mapping[str, Any]) -> dict[str, Any]:
     """Represent releases whose actor pause strategy was always terminate."""
@@ -68,10 +71,16 @@ def compatible_config_epoch_payloads(
     """
 
     current = deepcopy(dict(payload))
-    budget_representations = [current]
-    pre_budget = without_cohort_search_budget_defaults(payload)
-    if pre_budget != current:
-        budget_representations.append(pre_budget)
+    execution_representations = [current]
+    pre_execution = without_search_execution_defaults(payload)
+    if pre_execution != current:
+        execution_representations.append(pre_execution)
+    budget_representations = []
+    for representation in execution_representations:
+        budget_representations.append(representation)
+        pre_budget = without_cohort_search_budget_defaults(representation)
+        if pre_budget != representation:
+            budget_representations.append(pre_budget)
     pipeline_representations = []
     for representation in budget_representations:
         pipeline_representations.append(representation)
@@ -105,6 +114,30 @@ def compatible_config_epoch_payloads(
     return tuple(variants)
 
 
+def without_search_execution_defaults(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Omit only the exact disabled experiment defaults of the prior release."""
+    result = deepcopy(dict(payload))
+    defaults = asdict(SearchExecutionConfig())
+
+    def exact(actual: object, expected: object) -> bool:
+        if type(actual) is not type(expected):
+            return False
+        if isinstance(expected, dict):
+            assert isinstance(actual, dict)
+            return actual.keys() == expected.keys() and all(
+                exact(actual[key], value) for key, value in expected.items()
+            )
+        return actual == expected
+
+    for name in ("selfplay", "arena"):
+        section = result.get(name)
+        if isinstance(section, dict) and exact(
+            section.get("search_execution"), defaults
+        ):
+            del section["search_execution"]
+    return result
+
+
 def without_cohort_search_budget_defaults(payload: Mapping[str, Any]) -> dict[str, Any]:
     """Represent the prior per-game-budget release without erasing opt-ins.
 
@@ -129,7 +162,7 @@ def without_cohort_search_budget_defaults(payload: Mapping[str, Any]) -> dict[st
 
 def without_selfplay_pipeline_defaults(payload: Mapping[str, Any]) -> dict[str, Any]:
     """Represent the release before optional actor pipelines and CUDA graphs."""
-    result = deepcopy(dict(payload))
+    result = without_search_execution_defaults(payload)
 
     def omit_defaults(parent: object, defaults: Mapping[str, object]) -> None:
         if not isinstance(parent, dict):

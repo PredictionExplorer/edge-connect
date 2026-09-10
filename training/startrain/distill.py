@@ -207,6 +207,9 @@ class BrowserSearchConfig:
     c_scale: float = 1.0
     # The browser's pie responder swaps below -swap_dead_zone of selected keep Q.
     swap_dead_zone: float = 0.02
+    first_visit_batch_size: int = 1
+    subtree_reuse: bool = False
+    subtree_reuse_max_nodes: int = 4_096
 
     def __post_init__(self) -> None:
         if (
@@ -224,6 +227,28 @@ class BrowserSearchConfig:
             or not 0 <= float(self.swap_dead_zone) < 1
         ):
             raise DistillationConfigError("browser swap_dead_zone must be in [0, 1)")
+        if (
+            type(self.first_visit_batch_size) is not int
+            or not 1 <= self.first_visit_batch_size <= 64
+            or type(self.subtree_reuse) is not bool
+            or type(self.subtree_reuse_max_nodes) is not int
+            or not 1 <= self.subtree_reuse_max_nodes <= 65_536
+        ):
+            raise DistillationConfigError(
+                "experimental browser search limits are invalid"
+            )
+
+    def manifest_fields(self) -> dict[str, object]:
+        """Keep default exports identical to the original browser contract."""
+
+        fields = asdict(self)
+        if self.first_visit_batch_size == 1:
+            fields.pop("first_visit_batch_size")
+        if not self.subtree_reuse:
+            fields.pop("subtree_reuse")
+        if self.subtree_reuse_max_nodes == 4_096:
+            fields.pop("subtree_reuse_max_nodes")
+        return fields
 
 
 @dataclass(frozen=True, slots=True)
@@ -670,7 +695,7 @@ class DistillationRunner:
                 "checkpoint": _artifact_entry(checkpoint, checkpoint_sha256),
             },
             "tensors": _browser_tensor_schema(model),
-            "recommended_local_search": asdict(self.config.export.recommended_search),
+            "recommended_local_search": self.config.export.recommended_search.manifest_fields(),
             "training": {
                 "steps": self.config.train.steps,
                 "replay_samples": replay_samples,

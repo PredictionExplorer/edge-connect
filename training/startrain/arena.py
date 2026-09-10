@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import hashlib
 import json
 import random
 import time
@@ -15,11 +16,18 @@ from statistics import NormalDist
 from typing import Any, Iterator, Literal, Protocol, TypeVar, cast
 
 from .config import ArenaConfig
+from .config_compatibility import without_search_execution_defaults
 from .contracts import RULES_HASH, SEARCH_ALGORITHM_ID, SEGMENT_STANDARD
 from .inference import GraphInferenceAdapter, InferenceResponse, NativeEvalBatchProtocol
 from .inference_batching import BoundedInferenceBroker
 from .native import BITBOARD_WORDS
 from .selfplay import STANDARD_VARIANT, GameVariant
+from .search_options import (
+    require_search_execution,
+    search_batch_row_limit,
+    search_model_context,
+)
+from .search_sessions import CompletedSearchCache
 from .balanced_evaluation import (
     BALANCED_CATEGORIES,
     balanced_opening_seed,
@@ -1379,6 +1387,14 @@ class ArenaRunner:
         self.candidate = candidate
         self.baseline = baseline
         self.config = config
+        require_search_execution(native_module, config.search_execution)
+        self._search_sessions = (
+            CompletedSearchCache(
+                max_nodes=config.search_execution.subtree_reuse_max_nodes
+            )
+            if config.search_execution.subtree_reuse
+            else None
+        )
         self.stable_pair_seeds = stable_pair_seeds or config.balanced_cells
         self.candidate_search = ArenaSearchBudget.from_config(config)
         self.baseline_search = baseline_search or self.candidate_search
@@ -1688,6 +1704,25 @@ class ArenaRunner:
         if self._resume_contract is not None:
             with self._resume_lock:
                 result["resume_state"] = self._resume_snapshot()
+        execution = self.config.search_execution.contract()
+        if execution is not None:
+            search_metadata = cast(dict[str, object], result["search"])
+            search_metadata["execution"] = execution
+            if self._search_sessions is not None:
+                search_metadata["deterministic"] = False
+                baseline_metadata["deterministic"] = False
+                search_metadata["reuse_trace_policy"] = (
+                    "session-history-and-group-scheduling-dependent"
+                )
+                search_metadata["resume_search_policy"] = (
+                    "fresh-root-statistics-after-resume"
+                )
+                search_metadata["budget_accounting"] = (
+                    "fixed-new-simulations-plus-retained-visits"
+                )
+                cast(dict[str, object], result["evaluation_metrics"])[
+                    "completed_search_cache"
+                ] = self._search_sessions.metrics_snapshot()
         return result
 
     def _initialize_resume(
@@ -1712,7 +1747,9 @@ class ArenaRunner:
                     "baseline": self.baseline.model_version,
                     "rules_hash": RULES_HASH,
                     "seed_stream_policy": "independent-cell-pair-seat-move-v2",
-                    "config": asdict(self.config),
+                    "config": without_search_execution_defaults(
+                        {"arena": asdict(self.config)}
+                    )["arena"],
                     "search_algorithm": SEARCH_ALGORITHM_ID,
                     "candidate_search": self.candidate_search.metadata(),
                     "baseline_search": self.baseline_search.metadata(),
@@ -1720,7 +1757,11 @@ class ArenaRunner:
             )
         )
         if resume_state is not None:
-            if any(resume_state.get(key) != value for key, value in contract.items()):
+            supplied = dict(resume_state)
+            supplied["config"] = without_search_execution_defaults(
+                {"arena": supplied.get("config")}
+            )["arena"]
+            if any(supplied.get(key) != value for key, value in contract.items()):
                 raise ValueError(
                     "arena resume state disagrees with evaluation contract"
                 )
@@ -1910,6 +1951,8 @@ class ArenaRunner:
                 broker.shutdown(wait=True, cancel_pending=False)
                 self._shared_inference_metrics = broker.metrics_snapshot()
             self._shared_broker = None
+            if self._search_sessions is not None:
+                self._search_sessions.clear()
 
     def _play_balanced_groups(
         self,
@@ -2272,6 +2315,18 @@ class ArenaRunner:
                             node_count,
                             **(
                                 {
+                                    "reuse_group_identity": (
+                                        ring,
+                                        variant.label,
+                                        evaluator_index,
+                                        tuple(specifications[row] for row in rows),
+                                    )
+                                }
+                                if self.config.search_execution.subtree_reuse
+                                else {}
+                            ),
+                            **(
+                                {
                                     "seeds_per_root": [
                                         balanced_search_seed(
                                             specifications[row][2],
@@ -2425,6 +2480,7 @@ class ArenaRunner:
         swap_available: Sequence[bool] | None = None,
         node_count: int | None = None,
         seeds_per_root: Sequence[int] | None = None,
+        reuse_group_identity: object | None = None,
     ) -> tuple[list[int], list[int]] | None:
         if stop_requested():
             return None
@@ -2439,15 +2495,40 @@ class ArenaRunner:
             options["simulations_per_root"] = [int(value) for value in budgets]
         if pda_seats != (0, 0):
             options["pda_by_seat"] = [pda_seats] * row_count
-        search = self.native.SearchBatch(
-            states,
-            simulations=budget.simulations,
-            max_considered=budget.max_considered,
-            c_visit=budget.c_visit,
-            c_scale=budget.c_scale,
-            deterministic_seed=seed,
+        execution = self.config.search_execution
+        if execution.first_visit_batch_size > 1:
+            options["first_visit_batch_size"] = execution.first_visit_batch_size
+        search = None
+        if self._search_sessions is not None:
+            if reuse_group_identity is None:
+                raise ValueError(
+                    "arena subtree reuse requires logical pair/seat identities"
+                )
+            group_identity = hashlib.sha256(
+                repr(reuse_group_identity).encode()
+            ).hexdigest()
+            context = search_model_context(evaluator) + ":arena-group-" + group_identity
+            options["model_context"] = context
+            search = self._search_sessions.take(
+                states, context, [pda_seats] * row_count
+            )
+        constructor_options = {
+            "simulations": budget.simulations,
+            "max_considered": budget.max_considered,
+            "c_visit": budget.c_visit,
+            "c_scale": budget.c_scale,
+            "deterministic_seed": seed,
             **options,
-        )
+        }
+        if search is None:
+            search = self.native.SearchBatch(states, **constructor_options)
+        else:
+            search.advance(
+                states,
+                **constructor_options,
+                reuse_tree=True,
+                max_reused_nodes=execution.subtree_reuse_max_nodes,
+            )
         roots = search.root_requests()
         response = self._evaluate_serialized(
             inference_executor,
@@ -2467,7 +2548,19 @@ class ArenaRunner:
             guard += 1
             if guard > guard_limit:
                 raise RuntimeError("batched arena search failed to make progress")
-            requests = search.next_requests()
+            requests = (
+                search.next_requests(
+                    max_rows=(
+                        self._shared_broker.max_batch_rows
+                        if self._shared_broker is not None
+                        else search_batch_row_limit(
+                            evaluator, max(row_count, execution.first_visit_batch_size)
+                        )
+                    )
+                )
+                if execution.first_visit_batch_size > 1
+                else search.next_requests()
+            )
             if len(requests) == 0:
                 continue
             response = self._evaluate_serialized(
@@ -2491,6 +2584,8 @@ class ArenaRunner:
             for index, available in enumerate(swap_available):
                 if available and keep_values[index] < -self.config.swap_dead_zone:
                     actions[index] = node_count
+        if self._search_sessions is not None and not stop_requested():
+            self._search_sessions.put(search)
         return list(rows), actions
 
     def _evaluate_serialized(
@@ -2611,6 +2706,18 @@ class ArenaRunner:
                 pda_seats,
                 [bool(state_data.swap_available[0])],
                 node_count,
+                **(
+                    {
+                        "reuse_group_identity": (
+                            ring,
+                            variant.label,
+                            0 if player == candidate_player else 1,
+                            (specification,),
+                        )
+                    }
+                    if self.config.search_execution.subtree_reuse
+                    else {}
+                ),
                 **(
                     {
                         "seeds_per_root": [

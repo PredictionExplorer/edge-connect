@@ -191,6 +191,9 @@ def evaluation_contract(config: ArenaConfig) -> dict[str, object]:
         "hoeffding_lambdas": list(HOEFFDING_LAMBDAS),
         "pair_independence": "independent seed streams across pairs; arbitrary dependence within each seat reversal",
     }
+    execution = config.search_execution.contract()
+    if execution is not None:
+        contract["search_execution"] = execution
     encoded = json.dumps(contract, sort_keys=True, separators=(",", ":")).encode()
     return {**contract, "identity": "sha256-" + hashlib.sha256(encoded).hexdigest()}
 

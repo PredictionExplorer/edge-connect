@@ -1,11 +1,105 @@
 #![allow(missing_docs)]
 #![cfg(target_arch = "wasm32")]
 
-use star_wasm::{WASM_BINDINGS_ENABLED, WasmGumbel, WasmSearchTree, WasmState};
+use star_wasm::{
+    WASM_BINDINGS_ENABLED, WasmGumbel, WasmSearchSession, WasmSearchTree, WasmState,
+    search_execution_version,
+};
 use wasm_bindgen_test::wasm_bindgen_test;
 
 const RULES_HASH: u64 = 0xa5d9_32b0_ef83_54e8;
 const _: () = assert!(WASM_BINDINGS_ENABLED);
+
+fn finish_session(session: &mut WasmSearchSession) {
+    let actions = session.root_actions().unwrap();
+    session
+        .initialize_root(session.root_token().unwrap(), 0.0, vec![0.0; actions.len()])
+        .unwrap();
+    while !session.done() {
+        let count = session.next_requests().unwrap();
+        if count == 0 {
+            continue;
+        }
+        let tokens = session.pending_tokens();
+        let mut values = Vec::new();
+        let mut offsets = vec![0];
+        let mut logits = Vec::new();
+        for row in 0..count {
+            let state = session.pending_state(row).unwrap();
+            values.push(if state.to_move() == 0 { 0.25 } else { -0.25 });
+            logits.extend(
+                session
+                    .pending_actions(row)
+                    .unwrap()
+                    .iter()
+                    .map(|action| -f32::from(*action) / 100.0),
+            );
+            offsets.push(logits.len());
+        }
+        let before = session.simulations();
+        let mut bad = tokens.clone();
+        bad[0] = u64::MAX;
+        assert!(
+            session
+                .submit(bad, values.clone(), offsets.clone(), logits.clone())
+                .is_err()
+        );
+        assert_eq!(session.simulations(), before);
+        assert_eq!(session.pending_tokens(), tokens);
+        session.submit(tokens, values, offsets, logits).unwrap();
+    }
+    session.complete().unwrap();
+}
+
+#[wasm_bindgen_test]
+fn wasm_sessions_batch_in_order_and_reuse_only_completed_descendants() {
+    assert_eq!(search_execution_version(), 1);
+    for (mode, handicap, pie) in [
+        ("classic", 1, false),
+        ("double", 1, false),
+        ("classic", 4, false),
+        ("double", 4, false),
+        ("classic", 1, true),
+        ("double", 1, true),
+    ] {
+        let mut state = WasmState::new(4, mode, handicap, pie).unwrap();
+        let mut serial = WasmSearchSession::new(&state, 128, 16, 50.0, 1.0, 17, 1).unwrap();
+        let mut batched = WasmSearchSession::new(&state, 128, 16, 50.0, 1.0, 17, 4).unwrap();
+        finish_session(&mut serial);
+        finish_session(&mut batched);
+        assert_eq!(
+            serial.selected_action().unwrap(),
+            batched.selected_action().unwrap()
+        );
+        assert_eq!(serial.visits().unwrap(), batched.visits().unwrap());
+        assert_eq!(serial.q_values().unwrap(), batched.q_values().unwrap());
+        assert_eq!(
+            serial.policy_target().unwrap(),
+            batched.policy_target().unwrap()
+        );
+        assert_eq!(batched.visits().unwrap().iter().sum::<u32>(), 128);
+        state
+            .apply(batched.selected_action().unwrap().unwrap())
+            .unwrap();
+        batched
+            .restart(&state, 16, 4, 50.0, 1.0, 18, 4, true, 4096)
+            .unwrap();
+        assert!(batched.actions().is_err());
+        finish_session(&mut batched);
+        assert!(batched.reused_nodes().unwrap() > 0);
+        assert_eq!(batched.visits().unwrap().iter().sum::<u32>(), 16);
+        assert_eq!(
+            batched.total_visits().unwrap().iter().sum::<u32>(),
+            16 + batched.reused_visits().unwrap()
+        );
+        // Repeating the same root is a fresh search, never accumulated work.
+        batched
+            .restart(&state, 4, 4, 50.0, 1.0, 18, 4, true, 4096)
+            .unwrap();
+        finish_session(&mut batched);
+        assert_eq!(batched.reused_nodes().unwrap(), 0);
+    }
+}
 
 fn assert_ascending_nodes(actions: &[u16]) {
     assert!(actions.windows(2).all(|pair| pair[0] < pair[1]));
@@ -181,6 +275,36 @@ fn wasm_gumbel_uses_the_exact_requested_budget() {
     );
     let selected = scheduler.selected(completed_q, visits.clone()).unwrap();
     assert_eq!(visits[selected], visits.iter().copied().max().unwrap());
+}
+
+#[wasm_bindgen_test]
+fn wasm_scheduled_candidates_match_checked_search_across_phase_boundaries() {
+    let logits = vec![0.5, -0.25, 1.0, 0.0, -1.0];
+    let mut q = vec![0.0; logits.len()];
+    let mut visits = vec![0_u32; logits.len()];
+    let mut checked = WasmGumbel::new(logits.clone(), 33, 5, 50.0, 1.0, 0x5eed).unwrap();
+    let mut fast = WasmGumbel::new(logits, 33, 5, 50.0, 1.0, 0x5eed).unwrap();
+    let mut boundaries = 0;
+    for simulation in 0..33 {
+        let expected = checked.next(q.clone(), visits.clone()).unwrap().unwrap();
+        let actual = fast.next_scheduled().unwrap_or_else(|| {
+            boundaries += 1;
+            fast.next(q.clone(), visits.clone()).unwrap().unwrap()
+        });
+        assert_eq!(actual, expected);
+        assert_eq!(fast.next_scheduled(), Some(actual));
+        visits[actual] += 1;
+        q[actual] = (simulation % 7) as f32 / 3.0 - 1.0;
+        checked.record(expected).unwrap();
+        fast.record(actual).unwrap();
+    }
+    assert!(boundaries > 0 && boundaries < 5);
+    assert!(fast.done());
+    assert_eq!(fast.next_scheduled(), None);
+    assert_eq!(
+        checked.selected(q.clone(), visits.clone()).unwrap(),
+        fast.selected(q, visits).unwrap()
+    );
 }
 
 #[wasm_bindgen_test]

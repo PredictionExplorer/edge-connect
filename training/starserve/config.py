@@ -11,6 +11,8 @@ from urllib.parse import urlsplit
 
 import yaml
 
+from startrain.search_options import SearchExecutionConfig, parse_search_execution
+
 from startrain.contracts import (
     ACTION_LAYOUT_SCHEMA_ID,
     EXTERNAL_FEATURE_SCHEMA_ID,
@@ -103,8 +105,14 @@ class ServingInferenceConfig:
     max_batch_rows: int = 16
     max_pending_requests: int = 16
     max_wait_seconds: float = 0.001
+    search_cache_entries: int = 8
 
     def __post_init__(self) -> None:
+        if (
+            type(self.search_cache_entries) is not int
+            or not 1 <= self.search_cache_entries <= 64
+        ):
+            raise ServerConfigError("search_cache_entries must be in 1..64")
         for name in ("cache_max_entries", "cache_max_bytes"):
             value = getattr(self, name)
             if type(value) is not int or value < 0:
@@ -192,10 +200,17 @@ class ServerConfig:
     limits: LimitConfig = LimitConfig()
     inference: ServingInferenceConfig = ServingInferenceConfig()
     security: SecurityConfig = SecurityConfig()
+    search_execution: SearchExecutionConfig = SearchExecutionConfig()
 
     def __post_init__(self) -> None:
         if self.schema_version != SERVER_CONFIG_SCHEMA_VERSION:
             raise ServerConfigError("server configuration schema_version must be 2")
+        if not isinstance(self.search_execution, SearchExecutionConfig):
+            raise ServerConfigError("search_execution requires typed settings")
+        if self.search_execution.full_budget.mode != "fixed":
+            raise ServerConfigError(
+                "adaptive full budgets are for self-play; serving honors exact requested budgets"
+            )
         expected = (
             (self.rules_schema_id, RULES_SCHEMA_ID, "rules schema"),
             (self.rules_hash, RULES_HASH_WIRE, "rules hash"),
@@ -266,6 +281,12 @@ def load_server_config(path: str | Path) -> ServerConfig:
                 raise ServerConfigError("cors_allow_origins must be a list")
             nested["cors_allow_origins"] = tuple(origins)
         values[name] = _construct(cls, nested)
+    try:
+        values["search_execution"] = parse_search_execution(
+            values.get("search_execution", {})
+        )
+    except (TypeError, ValueError) as exc:
+        raise ServerConfigError(str(exc)) from exc
     root = source.resolve().parent
     for name in ("experiment_config", "model_manifest"):
         value = values[name]

@@ -848,9 +848,11 @@ def test_additive_default_field_accepts_legacy_chain_hash(tmp_path: Path) -> Non
     # supported epoch. Removing the whole disabled inference service collapses
     # the otherwise independent pre/post-topology representations.
     assert expected <= compatible
-    # Cohort-budget defaults preserve both pipeline representations; the shared
-    # pre-pipeline representation is deduplicated across those epochs.
-    assert len(compatible) == 72 * len(expected)
+    # The search-execution epoch preserves current and pre-experiment profiles
+    # across both cohort-budget epochs. Their shared pre-pipeline representation
+    # is deduplicated: five pipeline representations instead of the prior three,
+    # each with the same 24 scheduling/clipping/topology representations.
+    assert len(compatible) == 120 * len(expected)
     # A profile that opts into a new field no longer matches releases that
     # never had it, but keeps the variants for the other additive fields.
     opted = yaml.safe_load(fixture.old_profile.read_text(encoding="utf-8"))
@@ -859,7 +861,7 @@ def test_additive_default_field_accepts_legacy_chain_hash(tmp_path: Path) -> Non
     opted_path = tmp_path / "opted.yaml"
     opted_path.write_text(yaml.safe_dump(opted, sort_keys=False), encoding="utf-8")
     opted_config = load_config(opted_path)
-    assert len(migration._compatible_source_config_sha256s(opted_config)) == 576
+    assert len(migration._compatible_source_config_sha256s(opted_config)) == 960
 
     opted.setdefault("selfplay", {}).setdefault("variants", {})[
         "handicap_classic_share"
@@ -867,7 +869,7 @@ def test_additive_default_field_accepts_legacy_chain_hash(tmp_path: Path) -> Non
     opted.setdefault("arena", {})["segment_handicap_classic_share"] = 0.5
     opted_path.write_text(yaml.safe_dump(opted, sort_keys=False), encoding="utf-8")
     assert (
-        len(migration._compatible_source_config_sha256s(load_config(opted_path))) == 144
+        len(migration._compatible_source_config_sha256s(load_config(opted_path))) == 240
     )
 
     # The head a release without scheduling or plateau additions recorded.
@@ -880,6 +882,16 @@ def test_additive_default_field_accepts_legacy_chain_hash(tmp_path: Path) -> Non
         ("orchestration", "historical_evaluation", "session_seconds"),
         ("orchestration", "historical_evaluation", "cooldown_seconds"),
         ("orchestration", "promotion", "pause_strategy"),
+        ("selfplay", "search_execution"),
+        ("arena", "search_execution"),
+    )
+    assert legacy_hash in compatible
+    experimental = yaml.safe_load(fixture.old_profile.read_text(encoding="utf-8"))
+    experimental["selfplay"]["search_execution"] = {"first_visit_batch_size": 2}
+    experimental_path = tmp_path / "experimental-execution.yaml"
+    experimental_path.write_text(yaml.safe_dump(experimental, sort_keys=False))
+    assert legacy_hash not in migration._compatible_source_config_sha256s(
+        load_config(experimental_path)
     )
     source_profile_sha256 = hashlib.sha256(fixture.old_profile_bytes).hexdigest()
     record = {

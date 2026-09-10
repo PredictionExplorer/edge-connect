@@ -13,6 +13,7 @@
 mod batch;
 mod evaluation;
 mod gumbel;
+mod session;
 mod tree;
 
 /// Search behavior fingerprint, independent of the game and model schemas.
@@ -24,4 +25,5 @@ pub use batch::{
 };
 pub use evaluation::{BatchEvaluator, Evaluation, EvaluationRequest};
 pub use gumbel::{GumbelError, GumbelParameters, GumbelSequentialHalving};
-pub use tree::{RootActionStats, SearchError, SearchTree, SimulationStart};
+pub use session::{SearchSession, SessionConfig, SessionError, SessionResult};
+pub use tree::{ReuseStats, RootActionStats, SearchError, SearchTree, SimulationStart};

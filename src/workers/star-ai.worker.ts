@@ -24,6 +24,8 @@ import {
   float32ToFloat16Array,
 } from '@/lib/star/ai/features';
 import {
+  DEFAULT_BROWSER_AI_SUBTREE_REUSE_MAX_NODES,
+  MAX_BROWSER_AI_FIRST_VISIT_BATCH_SIZE,
   STAR_BROWSER_MODEL_MANIFEST_PATH,
   parseStarBrowserModelManifest,
   type StarBrowserModelManifest,
@@ -101,6 +103,7 @@ interface WasmSearchTreeConstructor {
 
 interface WasmGumbel {
   next(completedQ: Float32Array, visits: Uint32Array): number;
+  next_scheduled?(): number | undefined;
   record(candidate: number): void;
   done(): boolean;
   selected(completedQ: Float32Array, visits: Uint32Array): number;
@@ -124,6 +127,41 @@ interface StarWasmModule {
   WasmState: WasmStateConstructor;
   WasmSearchTree: WasmSearchTreeConstructor;
   WasmGumbel: WasmGumbelConstructor;
+  search_execution_version?(): number;
+  WasmSearchSession?: new (
+    state: WasmState, simulations: number, maxConsidered: number,
+    cVisit: number, cScale: number, seed: bigint, firstVisitBatchSize: number,
+  ) => WasmSearchSession;
+}
+
+export interface WasmSearchSession {
+  restart(state: WasmState, simulations: number, maxConsidered: number,
+    cVisit: number, cScale: number, seed: bigint, firstVisitBatchSize: number,
+    allowReuse: boolean, maxNodes: number): void;
+  root_actions(): Int32Array;
+  root_token(): bigint;
+  initialize_root(token: bigint, value: number, logits: Float32Array): void;
+  next_requests(): number;
+  pending_tokens(): BigUint64Array;
+  pending_state(row: number): WasmState;
+  pending_actions(row: number): Int32Array;
+  submit(tokens: BigUint64Array, values: Float32Array, offsets: Uint32Array, logits: Float32Array): void;
+  done(): boolean;
+  simulations(): number;
+  unique_nodes(): number;
+  complete(): void;
+  selected_action(): number | undefined;
+  selected_action_value(): number | undefined;
+  root_value(): number | undefined;
+  actions(): Int32Array;
+  visits(): Uint32Array;
+  inherited_visits(): Uint32Array;
+  total_visits(): Uint32Array;
+  q_values(): Float32Array;
+  policy_target(): Float32Array;
+  reused_visits(): number;
+  reused_nodes(): number;
+  free?(): void;
 }
 
 export const STAR_LOCAL_SEARCH_ALGORITHM_ID =
@@ -140,7 +178,17 @@ export function hasExpectedWasmSearch(wasm: Partial<StarWasmModule>): boolean {
 }
 
 export function versionedWasmUrl(url: string): string {
-  return `${url}?search=${encodeURIComponent(STAR_LOCAL_SEARCH_ALGORITHM_ID)}`;
+  return `${url}?search=${encodeURIComponent(STAR_LOCAL_SEARCH_ALGORITHM_ID)}&implementation=search-session-v1`;
+}
+
+export function hasExpectedWasmExecution(wasm: Partial<StarWasmModule>): boolean {
+  try {
+    return wasm.search_execution_version?.() === 1 && typeof wasm.WasmSearchSession === 'function';
+  } catch { return false; }
+}
+
+export function usesExperimentalSearch(manifest: StarBrowserModelManifest): boolean {
+  return (manifest.search.firstVisitBatchSize ?? 1) > 1 || manifest.search.subtreeReuse === true;
 }
 
 interface LocalRuntime {
@@ -149,6 +197,7 @@ interface LocalRuntime {
   session: Ort.InferenceSession;
   wasm: StarWasmModule;
   predictions: PredictionCache;
+  completedSearch?: { session: WasmSearchSession; context: string };
 }
 
 interface Evaluation {
@@ -322,6 +371,9 @@ async function importWasm(
       'unavailable',
       'Local AI WASM search is incompatible. Rebuild and publish the current WASM package.',
     );
+  }
+  if (usesExperimentalSearch(manifest) && !hasExpectedWasmExecution(wasmModule)) {
+    throw new StarAiError('unavailable', 'Experimental local search requires the current WASM execution package.');
   }
   return wasmModule;
 }
@@ -664,6 +716,13 @@ export function expectedScoreMargin(logits: Float32Array): number {
   );
 }
 
+function predictionKey(runtime: LocalRuntime, semantic: StarAiSemanticState, legalActions: Int32Array): string {
+  return JSON.stringify([
+    runtime.manifest.model.sha256, runtime.manifest.featureSchemaHash,
+    semantic, Array.from(legalActions), 0,
+  ]);
+}
+
 export async function evaluate(
   runtime: LocalRuntime,
   semantic: StarAiSemanticState,
@@ -671,13 +730,7 @@ export async function evaluate(
 ): Promise<Evaluation> {
   // Include complete feature history and legal-action order, rather than a board hash.
   // Browser inference always encodes a playout-doubling advantage of zero.
-  const key = JSON.stringify([
-    runtime.manifest.model.sha256,
-    runtime.manifest.featureSchemaHash,
-    semantic,
-    Array.from(legalActions),
-    0,
-  ]);
+  const key = predictionKey(runtime, semantic, legalActions);
   const cached = runtime.predictions.get(key);
   if (cached) return cached;
 
@@ -694,6 +747,125 @@ export async function evaluate(
       for (const tensor of Object.values(outputs)) tensor.dispose();
     }
   }
+}
+
+export interface EvaluationRow {
+  semantic: StarAiSemanticState;
+  legalActions: Int32Array;
+}
+
+/** Stack every input, including topology, ring and per-row history/legal masks. */
+export function batchTensorFeeds(runtime: LocalRuntime, states: readonly StarAiSemanticState[]): Record<string, Ort.Tensor> {
+  if (!states.length || states.length > MAX_BROWSER_AI_FIRST_VISIT_BATCH_SIZE ||
+      states.some((state) => state.rings !== states[0].rings)) {
+    throw new StarAiError('protocol', 'Local inference batch must contain 1-64 rows on one board.');
+  }
+  const encoded = states.map(encodeStarFeatures);
+  const rows = encoded.length;
+  const nodes = encoded[0].nodeCount;
+  const degree = encoded[0].maxDegree;
+  const nodeFeatures = new Float32Array(rows * nodes * STAR_NODE_FEATURE_DIM);
+  const globalFeatures = new Float32Array(rows * STAR_GLOBAL_FEATURE_DIM);
+  const neighborIndex = new BigInt64Array(rows * nodes * degree);
+  const neighborMask = new Uint8Array(rows * nodes * degree);
+  const edgeType = new BigInt64Array(rows * nodes * degree);
+  const nodeMask = new Uint8Array(rows * nodes);
+  const legalMask = new Uint8Array(rows * nodes);
+  const rings = new BigInt64Array(rows);
+  encoded.forEach((row, index) => {
+    if (row.nodeCount !== nodes || row.maxDegree !== degree) {
+      throw new StarAiError('protocol', 'Local inference batch topology differs between rows.');
+    }
+    nodeFeatures.set(row.nodeFeatures, index * nodes * STAR_NODE_FEATURE_DIM);
+    globalFeatures.set(row.globalFeatures, index * STAR_GLOBAL_FEATURE_DIM);
+    neighborIndex.set(row.neighborIndex, index * nodes * degree);
+    neighborMask.set(row.neighborMask, index * nodes * degree);
+    edgeType.set(row.neighborEdgeType, index * nodes * degree);
+    nodeMask.set(row.nodeMask, index * nodes);
+    legalMask.set(row.legalActionMask, index * nodes);
+    rings.set(row.rings, index);
+  });
+  const { Tensor } = runtime.ort;
+  const feeds: Record<string, Ort.Tensor> = {};
+  try {
+    feeds.node_features = new Tensor('float16', float32ToFloat16Array(nodeFeatures), [rows, nodes, STAR_NODE_FEATURE_DIM]);
+    feeds.global_features = new Tensor('float16', float32ToFloat16Array(globalFeatures), [rows, STAR_GLOBAL_FEATURE_DIM]);
+    feeds.neighbor_index = new Tensor('int64', neighborIndex, [rows, nodes, degree]);
+    feeds.neighbor_mask = new Tensor('bool', neighborMask, [rows, nodes, degree]);
+    feeds.neighbor_edge_type = new Tensor('int64', edgeType, [rows, nodes, degree]);
+    feeds.node_mask = new Tensor('bool', nodeMask, [rows, nodes]);
+    feeds.legal_action_mask = new Tensor('bool', legalMask, [rows, nodes]);
+    feeds.rings = new Tensor('int64', rings, [rows]);
+    return feeds;
+  } catch (error) {
+    for (const tensor of Object.values(feeds)) tensor.dispose();
+    throw error;
+  }
+}
+
+function decodeBatch(outputs: Ort.InferenceSession.OnnxValueMapType, rows: readonly EvaluationRow[]): Evaluation[] {
+  const batch = rows.length;
+  const nodes = rows[0].semantic.stones.length;
+  const shapes = {
+    policy_logits: [batch, nodes], outcome_logits: [batch, 2], score_margin_logits: [batch, 303],
+    ownership_logits: [batch, nodes, 3], alive_logits: [batch, nodes], soft_policy_logits: [batch, nodes],
+  };
+  const decoded: Record<string, Float32Array> = {};
+  for (const [name, shape] of Object.entries(shapes)) {
+    const tensor = outputs[name];
+    if (!tensor || !('dims' in tensor) || !arraysEqual(tensor.dims, shape)) {
+      throw new StarAiError('protocol', `ONNX batch output ${name} has the wrong shape.`);
+    }
+    const values = finiteFloatData(tensor, name);
+    if (values.length !== shape.reduce((product, dimension) => product * dimension, 1)) {
+      throw new StarAiError('protocol', `ONNX batch output ${name} has the wrong data length.`);
+    }
+    decoded[name] = values;
+  }
+  return rows.map((row, index) => {
+    const logits = new Float32Array(row.legalActions.length);
+    row.legalActions.forEach((action, column) => {
+      logits[column] = decoded.policy_logits[index * nodes + actionCodeToModelIndex(action, nodes)];
+    });
+    const outcome = outcomeBelief(decoded.outcome_logits.subarray(index * 2, (index + 1) * 2));
+    return { logits, outcome, value: outcome.win - outcome.loss,
+      expectedMargin: expectedScoreMargin(decoded.score_margin_logits.subarray(index * 303, (index + 1) * 303)) };
+  });
+}
+
+/** Predict cache misses in one real ONNX batch, publishing only fully validated rows. */
+export async function evaluateBatch(runtime: LocalRuntime, rows: readonly EvaluationRow[]): Promise<Evaluation[]> {
+  if (!rows.length) return [];
+  if (rows.length > MAX_BROWSER_AI_FIRST_VISIT_BATCH_SIZE || rows.some((row) => row.semantic.rings !== rows[0].semantic.rings)) {
+    throw new StarAiError('protocol', 'Local inference batch is too large or mixes boards.');
+  }
+  const keys = rows.map((row) => predictionKey(runtime, row.semantic, row.legalActions));
+  const resolved = new Map<string, Evaluation>();
+  const missing = new Map<string, EvaluationRow>();
+  rows.forEach((row, index) => {
+    const key = keys[index];
+    if (resolved.has(key) || missing.has(key)) return;
+    const cached = runtime.predictions.get(key);
+    if (cached) resolved.set(key, cached);
+    else missing.set(key, row);
+  });
+  if (missing.size) {
+    const uniqueRows = [...missing.values()];
+    const feeds = batchTensorFeeds(runtime, uniqueRows.map((row) => row.semantic));
+    let outputs: Ort.InferenceSession.OnnxValueMapType | undefined;
+    try {
+      outputs = await runtime.session.run(feeds);
+      const predictions = decodeBatch(outputs, uniqueRows);
+      [...missing.keys()].forEach((key, index) => {
+        runtime.predictions.set(key, predictions[index]);
+        resolved.set(key, predictions[index]);
+      });
+    } finally {
+      for (const tensor of Object.values(feeds)) tensor.dispose();
+      if (outputs) for (const tensor of Object.values(outputs)) tensor.dispose();
+    }
+  }
+  return keys.map((key) => cloneEvaluation(resolved.get(key)!));
 }
 
 function decodeEvaluation(
@@ -774,6 +946,125 @@ export function summarizeSearch(
   };
 }
 
+/** Own a session exclusively until completion; cached trees are never mutated in place. */
+export async function runSessionSearch(
+  runtime: LocalRuntime, root: WasmState, semantic: StarAiSemanticState,
+  search: StarAiSearchBudget, checkCancelled: () => void,
+  yieldControl: () => Promise<void>,
+) {
+  const previous = runtime.completedSearch;
+  delete runtime.completedSearch;
+  let owned: WasmSearchSession | null = previous?.session ?? null;
+  try {
+    checkCancelled();
+    if (!hasExpectedWasmExecution(runtime.wasm) || !runtime.wasm.WasmSearchSession) {
+      throw new StarAiError('unavailable', 'Experimental local search requires WASM execution version 1.');
+    }
+    const options = runtime.manifest.search;
+    const batchSize = options.firstVisitBatchSize ?? 1;
+    const maxNodes = options.subtreeReuseMaxNodes ?? DEFAULT_BROWSER_AI_SUBTREE_REUSE_MAX_NODES;
+    const context = JSON.stringify([
+      runtime.manifest.model.sha256, runtime.manifest.featureSchemaHash,
+      STAR_LOCAL_SEARCH_ALGORITHM_ID, 'float16', 0, 0, options.cVisit, options.cScale,
+    ]);
+    if (owned && options.subtreeReuse && previous?.context === context && owned.done()) {
+      owned.restart(root, search.simulations, search.maxConsidered, options.cVisit,
+        options.cScale, root.hash64(), batchSize, true, maxNodes);
+    } else {
+      owned?.free?.();
+      owned = null;
+      owned = new runtime.wasm.WasmSearchSession(root, search.simulations, search.maxConsidered,
+        options.cVisit, options.cScale, root.hash64(), batchSize);
+    }
+    const rootActions = owned.root_actions();
+    if (!arraysEqual(rootActions, root.legal_actions())) {
+      throw new StarAiError('protocol', 'WASM session root actions are incompatible.');
+    }
+    const token = owned.root_token();
+    const rootEvaluation = await evaluate(runtime, semantic, rootActions);
+    checkCancelled();
+    if (owned.root_token() !== token) throw new StarAiError('stale', 'WASM session root token changed.');
+    owned.initialize_root(token, rootEvaluation.value, rootEvaluation.logits);
+    let iterations = 0;
+    let lastYield = 0;
+    while (!owned.done()) {
+      checkCancelled();
+      if (++iterations > search.simulations * 4 + 16) {
+        throw new StarAiError('protocol', 'WASM session failed to make progress.');
+      }
+      const count = owned.next_requests();
+      const tokens = owned.pending_tokens();
+      if (count !== tokens.length || count > batchSize) {
+        throw new StarAiError('protocol', 'WASM session returned an invalid batch size.');
+      }
+      if (count) {
+        const rows: EvaluationRow[] = [];
+        for (let row = 0; row < count; row++) {
+          const state = owned.pending_state(row);
+          try {
+            rows.push({ semantic: semanticFromWasm(semantic.rings, state), legalActions: owned.pending_actions(row) });
+          } finally { state.free?.(); }
+        }
+        const evaluations = await evaluateBatch(runtime, rows);
+        checkCancelled();
+        const currentTokens = owned.pending_tokens();
+        if (currentTokens.length !== tokens.length || tokens.some((value, index) => value !== currentTokens[index])) {
+          throw new StarAiError('stale', 'WASM session pending tokens changed.');
+        }
+        const offsets = new Uint32Array(count + 1);
+        evaluations.forEach((evaluation, index) => { offsets[index + 1] = offsets[index] + evaluation.logits.length; });
+        const logits = new Float32Array(offsets[count]);
+        evaluations.forEach((evaluation, index) => logits.set(evaluation.logits, offsets[index]));
+        owned.submit(tokens, Float32Array.from(evaluations, (evaluation) => evaluation.value), offsets, logits);
+      }
+      const completed = owned.simulations();
+      if (completed - lastYield >= 8 || !count) {
+        await yieldControl();
+        checkCancelled();
+        lastYield = completed;
+      }
+    }
+    if (owned.simulations() !== search.simulations) {
+      throw new StarAiError('protocol', 'WASM session did not consume its new simulation budget.');
+    }
+    owned.complete();
+    const rootActionsResult = Array.from(owned.actions());
+    const rootVisits = Array.from(owned.visits());
+    const rootQ = Array.from(owned.q_values());
+    const rootPolicy = Array.from(owned.policy_target());
+    const inheritedVisits = Array.from(owned.inherited_visits());
+    const totalVisits = Array.from(owned.total_visits());
+    const actionCode = owned.selected_action();
+    const selectedValue = owned.selected_action_value();
+    const rootValue = owned.root_value() ?? rootEvaluation.value;
+    const length = rootActions.length;
+    const nonnegativeInteger = (value: number) => Number.isInteger(value) && value >= 0;
+    if (!arraysEqual(rootActionsResult, rootActions) ||
+        [rootVisits, rootQ, rootPolicy, inheritedVisits, totalVisits].some((row) => row.length !== length) ||
+        ![...rootVisits, ...inheritedVisits, ...totalVisits].every(nonnegativeInteger) ||
+        !rootQ.every((value) => Number.isFinite(value) && Math.abs(value) <= 1) ||
+        !rootPolicy.every((value) => Number.isFinite(value) && value >= 0 && value <= 1) ||
+        Math.abs(rootPolicy.reduce((sum, value) => sum + value, 0) - 1) > 1e-4 ||
+        rootVisits.reduce((sum, value) => sum + value, 0) !== search.simulations ||
+        !totalVisits.every((value, index) => value === rootVisits[index] + inheritedVisits[index]) ||
+        actionCode === undefined || !rootActionsResult.includes(actionCode) ||
+        selectedValue === undefined || !Number.isFinite(selectedValue) || Math.abs(selectedValue) > 1 ||
+        rootQ[rootActionsResult.indexOf(actionCode)] !== selectedValue ||
+        !Number.isFinite(rootValue) || Math.abs(rootValue) > 1) {
+      throw new StarAiError('protocol', 'WASM session result is malformed.');
+    }
+    const result = { actionCode, swapRecommended: semantic.swapAvailable && selectedValue < -options.swapDeadZone,
+      rootValue, rootActions: rootActionsResult, rootVisits, rootQ, rootPolicy, rootEvaluation,
+      inheritedVisits, totalVisits, reusedNodes: owned.reused_nodes(), reusedVisits: owned.reused_visits() };
+    checkCancelled();
+    if (options.subtreeReuse && owned.unique_nodes() <= maxNodes) {
+      runtime.completedSearch = { session: owned, context };
+      owned = null;
+    }
+    return result;
+  } finally { owned?.free?.(); }
+}
+
 async function chooseAction(
   taskId: string,
   request: StarAiRequest,
@@ -803,6 +1094,16 @@ async function chooseAction(
   let tree: WasmSearchTree | null = null;
   let scheduler: WasmGumbel | null = null;
   try {
+    if (usesExperimentalSearch(runtime.manifest)) {
+      const result = await runSessionSearch(runtime, root, request.state, search,
+        () => { ensureNotCancelled(taskId); if (signal.aborted) throw new StarAiError('cancelled', 'Local AI request cancelled.'); },
+        () => yieldToCancellation(taskId));
+      return { ...result, outcome: result.rootEvaluation.outcome,
+        modelValue: result.rootEvaluation.value, searchValue: result.rootEvaluation.value,
+        expectedMargin: result.rootEvaluation.expectedMargin, modelVersion: runtime.manifest.modelVersion,
+        modelIdentity: runtime.manifest.modelVersion, search,
+        timingMs: { modelLoad, inferenceSearch: nowMs() - searchStarted } };
+    }
     tree = new runtime.wasm.WasmSearchTree(
       root,
       runtime.manifest.search.cVisit,
@@ -829,10 +1130,11 @@ async function chooseAction(
       root.hash64(),
     );
     let simulations = 0;
+    const actions = tree.actions();
     while (!scheduler.done()) {
       ensureNotCancelled(taskId);
-      const candidate = scheduler.next(tree.completed_q(), tree.visits());
-      const actions = tree.actions();
+      const candidate = scheduler.next_scheduled?.()
+        ?? scheduler.next(tree.completed_q(), tree.visits());
       if (candidate < 0 || candidate >= actions.length) {
         throw new StarAiError('protocol', 'WASM Gumbel scheduler returned an invalid edge.');
       }

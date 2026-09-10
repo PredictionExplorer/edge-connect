@@ -17,6 +17,9 @@ The measured 8-H100 host evidence, accepted treatments and current forecast are 
 [target-host benchmark results](docs/h100-target-host-benchmark-results.md).
 The latest search fixes and verified runtime are recorded in the
 [MCTS corrections and deployment report](docs/mcts-rollout-20260910.md).
+Optional first-visit batching, subtree reuse and self-play budget experiments are
+documented in [search execution controls](docs/search-execution.md); shipped profiles
+keep these experiments disabled.
 
 ## Architecture
 

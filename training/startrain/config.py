@@ -20,6 +20,7 @@ from .model import ModelConfig
 from .optim import OptimizerConfig
 from .gradient_clipping import GradientClippingConfig
 from .selfplay import SelfPlayConfig, VariantMixtureConfig
+from .search_options import SearchExecutionConfig, parse_search_execution
 from .topology import SUPPORTED_RINGS
 
 CONFIG_SCHEMA_VERSION = 4
@@ -1451,8 +1452,16 @@ class ArenaConfig:
     cell_regression_floor_elo: float = -100.0
     handicap_severity_cycle: tuple[int, ...] = (2, 4, 6, 9)
     strength_simulations: int = 1_024
+    search_execution: SearchExecutionConfig = SearchExecutionConfig()
 
     def __post_init__(self) -> None:
+        if not isinstance(self.search_execution, SearchExecutionConfig):
+            raise ConfigError("arena.search_execution requires typed settings")
+        if self.search_execution.full_budget.mode != "fixed":
+            raise ConfigError(
+                "arena must measure fixed search effort; root-entropy full budgets "
+                "are supported only in selfplay.search_execution.full_budget"
+            )
         if type(self.balanced_cells) is not bool:
             raise ConfigError("arena.balanced_cells must be boolean")
         if (
@@ -1911,6 +1920,13 @@ def _normalize_selfplay(values: object) -> dict[str, Any]:
     """Build the nested variant mixture from its YAML mapping."""
 
     output = _mapping("selfplay", values)
+    if "search_execution" in output:
+        try:
+            output["search_execution"] = parse_search_execution(
+                output["search_execution"]
+            )
+        except (TypeError, ValueError) as exc:
+            raise ConfigError(f"invalid selfplay.search_execution: {exc}") from exc
     raw_variants = output.get("variants")
     if raw_variants is None:
         return output
@@ -2117,6 +2133,13 @@ def load_config(path: str | Path) -> ExperimentConfig:
     ):
         learner_values["segment_quotas"] = dict(mixture.segment_fractions)
     arena_values = _mapping("arena", raw.get("arena", {}))
+    if "search_execution" in arena_values:
+        try:
+            arena_values["search_execution"] = parse_search_execution(
+                arena_values["search_execution"]
+            )
+        except (TypeError, ValueError) as exc:
+            raise ConfigError(f"invalid arena.search_execution: {exc}") from exc
     arena_values["rings"] = tuple(arena_values.get("rings", SUPPORTED_RINGS))
     arena_values["per_ring_regression_floor_elo"] = {
         int(ring): float(value)

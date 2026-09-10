@@ -47,6 +47,7 @@ describe('local worker runtime contract', () => {
       const url = new URL(runtime.versionedWasmUrl(`/models/star/${filename}`), 'https://example.test');
       expect(url.pathname).toBe(`/models/star/${filename}`);
       expect(url.searchParams.get('search')).toBe(runtime.STAR_LOCAL_SEARCH_ALGORITHM_ID);
+      expect(url.searchParams.get('implementation')).toBe('search-session-v1');
     }
   });
 

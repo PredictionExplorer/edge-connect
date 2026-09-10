@@ -23,6 +23,12 @@ from startrain.model import GraphResTNet
 from startrain.contracts import MODE_INDEX
 from startrain.native import BITBOARD_WORDS, load_star_native, positions_from_native
 from startrain.training import maybe_compile_model
+from startrain.search_options import (
+    require_search_execution,
+    search_model_context,
+    search_batch_row_limit,
+)
+from startrain.search_sessions import CompletedSearchCache
 
 from .config import ServerConfig
 from .schemas import API_SCHEMA_VERSION, AnalyzeRequest
@@ -58,8 +64,11 @@ class LoadedModel:
     manifest: ModelManifest
     evaluator: GraphInferenceAdapter | CohortInferenceAdapter
     broker: BoundedInferenceBroker | None = None
+    search_cache: CompletedSearchCache | None = None
 
     def close(self) -> None:
+        if self.search_cache is not None:
+            self.search_cache.clear()
         if self.broker is not None:
             self.broker.shutdown()
         base = (
@@ -212,8 +221,8 @@ class AtomicModelManager:
     def _update_batch_wait(self) -> None:
         # The manager condition protects the active count. The single owner
         # snapshots this public limit when starting its next bounded batch.
-        # One admitted search has only one outstanding leaf: waiting cannot
-        # fill its batch, regardless of the configured HTTP concurrency limit.
+        # Each caller submits all its prefetched leaves together; waiting for
+        # another submission helps only when other callers are admitted.
         if self._current is not None and self._current.broker is not None:
             self._current.broker.max_wait_seconds = (
                 self.config.inference.max_wait_seconds if self._active > 1 else 0.0
@@ -311,17 +320,31 @@ class AtomicModelManager:
             model_step=manifest.model_step,
             model_identity=manifest.model_identity,
         )
+        search_cache = (
+            CompletedSearchCache(
+                capacity=self.config.inference.search_cache_entries,
+                max_nodes=self.config.search_execution.subtree_reuse_max_nodes,
+            )
+            if self.config.search_execution.subtree_reuse
+            else None
+        )
         if not self.config.inference.shared_batching:
-            return LoadedModel(manifest=manifest, evaluator=evaluator)
+            return LoadedModel(
+                manifest=manifest, evaluator=evaluator, search_cache=search_cache
+            )
         inference = self.config.inference
         broker = BoundedInferenceBroker(
             max_batch_rows=min(
-                inference.max_batch_rows, self.config.limits.max_concurrency
+                inference.max_batch_rows,
+                self.config.limits.max_concurrency
+                * self.config.search_execution.first_visit_batch_size,
             ),
             max_pending_requests=inference.max_pending_requests,
             max_wait_seconds=0.0,
         )
-        return LoadedModel(manifest, broker.cohort_adapter(evaluator), broker)
+        return LoadedModel(
+            manifest, broker.cohort_adapter(evaluator), broker, search_cache
+        )
 
 
 class NativeAnalysisService:
@@ -335,6 +358,7 @@ class NativeAnalysisService:
         self.config = config
         self.native: Any = native_module or load_star_native(required=True)
         assert self.native is not None
+        require_search_execution(self.native, config.search_execution)
         self.models = model_manager or AtomicModelManager(config)
 
     def startup(self) -> None:
@@ -367,8 +391,8 @@ class NativeAnalysisService:
                 if request.to_move == 0
                 else (-request.pda, request.pda)
             )
-            search = self.native.SearchBatch(
-                states,
+            execution = self.config.search_execution
+            options: dict[str, Any] = dict(
                 simulations=request.search.simulations,
                 max_considered=request.search.max_considered,
                 c_visit=self.config.search.c_visit,
@@ -376,6 +400,35 @@ class NativeAnalysisService:
                 deterministic_seed=request.search.seed,
                 pda_by_seat=[pda_seats],
             )
+            context = (
+                f"{search_model_context(evaluator)}:history={request.history is not None}"
+                if execution.subtree_reuse
+                else None
+            )
+            if execution.enabled:
+                options.update(
+                    first_visit_batch_size=execution.first_visit_batch_size,
+                    model_context=context,
+                )
+            pool = lease.model.search_cache if execution.subtree_reuse else None
+            if execution.subtree_reuse and pool is None:
+                raise AnalysisError(
+                    "native_search_error",
+                    "model bundle lacks its bounded search reuse cache",
+                )
+            search = None
+            if pool is not None:
+                assert context is not None
+                search = pool.take(states, context, [pda_seats])
+            if search is None:
+                search = self.native.SearchBatch(states, **options)
+            else:
+                search.advance(
+                    states,
+                    **options,
+                    reuse_tree=True,
+                    max_reused_nodes=execution.subtree_reuse_max_nodes,
+                )
             roots = search.root_requests()
             if len(roots) != 1:
                 raise AnalysisError(
@@ -397,7 +450,15 @@ class NativeAnalysisService:
                         "native_search_stalled",
                         "native Gumbel search failed to make progress",
                     )
-                requests = search.next_requests()
+                requests = (
+                    search.next_requests(
+                        max_rows=search_batch_row_limit(
+                            evaluator, execution.first_visit_batch_size
+                        )
+                    )
+                    if execution.enabled
+                    else search.next_requests()
+                )
                 if len(requests) == 0:
                     continue
                 response = evaluator.evaluate(requests)
@@ -419,6 +480,10 @@ class NativeAnalysisService:
                 request=request,
                 swap_dead_zone=self.config.search.swap_dead_zone,
             )
+            if cancellation.is_set():
+                raise SearchCancelled()
+            if pool is not None:
+                pool.put(search)
         return payload
 
     def _import_state(self, request: AnalyzeRequest) -> Any:
