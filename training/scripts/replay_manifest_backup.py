@@ -13,7 +13,7 @@ import shutil
 import sqlite3
 import time
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from pathlib import Path
 
 from startrain.contracts import FEATURE_SCHEMA_HASH, RULES_HASH_WIRE
@@ -68,7 +68,7 @@ def _integrity_ok(path: Path, *, run_root: Path, full: bool = True) -> tuple[boo
     try:
         run_id, family = _run_identity(run_root)
         uri = f"{path.resolve().as_uri()}?mode=ro"
-        with sqlite3.connect(uri, uri=True, timeout=30.0) as connection:
+        with closing(sqlite3.connect(uri, uri=True, timeout=30.0)) as connection:
             if full:
                 rows = connection.execute("PRAGMA integrity_check").fetchall()
                 messages = [str(row[0]) for row in rows]
@@ -133,7 +133,7 @@ def _unregistered_database_is_empty(path: Path) -> bool:
         return True
     try:
         uri = f"{path.resolve().as_uri()}?mode=ro"
-        with sqlite3.connect(uri, uri=True, timeout=30.0) as connection:
+        with closing(sqlite3.connect(uri, uri=True, timeout=30.0)) as connection:
             tables = {
                 str(row[0])
                 for row in connection.execute(
@@ -156,6 +156,51 @@ def _sha256(path: Path) -> str:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _copy_pinned_snapshot(
+    source: sqlite3.Connection,
+    target: sqlite3.Connection,
+    *,
+    timeout_seconds: float = 900.0,
+    stall_timeout_seconds: float = 60.0,
+) -> None:
+    """Copy one read snapshot; never chase a changing WAL indefinitely."""
+
+    started = time.monotonic()
+    last_progress = started
+    least_remaining: int | None = None
+
+    def progress(status: int, remaining: int, total: int) -> None:
+        nonlocal last_progress, least_remaining
+        now = time.monotonic()
+        if now - started >= timeout_seconds:
+            raise RuntimeError(
+                f"SQLite replay backup exceeded {timeout_seconds:g}s copy deadline "
+                f"(status={status}, remaining={remaining}, total={total})"
+            )
+        if status in (sqlite3.SQLITE_OK, sqlite3.SQLITE_DONE) and (
+            least_remaining is None or remaining < least_remaining
+        ):
+            least_remaining = remaining
+            last_progress = now
+        if now - last_progress >= stall_timeout_seconds:
+            raise RuntimeError(
+                f"SQLite replay backup made no forward progress for "
+                f"{stall_timeout_seconds:g}s "
+                f"(status={status}, remaining={remaining}, total={total})"
+            )
+
+    source.execute("BEGIN")
+    try:
+        # BEGIN alone is deferred. Reading the schema pins a WAL read snapshot
+        # across backup_step calls, including read-only shared-memory mounts.
+        source.execute("SELECT rootpage FROM sqlite_schema LIMIT 1").fetchone()
+        source.backup(target, pages=1024, progress=progress, sleep=0.05)
+    finally:
+        # Release the reader even when a callback aborts an endlessly restarting
+        # or busy copy, so online writers can reclaim/checkpoint their WAL.
+        source.rollback()
 
 
 def _create_backup_locked(
@@ -199,9 +244,9 @@ def _create_backup_locked(
     temporary = destination.with_suffix(".sqlite3.tmp")
     try:
         source_uri = f"{source_path.resolve().as_uri()}?mode=ro"
-        with sqlite3.connect(source_uri, uri=True, timeout=30.0) as source:
-            with sqlite3.connect(temporary) as target:
-                source.backup(target, pages=1024, sleep=0.05)
+        with closing(sqlite3.connect(source_uri, uri=True, timeout=30.0)) as source:
+            with closing(sqlite3.connect(temporary)) as target:
+                _copy_pinned_snapshot(source, target)
         ok, reason = _integrity_ok(temporary, run_root=run_root)
         if not ok:
             raise RuntimeError(f"new replay backup failed integrity check: {reason}")
@@ -222,7 +267,10 @@ def _create_backup_locked(
     except sqlite3.Error as exc:
         raise RuntimeError(f"SQLite replay backup failed: {exc}") from exc
     finally:
-        temporary.unlink(missing_ok=True)
+        # The integrity reader can create WAL sidecars for a copied WAL-mode
+        # header. Every connection is closed before removing these owned files.
+        for suffix in ("", "-wal", "-shm", "-journal"):
+            Path(f"{temporary}{suffix}").unlink(missing_ok=True)
     backups = sorted(
         backup_directory.glob("manifest-*.sqlite3"),
         key=lambda path: path.stat().st_mtime_ns,

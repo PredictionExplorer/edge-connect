@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from pathlib import Path
 
 import pytest
@@ -83,6 +83,163 @@ def test_online_backup_preserves_create_once_initialization_marker(tmp_path) -> 
     create_backup(run_root, retain=2)
 
     assert marker.read_bytes() == before
+
+
+def test_online_backup_pins_one_snapshot_while_writers_commit_between_chunks(
+    tmp_path, monkeypatch
+) -> None:
+    run_root = tmp_path / "concurrent-run"
+    _database(run_root, "before")
+    manifest = run_root / "replay" / "manifest.sqlite3"
+    connect = sqlite3.connect
+    with closing(connect(manifest)) as writer:
+        assert writer.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+        writer.execute("CREATE TABLE padding(payload BLOB)")
+        writer.executemany("INSERT INTO padding VALUES (zeroblob(4096))", [()] * 2300)
+        writer.execute("CREATE TABLE arriving(value TEXT)")
+        writer.commit()
+
+    steps = []
+    commits = []
+
+    class InterleavedSource(sqlite3.Connection):
+        def backup(self, target, *, pages, progress, sleep):
+            assert self.in_transaction
+
+            def interleave(status, remaining, total):
+                steps.append((status, remaining, total))
+                if status == sqlite3.SQLITE_OK and remaining:
+                    # A separate real connection commits after every partial
+                    # backup_step; the pinned reader must never restart.
+                    value = f"after-{len(commits)}"
+                    with closing(connect(manifest)) as writer:
+                        with writer:
+                            writer.execute("UPDATE state SET value = ?", (value,))
+                            writer.execute("INSERT INTO arriving VALUES (?)", (value,))
+                    commits.append(value)
+                progress(status, remaining, total)
+
+            return super().backup(target, pages=pages, progress=interleave, sleep=sleep)
+
+    def monitored_connect(*args, **kwargs):
+        if kwargs.get("uri") and "mode=ro" in str(args[0]):
+            kwargs["factory"] = InterleavedSource
+        return connect(*args, **kwargs)
+
+    monkeypatch.setattr(backup_module.sqlite3, "connect", monitored_connect)
+    destination = create_backup(run_root, retain=2)
+    assert commits
+    remaining = [count for _status, count, _total in steps]
+    assert remaining == sorted(remaining, reverse=True)
+    assert len(set(remaining)) == len(remaining)
+    assert remaining[-1] == 0
+    with closing(connect(destination)) as snapshot:
+        assert snapshot.execute("PRAGMA integrity_check").fetchone() == ("ok",)
+        assert snapshot.execute("SELECT value FROM state").fetchone() == ("before",)
+        assert snapshot.execute("SELECT COUNT(*) FROM arriving").fetchone() == (0,)
+        assert snapshot.execute("SELECT COUNT(*) FROM padding").fetchone() == (2300,)
+    with closing(connect(manifest)) as current:
+        assert current.execute("SELECT value FROM state").fetchone() == (commits[-1],)
+        assert current.execute("SELECT COUNT(*) FROM arriving").fetchone() == (
+            len(commits),
+        )
+
+
+@pytest.mark.parametrize("status", [sqlite3.SQLITE_OK, sqlite3.SQLITE_BUSY])
+def test_backup_watchdog_aborts_nonprogress_and_releases_read_snapshot(
+    monkeypatch, status
+) -> None:
+    now = [0.0]
+    monkeypatch.setattr(backup_module.time, "monotonic", lambda: now[0])
+
+    class StalledSource:
+        statements = []
+        rolled_back = False
+
+        def execute(self, sql):
+            self.statements.append(sql)
+            return self
+
+        def fetchone(self):
+            return (1,)
+
+        def backup(self, _target, *, pages, progress, sleep):
+            assert self.statements == [
+                "BEGIN",
+                "SELECT rootpage FROM sqlite_schema LIMIT 1",
+            ]
+            for _ in range(20):
+                now[0] += 1
+                progress(status, 4096, 5120)
+            raise AssertionError("watchdog failed to stop a nonprogressing copy")
+
+        def rollback(self):
+            self.rolled_back = True
+
+    source = StalledSource()
+    with pytest.raises(RuntimeError, match="no forward progress"):
+        backup_module._copy_pinned_snapshot(
+            source, None, timeout_seconds=20, stall_timeout_seconds=3
+        )
+    assert source.rolled_back
+    assert now[0] <= 4
+
+
+def test_backup_deadline_bounds_even_continuously_progressing_copy(monkeypatch):
+    now = [0.0]
+    monkeypatch.setattr(backup_module.time, "monotonic", lambda: now[0])
+
+    class SlowSource:
+        rolled_back = False
+
+        def execute(self, _sql):
+            return self
+
+        def fetchone(self):
+            return (1,)
+
+        def backup(self, _target, *, pages, progress, sleep):
+            for remaining in range(100, 0, -1):
+                now[0] += 1
+                progress(sqlite3.SQLITE_OK, remaining, 101)
+
+        def rollback(self):
+            self.rolled_back = True
+
+    source = SlowSource()
+    with pytest.raises(RuntimeError, match="copy deadline"):
+        backup_module._copy_pinned_snapshot(
+            source, None, timeout_seconds=3, stall_timeout_seconds=60
+        )
+    assert source.rolled_back
+    assert now[0] == 3
+
+
+def test_aborted_copy_closes_connections_and_preserves_published_backup(
+    tmp_path, monkeypatch
+):
+    run_root = tmp_path / "aborted-run"
+    _database(run_root, "durable")
+    previous = create_backup(run_root, retain=2)
+    latest = previous.parent / "latest.json"
+    pointer = latest.read_bytes()
+    connections = []
+
+    def abort(source, target):
+        connections.extend((source, target))
+        target.execute("CREATE TABLE incomplete(value TEXT)")
+        target.commit()
+        raise RuntimeError("SQLite replay backup made no forward progress")
+
+    monkeypatch.setattr(backup_module, "_copy_pinned_snapshot", abort)
+    with pytest.raises(RuntimeError, match="no forward progress"):
+        create_backup(run_root, retain=2)
+    assert latest.read_bytes() == pointer
+    assert list(previous.parent.glob("manifest-*.sqlite3")) == [previous]
+    assert not list(previous.parent.glob("*.tmp*"))
+    for connection in connections:
+        with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+            connection.execute("SELECT 1")
 
 
 def test_missing_manifest_is_allowed_until_replay_initialization(tmp_path) -> None:
