@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from collections import deque
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -17,6 +18,8 @@ from .balanced_evaluation import (
     cycle_confidence_sequence,
 )
 from .config import ArenaConfig
+from .checkpoint import load_model_manifest
+from .search_options import parse_search_execution
 
 
 def _elo(score: float) -> float | None:
@@ -58,6 +61,7 @@ def _validated_measurement(
         segment_handicap_pda=tuple(contract["handicap_pda"]),
         unforced_opening_fraction=contract["unforced_opening_fraction"],
         swap_dead_zone=contract["swap_dead_zone"],
+        search_execution=parse_search_execution(contract.get("search_execution", {})),
     )
     if evaluation_contract(cfg) != contract:
         raise ValueError("balanced evaluation contract identity or fields disagree")
@@ -83,7 +87,7 @@ def _validated_measurement(
     }
 
 
-def balanced_strength_summary(
+def _balanced_strength_summary(
     root: Path,
     results: Sequence[Mapping[str, Any]],
     *,
@@ -91,6 +95,7 @@ def balanced_strength_summary(
     provisioned_gpus: int,
     strength_simulations: int = 1024,
     evaluation_config: ArenaConfig | None = None,
+    anchor_identity: str | None = None,
 ) -> dict[str, Any]:
     """Keep latest rejected candidates and cheap screens out of the headline.
 
@@ -203,7 +208,7 @@ def balanced_strength_summary(
     output["evaluation_contract"] = contract
     output["expected_cells"] = len(contract["cells"])
     output["objective"] = contract["objective"]
-    anchor = measurements[0]["result"]["baseline"]
+    anchor = anchor_identity or measurements[0]["result"]["baseline"]
     output["anchor_identity"] = anchor
     if not isinstance(frontier, str):
         output["reason"] = "persisted champion identity is unavailable"
@@ -312,3 +317,197 @@ def balanced_strength_summary(
             provisioned_gpus * wall_seconds / 3600
         )
     return output
+
+
+def _epoch_candidate_step(root: Path, result: Mapping[str, Any]) -> int:
+    explicit = result.get("candidate_step")
+    if explicit is not None and (type(explicit) is not int or explicit < 0):
+        raise ValueError("epoch candidate step is invalid")
+    manifest_path = result.get("candidate_manifest")
+    if isinstance(manifest_path, str) and manifest_path:
+        path = Path(manifest_path)
+        if not path.is_absolute():
+            path = root / path
+        manifest = load_model_manifest(path)
+        if manifest.model_identity != result.get("candidate"):
+            raise ValueError("epoch candidate manifest identity disagrees")
+        if explicit is not None and explicit != manifest.model_step:
+            raise ValueError("epoch candidate step disagrees with its manifest")
+        return manifest.model_step
+    if type(explicit) is not int or explicit < 0:
+        raise ValueError("epoch candidate step is unavailable")
+    return explicit
+
+
+def balanced_strength_summary(
+    root: Path,
+    results: Sequence[Mapping[str, Any]],
+    *,
+    wall_seconds: float,
+    provisioned_gpus: int,
+    strength_simulations: int = 1024,
+    evaluation_config: ArenaConfig | None = None,
+    observed_until_ns: int | None = None,
+) -> dict[str, Any]:
+    """Keep historical evidence, but use an explicit origin for current rates.
+
+    A strength-epoch.json marker names the immutable evaluation contract, its
+    starting champion, activation time and stopped learner step. Reported epoch
+    gain is realized champion-frontier change, not causal release attribution.
+    """
+    historical = _balanced_strength_summary(
+        root,
+        results,
+        wall_seconds=wall_seconds,
+        provisioned_gpus=provisioned_gpus,
+        strength_simulations=strength_simulations,
+        evaluation_config=evaluation_config,
+    )
+    lifetime = {
+        "lifetime_normalized_elo_per_wall_hour": historical["elo_per_wall_hour"],
+        "lifetime_normalized_elo_per_provisioned_gpu_hour": historical[
+            "elo_per_provisioned_gpu_hour"
+        ],
+        "lifetime_wall_seconds": wall_seconds,
+        "lifetime_provisioned_gpu_hours": provisioned_gpus * wall_seconds / 3600,
+    }
+    output = {
+        **historical,
+        **lifetime,
+        "elo_per_wall_hour": None,
+        "elo_per_provisioned_gpu_hour": None,
+        "denominator": "unavailable-without-valid-explicit-strength-epoch",
+        "rate_status": "epoch_not_configured",
+        "rating_scope": "historical-contract-anchor",
+        "strength_epoch": None,
+    }
+    marker_path = root / "strength-epoch.json"
+    if not marker_path.exists():
+        return output
+    try:
+        if marker_path.is_symlink():
+            raise ValueError("strength epoch may not be a symbolic link")
+        marker = json.loads(marker_path.read_text())
+        if (
+            not isinstance(marker, dict)
+            or type(marker.get("schema_version")) is not int
+            or marker.get("schema_version") != 1
+        ):
+            raise ValueError("strength epoch schema is invalid")
+        started = marker.get("started_ns")
+        boundary = marker.get("minimum_candidate_step")
+        anchor = marker.get("anchor_identity")
+        if (
+            type(started) is not int
+            or started <= 0
+            or type(boundary) is not int
+            or boundary < 0
+            or not isinstance(anchor, str)
+            or not anchor
+        ):
+            raise ValueError("strength epoch anchor/time/boundary is invalid")
+        source = marker.get("source_commit")
+        if source is not None and (
+            not isinstance(source, str)
+            or re.fullmatch(r"[0-9a-f]{7,64}", source) is None
+        ):
+            raise ValueError("strength epoch source commit is invalid")
+        contract = historical.get("evaluation_contract")
+        if not isinstance(contract, dict) or marker.get(
+            "evaluation_contract_identity"
+        ) != contract.get("identity"):
+            raise ValueError("strength epoch belongs to another evaluation contract")
+        run_started = None
+        run_path = root / "run.json"
+        if run_path.is_file():
+            run = json.loads(run_path.read_text())
+            run_started = run.get("created_ns") if isinstance(run, dict) else None
+            if (
+                type(run_started) is not int
+                or run_started <= 0
+                or started < run_started
+            ):
+                raise ValueError("strength epoch predates or lacks a valid run origin")
+        if observed_until_ns is None:
+            if (
+                run_started is None
+                or not math.isfinite(wall_seconds)
+                or wall_seconds < 0
+            ):
+                raise ValueError("strength epoch observation end is unavailable")
+            observed_until_ns = run_started + round(wall_seconds * 1e9)
+        if type(observed_until_ns) is not int or observed_until_ns <= started:
+            raise ValueError("strength epoch observation end must follow activation")
+    except (OSError, ValueError, TypeError) as error:
+        output["rate_status"] = "invalid_epoch"
+        output["strength_epoch"] = {"path": str(marker_path), "error": str(error)}
+        return output
+
+    eligible = []
+    exclusions = []
+    for result in results:
+        if (
+            result.get("result_kind") != "historical_crossplay"
+            or result.get("terminal") is not True
+        ):
+            eligible.append(result)
+            continue
+        try:
+            evaluation_started = result.get("started_ns")
+            if (
+                type(evaluation_started) is not int
+                or evaluation_started < started
+                or _completed_time(result) < evaluation_started
+                or _completed_time(result) > observed_until_ns
+            ):
+                raise ValueError("strength evaluation is outside the explicit epoch")
+            if _epoch_candidate_step(root, result) <= boundary:
+                raise ValueError(
+                    "strength candidate predates the epoch learner boundary"
+                )
+            eligible.append(result)
+        except (OSError, ValueError, TypeError) as error:
+            exclusions.append({"path": result.get("_path"), "reason": str(error)})
+    elapsed = (observed_until_ns - started) / 1e9
+    epoch = _balanced_strength_summary(
+        root,
+        eligible,
+        wall_seconds=elapsed,
+        provisioned_gpus=provisioned_gpus,
+        strength_simulations=strength_simulations,
+        evaluation_config=evaluation_config,
+        anchor_identity=anchor,
+    )
+    if historical["frontier_identity"] != anchor and not any(
+        result.get("result_kind") == "historical_crossplay"
+        and result.get("terminal") is True
+        and result.get("candidate") == historical["frontier_identity"]
+        for result in eligible
+    ):
+        epoch.update(
+            status="missing",
+            available=False,
+            rating=None,
+            confidence_interval=[None, None],
+            elo_per_wall_hour=None,
+            elo_per_provisioned_gpu_hour=None,
+            reason="frontier has no post-boundary candidate measurement",
+        )
+    return {
+        **epoch,
+        **lifetime,
+        "anchor_identity": anchor,
+        "historical": historical,
+        "rating_scope": "explicit-epoch-anchor",
+        "rate_status": "available"
+        if epoch["elo_per_wall_hour"] is not None
+        else "epoch_evidence_unavailable",
+        "denominator": "explicit-epoch-wall-time-including-training-evaluation-warmup-pauses-and-rejected-candidates",
+        "strength_epoch": {
+            **marker,
+            "observed_until_ns": observed_until_ns,
+            "wall_seconds": elapsed,
+            "scope": "realized-champion-frontier-change-not-causal-release-efficiency",
+        },
+        "excluded_results": [*epoch["excluded_results"], *exclusions],
+    }

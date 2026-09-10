@@ -330,6 +330,8 @@ class ManifestModelProvider:
                     cuda_graphs=refresh.inference.cuda_graphs,
                     cuda_graph_max_entries=refresh.inference.cuda_graph_max_entries,
                     cuda_graph_max_bytes=refresh.inference.cuda_graph_max_bytes,
+                    compact_inference_gather=refresh.inference.compact_inference_gather,
+                    small_batch_graph_buckets=refresh.inference.small_batch_graph_buckets,
                 ),
                 homogeneous_relational_bias=refresh.inference.homogeneous_relational_bias,
                 model_version=manifest.model_version,
@@ -921,6 +923,7 @@ class ActorSupervisor:
                             actor_id=self.actor_id,
                             generation=generation,
                         ),
+                        source_role=model_role,
                     )
                     if self._pause_checkpoint is not None:
                         selfplay.pause_checkpoint = self._pause_checkpoint

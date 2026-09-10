@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import fcntl
+import math
 import os
 import sqlite3
 import stat
@@ -54,6 +55,49 @@ def _validated_segments(segments: Sequence[str]) -> tuple[str, ...]:
             "segments must be a non-empty unique subset of " + ", ".join(SEGMENTS)
         )
     return requested
+
+
+def _segment_fractions(quotas: Mapping[str, float]) -> dict[str, float]:
+    _validated_segments(tuple(quotas))
+    if any(
+        isinstance(value, bool) or not math.isfinite(float(value)) or float(value) < 0
+        for value in quotas.values()
+    ):
+        raise ValueError("segment quotas must be finite and non-negative")
+    positive = {
+        key: float(quotas[key]) for key in sorted(quotas) if float(quotas[key]) > 0
+    }
+    total = math.fsum(positive.values())
+    if not positive or not math.isfinite(total):
+        raise ValueError("segment quotas must contain a positive finite fraction")
+    return {key: value / total for key, value in positive.items()}
+
+
+def _bounded_segment_targets(
+    total: int, fractions: Mapping[str, float], capacities: Mapping[str, int]
+) -> dict[str, int]:
+    """Proportional water filling with stable largest-remainder rounding."""
+    result = dict.fromkeys(fractions, 0)
+    active = {key for key in fractions if capacities.get(key, 0) > 0}
+    remaining = min(total, sum(capacities.get(key, 0) for key in active))
+    while remaining and active:
+        weight = math.fsum(fractions[key] for key in sorted(active))
+        exact = {key: remaining * fractions[key] / weight for key in sorted(active)}
+        proposed = {key: math.floor(value) for key, value in exact.items()}
+        remainder = remaining - sum(proposed.values())
+        for key in sorted(active, key=lambda key: (-(exact[key] - proposed[key]), key))[
+            :remainder
+        ]:
+            proposed[key] += 1
+        constrained = [key for key in sorted(active) if proposed[key] > capacities[key]]
+        if not constrained:
+            result.update(proposed)
+            break
+        for key in constrained:
+            result[key] = capacities[key]
+            remaining -= capacities[key]
+            active.remove(key)
+    return result
 
 
 def _validated_optional_shard_id(name: str, value: int | None) -> int | None:
@@ -891,9 +935,40 @@ class ReplayStore:
         generation_family: str,
         retain_shards_per_ring: int,
         dry_run: bool,
+        minimum_samples_per_ring: int = 0,
+        current_model_step: int | None = None,
+        max_model_lag_steps: int | None = None,
+        minimum_shard_id_exclusive: int | None = None,
+        segment_quotas: Mapping[str, float] | None = None,
     ) -> dict[str, int]:
         if retain_shards_per_ring <= 0:
             raise ValueError("retain_shards_per_ring must be positive")
+        if type(minimum_samples_per_ring) is not int or minimum_samples_per_ring < 0:
+            raise ValueError("minimum_samples_per_ring must be non-negative")
+        sample_floor_ids: set[int] = set()
+        sample_floor_rows = 0
+        if minimum_samples_per_ring:
+            if (
+                type(current_model_step) is not int
+                or current_model_step < 0
+                or type(max_model_lag_steps) is not int
+                or max_model_lag_steps < 0
+            ):
+                raise ValueError(
+                    "sample-aware retention requires non-negative model step and lag"
+                )
+            selection = self.select_recent_spans(
+                rings=SUPPORTED_RINGS,
+                per_ring_quota=minimum_samples_per_ring,
+                run_id=run_id,
+                generation_family=generation_family,
+                current_model_step=current_model_step,
+                max_model_lag_steps=max_model_lag_steps,
+                minimum_shard_id_exclusive=minimum_shard_id_exclusive,
+                segment_quotas=segment_quotas,
+            )
+            sample_floor_ids = {span.record.shard_id for span in selection.spans}
+            sample_floor_rows = sum(span.sample_count for span in selection.spans)
         protected_ranges = [
             (int(row["minimum_shard_id"]), int(row["maximum_shard_id"]))
             for row in self.connection.execute(
@@ -920,7 +995,11 @@ class ReplayStore:
                     lower <= record.shard_id <= upper
                     for lower, upper in protected_ranges
                 )
-                if is_protected or retained < retain_shards_per_ring:
+                if (
+                    is_protected
+                    or record.shard_id in sample_floor_ids
+                    or retained < retain_shards_per_ring
+                ):
                     retained += 1
                     continue
                 candidates.append(record)
@@ -934,6 +1013,9 @@ class ReplayStore:
             "deleted_bytes": 0,
             "protected_watermarks": len(protected_ranges),
             "dry_run": int(dry_run),
+            "sample_floor_shards": len(sample_floor_ids),
+            "sample_floor_rows": sample_floor_rows,
+            "minimum_samples_per_ring": minimum_samples_per_ring,
         }
         if dry_run or not candidates:
             return metrics
@@ -1587,6 +1669,15 @@ class ReplayStore:
 
         if per_ring_quota <= 0:
             raise ValueError("per_ring_quota must be positive")
+        if (
+            type(current_model_step) is not int
+            or current_model_step < 0
+            or type(max_model_lag_steps) is not int
+            or max_model_lag_steps < 0
+        ):
+            raise ValueError("current model step and lag must be nonnegative integers")
+        run_id = validate_identifier("run_id", run_id)
+        generation_family = validate_identifier("generation_family", generation_family)
         requested = _validated_rings(rings)
         minimum_shard_id_exclusive = _validated_optional_shard_id(
             "minimum_shard_id_exclusive",
@@ -1594,16 +1685,7 @@ class ReplayStore:
         )
         fractions: dict[str, float] | None = None
         if segment_quotas is not None:
-            fractions = {
-                segment: float(fraction)
-                for segment, fraction in segment_quotas.items()
-                if float(fraction) > 0
-            }
-            _validated_segments(tuple(fractions))
-            total = sum(fractions.values())
-            if total <= 0:
-                raise ValueError("segment quotas must contain a positive fraction")
-            fractions = {segment: value / total for segment, value in fractions.items()}
+            fractions = _segment_fractions(segment_quotas)
         cutoff_clause = "AND id > ?" if minimum_shard_id_exclusive is not None else ""
         cutoff_parameters = (
             (minimum_shard_id_exclusive,)
@@ -1669,48 +1751,34 @@ class ReplayStore:
             if fractions is None:
                 selected = take_recent(ring, per_ring_quota, None)
             else:
-                # First pass: each segment takes its share. Second pass: the
-                # shortfall is offered to the segments that still have data.
-                targets = {
-                    segment: int(round(per_ring_quota * fraction))
-                    for segment, fraction in fractions.items()
-                }
-                drift = per_ring_quota - sum(targets.values())
-                if drift and targets:
-                    largest = max(targets, key=lambda segment: fractions[segment])
-                    targets[largest] += drift
-                selected = []
-                taken: dict[str, int] = {}
-                for segment, target in targets.items():
-                    chosen = take_recent(ring, target, (segment,))
-                    taken[segment] = sum(span.sample_count for span in chosen)
-                    selected.extend(chosen)
-                shortfall = per_ring_quota - sum(taken.values())
-                if shortfall > 0:
-                    saturated = {
-                        segment
-                        for segment, target in targets.items()
-                        if taken[segment] >= target
-                    }
-                    for segment in sorted(
-                        saturated, key=lambda name: fractions[name], reverse=True
-                    ):
-                        if shortfall <= 0:
-                            break
-                        extra = take_recent(
-                            ring, taken[segment] + shortfall, (segment,)
-                        )
-                        gained = (
-                            sum(span.sample_count for span in extra) - taken[segment]
-                        )
-                        if gained <= 0:
-                            continue
-                        selected = [
-                            span for span in selected if span.record.segment != segment
-                        ]
-                        selected.extend(extra)
-                        taken[segment] += gained
-                        shortfall -= gained
+                rows = self.connection.execute(
+                    f"""SELECT segment, SUM(sample_count) AS samples FROM shards
+                    WHERE state = 'ready' AND run_id = ? AND generation_family = ?
+                      AND rules_hash = ? AND feature_schema_hash = ?
+                      AND ring = ? AND model_step BETWEEN ? AND ? AND id <= ?
+                      {cutoff_clause}
+                    GROUP BY segment""",
+                    (
+                        run_id,
+                        generation_family,
+                        f"{RULES_HASH:016x}",
+                        f"{FEATURE_SCHEMA_HASH:016x}",
+                        ring,
+                        max(0, current_model_step - max_model_lag_steps),
+                        current_model_step,
+                        maximum_shard_id,
+                        *cutoff_parameters,
+                    ),
+                )
+                capacities = {str(row["segment"]): int(row["samples"]) for row in rows}
+                targets = _bounded_segment_targets(
+                    per_ring_quota, fractions, capacities
+                )
+                selected = [
+                    span
+                    for segment, target in targets.items()
+                    for span in take_recent(ring, target, (segment,))
+                ]
             spans.extend(selected)
             counts[int(ring)] = sum(span.sample_count for span in selected)
             for span in selected:

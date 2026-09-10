@@ -7,6 +7,7 @@ import sqlite3
 from copy import deepcopy
 from dataclasses import dataclass, replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Callable
 
 import pytest
@@ -848,11 +849,19 @@ def test_additive_default_field_accepts_legacy_chain_hash(tmp_path: Path) -> Non
     # supported epoch. Removing the whole disabled inference service collapses
     # the otherwise independent pre/post-topology representations.
     assert expected <= compatible
-    # The search-execution epoch preserves current and pre-experiment profiles
-    # across both cohort-budget epochs. Their shared pre-pipeline representation
-    # is deduplicated: five pipeline representations instead of the prior three,
-    # each with the same 24 scheduling/clipping/topology representations.
-    assert len(compatible) == 120 * len(expected)
+    # Preserve the full 120-representation pre-neural-execution epoch, not just
+    # the one legacy chain head below. The new disabled-field representations
+    # add 64 distinct combinations after all earlier omissions are deduplicated.
+    prior_payload = config.as_dict()
+    prior_inference = prior_payload["orchestration"]["model_refresh"]["inference"]
+    del prior_inference["compact_inference_gather"]
+    del prior_inference["small_batch_graph_buckets"]
+    prior = migration._compatible_source_config_sha256s(
+        SimpleNamespace(as_dict=lambda: deepcopy(prior_payload))
+    )
+    assert len(prior) == 120 * len(expected)
+    assert prior <= compatible
+    assert len(compatible) == 184 * len(expected)
     # A profile that opts into a new field no longer matches releases that
     # never had it, but keeps the variants for the other additive fields.
     opted = yaml.safe_load(fixture.old_profile.read_text(encoding="utf-8"))
@@ -861,7 +870,7 @@ def test_additive_default_field_accepts_legacy_chain_hash(tmp_path: Path) -> Non
     opted_path = tmp_path / "opted.yaml"
     opted_path.write_text(yaml.safe_dump(opted, sort_keys=False), encoding="utf-8")
     opted_config = load_config(opted_path)
-    assert len(migration._compatible_source_config_sha256s(opted_config)) == 960
+    assert len(migration._compatible_source_config_sha256s(opted_config)) == 1472
 
     opted.setdefault("selfplay", {}).setdefault("variants", {})[
         "handicap_classic_share"
@@ -869,7 +878,7 @@ def test_additive_default_field_accepts_legacy_chain_hash(tmp_path: Path) -> Non
     opted.setdefault("arena", {})["segment_handicap_classic_share"] = 0.5
     opted_path.write_text(yaml.safe_dump(opted, sort_keys=False), encoding="utf-8")
     assert (
-        len(migration._compatible_source_config_sha256s(load_config(opted_path))) == 240
+        len(migration._compatible_source_config_sha256s(load_config(opted_path))) == 368
     )
 
     # The head a release without scheduling or plateau additions recorded.
@@ -884,6 +893,8 @@ def test_additive_default_field_accepts_legacy_chain_hash(tmp_path: Path) -> Non
         ("orchestration", "promotion", "pause_strategy"),
         ("selfplay", "search_execution"),
         ("arena", "search_execution"),
+        ("orchestration", "model_refresh", "inference", "compact_inference_gather"),
+        ("orchestration", "model_refresh", "inference", "small_batch_graph_buckets"),
     )
     assert legacy_hash in compatible
     experimental = yaml.safe_load(fixture.old_profile.read_text(encoding="utf-8"))
@@ -1665,7 +1676,17 @@ def test_same_scope_guard_change_still_requires_terminal_evidence(tmp_path):
     assert _snapshot(fixture.root) == before
 
 
-def test_broadcast_topology_cutover_is_reversible_and_preserves_pending_work(tmp_path):
+@pytest.mark.parametrize(
+    "field,values",
+    [
+        ("preserve_broadcast_topology", (False, True)),
+        ("compact_inference_gather", (True, False)),
+        ("small_batch_graph_buckets", (True, False)),
+    ],
+)
+def test_inference_execution_cutover_is_reversible_and_preserves_pending_work(
+    tmp_path, field, values
+):
     from dataclasses import replace
 
     from startrain.balanced_evaluation import evaluation_contract
@@ -1695,22 +1716,21 @@ def test_broadcast_topology_cutover_is_reversible_and_preserves_pending_work(tmp
     before = {path: path.read_bytes() for path in retained}
     source_profile = fixture.old_profile
     source_commit = fixture.request.from_source_commit
-    for index, enabled in enumerate((False, True)):
+    for index, enabled in enumerate(values):
         raw = yaml.safe_load(source_profile.read_text())
-        raw["orchestration"]["model_refresh"]["inference"][
-            "preserve_broadcast_topology"
-        ] = enabled
+        raw["orchestration"]["model_refresh"]["inference"][field] = enabled
         fixture.candidate_profile.write_text(yaml.safe_dump(raw))
         request = replace(
             fixture.request,
             old_profile=source_profile,
-            target_profile_name=f"profile-broadcast-{index}.yaml",
+            target_profile_name=f"profile-{field}-{index}.yaml",
             from_source_commit=source_commit,
             to_source_commit=str(index + 2) * 40,
         )
         plan = migration.plan_migration(request)
         migration.apply_migration(plan)
         changed = load_config(plan.target_profile)
+        assert getattr(changed.orchestration.model_refresh.inference, field) is enabled
         assert changed.model == original.model
         assert changed.game == original.game
         assert changed.optimizer == original.optimizer
@@ -1724,7 +1744,7 @@ def test_broadcast_topology_cutover_is_reversible_and_preserves_pending_work(tmp
             (fixture.root / "continuous-migrations.jsonl").read_text().splitlines()[-1]
         )
         assert [change["path"] for change in record["changes"]] == [
-            "orchestration.model_refresh.inference.preserve_broadcast_topology"
+            f"orchestration.model_refresh.inference.{field}"
         ]
         assert "utd_segment" not in record
         assert "evaluation_contract_transition" not in record

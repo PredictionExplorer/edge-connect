@@ -2389,6 +2389,7 @@ def build_strength_efficiency_report(
             root,
             arenas,
             wall_seconds=wall_seconds,
+            observed_until_ns=observed_until_ns,
             provisioned_gpus=provisioned_gpus,
             strength_simulations=strength_config.simulations
             if strength_config is not None

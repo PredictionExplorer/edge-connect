@@ -297,6 +297,8 @@ class LocalEdgeBlock(nn.Module):
         super().__init__()
         bottleneck = max(8, int(width * bottleneck_ratio))
         self.local_operator = local_operator
+        # Runtime-only inference option; never part of checkpoint parameters.
+        self.compact_inference_gather = False
         self.norm = nn.RMSNorm(width, eps=norm_eps)
         self.self_projection = nn.Linear(width, bottleneck, bias=False)
         self.neighbor_projection = nn.Linear(width, bottleneck, bias=False)
@@ -326,7 +328,19 @@ class LocalEdgeBlock(nn.Module):
         if self.modulation is not None and condition is not None:
             scale, shift = self.modulation(condition).unsqueeze(1).chunk(2, dim=-1)
             normalized = normalized * (1.0 + scale) + shift
-        neighbors = _gather_neighbors(normalized, neighbor_index)
+        neighbor_inputs = normalized
+        if self.compact_inference_gather:
+            if self.training or torch.is_grad_enabled():
+                raise ValueError("compact neighbor gathering requires inference")
+            if torch.is_autocast_enabled(normalized.device.type):
+                # Autocast would perform the same conversion on the larger
+                # gathered matrix immediately before neighbor_projection.
+                # Casting per node first avoids repeating that storage for
+                # every incident edge; normalization/residuals stay unchanged.
+                neighbor_inputs = normalized.to(
+                    dtype=torch.get_autocast_dtype(normalized.device.type)
+                )
+        neighbors = _gather_neighbors(neighbor_inputs, neighbor_index)
         messages = self.neighbor_projection(neighbors)
         messages = messages + self.edge_embedding(neighbor_edge_type)
         if self.source_gate_projection is not None:
@@ -646,6 +660,30 @@ class GraphResTNet(nn.Module):
 
     def clear_inference_caches(self) -> None:
         self._inference_relation_bias_cache.clear()
+
+    @property
+    def inference_execution_signature(self) -> tuple[str, bool]:
+        """Cache identity for runtime choices that can affect neural execution."""
+        enabled = False
+        for group in self.rrt_groups:
+            assert isinstance(group, RRTGroup)
+            for block in group.local_blocks:
+                assert isinstance(block, LocalEdgeBlock)
+                enabled = enabled or block.compact_inference_gather
+        return ("graph-inference-v1", enabled)
+
+    def set_compact_inference_gather(self, enabled: bool) -> None:
+        """Select cast-before-gather execution without changing saved weights."""
+        if type(enabled) is not bool:
+            raise ValueError("compact inference gathering must be boolean")
+        if enabled and self.training:
+            raise ValueError("compact neighbor gathering requires an eval model")
+        for group in self.rrt_groups:
+            assert isinstance(group, RRTGroup)
+            for block in group.local_blocks:
+                assert isinstance(block, LocalEdgeBlock)
+                block.compact_inference_gather = enabled
+        self.clear_inference_caches()
 
     def prepare_inference_relational_bias(
         self, ring: int, *, dtype: torch.dtype

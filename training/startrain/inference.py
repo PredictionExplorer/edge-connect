@@ -10,7 +10,8 @@ import struct
 import threading
 import time
 from dataclasses import dataclass
-from typing import Protocol, Sequence, runtime_checkable
+from functools import lru_cache
+from typing import Any, Protocol, Sequence, cast, runtime_checkable
 
 import numpy as np
 import torch
@@ -29,6 +30,7 @@ from .features_v3 import encode_legacy_batch
 from .inference_cache import BoundedPredictionCache, PinnedTransferPool, RawPrediction
 from .inference_graphs import BoundedInferenceGraphs, CudaBackend
 from .native import (
+    NativeFeatureDataProtocol,
     NativeStateDataProtocol,
     encode_native_feature_data,
     encode_native_state_data,
@@ -44,6 +46,15 @@ class NativeEvalBatchProtocol(Protocol):
     legal_actions: Sequence[int]
 
     def __len__(self) -> int: ...
+
+
+class _NativeKeyBatchProtocol(NativeEvalBatchProtocol, Protocol):
+    rings: int
+    node_count: int
+
+    def inference_keys(self) -> list[bytes]: ...
+    def prefetch_features(self, indices: list[int]) -> None: ...
+    def selected_features(self, indices: list[int]) -> NativeFeatureDataProtocol: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,6 +94,8 @@ class InferenceConfig:
     cuda_graphs: bool = False
     cuda_graph_max_entries: int = 8
     cuda_graph_max_bytes: int = 2 * 1024**3
+    compact_inference_gather: bool = False
+    small_batch_graph_buckets: bool = False
 
     def __post_init__(self) -> None:
         if self.precision not in ("fp32", "bf16", "auto"):
@@ -110,6 +123,8 @@ class InferenceConfig:
             "pinned_transfers",
             "preserve_broadcast_topology",
             "cuda_graphs",
+            "compact_inference_gather",
+            "small_batch_graph_buckets",
         ):
             if type(getattr(self, name)) is not bool:
                 raise ValueError(f"{name} must be boolean")
@@ -131,13 +146,30 @@ class InferenceConfig:
         return self.feature_schema_version == LEGACY_FEATURE_SCHEMA_VERSION
 
 
-InferenceNamespace = tuple[str, str, int, int, str, int]
+InferenceNamespace = tuple[object, ...]
+
+
+@lru_cache(maxsize=1)
+def _native_key_batch_type() -> type | None:
+    """Only the sealed PyO3 type may provide trusted immutable semantic keys."""
+    try:
+        import star_native
+    except ImportError:
+        return None
+    version = getattr(star_native, "native_inference_key_version", None)
+    return (
+        getattr(star_native, "EvalBatch", None)
+        if callable(version) and version() == 1
+        else None
+    )
 
 
 @dataclass(frozen=True, slots=True)
 class PreparedInferenceRequest:
     """Owned host snapshot, prepared independently of the GPU worker."""
 
+    # A native request stores a private None sentinel until this attribute is
+    # first accessed; __getattribute__ always exposes an owned EncodedBatch.
     encoded: EncodedBatch
     tokens: tuple[int, ...]
     legal_offsets: tuple[int, ...]
@@ -148,6 +180,42 @@ class PreparedInferenceRequest:
     key_tensor_stamps: tuple[tuple[int, int, int], ...] | None = None
     prepare_seconds: float = 0.0
     key_seconds: float = 0.0
+    native_snapshot: Any = dataclasses.field(default=None, repr=False, compare=False)
+    native_preserve_broadcast_topology: bool = False
+
+    def __getattribute__(self, name: str) -> Any:
+        if name == "encoded":
+            encoded = object.__getattribute__(self, name)
+            if encoded is None:
+                snapshot = object.__getattribute__(self, "native_snapshot")
+                if type(snapshot) is not _native_key_batch_type():
+                    raise ValueError("deferred features require an immutable native snapshot")
+                preserve = object.__getattribute__(self, "native_preserve_broadcast_topology")
+                with torch.inference_mode(False):
+                    host = encode_native_feature_data(
+                        snapshot.selected_features(list(range(len(snapshot)))),
+                        source="native_request",
+                    )
+                    encoded = _own_encoded_batch(host, preserve)
+                # Explicit tensor access exposes writable owned storage. From
+                # this point use the full-input key/stamp validation path, so
+                # direct tensor mutation and dataclasses.replace remain safe.
+                object.__setattr__(self, "encoded", encoded)
+                object.__setattr__(self, "prepared_keys", None)
+                object.__setattr__(self, "key_tensor_stamps", None)
+            return encoded
+        return object.__getattribute__(self, name)
+
+    @property
+    def native_lazy(self) -> bool:
+        return (
+            object.__getattribute__(self, "encoded") is None
+            and type(self.native_snapshot) is _native_key_batch_type()
+        )
+
+    @property
+    def max_nodes(self) -> int:
+        return int(self.native_snapshot.node_count) if self.native_lazy else self.encoded.max_nodes
 
     @property
     def rows(self) -> int:
@@ -155,6 +223,8 @@ class PreparedInferenceRequest:
 
     @property
     def ring(self) -> int | None:
+        if self.native_lazy:
+            return int(self.native_snapshot.rings)
         rings = self.encoded.rings.tolist()
         return (
             int(rings[0]) if rings and all(ring == rings[0] for ring in rings) else None
@@ -220,6 +290,15 @@ def _clone_batch_tensor(tensor: torch.Tensor) -> torch.Tensor:
     return detached.clone()
 
 
+def _own_encoded_batch(host: EncodedBatch, preserve_broadcast: bool) -> EncodedBatch:
+    return EncodedBatch(**{
+        field.name: (
+            _clone_batch_tensor(getattr(host, field.name)) if preserve_broadcast
+            else getattr(host, field.name).detach().clone()
+        ) for field in dataclasses.fields(host)
+    })
+
+
 def _merge_batch_tensors(tensors: Sequence[torch.Tensor]) -> torch.Tensor:
     """Keep identical broadcast rows shared; preserve arbitrary caller inputs."""
 
@@ -265,6 +344,12 @@ class GraphInferenceAdapter:
         if resolved_precision != config.precision:
             config = dataclasses.replace(config, precision=resolved_precision)
         self.config = config
+        raw_model = getattr(self.model, "_orig_mod", self.model)
+        configure_gather = getattr(raw_model, "set_compact_inference_gather", None)
+        if callable(configure_gather):
+            configure_gather(config.compact_inference_gather)
+        elif config.compact_inference_gather:
+            raise ValueError("model does not support compact inference gather")
         self.model_version = model_version
         self.model_step = int(model_step)
         self.model_identity = model_identity or model_version
@@ -351,13 +436,19 @@ class GraphInferenceAdapter:
 
     @property
     def namespace(self) -> InferenceNamespace:
-        return (
+        namespace = (
             self.model_identity,
             self.model_version,
             self.model_step,
             self.config.feature_schema_version,
             self.config.precision,
             RULES_HASH,
+        )
+        raw_model = getattr(self.model, "_orig_mod", self.model)
+        signature = getattr(raw_model, "inference_execution_signature", None)
+        return (
+            namespace if signature in (None, ("graph-inference-v1", False))
+            else (*namespace, "execution", signature)
         )
 
     def efficiency_snapshot(self) -> dict[str, int | float]:
@@ -521,7 +612,8 @@ class GraphInferenceAdapter:
         """Validate and snapshot inputs on a CPU producer, before GPU submission.
 
         An immutable model identity must remain pinned until the result arrives.
-        No GPU operations or prediction-cache accesses happen in this method.
+        No GPU operations or cache LRU mutations happen here. Native requests
+        use read-only cache hints to score likely misses on the CPU producer.
         """
 
         preparation_started = time.perf_counter()
@@ -533,6 +625,43 @@ class GraphInferenceAdapter:
         )
         if not 0 <= weight <= 1:
             raise ValueError("score utility weight must be in [0, 1]")
+        if not self.config.legacy_features and type(requests) is _native_key_batch_type():
+            native_request = cast(_NativeKeyBatchProtocol, requests)
+            tokens = tuple(requests.tokens)
+            offsets = tuple(requests.legal_offsets)
+            actions = tuple(requests.legal_actions)
+            if not tokens or len(tokens) != len(requests):
+                raise ValueError("prepared requests require a nonempty matching token batch")
+            # The sealed native method validates CSR against its owned engine
+            # states. Every field determining features is serialized exactly.
+            key_started = time.perf_counter()
+            semantic_keys = native_request.inference_keys()
+            if len(semantic_keys) != len(tokens):
+                raise ValueError("native inference key row count is incompatible")
+            keyed = self._prediction_cache.enabled or self.config.deduplicate
+            prefix = repr(namespace).encode("utf-8") + b"\0native-semantic-v1\0"
+            keys = tuple(prefix + key for key in semantic_keys) if keyed else None
+            key_seconds = time.perf_counter() - key_started
+            hints = self._prediction_cache.peek_many(keys) if keys is not None and self._prediction_cache.enabled else (None,) * len(tokens)
+            seen: set[bytes] = set()
+            prepare_rows: list[int] = []
+            for row, hint in enumerate(hints):
+                if hint is not None:
+                    continue
+                if self.config.deduplicate and keys is not None:
+                    if keys[row] in seen:
+                        continue
+                    seen.add(keys[row])
+                prepare_rows.append(row)
+            native_request.prefetch_features(prepare_rows)
+            with self._stats_lock:
+                self.last_feature_path = "rust"
+                self.feature_path_counts["rust"] += 1
+            return PreparedInferenceRequest(
+                cast(EncodedBatch, None), tokens, offsets, actions, namespace, float(weight), keys, None,
+                time.perf_counter() - preparation_started, key_seconds,
+                requests, self.config.preserve_broadcast_topology,
+            )
         native_features = getattr(requests, "features", None)
         if native_features is not None and all(
             isinstance(value, list)
@@ -588,16 +717,7 @@ class GraphInferenceAdapter:
         # Preserve version counters even when a producer uses inference_mode.
         # Direct callers' later PyTorch mutations then invalidate prepared keys.
         with torch.inference_mode(False):
-            owned = EncodedBatch(
-                **{
-                    field.name: (
-                        _clone_batch_tensor(getattr(host, field.name))
-                        if self.config.preserve_broadcast_topology
-                        else getattr(host, field.name).detach().clone()
-                    )
-                    for field in dataclasses.fields(host)
-                }
-            )
+            owned = _own_encoded_batch(host, self.config.preserve_broadcast_topology)
         keyed = self._prediction_cache.enabled or self.config.deduplicate
         key_started = time.perf_counter()
         keys = tuple(self._row_keys(owned, namespace)) if keyed else None
@@ -792,7 +912,9 @@ class GraphInferenceAdapter:
             return rows
         upper = 1 << (rows - 1).bit_length()
         intermediate = upper * 3 // 4
-        if self.config.cuda_graphs and rows > 64 and rows <= intermediate:
+        if self.config.cuda_graphs and (
+            rows > 64 or (self.config.small_batch_graph_buckets and upper >= 4)
+        ) and rows <= intermediate:
             return intermediate
         return upper
 
@@ -837,7 +959,7 @@ class GraphInferenceAdapter:
             ):
                 raise ValueError("batched requests must have one common ring")
             if any(
-                request.encoded.max_nodes != first.encoded.max_nodes
+                request.max_nodes != first.max_nodes
                 for request in requests
             ):
                 raise ValueError("batched inference shapes are incompatible")
@@ -858,6 +980,11 @@ class GraphInferenceAdapter:
             keys: list[bytes] = []
             if keyed:
                 for request in requests:
+                    if request.native_lazy:
+                        if request.prepared_keys is None or len(request.prepared_keys) != request.rows:
+                            raise ValueError("native prepared keys are incomplete")
+                        keys.extend(request.prepared_keys)
+                        continue
                     stamps = self._tensor_stamps(request.encoded)
                     if (
                         request.prepared_keys is not None
@@ -908,29 +1035,47 @@ class GraphInferenceAdapter:
                     pending_keys[keys[row]] = row
             self._cache_seconds += time.perf_counter() - cache_started
             if misses:
-                host = (
-                    first.encoded
-                    if len(requests) == 1
-                    else EncodedBatch(
-                        **{
-                            field.name: _merge_batch_tensors(
-                                [
-                                    getattr(request.encoded, field.name)
-                                    for request in requests
-                                ]
-                            )
-                            for field in dataclasses.fields(first.encoded)
-                        }
-                    )
-                )
+                # Select before native scoring/feature construction. General
+                # Python requests retain their validated owned tensor snapshots.
+                pieces: list[EncodedBatch] = []
+                offset = 0
+                cursor = 0
+                for request in requests:
+                    local: list[int] = []
+                    end = offset + request.rows
+                    while cursor < len(misses) and misses[cursor] < end:
+                        local.append(misses[cursor] - offset)
+                        cursor += 1
+                    if local:
+                        if request.native_lazy:
+                            with torch.inference_mode(False):
+                                features = request.native_snapshot.selected_features(local)
+                                encoded = _own_encoded_batch(
+                                    encode_native_feature_data(features, source="native_request"),
+                                    self.config.preserve_broadcast_topology,
+                                )
+                        else:
+                            encoded = request.encoded
+                            if len(local) != request.rows:
+                                indices = torch.tensor(local, dtype=torch.long)
+                                encoded = EncodedBatch(**{
+                                    field.name: _select_batch_tensor(getattr(encoded, field.name), indices)
+                                    for field in dataclasses.fields(encoded)
+                                })
+                        pieces.append(encoded)
+                    offset = end
+                host = pieces[0] if len(pieces) == 1 else EncodedBatch(**{
+                    field.name: _merge_batch_tensors([getattr(piece, field.name) for piece in pieces])
+                    for field in dataclasses.fields(EncodedBatch)
+                })
                 physical_rows = self._inference_batch_rows(len(misses))
                 indices = torch.tensor(
-                    misses + [misses[-1]] * (physical_rows - len(misses)),
+                    list(range(len(misses))) + [len(misses) - 1] * (physical_rows - len(misses)),
                     dtype=torch.long,
                 )
                 selected = (
                     host
-                    if len(misses) == rows and physical_rows == rows
+                    if physical_rows == len(misses)
                     else EncodedBatch(
                         **{
                             field.name: _select_batch_tensor(
@@ -968,7 +1113,7 @@ class GraphInferenceAdapter:
                     ]
                 )
             )
-            nodes = first.encoded.max_nodes
+            nodes = first.max_nodes
             outcome = torch.softmax(raw[:, nodes : nodes + 2], dim=-1)
             outcome_values = outcome[:, 1] - outcome[:, 0]
             score_probability = torch.softmax(raw[:, nodes + 2 :], dim=-1)
@@ -989,9 +1134,17 @@ class GraphInferenceAdapter:
                         values
                         + request.score_utility_weight * expectations[start:end] / scale
                     ).clamp(-1, 1)
-                logits = raw[start:end, :nodes].masked_select(
-                    request.encoded.legal_action_mask
-                )
+                if request.native_lazy:
+                    # CSR is immutable and already validated in native code.
+                    row_indices = torch.repeat_interleave(
+                        torch.arange(request.rows),
+                        torch.tensor(np.diff(request.legal_offsets), dtype=torch.long),
+                    )
+                    logits = raw[start:end, :nodes][
+                        row_indices, torch.tensor(request.legal_actions, dtype=torch.long)
+                    ]
+                else:
+                    logits = raw[start:end, :nodes].masked_select(request.encoded.legal_action_mask)
                 response = InferenceResponse(
                     list(request.tokens),
                     values.tolist(),

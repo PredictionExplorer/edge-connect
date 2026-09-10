@@ -5,7 +5,8 @@ from __future__ import annotations
 from collections import OrderedDict
 from dataclasses import dataclass
 import sys
-from typing import Mapping
+import threading
+from typing import Mapping, Sequence
 
 import torch
 from torch import Tensor
@@ -36,22 +37,37 @@ class BoundedPredictionCache:
         self._entries: OrderedDict[bytes, tuple[RawPrediction, int]] = OrderedDict()
         self.bytes = 0
         self.evictions = 0
+        self._lock = threading.RLock()
 
     @property
     def enabled(self) -> bool:
         return self.max_entries > 0 and self.max_bytes > 0
 
     def __len__(self) -> int:
-        return len(self._entries)
+        with self._lock:
+            return len(self._entries)
+
+    def peek_many(self, keys: Sequence[bytes]) -> tuple[RawPrediction | None, ...]:
+        """Read immutable producer hints without changing LRU order or counters.
+
+        Hints may be evicted before inference; the owner always looks up again.
+        """
+        with self._lock:
+            return tuple(self._entries[key][0] if key in self._entries else None for key in keys)
 
     def get(self, key: bytes) -> RawPrediction | None:
-        entry = self._entries.get(key)
-        if entry is None:
-            return None
-        self._entries.move_to_end(key)
-        return entry[0]
+        with self._lock:
+            entry = self._entries.get(key)
+            if entry is None:
+                return None
+            self._entries.move_to_end(key)
+            return entry[0]
 
     def put(self, key: bytes, value: RawPrediction) -> None:
+        with self._lock:
+            self._put_locked(key, value)
+
+    def _put_locked(self, key: bytes, value: RawPrediction) -> None:
         if not self.enabled:
             return
         # Include Python objects and conservative map/link accounting, not just
@@ -79,8 +95,9 @@ class BoundedPredictionCache:
         self.bytes += charge
 
     def clear(self) -> None:
-        self._entries.clear()
-        self.bytes = 0
+        with self._lock:
+            self._entries.clear()
+            self.bytes = 0
 
 
 @dataclass(slots=True)

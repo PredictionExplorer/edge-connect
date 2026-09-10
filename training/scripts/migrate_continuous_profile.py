@@ -141,6 +141,8 @@ _ALLOWED_PROFILE_PATHS = {
             "cuda_graphs",
             "cuda_graph_max_entries",
             "cuda_graph_max_bytes",
+            "compact_inference_gather",
+            "small_batch_graph_buckets",
         )
     ),
     *(

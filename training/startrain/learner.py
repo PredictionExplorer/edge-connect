@@ -10,9 +10,9 @@ import os
 import random
 import time
 from bisect import bisect_right
-from collections import OrderedDict, defaultdict
+from collections import OrderedDict, defaultdict, deque
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from fractions import Fraction
 from pathlib import Path
 
@@ -303,17 +303,18 @@ class LazyShardReplayDataset(Dataset[ReplaySample]):
         raise IndexError(offset)
 
     def shard_batch_chunks(self, batch_size: int) -> tuple[ShardBatchChunk, ...]:
+        """Cover every selected row, including short spans and partial tails."""
         if batch_size <= 0:
             raise ValueError("batch_size must be positive")
         chunks: list[ShardBatchChunk] = []
         for span_index, span in enumerate(self.spans):
-            for batch in range(span.sample_count // batch_size):
+            for offset in range(0, span.sample_count, batch_size):
                 chunks.append(
                     ShardBatchChunk(
                         ring=span.record.ring,
                         span_index=span_index,
-                        dataset_start=(self._starts[span_index] + batch * batch_size),
-                        sample_count=batch_size,
+                        dataset_start=self._starts[span_index] + offset,
+                        sample_count=min(batch_size, span.sample_count - offset),
                     )
                 )
         return tuple(chunks)
@@ -445,14 +446,19 @@ class UniqueReplayBatchSampler(Sampler[list[int]]):
         self.shards_per_batch = shards_per_batch
         self.rank = rank
         self.world_size = world_size
-        self.chunks = dataset.shard_batch_chunks(batch_size)
-        if len(self.chunks) < batches * world_size * shards_per_batch:
-            raise ValueError("replay spans lack enough full shard-local unique batches")
+        # Shard diversity is a minimum where possible, not a requirement that
+        # every file contain a full optimizer batch. A streamed game may have
+        # only a few rows; all of them remain eligible.
+        fragment_rows = max(
+            1, math.ceil(batch_size / min(shards_per_batch, batch_size))
+        )
+        self.chunks = dataset.shard_batch_chunks(fragment_rows)
+        self.capacities = {
+            ring: dataset.ring_count(ring) // batch_size for ring in dataset.rings
+        }
+        if sum(self.capacities.values()) < batches * world_size:
+            raise ValueError("replay spans lack enough ring-homogeneous unique batches")
         if ring_stratified:
-            if len(self.chunks) < batches * world_size:
-                raise ValueError(
-                    "ring-stratified replay lacks enough homogeneous unique batches"
-                )
             if self.ring_weights is not None and (
                 any(weight < 0 for weight in self.ring_weights.values())
                 or not any(weight > 0 for weight in self.ring_weights.values())
@@ -465,23 +471,18 @@ class UniqueReplayBatchSampler(Sampler[list[int]]):
     def __iter__(self) -> Iterator[list[int]]:
         rng = random.Random(self.seed + self.epoch * 1_000_003)
         total_batches = self.batches * self.world_size
+        capacities = self.capacities
         if not self.ring_stratified:
-            chosen_groups = [
-                [chunk] for chunk in rng.sample(self.chunks, total_batches)
-            ]
+            order = rng.sample(
+                [
+                    ring
+                    for ring, capacity in sorted(capacities.items())
+                    for _ in range(capacity)
+                ],
+                total_batches,
+            )
+            used = {ring: order.count(ring) for ring in capacities}
         else:
-            by_ring: dict[int, list[ShardBatchChunk]] = defaultdict(list)
-            for chunk in self.chunks:
-                by_ring[chunk.ring].append(chunk)
-            groups_by_ring = {
-                ring: _cross_shard_chunk_groups(
-                    chunks,
-                    shards_per_batch=self.shards_per_batch,
-                    rng=rng,
-                )
-                for ring, chunks in by_ring.items()
-            }
-            capacities = {ring: len(groups) for ring, groups in groups_by_ring.items()}
             if self.ring_weights is None:
                 order = []
                 used = {ring: 0 for ring in capacities}
@@ -499,36 +500,169 @@ class UniqueReplayBatchSampler(Sampler[list[int]]):
                 used = _weighted_ring_quotas(
                     total_batches,
                     capacities=capacities,
-                    weights={
-                        ring: self.ring_weights.get(ring, 0.0) for ring in capacities
-                    },
+                    weights=self.ring_weights,
                 )
                 order = [
                     ring for ring, count in sorted(used.items()) for _ in range(count)
                 ]
                 rng.shuffle(order)
-            ring_groups: dict[int, Iterator[list[ShardBatchChunk]]] = {}
-            for ring, count in used.items():
-                ring_groups[ring] = iter(rng.sample(groups_by_ring[ring], count))
-            chosen_groups = [next(ring_groups[ring]) for ring in order]
-        local_groups = chosen_groups[self.rank :: self.world_size]
-        local = []
-        for group in local_groups:
-            batch_indices: list[int] = []
-            base = self.batch_size // len(group)
-            remainder = self.batch_size % len(group)
-            for offset, chunk in enumerate(group):
-                indices = self.dataset.indices_for_chunk(chunk)
-                rng.shuffle(indices)
-                count = base + int(offset < remainder)
-                batch_indices.extend(indices[:count])
-            rng.shuffle(batch_indices)
-            if len(batch_indices) != self.batch_size:
-                raise RuntimeError("cross-shard sampler emitted an incomplete batch")
-            local.append(batch_indices)
+        by_ring: dict[int, list[ShardBatchChunk]] = defaultdict(list)
+        for chunk in self.chunks:
+            by_ring[chunk.ring].append(chunk)
+        packed = {
+            ring: iter(
+                _pack_replay_batches(
+                    self.dataset,
+                    by_ring[ring],
+                    batch_size=self.batch_size,
+                    batches=count,
+                    minimum_shards=self.shards_per_batch,
+                    rng=rng,
+                )
+            )
+            for ring, count in sorted(used.items())
+            if count
+        }
+        # Every rank constructs the same global plan before taking its disjoint
+        # batches. Physical loader workers never choose or duplicate row IDs.
+        global_batches = [next(packed[ring]) for ring in order]
+        local = global_batches[self.rank :: self.world_size]
         if len(local) != self.batches:
             raise RuntimeError("distributed sampler emitted uneven batches")
         yield from local
+
+
+def _pack_replay_batches(
+    dataset: LazyShardReplayDataset,
+    chunks: Sequence[ShardBatchChunk],
+    *,
+    batch_size: int,
+    batches: int,
+    minimum_shards: int,
+    rng: random.Random,
+) -> list[list[int]]:
+    """Pack shuffled fragments without dropping rows or requiring large files."""
+    shuffled = list(chunks)
+    rng.shuffle(shuffled)
+    by_span: dict[int, deque[tuple[int, ShardBatchChunk, int]]] = defaultdict(deque)
+    for priority, chunk in enumerate(shuffled):
+        by_span[chunk.span_index].append((priority, chunk, 0))
+    available = [(queue[0][0], span) for span, queue in by_span.items()]
+    heapq.heapify(available)
+    permutations: dict[int, list[int]] = {}
+    output = []
+    for _ in range(batches):
+        required = min(minimum_shards, len(by_span), batch_size)
+        seen: set[int] = set()
+        held: list[tuple[int, int]] = []
+        indices: list[int] = []
+        while len(indices) < batch_size:
+            if not available:
+                raise RuntimeError("replay row packing exhausted before its capacity")
+            _, span_index = heapq.heappop(available)
+            queue = by_span[span_index]
+            priority, chunk, consumed = queue.popleft()
+            seen.add(span_index)
+            # Reserve one row for each still-needed distinct source. This also
+            # handles batch sizes not divisible by the desired diversity.
+            room = batch_size - len(indices) - max(0, required - len(seen))
+            take = min(chunk.sample_count - consumed, room)
+            if take <= 0:
+                raise RuntimeError(
+                    "replay shard diversity reservation made no progress"
+                )
+            permutation = permutations.get(span_index)
+            if permutation is None:
+                start = dataset._starts[span_index]
+                permutation = list(
+                    range(start, start + dataset.spans[span_index].sample_count)
+                )
+                rng.shuffle(permutation)
+                permutations[span_index] = permutation
+            offset = chunk.dataset_start - dataset._starts[span_index] + consumed
+            indices.extend(permutation[offset : offset + take])
+            if consumed + take < chunk.sample_count:
+                queue.appendleft((priority, chunk, consumed + take))
+            if queue:
+                head = (queue[0][0], span_index)
+                if len(seen) < required:
+                    held.append(head)
+                else:
+                    heapq.heappush(available, head)
+            else:
+                del by_span[span_index]
+                permutations.pop(span_index, None)
+            if len(seen) >= required and held:
+                for head in held:
+                    heapq.heappush(available, head)
+                held.clear()
+        rng.shuffle(indices)
+        output.append(indices)
+    return output
+
+
+def replay_selection_diagnostics(
+    selection: ReplaySelection, *, batch_size: int, current_model_step: int
+) -> dict[str, object]:
+    """Metadata-only accounting of selected rows and actual packing capacity."""
+    if batch_size <= 0:
+        raise ValueError("diagnostic batch size must be positive")
+    rows: dict[int, int] = defaultdict(int)
+    old_rows: dict[int, int] = defaultdict(int)
+    short_rows: dict[int, int] = defaultdict(int)
+    modes: dict[str, int] = defaultdict(int)
+    cells: dict[str, int] = defaultdict(int)
+    ages: dict[int, int] = defaultdict(int)
+    for span in selection.spans:
+        ring, count = span.record.ring, span.sample_count
+        rows[ring] += count
+        old_rows[ring] += (count // batch_size) * batch_size
+        short_rows[ring] += count if count < batch_size else 0
+        variant = getattr(span.record, "variant", "unknown")
+        mode = (
+            "handicap-" + variant.rsplit("-", 1)[-1]
+            if variant.startswith("handicap-")
+            else variant
+        )
+        modes[mode] += count
+        cells[f"r{ring}/{mode}"] += count
+        model_step = getattr(span.record, "model_step", None)
+        if type(model_step) is int:
+            ages[current_model_step - model_step] += count
+    total_aged = sum(ages.values())
+
+    def quantile(fraction: float) -> int | None:
+        consumed = 0
+        for age, count in sorted(ages.items()):
+            consumed += count
+            if consumed >= max(1, math.ceil(total_aged * fraction)):
+                return age
+        return None
+
+    return {
+        "sampler": "selected-span-packing-v2",
+        "selected_rows_by_ring": {str(r): n for r, n in sorted(rows.items())},
+        "batch_capacity_by_ring": {
+            str(r): n // batch_size for r, n in sorted(rows.items())
+        },
+        "packable_rows_by_ring": {
+            str(r): (n // batch_size) * batch_size for r, n in sorted(rows.items())
+        },
+        "legacy_chunk_rows_by_ring": {str(r): n for r, n in sorted(old_rows.items())},
+        "short_span_rows_by_ring": {str(r): n for r, n in sorted(short_rows.items())},
+        "selected_rows_by_six_mode": dict(sorted(modes.items())),
+        "selected_rows_by_ring_and_six_mode": dict(sorted(cells.items())),
+        "selected_model_age": {
+            "known_rows": total_aged,
+            "mean": sum(age * count for age, count in ages.items()) / total_aged
+            if total_aged
+            else None,
+            "minimum": min(ages) if ages else None,
+            "maximum": max(ages) if ages else None,
+            "p50": quantile(0.5),
+            "p90": quantile(0.9),
+        },
+    }
 
 
 @dataclass(frozen=True, slots=True)
@@ -797,6 +931,8 @@ class ReplayWindowSession:
     pause_generation: int = 0
     suspended: bool = False
     closed: bool = False
+    opened_monotonic: float = field(default_factory=time.monotonic)
+    opened_committed_samples: int = 0
 
     @property
     def batches_remaining(self) -> int:
@@ -1697,6 +1833,15 @@ class LearnerLoop:
                             window_batches_allocated=(spin_window.batches_allocated),
                             window_batches_consumed=(spin_window.batches_consumed),
                             window_reuse=True,
+                            window_age_seconds=max(
+                                0.0, time.monotonic() - spin_window.opened_monotonic
+                            ),
+                            window_selection_max_shard_id=spin_window.selection.max_shard_id,
+                            new_committed_samples_since_window_open=max(
+                                0,
+                                self._latest_total_replay_samples
+                                - spin_window.opened_committed_samples,
+                            ),
                         )
                     time.sleep(self.learner_config.replay_poll_seconds)
                     continue
@@ -2253,6 +2398,10 @@ class LearnerLoop:
                     self.ring_mixture_config.next_weight_step(self.step)
                 ),
                 shutdown_loader_workers=not pooled_loader,
+                opened_committed_samples=self.store.total_committed_sample_count(
+                    run_id=self.run_identity.run_id,
+                    generation_family=self.run_identity.generation_family,
+                ),
             )
         except BaseException:
             if loader is not None:
@@ -2301,6 +2450,11 @@ class LearnerLoop:
                     ),
                     "replay_samples": selection.sample_count,
                     "replay_max_shard_id": selection.max_shard_id,
+                    "replay_selection": replay_selection_diagnostics(
+                        selection,
+                        batch_size=self.train_config.per_rank_batch_size,
+                        current_model_step=self.step,
+                    ),
                 }
             )
         return session
@@ -2436,6 +2590,16 @@ class LearnerLoop:
                 "window_reuse_spins": window.reuse_spins,
                 "utd_wait_spins": window.utd_wait_spins,
                 "loader_workers_effective": window.effective_workers,
+                "sampler": "selected-span-packing-v2",
+                "window_age_seconds": max(
+                    0.0, time.monotonic() - window.opened_monotonic
+                ),
+                "window_opened_step": window.opened_step,
+                "window_selection_max_shard_id": window.selection.max_shard_id,
+                "new_committed_samples_since_window_open": max(
+                    0,
+                    self._latest_total_replay_samples - window.opened_committed_samples,
+                ),
             }
         )
 
@@ -3044,16 +3208,10 @@ class LearnerLoop:
 
     def _maximum_unique_batches(self, selection: ReplaySelection) -> int:
         batch = self.train_config.per_rank_batch_size
-        chunk_counts: dict[int, list[int]] = defaultdict(list)
+        rows_by_ring: dict[int, int] = defaultdict(int)
         for span in selection.spans:
-            chunk_counts[span.record.ring].append(span.sample_count // batch)
-        capacities = {
-            ring: _maximum_cross_shard_groups(
-                counts,
-                shards_per_batch=self.data_config.shards_per_batch,
-            )
-            for ring, counts in chunk_counts.items()
-        }
+            rows_by_ring[span.record.ring] += span.sample_count
+        capacities = {ring: count // batch for ring, count in rows_by_ring.items()}
         capacity = sum(capacities.values()) // self.world_size
         weights = self._active_ring_weights()
         if not self.data_config.ring_stratified or weights is None:
@@ -3141,17 +3299,30 @@ class LearnerLoop:
             if self.data_config.ring_stratified
             else True
         )
-        return (
+        ready = (
             sum(active_counts.values()) >= self.learner_config.minimum_replay_samples
             and per_ring_ready
             and self._available_batch_capacity(active_counts) >= self.world_size
         )
+        weights = self._active_ring_weights()
+        if ready and self.data_config.ring_stratified and weights is not None:
+            try:
+                _weighted_ring_quotas(
+                    self.world_size,
+                    capacities={
+                        ring: count // self.train_config.per_rank_batch_size
+                        for ring, count in active_counts.items()
+                    },
+                    weights=weights,
+                )
+            except ValueError:
+                return False
+        return ready
 
     def _available_batch_capacity(self, counts: Mapping[int, int]) -> int:
         batch = self.train_config.per_rank_batch_size
-        if self.data_config.ring_stratified:
-            return sum(count // batch for count in counts.values())
-        return sum(counts.values()) // batch
+        # Even unstratified scheduling emits homogeneous board-size batches.
+        return sum(count // batch for count in counts.values())
 
     def _recover_pending_state_rebase(self) -> None:
         outcome: dict[str, object] | None = None
@@ -4093,6 +4264,11 @@ class LearnerLoop:
             generation_family=self.run_identity.generation_family,
             retain_shards_per_ring=retention.replay_shards_per_ring,
             dry_run=retention.dry_run,
+            minimum_samples_per_ring=self.learner_config.recent_samples_per_ring,
+            current_model_step=self.step,
+            max_model_lag_steps=self.learner_config.max_replay_lag_steps,
+            minimum_shard_id_exclusive=self.learner_config.minimum_replay_shard_id_exclusive,
+            segment_quotas=self.learner_config.segment_quotas,
         )
         self.metrics.append(
             {

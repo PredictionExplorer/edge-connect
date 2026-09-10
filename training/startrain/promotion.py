@@ -190,6 +190,8 @@ def load_manifest_evaluator(
             cuda_graphs=refresh.inference.cuda_graphs,
             cuda_graph_max_entries=refresh.inference.cuda_graph_max_entries,
             cuda_graph_max_bytes=refresh.inference.cuda_graph_max_bytes,
+            compact_inference_gather=refresh.inference.compact_inference_gather,
+            small_batch_graph_buckets=refresh.inference.small_batch_graph_buckets,
         ),
         model_version=manifest.model_version,
         model_step=manifest.model_step,

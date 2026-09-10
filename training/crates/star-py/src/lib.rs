@@ -12,7 +12,8 @@
 //! during lineage transfer and cross-schema arenas.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
@@ -602,6 +603,7 @@ fn validate_schema_version(schema_version: u8) -> Result<(), String> {
     }
 }
 
+#[derive(Clone)]
 struct PackedFeatureRow {
     rings: u8,
     node_count: usize,
@@ -1121,7 +1123,10 @@ struct PyEvalBatch {
     tree_indices: Vec<usize>,
     tokens: Vec<u64>,
     states: PyStateData,
-    features: PyFeatureData,
+    request_states: Arc<Vec<GameState>>,
+    feature_rows: Arc<Vec<OnceLock<PackedFeatureRow>>>,
+    features: Arc<OnceLock<PyFeatureData>>,
+    encoded_feature_rows: Arc<AtomicUsize>,
     legal_offsets: Vec<usize>,
     legal_actions: Vec<i32>,
     pda: Vec<i8>,
@@ -1148,10 +1153,96 @@ impl PyEvalBatch {
         self.states.clone()
     }
 
-    /// Precomputed contiguous schema-v4 features for the request states.
+    /// Lazily computed schema-v4 features; exported writable buffers are copies.
     #[getter]
-    fn features(&self) -> PyFeatureData {
-        self.features.clone()
+    fn features(&self, py: Python<'_>) -> PyFeatureData {
+        py.detach(|| {
+            self.features
+                .get_or_init(|| {
+                    self.select_rows_unchecked(&(0..self.request_states.len()).collect::<Vec<_>>())
+                })
+                .clone()
+        })
+    }
+
+    /// Board size without forcing feature generation.
+    #[getter]
+    const fn rings(&self) -> u8 {
+        self.states.rings
+    }
+
+    /// Dense node count without forcing feature generation.
+    #[getter]
+    const fn node_count(&self) -> u16 {
+        self.states.node_count
+    }
+
+    /// Rows scored/encoded by this immutable request snapshot.
+    #[getter]
+    fn encoded_feature_rows(&self) -> usize {
+        self.encoded_feature_rows.load(Ordering::Relaxed)
+    }
+
+    /// Exact schema-framed semantic bytes determining every model input.
+    /// Checks legal rows against owned engine snapshots before publication.
+    fn inference_keys<'py>(&self, py: Python<'py>) -> PyResult<Vec<Bound<'py, PyBytes>>> {
+        let keys = py
+            .detach(|| {
+                let mut offset = 0;
+                let mut keys = Vec::with_capacity(self.request_states.len());
+                for (row, state) in self.request_states.iter().enumerate() {
+                    let legal = state.legal_actions().to_vec();
+                    let end = offset + legal.len();
+                    if self.legal_offsets.get(row) != Some(&offset)
+                        || self.legal_offsets.get(row + 1) != Some(&end)
+                        || self.legal_actions.get(offset..end).is_none_or(|actual| {
+                            !actual.iter().copied().eq(legal
+                                .iter()
+                                .map(|action| action.code(state.board().node_count())))
+                        })
+                    {
+                        return Err(
+                            "native request legal-action metadata disagrees with its state",
+                        );
+                    }
+                    keys.push(inference_state_key(
+                        state,
+                        FeatureContext::known(self.pda[row]),
+                    ));
+                    offset = end;
+                }
+                if offset != self.legal_actions.len()
+                    || self.legal_offsets.len() != self.request_states.len() + 1
+                {
+                    return Err("native request legal-action offsets are invalid");
+                }
+                Ok(keys)
+            })
+            .map_err(PyValueError::new_err)?;
+        Ok(keys.iter().map(|key| PyBytes::new(py, key)).collect())
+    }
+
+    /// Encode only selected cache-miss rows without changing this request.
+    fn selected_features(&self, py: Python<'_>, indices: Vec<usize>) -> PyResult<PyFeatureData> {
+        if indices
+            .iter()
+            .any(|index| *index >= self.request_states.len())
+        {
+            return Err(PyValueError::new_err("feature row index is out of range"));
+        }
+        py.detach(|| Ok(self.select_rows_unchecked(&indices)))
+    }
+
+    /// Score predicted misses on a CPU producer, preserving GPU-owner overlap.
+    fn prefetch_features(&self, py: Python<'_>, indices: Vec<usize>) -> PyResult<()> {
+        if indices
+            .iter()
+            .any(|index| *index >= self.request_states.len())
+        {
+            return Err(PyValueError::new_err("feature row index is out of range"));
+        }
+        py.detach(|| self.prefetch_rows_unchecked(&indices));
+        Ok(())
     }
 
     /// CSR offsets into `legal_actions`.
@@ -1171,6 +1262,74 @@ impl PyEvalBatch {
     fn pda(&self) -> Vec<i8> {
         self.pda.clone()
     }
+}
+
+impl PyEvalBatch {
+    fn prefetch_rows_unchecked(&self, indices: &[usize]) {
+        indices
+            .par_iter()
+            .map_init(ScoringScratch::default, |scratch, &index| {
+                self.feature_rows[index].get_or_init(|| {
+                    let state = &self.request_states[index];
+                    let score = scratch.score_state(state);
+                    self.encoded_feature_rows.fetch_add(1, Ordering::Relaxed);
+                    pack_feature_row(state, FeatureContext::known(self.pda[index]), &score)
+                });
+            })
+            .for_each(|()| {});
+    }
+
+    fn select_rows_unchecked(&self, indices: &[usize]) -> PyFeatureData {
+        self.prefetch_rows_unchecked(indices);
+        pack_feature_rows(
+            indices
+                .iter()
+                .map(|index| {
+                    self.feature_rows[*index]
+                        .get()
+                        .expect("requested feature row is initialized")
+                        .clone()
+                })
+                .collect(),
+            FEATURE_SCHEMA_VERSION,
+        )
+    }
+}
+
+fn inference_state_key(state: &GameState, context: FeatureContext) -> Vec<u8> {
+    let key = state.key();
+    let mut bytes = Vec::with_capacity(64 + 6 * BITBOARD_WORDS * 8);
+    bytes.extend_from_slice(b"star-native-input-v1\0");
+    bytes.extend_from_slice(&rules_hash().to_le_bytes());
+    bytes.extend_from_slice(&FEATURE_SCHEMA_HASH.to_le_bytes());
+    bytes.extend_from_slice(&state.board().topology_hash().to_le_bytes());
+    bytes.extend_from_slice(&[
+        FEATURE_SCHEMA_VERSION,
+        key.rings,
+        key.moves_left,
+        u8::from(key.opening),
+        u8::from(key.terminal),
+        key.mode as u8,
+        key.handicap,
+        u8::from(key.pie_pending),
+        u8::from(key.swap_available),
+        u8::from(context.history_known),
+        context.pda as u8,
+    ]);
+    // Model features are player-relative, including their retained history.
+    for board in [
+        key.stones[key.to_move.index()],
+        key.stones[key.to_move.opponent().index()],
+        key.current_turn,
+        key.previous_turn,
+        key.own_previous_turn,
+        key.handicap_stones,
+    ] {
+        for word in board.words() {
+            bytes.extend_from_slice(&word.to_le_bytes());
+        }
+    }
+    bytes
 }
 
 #[derive(Clone, Debug)]
@@ -3078,10 +3237,7 @@ fn pack_requests(
         .zip(&request_states)
         .map(|(tree_index, state)| pda_by_seat[*tree_index][state.to_move().index()])
         .collect();
-    let contexts: Vec<_> = pda.iter().map(|pda| FeatureContext::known(*pda)).collect();
     let states = pack_states(&request_states);
-    let features = pack_feature_states(&request_states, &contexts, FEATURE_SCHEMA_VERSION)
-        .expect("the production schema version is always valid");
     let mut legal_offsets = Vec::with_capacity(requests.len() + 1);
     let mut legal_actions = Vec::new();
     legal_offsets.push(0);
@@ -3099,7 +3255,10 @@ fn pack_requests(
         tree_indices,
         tokens,
         states,
-        features,
+        feature_rows: Arc::new((0..request_states.len()).map(|_| OnceLock::new()).collect()),
+        request_states: Arc::new(request_states),
+        features: Arc::new(OnceLock::new()),
+        encoded_feature_rows: Arc::new(AtomicUsize::new(0)),
         legal_offsets,
         legal_actions,
         pda,
@@ -3298,6 +3457,12 @@ const fn native_search_execution_version() -> u8 {
     1
 }
 
+/// Exact immutable native-key and lazy feature request protocol version.
+#[pyfunction]
+const fn native_inference_key_version() -> u8 {
+    1
+}
+
 /// Production feature schema version.
 #[pyfunction]
 const fn native_feature_schema_version() -> u8 {
@@ -3362,6 +3527,7 @@ fn star_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(native_rules_schema, module)?)?;
     module.add_function(wrap_pyfunction!(native_search_algorithm_id, module)?)?;
     module.add_function(wrap_pyfunction!(native_search_execution_version, module)?)?;
+    module.add_function(wrap_pyfunction!(native_inference_key_version, module)?)?;
     module.add_function(wrap_pyfunction!(native_feature_schema_version, module)?)?;
     module.add_function(wrap_pyfunction!(native_feature_schema_hash, module)?)?;
     module.add_function(wrap_pyfunction!(native_legacy_feature_schema_hash, module)?)?;
@@ -3964,7 +4130,7 @@ mod tests {
             let roots = search.root_requests(py).unwrap();
             // Every root has player 1 to move: seat-1 advantages apply.
             assert_eq!(roots.pda, [0, -2, 1]);
-            let root_globals = f32s(&roots.features.buffers.global_features);
+            let root_globals = f32s(&roots.features(py).buffers.global_features);
             assert!((root_globals[GLOBAL_FEATURE_DIM + 24] + 2.0 / 3.0).abs() <= 1.0e-6);
             submit_uniform_roots(&mut search, py, roots);
             while !search.is_done() {

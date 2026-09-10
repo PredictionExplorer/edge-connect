@@ -71,10 +71,16 @@ def compatible_config_epoch_payloads(
     """
 
     current = deepcopy(dict(payload))
-    execution_representations = [current]
-    pre_execution = without_search_execution_defaults(payload)
-    if pre_execution != current:
-        execution_representations.append(pre_execution)
+    inference_representations = [current]
+    pre_inference_execution = without_inference_execution_defaults(current)
+    if pre_inference_execution != current:
+        inference_representations.append(pre_inference_execution)
+    execution_representations = []
+    for representation in inference_representations:
+        execution_representations.append(representation)
+        pre_execution = without_search_execution_defaults(representation)
+        if pre_execution != representation:
+            execution_representations.append(pre_execution)
     budget_representations = []
     for representation in execution_representations:
         budget_representations.append(representation)
@@ -162,7 +168,9 @@ def without_cohort_search_budget_defaults(payload: Mapping[str, Any]) -> dict[st
 
 def without_selfplay_pipeline_defaults(payload: Mapping[str, Any]) -> dict[str, Any]:
     """Represent the release before optional actor pipelines and CUDA graphs."""
-    result = without_search_execution_defaults(payload)
+    result = without_inference_execution_defaults(
+        without_search_execution_defaults(payload)
+    )
 
     def omit_defaults(parent: object, defaults: Mapping[str, object]) -> None:
         if not isinstance(parent, dict):
@@ -198,6 +206,21 @@ def without_selfplay_pipeline_defaults(payload: Mapping[str, Any]) -> dict[str, 
                     "cuda_graph_max_bytes": 2 * 1024**3,
                 },
             )
+    return result
+
+
+def without_inference_execution_defaults(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Represent releases before the two explicit neural execution experiments."""
+    result = deepcopy(dict(payload))
+    parent: object = result
+    for name in ("orchestration", "model_refresh", "inference"):
+        if not isinstance(parent, dict):
+            return result
+        parent = parent.get(name)
+    if isinstance(parent, dict):
+        for name in ("compact_inference_gather", "small_batch_graph_buckets"):
+            if parent.get(name) is False:
+                del parent[name]
     return result
 
 
@@ -257,7 +280,7 @@ def without_broadcast_topology_default(
 def without_efficiency_defaults(payload: Mapping[str, Any]) -> dict[str, Any]:
     """Return the prior-epoch representation without changing enabled features."""
 
-    result = deepcopy(dict(payload))
+    result = without_inference_execution_defaults(payload)
 
     def omit(parent: object, key: str, default: object) -> None:
         if not isinstance(parent, dict) or key not in parent:

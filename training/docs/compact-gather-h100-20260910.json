@@ -1,0 +1,139 @@
+{
+  "plan": {
+    "schema_version": 1,
+    "model_identity": "sha256-9e58731d7a1e8f59a1647ae0905d142c5a09010171ac17a538d2cd468cf4699f",
+    "manifest_sha256": "f62539a24fbcc731e6aa69424981901e599ea5b53ca97df5f45de87b46bcafb4",
+    "checkpoint_sha256": "9e58731d7a1e8f59a1647ae0905d142c5a09010171ac17a538d2cd468cf4699f",
+    "config_sha256": "8dc815f2f25790d882a690313857694b3c3c9d27ea58b5dcef64dd951e6a8a07",
+    "model_source_sha256": "fac8b70a62fd848da90ee1ea295ab86fbf6847c4a385e54c06c3bcf647bc87b0",
+    "precision": "bf16",
+    "device": "cuda:0",
+    "rings": [
+      10
+    ],
+    "batch_sizes": [
+      32,
+      64,
+      128
+    ],
+    "repeats": 6,
+    "iterations": 3,
+    "warmups": 3,
+    "compile": true,
+    "arms": [
+      "preserve-gather",
+      "compact-gather"
+    ],
+    "scope": "paired whole-model latency and numerical comparison; not Elo or training throughput"
+  },
+  "plan_sha256": "9ed6179336f31632622b4dcbecaf5b717d22f28b9a12eabe02828ea081325925",
+  "records": [
+    {
+      "ring": 10,
+      "batch_size": 32,
+      "warmup_and_compile_seconds": 85.05191732011735,
+      "latency_seconds": [
+        [
+          0.009626696662356457,
+          0.00918040432346364,
+          0.00899219101605316,
+          0.008955245682348808,
+          0.008835370652377605,
+          0.008998191372180978
+        ],
+        [
+          0.009381703954810897,
+          0.009147680674990019,
+          0.008899854651341835,
+          0.00895421338888506,
+          0.009029058661932746,
+          0.008797070011496544
+        ]
+      ],
+      "paired_speedup_median": 1.0069761518298064,
+      "paired_speedup_min": 0.9785483717841212,
+      "paired_speedup_max": 1.0261138817346638,
+      "max_absolute_output_differences": {
+        "policy_logits": 0.0,
+        "outcome_logits": 0.0,
+        "score_margin_logits": 0.0,
+        "ownership_logits": 0.0,
+        "alive_logits": 0.0,
+        "soft_policy_logits": 0.0
+      }
+    },
+    {
+      "ring": 10,
+      "batch_size": 64,
+      "warmup_and_compile_seconds": 0.1565991840325296,
+      "latency_seconds": [
+        [
+          0.016380133961016934,
+          0.016559881313393515,
+          0.015826797656094033,
+          0.014930105690533916,
+          0.014819242370625338,
+          0.014796066020304957
+        ],
+        [
+          0.015645381684104603,
+          0.014061549368004004,
+          0.013912004651501775,
+          0.01651870800803105,
+          0.01689137564972043,
+          0.014856870286166668
+        ]
+      ],
+      "paired_speedup_median": 1.0214351080634276,
+      "paired_speedup_min": 0.8773259607704368,
+      "paired_speedup_max": 1.1776711712205965,
+      "max_absolute_output_differences": {
+        "policy_logits": 0.0,
+        "outcome_logits": 0.0,
+        "score_margin_logits": 0.0,
+        "ownership_logits": 0.0,
+        "alive_logits": 0.0,
+        "soft_policy_logits": 0.0
+      }
+    },
+    {
+      "ring": 10,
+      "batch_size": 128,
+      "warmup_and_compile_seconds": 0.19759251386858523,
+      "latency_seconds": [
+        [
+          0.0282704036993285,
+          0.028259060966471832,
+          0.028191154667486746,
+          0.028247358044609427,
+          0.028176832323273022,
+          0.027967867363865178
+        ],
+        [
+          0.028152317662412923,
+          0.02824472162562112,
+          0.028128157602623105,
+          0.028249057320257027,
+          0.028176270037268598,
+          0.028189336027329166
+        ]
+      ],
+      "paired_speedup_median": 1.0002638190787194,
+      "paired_speedup_min": 0.9921435303318504,
+      "paired_speedup_max": 1.0041945405110726,
+      "max_absolute_output_differences": {
+        "policy_logits": 0.0,
+        "outcome_logits": 0.0,
+        "score_margin_logits": 0.0,
+        "ownership_logits": 0.0,
+        "alive_logits": 0.0,
+        "soft_policy_logits": 0.0
+      }
+    }
+  ],
+  "elapsed_seconds": 97.55660823197104,
+  "torch": "2.13.0+cu130",
+  "device_name": "NVIDIA H100 80GB HBM3",
+  "peak_allocated_bytes": 595371520,
+  "peak_reserved_bytes": 1130364928
+}

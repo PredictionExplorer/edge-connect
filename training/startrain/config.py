@@ -690,6 +690,8 @@ class ActorInferenceConfig:
     cuda_graphs: bool = False
     cuda_graph_max_entries: int = 8
     cuda_graph_max_bytes: int = 2 * 1024**3
+    compact_inference_gather: bool = False
+    small_batch_graph_buckets: bool = False
 
     def __post_init__(self) -> None:
         for name in ("cache_max_entries", "cache_max_bytes"):
@@ -717,6 +719,8 @@ class ActorInferenceConfig:
             "preserve_broadcast_topology",
             "shared_batching",
             "cuda_graphs",
+            "compact_inference_gather",
+            "small_batch_graph_buckets",
         ):
             if type(getattr(self, name)) is not bool:
                 raise ConfigError(f"inference.{name} must be boolean")

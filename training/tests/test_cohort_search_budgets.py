@@ -316,8 +316,11 @@ def test_actor_reports_effective_schedule_in_all_telemetry(tmp_path, monkeypatch
             return evaluator
 
     class Task:
-        def __init__(self, native, evaluator, store, configured, identity):
+        def __init__(
+            self, native, evaluator, store, configured, identity, *, source_role
+        ):
             assert configured.cohort_search_budgets is True
+            assert source_role == "candidate"
 
         def run(self, *, stop_requested, progress):
             nonlocal stopped

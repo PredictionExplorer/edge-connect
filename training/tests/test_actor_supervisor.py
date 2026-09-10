@@ -71,8 +71,11 @@ def test_actor_supervisor_refreshes_only_at_batch_boundaries_and_emits_metrics(
     actor_events: list[tuple[int, int]] = []
 
     class FakeSelfPlayActor:
-        def __init__(self, _native, selected, _store, config, actor_identity) -> None:
+        def __init__(
+            self, _native, selected, _store, config, actor_identity, *, source_role
+        ) -> None:
             assert selected is evaluator
+            assert source_role == "candidate"
             assert config.games == (
                 experiment.orchestration.actor_games_per_batch
                 if games_override is None
@@ -246,7 +249,10 @@ def test_champion_selfplay_falls_back_to_candidate_beyond_replay_window(
     selected: list[object] = []
 
     class FakeSelfPlayActor:
-        def __init__(self, _native, evaluator, _store, _config, _identity) -> None:
+        def __init__(
+            self, _native, evaluator, _store, _config, _identity, *, source_role
+        ) -> None:
+            assert source_role == expected_role
             selected.append(evaluator)
             self.evaluator = evaluator
 
@@ -365,7 +371,10 @@ def test_actor_supervisor_records_interrupted_cohort_metrics(
     stopped = {"value": False}
 
     class InterruptedSelfPlayActor:
-        def __init__(self, _native, selected, _store, _config, _identity) -> None:
+        def __init__(
+            self, _native, selected, _store, _config, _identity, *, source_role
+        ) -> None:
+            assert source_role == "champion"
             self.selected = selected
 
         def run(self, **_kwargs):

@@ -479,7 +479,10 @@ def test_actor_streams_early_counts_and_continues_quota_with_new_model_and_gener
     tasks = []
 
     class SelfPlay:
-        def __init__(self, _native, evaluator, _store, config, identity):
+        def __init__(
+            self, _native, evaluator, _store, config, identity, *, source_role
+        ):
+            assert source_role == "candidate"
             self.evaluator = evaluator
             self.config = config
             self.identity = identity
@@ -639,7 +642,10 @@ def test_noncoordinated_rolling_actor_receives_max_pin_refill_gate(
     monkeypatch.setattr(actors.time, "monotonic", lambda: clock["now"])
 
     class SelfPlay:
-        def __init__(self, _native, evaluator, _store, _config, _identity):
+        def __init__(
+            self, _native, evaluator, _store, _config, _identity, *, source_role
+        ):
+            assert source_role == "candidate"
             self.evaluator = evaluator
 
         def run(self, *, stop_refill_requested, **_kwargs):
