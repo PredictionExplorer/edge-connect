@@ -5,7 +5,7 @@ import json
 import os
 import sqlite3
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable
 
@@ -297,6 +297,259 @@ def test_dry_run_does_not_write(tmp_path: Path) -> None:
     assert not (fixture.root / fixture.target_name).exists()
     assert not (fixture.root / "continuous-migrations.jsonl").exists()
     assert not (fixture.root / "migration-backups").exists()
+
+
+def _source_only_request(fixture: _Fixture) -> migration.MigrationRequest:
+    # The general migration fixture deliberately starts with an obsolete
+    # promotion policy. A source-only fixture must already satisfy today's
+    # unchanged validation contract on both sides of the runtime upgrade.
+    raw = yaml.safe_load(fixture.old_profile.read_text())
+    raw["orchestration"]["promotion"]["finish_inflight_candidate"] = True
+    raw["arena"]["continuation_pairs_per_ring"] = 25
+    fixture.old_profile.chmod(0o644)
+    fixture.old_profile.write_text(yaml.safe_dump(raw, sort_keys=False))
+    fixture.old_profile.chmod(0o444)
+    digest = hashlib.sha256(fixture.old_profile.read_bytes()).hexdigest()
+    (fixture.root / "profile.sha256").write_text(f"{digest}  {fixture.old_profile}\n")
+    fixture.candidate_profile.chmod(0o644)
+    fixture.candidate_profile.write_bytes(fixture.old_profile.read_bytes())
+    return replace(fixture.request, reason="upgrade-runtime-with-unchanged-profile")
+
+
+def test_source_only_dry_run_requires_no_configuration_change_or_writes(tmp_path):
+    fixture = _fixture(tmp_path)
+    request = _source_only_request(fixture)
+    before = _snapshot(fixture.root)
+    result = migration.migrate_continuous_profile(request)
+    assert result["kind"] == "source-only"
+    assert result["changes"] == []
+    assert result["source"]["config_sha256"] == result["target"]["config_sha256"]
+    assert result["source"]["source_commit"] == "a" * 40
+    assert result["target"]["source_commit"] == "b" * 40
+    assert _snapshot(fixture.root) == before
+
+
+def test_source_only_apply_preserves_durable_training_and_utd_state(tmp_path):
+    fixture = _fixture(tmp_path)
+    _with_update_to_data(
+        fixture,
+        old_target=1.0,
+        new_target=1.0,
+        old_intervals=(2_000_000, 1_000_000),
+        new_intervals=(2_000_000, 1_000_000),
+        segment={
+            "schema_version": 1,
+            "run_id": "continuous-test-run",
+            "generation_family": "family-continuous-test",
+            "target_updates_per_new_sample": 1.0,
+            "baseline_examples_consumed": 1024,
+            "baseline_committed_replay_samples": 2048,
+        },
+    )
+    request = _source_only_request(fixture)
+    before = _snapshot(fixture.root)
+    result = migration.migrate_continuous_profile(request, apply=True)
+    target = fixture.root / fixture.target_name
+    assert target.read_bytes() == fixture.old_profile.read_bytes()
+    assert target.stat().st_mode & 0o222 == 0
+    assert (fixture.root / "source-commit.txt").read_text() == f"{'b' * 40}\n"
+    assert result["utd_segment"] is None
+    for path, contents in before.items():
+        if path.startswith(("learner/", "status/", "replay/")) or path == "run.json":
+            assert _snapshot(fixture.root)[path] == contents
+    record = json.loads((fixture.root / "continuous-migrations.jsonl").read_text())
+    assert record["kind"] == "source-only"
+    assert record["changes"] == []
+    assert record["from_config_sha256"] == record["to_config_sha256"]
+    assert record["learner_step"] == result["boundary"]["learner_step"]
+    backup = Path(result["backup_bundle"])
+    assert (
+        backup / "source-commit.txt"
+    ).read_bytes() == fixture.old_source_commit_bytes
+    assert (backup / "learner/utd-segment.json").read_bytes() == before[
+        "learner/utd-segment.json"
+    ][0]
+
+
+@pytest.mark.parametrize(
+    "updates,message",
+    [
+        ({"to_source_commit": None}, "explicit --to-source-commit"),
+        ({"to_source_commit": "a" * 40}, "different target source commit"),
+        ({"to_source_commit": "a" * 7}, "different target source commit"),
+        ({"to_source_commit": "not-a-commit"}, "to_source_commit"),
+        ({"from_source_commit": "c" * 40}, "current source authority"),
+    ],
+)
+def test_source_only_rejects_missing_same_or_mismatched_source(
+    tmp_path, updates, message
+):
+    fixture = _fixture(tmp_path)
+    request = replace(_source_only_request(fixture), **updates)
+    before = _snapshot(fixture.root)
+    with pytest.raises(migration.MigrationError, match=message):
+        migration.migrate_continuous_profile(request, apply=True)
+    assert _snapshot(fixture.root) == before
+
+
+def test_source_only_requires_recorded_current_authority(tmp_path):
+    fixture = _fixture(tmp_path)
+    request = _source_only_request(fixture)
+    (fixture.root / "source-commit.txt").unlink()
+    with pytest.raises(migration.MigrationError, match="current source authority"):
+        migration.plan_migration(request)
+
+
+def test_source_only_preserves_lock_and_apply_fingerprint_checks(tmp_path):
+    fixture = _fixture(tmp_path)
+    request = _source_only_request(fixture)
+    lock = fixture.root / "coordinator.lock"
+    _write_json(lock, {"pid": os.getpid(), "created_ns": 30})
+    with pytest.raises(migration.MigrationError, match="live"):
+        migration.plan_migration(request)
+    lock.unlink()
+    plan = migration.plan_migration(request)
+    (fixture.root / "source-commit.txt").write_text(f"{'c' * 40}\n")
+    before = _snapshot(fixture.root)
+    with pytest.raises(migration.MigrationError, match="validated input changed"):
+        migration.apply_migration(plan)
+    assert _snapshot(fixture.root) == before
+
+
+def test_source_only_records_chain_into_another_source_and_profile_change(tmp_path):
+    fixture = _fixture(tmp_path)
+    first = migration.plan_migration(_source_only_request(fixture))
+    migration.apply_migration(first)
+    second = migration.plan_migration(
+        replace(
+            fixture.request,
+            old_profile=first.target_profile,
+            target_profile_name="profile-source-v3.yaml",
+            from_source_commit="b" * 40,
+            to_source_commit="c" * 40,
+        )
+    )
+    migration.apply_migration(second)
+    raw = yaml.safe_load(fixture.candidate_profile.read_text())
+    raw["learner"]["candidate_interval"] += 1000
+    fixture.candidate_profile.write_text(yaml.safe_dump(raw))
+    third = migration.plan_migration(
+        replace(
+            fixture.request,
+            old_profile=second.target_profile,
+            target_profile_name="profile-source-v4.yaml",
+            from_source_commit="c" * 40,
+            to_source_commit="d" * 40,
+        )
+    )
+    migration.apply_migration(third)
+    records = [
+        json.loads(line)
+        for line in (fixture.root / "continuous-migrations.jsonl")
+        .read_text()
+        .splitlines()
+    ]
+    assert [record["kind"] for record in records] == [
+        "source-only",
+        "source-only",
+        "profile",
+    ]
+    for previous, current in zip(records, records[1:]):
+        assert current["from_source_commit"] == previous["to_source_commit"]
+        assert current["from_config_sha256"] == previous["to_config_sha256"]
+    assert third.source_config_sha256 != third.target_config_sha256
+
+
+def test_source_only_run_passes_startup_preflight_and_disaster_snapshot(tmp_path):
+    from scripts.preflight_run_state import run_state_preflight
+    from scripts.training_disaster_recovery import create_snapshot, verify_snapshot
+    from startrain.config_compatibility import compatible_config_epoch_payloads
+    from test_run_state_preflight import _fixture as populated_run
+
+    state = populated_run(tmp_path)
+    raw = yaml.safe_load(
+        (Path(__file__).parents[1] / "configs/h100-8gpu-throughput.yaml").read_text()
+    )
+    for section in ("game", "model", "loss", "optimizer"):
+        raw[section] = state.experiment.as_dict()[section]
+    raw["orchestration"]["run_id"] = state.identity.run_id
+    raw["orchestration"]["directories"]["root"] = str(state.root)
+    raw["orchestration"]["autonomous"] = {"enabled": False}
+    old = state.root / "profile-source-before.yaml"
+    old.write_text(yaml.safe_dump(raw, sort_keys=False))
+    old.chmod(0o444)
+    digest = hashlib.sha256(old.read_bytes()).hexdigest()
+    (state.root / "profile.sha256").write_text(f"{digest}  {old}\n")
+    (state.root / "source-commit.txt").write_text(f"{'a' * 40}\n")
+    _write_json(
+        state.root / "status/learner.heartbeat.json",
+        {
+            "schema_version": 1,
+            "worker": "learner",
+            "pid": 999_999_999,
+            "heartbeat_ns": 20,
+            "phase": "stopped",
+            "step": 10,
+            "examples_consumed": 100,
+        },
+    )
+    run_state_preflight(state.root, old, apply=True)
+    staged = tmp_path / "profile-source-staged.yaml"
+    staged.write_bytes(old.read_bytes())
+    request = migration.MigrationRequest(
+        old_profile=old,
+        new_profile=staged,
+        target_profile_name="profile-source-after.yaml",
+        reason="source-only-startup-and-snapshot-test",
+        from_source_commit="a" * 40,
+        to_source_commit="b" * 40,
+    )
+    migration.migrate_continuous_profile(request, apply=True)
+    target = state.root / request.target_profile_name
+    report = run_state_preflight(state.root, target)
+    assert report["status"] == "ok"
+    assert report["migrations"] == []
+    config = load_config(target)
+    assert config.as_dict() in list(compatible_config_epoch_payloads(config.as_dict()))
+    snapshot = create_snapshot(
+        state.root,
+        target,
+        tmp_path / "snapshot-backup",
+        enforce_separate_filesystem=False,
+    )
+    assert verify_snapshot(snapshot)["status"] == "ok"
+    payload = json.loads(snapshot.read_text())
+    assert "continuous-migrations.jsonl" in payload["catalog"]
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("kind", "profile"),
+        ("to_source_commit", "a" * 40),
+        ("to_config_sha256", "d" * 64),
+    ],
+)
+def test_source_only_chain_rejects_forged_noop_or_configuration_change(
+    tmp_path, field, value
+):
+    fixture = _fixture(tmp_path)
+    plan = migration.plan_migration(_source_only_request(fixture))
+    migration.apply_migration(plan)
+    path = fixture.root / "continuous-migrations.jsonl"
+    record = json.loads(path.read_text())
+    record[field] = value
+    _write_json(path, record)
+    with pytest.raises(migration.MigrationError, match="migration.*invalid"):
+        migration.plan_migration(
+            replace(
+                fixture.request,
+                old_profile=plan.target_profile,
+                target_profile_name="profile-forged-v3.yaml",
+                from_source_commit="b" * 40,
+                to_source_commit="c" * 40,
+            )
+        )
 
 
 def test_apply_writes_immutable_profile_record_and_complete_backup(

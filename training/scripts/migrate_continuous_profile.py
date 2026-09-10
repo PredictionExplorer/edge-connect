@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Safely migrate a stopped, non-autonomous continuous run profile."""
+"""Safely migrate a stopped continuous run's profile or explicit source revision."""
 
 from __future__ import annotations
 
@@ -276,6 +276,7 @@ class MigrationPlan:
         return {
             "status": "ok",
             "mode": mode,
+            "kind": self.migration_record.get("kind", "profile"),
             "run_id": self.migration_record["run_id"],
             "generation_family": self.migration_record["generation_family"],
             "coordinator_lock": self.coordinator_lock_status,
@@ -627,8 +628,6 @@ def _validate_profile_pair(
         raise MigrationError(
             "profile changes immutable or unsupported fields: " + ", ".join(disallowed)
         )
-    if not differences:
-        raise MigrationError("new profile has no semantic changes")
     return tuple(
         (".".join(path), _json_value(before), _json_value(after))
         for path, before, after in differences
@@ -856,6 +855,12 @@ def _validate_change_list(value: object) -> None:
         seen.add(path)
 
 
+def _distinct_source_commits(before: str, after: str) -> bool:
+    # Existing provenance accepts abbreviated Git IDs. A prefix expansion of
+    # the same ID must not masquerade as a source-only runtime change.
+    return not (before.startswith(after) or after.startswith(before))
+
+
 def _read_migration_chain(
     path: Path,
     *,
@@ -928,7 +933,20 @@ def _read_migration_chain(
         reason = record.get("reason")
         if not isinstance(reason, str) or not reason.strip() or "\n" in reason:
             raise MigrationError("continuous migration reason is invalid")
-        _validate_change_list(record.get("changes"))
+        kind = record.get("kind", "profile")
+        if kind == "source-only":
+            if (
+                record.get("changes") != []
+                or record["from_config_sha256"] != record["to_config_sha256"]
+                or not _distinct_source_commits(
+                    record["from_source_commit"], record["to_source_commit"]
+                )
+            ):
+                raise MigrationError("continuous source-only migration is invalid")
+        elif kind == "profile":
+            _validate_change_list(record.get("changes"))
+        else:
+            raise MigrationError("continuous migration kind is invalid")
         if records:
             previous = records[-1]
             boundary_regressed = (
@@ -1437,6 +1455,12 @@ def plan_migration(request: MigrationRequest) -> MigrationPlan:
         )
 
     changes = _validate_profile_pair(old_config, new_config, run_root=run_root)
+    source_only = not changes
+    if source_only and request.to_source_commit is None:
+        raise MigrationError(
+            "new profile has no semantic changes; a source-only upgrade requires "
+            "explicit --to-source-commit"
+        )
     lock_status, lock_data, _ = _coordinator_lock_status(run_root)
 
     old_profile_bytes = _read_bytes(old_profile, "old profile")
@@ -1451,7 +1475,7 @@ def plan_migration(request: MigrationRequest) -> MigrationPlan:
     materialized_source_config_sha256 = canonical_config_sha256(old_config)
     compatible_source_config_sha256s = _compatible_source_config_sha256s(old_config)
     target_config_sha256 = canonical_config_sha256(new_config)
-    if materialized_source_config_sha256 == target_config_sha256:
+    if changes and materialized_source_config_sha256 == target_config_sha256:
         raise MigrationError("target canonical hash does not change the profile")
 
     run_path = run_root / "run.json"
@@ -1482,6 +1506,19 @@ def plan_migration(request: MigrationRequest) -> MigrationPlan:
     from_source_commit, to_source_commit, source_commit_data = _resolve_source_commits(
         request, run_root=run_root, chain=chain
     )
+    if source_only:
+        if not chain and source_commit_data is None:
+            raise MigrationError(
+                "source-only upgrade requires current source authority in "
+                "source-commit.txt or the migration chain"
+            )
+        if not _distinct_source_commits(from_source_commit, to_source_commit):
+            raise MigrationError(
+                "source-only upgrade requires a different target source commit"
+            )
+        # Preserve the existing configuration epoch, including compatible
+        # hashes from releases predating additive default fields.
+        target_config_sha256 = source_config_sha256
 
     heartbeat_payload, _ = _read_json(heartbeat_path, "learner heartbeat")
     recovery_payload, recovery_data = _read_json(recovery_path, "learner recovery")
@@ -1610,6 +1647,7 @@ def plan_migration(request: MigrationRequest) -> MigrationPlan:
     ]
     migration_record: dict[str, object] = {
         "schema_version": MIGRATION_SCHEMA_VERSION,
+        "kind": "source-only" if source_only else "profile",
         "timestamp_ns": timestamp_ns,
         "run_id": run_id,
         "generation_family": generation_family,
