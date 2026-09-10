@@ -978,7 +978,7 @@
     "payload_files_opened": 0
   },
   "final_health": {
-    "checked_ns": 1789057450710556943,
+    "checked_ns": 1789057928221561864,
     "source_commit": "e8e877cd7292dd44558e280c8117e6242820c2ce",
     "release": "/home/ubuntu/edgeconnect-releases/variant-training-followup-e8e877c",
     "profile": "/home/ubuntu/edgeconnect-runs/variant-network/profile-training-optimized-20260910.yaml",
@@ -1001,14 +1001,14 @@
     ],
     "profile_sha256": "1db1a8b29a177e9b92a455d1468247e88e5fcfc5e74ce0aef1d9867a09265d62",
     "stop_checkpoint_step": 171673,
-    "learner_step": 171674,
+    "learner_step": 171676,
     "resumed_from": "recovery:/home/ubuntu/edgeconnect-runs/variant-network/learner/recovery/sha256-405dbeb16e7aa3a93fe0c08d81f0ef43d5c0634dc3a6b815b77e31ead3a7cdd8.pt",
     "workers": {
       "actor-cpu-ring4": {
         "state": "running",
         "pid": 1839906,
-        "phase": "selfplay_cohort",
-        "progress": 17,
+        "phase": "selfplay",
+        "progress": 45,
         "restart_count": 0,
         "inference": null
       },
@@ -1016,10 +1016,10 @@
         "state": "running",
         "pid": 1839899,
         "phase": "shared_cohorts",
-        "progress": 6,
+        "progress": 10,
         "restart_count": 0,
         "inference": {
-          "completed_requests": 32346,
+          "completed_requests": 66767,
           "failed_requests": 0,
           "worker_failures": 0
         }
@@ -1028,10 +1028,10 @@
         "state": "running",
         "pid": 1839900,
         "phase": "shared_cohorts",
-        "progress": 7,
+        "progress": 11,
         "restart_count": 0,
         "inference": {
-          "completed_requests": 32357,
+          "completed_requests": 68173,
           "failed_requests": 0,
           "worker_failures": 0
         }
@@ -1040,10 +1040,10 @@
         "state": "running",
         "pid": 1839901,
         "phase": "shared_cohorts",
-        "progress": 7,
+        "progress": 11,
         "restart_count": 0,
         "inference": {
-          "completed_requests": 31511,
+          "completed_requests": 67627,
           "failed_requests": 0,
           "worker_failures": 0
         }
@@ -1052,10 +1052,10 @@
         "state": "running",
         "pid": 1839902,
         "phase": "shared_cohorts",
-        "progress": 8,
+        "progress": 10,
         "restart_count": 0,
         "inference": {
-          "completed_requests": 31321,
+          "completed_requests": 66211,
           "failed_requests": 0,
           "worker_failures": 0
         }
@@ -1064,10 +1064,10 @@
         "state": "running",
         "pid": 1839903,
         "phase": "shared_cohorts",
-        "progress": 7,
+        "progress": 11,
         "restart_count": 0,
         "inference": {
-          "completed_requests": 33398,
+          "completed_requests": 71029,
           "failed_requests": 0,
           "worker_failures": 0
         }
@@ -1076,10 +1076,10 @@
         "state": "running",
         "pid": 1839904,
         "phase": "shared_cohorts",
-        "progress": 7,
+        "progress": 11,
         "restart_count": 0,
         "inference": {
-          "completed_requests": 30469,
+          "completed_requests": 65776,
           "failed_requests": 0,
           "worker_failures": 0
         }
@@ -1088,10 +1088,10 @@
         "state": "running",
         "pid": 1839905,
         "phase": "shared_cohorts",
-        "progress": 8,
+        "progress": 12,
         "restart_count": 0,
         "inference": {
-          "completed_requests": 9958,
+          "completed_requests": 22456,
           "failed_requests": 0,
           "worker_failures": 0
         }
@@ -1100,7 +1100,7 @@
         "state": "running",
         "pid": 1839907,
         "phase": "arena_inter_wave_cooldown",
-        "progress": 37,
+        "progress": 72,
         "restart_count": 0,
         "inference": null
       },
@@ -1108,7 +1108,7 @@
         "state": "running",
         "pid": 1839898,
         "phase": "update_to_data_wait",
-        "progress": 172,
+        "progress": 367,
         "restart_count": 0,
         "inference": null
       }
@@ -1223,5 +1223,51 @@
         "new_padding_percent": 11.929868571494442
       }
     }
-  }
+  },
+  "freshness_events": [
+    {
+      "timestamp_ns": 1789057461160636289,
+      "event": "replay_window_refreshed",
+      "step": 171674,
+      "epoch": 505,
+      "window_batches_consumed": 1,
+      "window_batches_remaining": 999,
+      "freshness_new_committed_rows": 549,
+      "freshness_additional_selected_rows": 549,
+      "replay_max_shard_id": null
+    },
+    {
+      "timestamp_ns": 1789057463746880829,
+      "event": "replay_window_allocated",
+      "step": 171674,
+      "epoch": 506,
+      "window_batches_consumed": 0,
+      "window_batches_remaining": null,
+      "freshness_new_committed_rows": null,
+      "freshness_additional_selected_rows": null,
+      "replay_max_shard_id": 57646
+    },
+    {
+      "timestamp_ns": 1789057924041475517,
+      "event": "replay_window_refreshed",
+      "step": 171676,
+      "epoch": 506,
+      "window_batches_consumed": 2,
+      "window_batches_remaining": 997,
+      "freshness_new_committed_rows": 585,
+      "freshness_additional_selected_rows": 585,
+      "replay_max_shard_id": null
+    },
+    {
+      "timestamp_ns": 1789057926643525329,
+      "event": "replay_window_allocated",
+      "step": 171676,
+      "epoch": 507,
+      "window_batches_consumed": 0,
+      "window_batches_remaining": null,
+      "freshness_new_committed_rows": null,
+      "freshness_additional_selected_rows": null,
+      "replay_max_shard_id": 57661
+    }
+  ]
 }
