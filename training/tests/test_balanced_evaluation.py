@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import replace
 from pathlib import Path
@@ -23,6 +24,7 @@ from startrain.balanced_evaluation import (
     summarize_balanced_pairs,
 )
 from startrain.config import ArenaConfig, load_config
+from startrain.contracts import SEARCH_ALGORITHM_ID
 from startrain.promotion import PromotionSupervisor
 
 
@@ -209,11 +211,23 @@ def test_largest_board_still_vetoes_a_proven_regression_in_one_of_six_modes() ->
     assert result["promotion"]["cell_vetoes"] == ["r10/classic-handicap"]
 
 
-def test_subset_contracts_are_distinct_and_legacy_contract_hash_is_unchanged() -> None:
+def test_subset_contracts_isolate_the_corrected_search_from_legacy_evidence() -> None:
     legacy = ArenaConfig(balanced_cells=True)
-    assert evaluation_contract(legacy)["identity"] == (
+    corrected = evaluation_contract(legacy)
+    legacy_identity = (
         "sha256-b7814ca5e96b14ce9392d26791870a2dd4aeed83bea6230a0ed68ebbe0848a20"
     )
+    assert corrected["search_algorithm"] == SEARCH_ALGORITHM_ID
+    assert corrected["identity"] != legacy_identity
+    # The algorithm marker alone retires the old evidence namespace. Rules,
+    # statistical tests and search budgets retain their previous contract.
+    old_payload = {
+        key: value
+        for key, value in corrected.items()
+        if key not in ("identity", "search_algorithm")
+    }
+    encoded = json.dumps(old_payload, sort_keys=True, separators=(",", ":")).encode()
+    assert "sha256-" + hashlib.sha256(encoded).hexdigest() == legacy_identity
     contracts = [
         evaluation_contract(replace(legacy, rings=rings))
         for rings in ((4,), (10,), (6, 10), (4, 6, 8, 10))

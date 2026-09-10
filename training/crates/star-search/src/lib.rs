@@ -7,12 +7,16 @@
 //! special case. Exact semantic keys turn the tree into a DAG and reuse
 //! `{a,b}` / `{b,a}` completed-turn states. The pie swap is never a search
 //! edge: the empty-board root of a pie game reports each opening's value as
-//! `-|q|`, and the game driver takes the swap from the responder's root value.
+//! `-|q|`, and the game driver takes the swap from the responder's selected
+//! keep-continuation value.
 
 mod batch;
 mod evaluation;
 mod gumbel;
 mod tree;
+
+/// Search behavior fingerprint, independent of the game and model schemas.
+pub const SEARCH_ALGORITHM_ID: &str = "gumbel-completed-q-v2-finite-noise-selected-keep";
 
 pub use batch::{
     RootSearchConfig, SearchNonce, SearchResult, SearchRunError, gumbel_search_batch,

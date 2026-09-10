@@ -20,6 +20,12 @@ mod bindings {
     };
     use wasm_bindgen::prelude::*;
 
+    /// Search behavior fingerprint, independent of game and model schemas.
+    #[wasm_bindgen]
+    pub fn search_algorithm_id() -> String {
+        star_search::SEARCH_ALGORITHM_ID.to_owned()
+    }
+
     /// Browser-owned *Star state for any rule variant.
     #[wasm_bindgen]
     pub struct WasmState {
@@ -396,8 +402,8 @@ mod bindings {
         }
 
         /// Visit-weighted root value for the player to move, once any
-        /// simulation has completed. The pie swap is recommended for the
-        /// responder exactly when this value is negative.
+        /// simulation has completed. This includes exploration; use the
+        /// selected edge's `completed_q` for the responder's pie-swap decision.
         pub fn root_value(&self) -> Option<f32> {
             self.inner.root_value()
         }
@@ -475,4 +481,4 @@ mod bindings {
 }
 
 #[cfg(target_arch = "wasm32")]
-pub use bindings::{WasmGumbel, WasmSearchTree, WasmState};
+pub use bindings::{WasmGumbel, WasmSearchTree, WasmState, search_algorithm_id};

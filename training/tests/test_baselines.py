@@ -234,6 +234,7 @@ class ArenaSearchBatch:
             terminal=[False],
             selected_actions=[self.selected],
             root_values=[0.0],
+            selected_action_values=[0.0],
         )
 
 

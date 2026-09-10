@@ -173,7 +173,12 @@ def create_app(
         startup = getattr(analysis_service, "startup", None)
         if callable(startup):
             await asyncio.to_thread(startup)
-        yield
+        try:
+            yield
+        finally:
+            shutdown = getattr(analysis_service, "shutdown", None)
+            if callable(shutdown):
+                await asyncio.to_thread(shutdown)
 
     app = FastAPI(
         title="Double *Star model service",

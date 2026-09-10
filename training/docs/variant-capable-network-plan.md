@@ -59,7 +59,7 @@ Implementation summary:
   conditioning, `rings` forward input, ONNX export), `ModelConfig.legacy`.
 - Phase 2 — pie root transform `-|q|` and `root_value`, per-root simulation budgets,
   `VariantMixtureConfig` (Stage B: standard 1/6, classic 1/6, handicap 1/3, pie 1/3),
-  handicap↔pda pairing, swap decision by root value, replay schema v5 with variant
+  handicap↔pda pairing, swap decision by selected keep value, replay schema v5 with variant
   provenance and teacher targets, segment-stratified replay windows
   (`learner.segment_quotas`), arena mixture segments with veto-on-regress floors
   (result schema v4), monitor/migrator/validator support.
@@ -494,7 +494,7 @@ exactly where rule context belongs. Changes in priority order:
 - Browser distillation exports (`distill.py`, `publish.py`) carry the new input
   layout; `src/lib/star/ai/features.ts` mirrors feature v4.
 - The swap decision is exposed as a server-side recommendation
-  (`swap_recommended` with the root value) so clients never need a swap logit.
+  (`swap_recommended` from selected keep Q, with root-value diagnostics) so clients never need a swap logit.
 
 ## 10. Lineage transfer: distillation warm start instead of scratch (Phase 3)
 

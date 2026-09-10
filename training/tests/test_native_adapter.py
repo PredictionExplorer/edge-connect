@@ -4,7 +4,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from startrain.contracts import FEATURE_SCHEMA_HASH, RULES_HASH
+from startrain.contracts import FEATURE_SCHEMA_HASH, RULES_HASH, SEARCH_ALGORITHM_ID
 from startrain.features import DoubleStarPosition, encode_batch
 from startrain.native import (
     BITBOARD_WORDS,
@@ -206,6 +206,7 @@ def test_native_module_requires_finalized_rules_hash() -> None:
     validate_native_module(
         SimpleNamespace(
             native_rules_hash=lambda: RULES_HASH,
+            native_search_algorithm_id=lambda: SEARCH_ALGORITHM_ID,
             StateBatch=CompatibleStateBatch,
         )
     )
@@ -213,6 +214,7 @@ def test_native_module_requires_finalized_rules_hash() -> None:
         SimpleNamespace(
             native_rules_hash=lambda: RULES_HASH,
             native_feature_schema_hash=lambda: FEATURE_SCHEMA_HASH,
+            native_search_algorithm_id=lambda: SEARCH_ALGORITHM_ID,
             StateBatch=CompatibleStateBatch,
         )
     )
@@ -230,3 +232,12 @@ def test_native_module_requires_finalized_rules_hash() -> None:
         validate_native_module(SimpleNamespace(native_rules_hash=lambda: RULES_HASH))
     with pytest.raises(NativeCompatibilityError, match="lacks"):
         validate_native_module(SimpleNamespace())
+    for search_algorithm in (None, lambda: "previous-search"):
+        with pytest.raises(NativeCompatibilityError, match="search algorithm"):
+            validate_native_module(
+                SimpleNamespace(
+                    native_rules_hash=lambda: RULES_HASH,
+                    StateBatch=CompatibleStateBatch,
+                    native_search_algorithm_id=search_algorithm,
+                )
+            )

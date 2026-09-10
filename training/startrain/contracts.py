@@ -12,6 +12,10 @@ RULES_HASH_HEX = "a5d932b0ef8354e8"
 RULES_HASH_WIRE = f"{RULES_HASH_ALGORITHM}:{RULES_HASH_HEX}"
 RULES_HASH = 0xA5D932B0EF8354E8
 
+# Search behavior changes independently of model inputs and game rules. Arena
+# evidence and resumed games must never span incompatible search algorithms.
+SEARCH_ALGORITHM_ID = "gumbel-completed-q-v2-finite-noise-selected-keep"
+
 # The previous lineage's contract. Only the lineage-transfer tool and the
 # cross-schema arena may accept artifacts carrying these identifiers.
 LEGACY_RULES_SCHEMA_ID = "edgeconnect.star.rules.v2"

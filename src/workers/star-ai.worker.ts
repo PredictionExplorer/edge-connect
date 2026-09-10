@@ -120,9 +120,27 @@ interface WasmGumbelConstructor {
 
 interface StarWasmModule {
   default(input?: string | URL | BufferSource): Promise<unknown>;
+  search_algorithm_id(): string;
   WasmState: WasmStateConstructor;
   WasmSearchTree: WasmSearchTreeConstructor;
   WasmGumbel: WasmGumbelConstructor;
+}
+
+export const STAR_LOCAL_SEARCH_ALGORITHM_ID =
+  'gumbel-completed-q-v2-finite-noise-selected-keep';
+
+export function hasExpectedWasmSearch(wasm: Partial<StarWasmModule>): boolean {
+  try {
+    return typeof wasm.search_algorithm_id === 'function' &&
+      wasm.search_algorithm_id() === STAR_LOCAL_SEARCH_ALGORITHM_ID;
+  } catch {
+    // A new JS wrapper paired with an old binary can lack the exported function.
+    return false;
+  }
+}
+
+export function versionedWasmUrl(url: string): string {
+  return `${url}?search=${encodeURIComponent(STAR_LOCAL_SEARCH_ALGORITHM_ID)}`;
 }
 
 interface LocalRuntime {
@@ -130,6 +148,7 @@ interface LocalRuntime {
   ort: typeof Ort;
   session: Ort.InferenceSession;
   wasm: StarWasmModule;
+  predictions: PredictionCache;
 }
 
 interface Evaluation {
@@ -137,6 +156,41 @@ interface Evaluation {
   outcome: StarAiOutcomeBelief;
   expectedMargin: number;
   logits: Float32Array;
+}
+
+function cloneEvaluation(evaluation: Evaluation): Evaluation {
+  return {
+    ...evaluation,
+    outcome: { ...evaluation.outcome },
+    logits: evaluation.logits.slice(),
+  };
+}
+
+/** Retains decoded predictions only; every search still starts with fresh statistics. */
+export class PredictionCache {
+  private readonly entries = new Map<string, Evaluation>();
+
+  constructor(private readonly capacity = 1_024) {
+    if (!Number.isInteger(capacity) || capacity <= 0) {
+      throw new Error('Prediction cache capacity must be a positive integer.');
+    }
+  }
+
+  get(key: string): Evaluation | undefined {
+    const evaluation = this.entries.get(key);
+    if (!evaluation) return undefined;
+    this.entries.delete(key);
+    this.entries.set(key, evaluation);
+    return cloneEvaluation(evaluation);
+  }
+
+  set(key: string, evaluation: Evaluation): void {
+    this.entries.delete(key);
+    this.entries.set(key, cloneEvaluation(evaluation));
+    if (this.entries.size > this.capacity) {
+      this.entries.delete(this.entries.keys().next().value!);
+    }
+  }
 }
 
 interface LocalSearchResult {
@@ -237,10 +291,10 @@ async function importWasm(
     wasmModule = (await import(
       /* webpackIgnore: true */
       /* turbopackIgnore: true */
-      manifest.wasm.moduleUrl
+      versionedWasmUrl(manifest.wasm.moduleUrl)
     )) as unknown as StarWasmModule;
     const binary = await fetchBytes(
-      manifest.wasm.binaryUrl,
+      versionedWasmUrl(manifest.wasm.binaryUrl),
       'Local AI WASM binary',
       signal,
     );
@@ -262,6 +316,12 @@ async function importWasm(
     wasmModule.WasmState.max_handicap() !== STAR_MAX_HANDICAP
   ) {
     throw new StarAiError('unavailable', 'Local AI WASM rules are incompatible.');
+  }
+  if (!hasExpectedWasmSearch(wasmModule)) {
+    throw new StarAiError(
+      'unavailable',
+      'Local AI WASM search is incompatible. Rebuild and publish the current WASM package.',
+    );
   }
   return wasmModule;
 }
@@ -374,7 +434,7 @@ async function loadRuntime(signal: AbortSignal): Promise<LocalRuntime> {
     await session.release();
     throw new StarAiError('unavailable', 'Local AI ONNX schema is incompatible.');
   }
-  return { manifest, ort, session, wasm };
+  return { manifest, ort, session, wasm, predictions: new PredictionCache() };
 }
 
 function getRuntime(signal: AbortSignal): Promise<LocalRuntime> {
@@ -604,19 +664,49 @@ export function expectedScoreMargin(logits: Float32Array): number {
   );
 }
 
-async function evaluate(
+export async function evaluate(
   runtime: LocalRuntime,
   semantic: StarAiSemanticState,
   legalActions: Int32Array,
 ): Promise<Evaluation> {
-  const outputs = await runtime.session.run(tensorFeeds(runtime, semantic));
+  // Include complete feature history and legal-action order, rather than a board hash.
+  // Browser inference always encodes a playout-doubling advantage of zero.
+  const key = JSON.stringify([
+    runtime.manifest.model.sha256,
+    runtime.manifest.featureSchemaHash,
+    semantic,
+    Array.from(legalActions),
+    0,
+  ]);
+  const cached = runtime.predictions.get(key);
+  if (cached) return cached;
+
+  const feeds = tensorFeeds(runtime, semantic);
+  let outputs: Ort.InferenceSession.OnnxValueMapType | undefined;
+  try {
+    outputs = await runtime.session.run(feeds);
+    const evaluation = decodeEvaluation(outputs, semantic.stones.length, legalActions);
+    runtime.predictions.set(key, evaluation);
+    return evaluation;
+  } finally {
+    for (const tensor of Object.values(feeds)) tensor.dispose();
+    if (outputs) {
+      for (const tensor of Object.values(outputs)) tensor.dispose();
+    }
+  }
+}
+
+function decodeEvaluation(
+  outputs: Ort.InferenceSession.OnnxValueMapType,
+  nodeCount: number,
+  legalActions: Int32Array,
+): Evaluation {
   const densePolicy = finiteFloatData(outputs.policy_logits, 'policy_logits');
   const outcomeLogits = finiteFloatData(outputs.outcome_logits, 'outcome_logits');
   const scoreMarginLogits = finiteFloatData(
     outputs.score_margin_logits,
     'score_margin_logits',
   );
-  const nodeCount = semantic.stones.length;
   if (densePolicy.length !== nodeCount) {
     throw new StarAiError('protocol', 'ONNX policy output has the wrong action layout.');
   }
@@ -646,6 +736,42 @@ async function yieldToCancellation(taskId: string): Promise<void> {
 
 function nowMs(): number {
   return typeof performance !== 'undefined' ? performance.now() : Date.now();
+}
+
+export function summarizeSearch(
+  tree: WasmSearchTree,
+  scheduler: WasmGumbel,
+  fallbackRootValue: number,
+  swapAvailable: boolean,
+  swapDeadZone: number,
+) {
+  const rootQ = Array.from(tree.completed_q());
+  const rootVisits = Array.from(tree.visits());
+  const selected = scheduler.selected(Float32Array.from(rootQ), Uint32Array.from(rootVisits));
+  const actions = tree.actions();
+  if (selected < 0 || selected >= actions.length) {
+    throw new StarAiError('protocol', 'WASM search selected an invalid edge.');
+  }
+  const rawRootValue = tree.root_value();
+  const rootValue = Math.max(
+    -1,
+    Math.min(1, rawRootValue === undefined ? fallbackRootValue : rawRootValue),
+  );
+  const selectedActionValue = rootQ[selected];
+  if (!Number.isFinite(rootValue) || !Number.isFinite(selectedActionValue)) {
+    throw new StarAiError('protocol', 'WASM search value is not finite.');
+  }
+  return {
+    actionCode: actions[selected],
+    // Compare the selected keep continuation with swapping. The exploration
+    // average can be negative even when search found a winning keep action.
+    swapRecommended: swapAvailable && selectedActionValue < -swapDeadZone,
+    rootValue,
+    rootActions: Array.from(actions),
+    rootPolicy: Array.from(tree.policy_target()),
+    rootQ,
+    rootVisits,
+  };
 }
 
 async function chooseAction(
@@ -734,38 +860,18 @@ async function chooseAction(
     if (simulations !== search.simulations) {
       throw new StarAiError('protocol', 'WASM search did not consume its exact budget.');
     }
-    const rootQ = Array.from(tree.completed_q());
-    const rootVisits = Array.from(tree.visits());
-    const selected = scheduler.selected(Float32Array.from(rootQ), Uint32Array.from(rootVisits));
-    const actions = tree.actions();
-    if (selected < 0 || selected >= actions.length) {
-      throw new StarAiError('protocol', 'WASM search selected an invalid edge.');
-    }
-    const rawRootValue = tree.root_value();
-    const rootValue = Math.max(
-      -1,
-      Math.min(1, rawRootValue === undefined ? rootEvaluation.value : rawRootValue),
-    );
-    if (!Number.isFinite(rootValue)) {
-      throw new StarAiError('protocol', 'WASM search root value is not finite.');
-    }
-    // The responder of a pie game swaps when keeping the position searches
-    // worse than the dead zone: the opener's position is then worth -rootValue.
-    const swapRecommended =
-      request.state.swapAvailable &&
-      rootValue < -runtime.manifest.search.swapDeadZone;
     return {
-      actionCode: actions[selected],
-      swapRecommended,
+      ...summarizeSearch(
+        tree,
+        scheduler,
+        rootEvaluation.value,
+        request.state.swapAvailable,
+        runtime.manifest.search.swapDeadZone,
+      ),
       outcome: rootEvaluation.outcome,
       modelValue: rootEvaluation.value,
       searchValue: rootEvaluation.value,
-      rootValue,
       expectedMargin: rootEvaluation.expectedMargin,
-      rootActions: Array.from(actions),
-      rootPolicy: Array.from(tree.policy_target()),
-      rootQ,
-      rootVisits,
       modelVersion: runtime.manifest.modelVersion,
       modelIdentity: runtime.manifest.modelVersion,
       search,

@@ -34,6 +34,22 @@ describe('local worker runtime contract', () => {
     expect(readyEvent).toEqual({ type: 'ready', protocolVersion: 3 });
   });
 
+  it('rejects older WASM search behavior and versions both cached assets', () => {
+    expect(runtime.hasExpectedWasmSearch({})).toBe(false);
+    expect(runtime.hasExpectedWasmSearch({ search_algorithm_id: () => 'old-search' })).toBe(false);
+    expect(runtime.hasExpectedWasmSearch({
+      search_algorithm_id: () => { throw new Error('missing WASM export'); },
+    })).toBe(false);
+    expect(runtime.hasExpectedWasmSearch({
+      search_algorithm_id: () => runtime.STAR_LOCAL_SEARCH_ALGORITHM_ID,
+    })).toBe(true);
+    for (const filename of ['star_wasm.js', 'star_wasm_bg.wasm']) {
+      const url = new URL(runtime.versionedWasmUrl(`/models/star/${filename}`), 'https://example.test');
+      expect(url.pathname).toBe(`/models/star/${filename}`);
+      expect(url.searchParams.get('search')).toBe(runtime.STAR_LOCAL_SEARCH_ALGORITHM_ID);
+    }
+  });
+
   it('decodes bitboards while rejecting overlap and off-board bits', () => {
     const state = {
       zero_bits: () => new BigUint64Array([BigInt(1), ...Array(6).fill(BigInt(0))]),
@@ -191,3 +207,169 @@ describe('local worker runtime contract', () => {
   });
 });
 
+describe('local prediction reuse', () => {
+  function makeRuntime(capacity = 1_024) {
+    const feedsDisposed = vi.fn();
+    const outputsDisposed = vi.fn();
+    class Tensor {
+      dispose = feedsDisposed;
+    }
+    const output = (values: Float32Array) => {
+      const data = float32ToFloat16Array(values);
+      return {
+        data,
+        dispose: () => {
+          data.fill(0);
+          outputsDisposed();
+        },
+      };
+    };
+    const run = vi.fn(async () => ({
+      policy_logits: output(Float32Array.from({ length: 50 }, (_, index) => index)),
+      outcome_logits: output(new Float32Array([0, 2])),
+      score_margin_logits: output(new Float32Array(303)),
+    }));
+    const localRuntime = {
+      manifest: { model: { sha256: 'model-one' }, featureSchemaHash: 'features-one' },
+      ort: { Tensor },
+      session: { run },
+      predictions: new runtime.PredictionCache(capacity),
+    };
+    const semantic = buildAiRequest(
+      { rings: 4, mode: 'double', pieRule: false, playerNames: ['A', 'B'] },
+      [],
+    ).state;
+    return { localRuntime, semantic, run, feedsDisposed, outputsDisposed };
+  }
+
+  it('reuses identical predictions after releasing tensors and isolates mutable results', async () => {
+    const { localRuntime, semantic, run, feedsDisposed, outputsDisposed } = makeRuntime();
+    const legal = Int32Array.from([1, 2]);
+    const first = await runtime.evaluate(localRuntime as never, semantic, legal);
+    const expectedWin = first.outcome.win;
+    first.logits.fill(100);
+    first.outcome.win = 0;
+    const second = await runtime.evaluate(
+      localRuntime as never,
+      JSON.parse(JSON.stringify(semantic)),
+      legal.slice(),
+    );
+    expect(run).toHaveBeenCalledTimes(1);
+    expect(Array.from(second.logits)).toEqual([1, 2]);
+    expect(second.outcome.win).toBe(expectedWin);
+    second.logits[0] = -100;
+    const third = await runtime.evaluate(localRuntime as never, semantic, legal);
+    expect(Array.from(third.logits)).toEqual([1, 2]);
+    expect(feedsDisposed).toHaveBeenCalledTimes(8);
+    expect(outputsDisposed).toHaveBeenCalledTimes(3);
+  });
+
+  it('distinguishes every feature-history plane and ordered legal actions', async () => {
+    const { localRuntime, semantic, run } = makeRuntime();
+    const legal = Int32Array.from([1, 2]);
+    await runtime.evaluate(localRuntime as never, semantic, legal);
+    for (const plane of ['currentTurn', 'previousTurn', 'ownPreviousTurn', 'handicapStones']) {
+      await runtime.evaluate(localRuntime as never, {
+        ...semantic,
+        history: { ...semantic.history, [plane]: [1] },
+      }, legal);
+    }
+    const reversed = await runtime.evaluate(localRuntime as never, semantic, Int32Array.from([2, 1]));
+    expect(Array.from(reversed.logits)).toEqual([2, 1]);
+    expect(run).toHaveBeenCalledTimes(6);
+  });
+
+  it('starts a fresh cache on runtime reload and distinguishes model and feature identities', async () => {
+    const first = makeRuntime();
+    const second = makeRuntime();
+    const legal = Int32Array.from([1, 2]);
+    await runtime.evaluate(first.localRuntime as never, first.semantic, legal);
+    await runtime.evaluate(second.localRuntime as never, second.semantic, legal);
+    first.localRuntime.manifest.model.sha256 = 'model-two';
+    await runtime.evaluate(first.localRuntime as never, first.semantic, legal);
+    first.localRuntime.manifest.featureSchemaHash = 'features-two';
+    await runtime.evaluate(first.localRuntime as never, first.semantic, legal);
+    expect(first.run).toHaveBeenCalledTimes(3);
+    expect(second.run).toHaveBeenCalledTimes(1);
+  });
+
+  it('evicts the least recently used prediction at its capacity', async () => {
+    const { localRuntime, semantic, run } = makeRuntime(2);
+    const evaluate = (actions: number[]) =>
+      runtime.evaluate(localRuntime as never, semantic, Int32Array.from(actions));
+    await evaluate([1]);
+    await evaluate([2]);
+    await evaluate([1]);
+    await evaluate([3]);
+    await evaluate([1]);
+    expect(run).toHaveBeenCalledTimes(3);
+    await evaluate([2]);
+    expect(run).toHaveBeenCalledTimes(4);
+  });
+
+  it('releases failed inference feeds and retries without caching the failure', async () => {
+    const { localRuntime, semantic, run, feedsDisposed } = makeRuntime();
+    run.mockRejectedValueOnce(new Error('temporary inference failure'));
+    const legal = Int32Array.from([1, 2]);
+    await expect(runtime.evaluate(localRuntime as never, semantic, legal)).rejects.toThrow(
+      'temporary inference failure',
+    );
+    await runtime.evaluate(localRuntime as never, semantic, legal);
+    expect(run).toHaveBeenCalledTimes(2);
+    expect(feedsDisposed).toHaveBeenCalledTimes(16);
+  });
+
+  it('releases rejected model outputs without retaining an invalid prediction', async () => {
+    const { localRuntime, semantic, run } = makeRuntime();
+    const dispose = vi.fn();
+    run.mockResolvedValueOnce({
+      policy_logits: { data: new Uint16Array([0x7e00]), dispose },
+      outcome_logits: { data: new Uint16Array(2), dispose },
+      score_margin_logits: { data: new Uint16Array(303), dispose },
+    });
+    const legal = Int32Array.from([1, 2]);
+    await expect(runtime.evaluate(localRuntime as never, semantic, legal)).rejects.toThrow(
+      /non-finite/i,
+    );
+    expect(dispose).toHaveBeenCalledTimes(3);
+    expect(Array.from((await runtime.evaluate(localRuntime as never, semantic, legal)).logits))
+      .toEqual([1, 2]);
+    expect(run).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('local pie search decisions', () => {
+  it('keeps a winning selected continuation despite a losing exploration average', () => {
+    const tree = {
+      completed_q: () => Float32Array.from([-0.8, 0.6]),
+      visits: () => Uint32Array.from([8, 2]),
+      actions: () => Int32Array.from([3, 7]),
+      policy_target: () => Float32Array.from([0.01, 0.99]),
+      root_value: () => -0.52,
+    };
+    const scheduler = { selected: () => 1 };
+    const result = runtime.summarizeSearch(tree as never, scheduler as never, -0.9, true, 0.02);
+    expect(result.actionCode).toBe(7);
+    expect(result.swapRecommended).toBe(false);
+    expect(result.rootValue).toBe(-0.52);
+  });
+
+  it('swaps for a losing selected continuation while respecting the dead zone', () => {
+    let selectedValue = -0.6;
+    const tree = {
+      completed_q: () => Float32Array.from([0.8, selectedValue]),
+      visits: () => Uint32Array.from([8, 2]),
+      actions: () => Int32Array.from([3, 7]),
+      policy_target: () => Float32Array.from([0.01, 0.99]),
+      root_value: () => 0.52,
+    };
+    const scheduler = { selected: () => 1 };
+    expect(runtime.summarizeSearch(tree as never, scheduler as never, 0, true, 0.02)
+      .swapRecommended).toBe(true);
+    expect(runtime.summarizeSearch(tree as never, scheduler as never, 0, false, 0.02)
+      .swapRecommended).toBe(false);
+    selectedValue = -0.01;
+    expect(runtime.summarizeSearch(tree as never, scheduler as never, 0, true, 0.02)
+      .swapRecommended).toBe(false);
+  });
+});

@@ -1186,6 +1186,7 @@ struct PackedSearchRow {
     terminal: bool,
     terminal_value: f32,
     root_value: f32,
+    selected_action_value: f32,
     actions: Vec<i32>,
     visits: Vec<u32>,
     q_values: Vec<f32>,
@@ -1200,6 +1201,7 @@ struct PySearchResults {
     terminal: Vec<bool>,
     terminal_values: Vec<f32>,
     root_values: Vec<f32>,
+    selected_action_values: Vec<f32>,
     action_offsets: Vec<usize>,
     actions: Vec<i32>,
     visits: Vec<u32>,
@@ -1228,11 +1230,18 @@ impl PySearchResults {
 
     /// Visit-weighted search value for the root player; terminal rows use `0`.
     ///
-    /// A pie-pending root reports the opener's optimal-swap payoff. The game
-    /// driver takes the pie swap when the responder's root value is negative.
+    /// A pie-pending root reports the opener's optimal-swap payoff. This mean
+    /// includes exploratory actions; use `selected_action_values` for pie swaps.
     #[getter]
     fn root_values(&self) -> Vec<f32> {
         self.root_values.clone()
+    }
+
+    /// Selected placement Q in root-player perspective; terminal rows use `0`.
+    /// The responder takes the pie swap when this keep value is negative.
+    #[getter]
+    fn selected_action_values(&self) -> Vec<f32> {
+        self.selected_action_values.clone()
     }
 
     #[getter]
@@ -1643,6 +1652,7 @@ fn pack_search_results(
                         .root_terminal_value()
                         .expect("inactive roots are terminal"),
                     root_value: 0.0,
+                    selected_action_value: 0.0,
                     actions: Vec::new(),
                     visits: Vec::new(),
                     q_values: Vec::new(),
@@ -1659,6 +1669,7 @@ fn pack_search_results(
                 terminal: false,
                 terminal_value: 0.0,
                 root_value: tree.root_value().unwrap_or(0.0),
+                selected_action_value: stats[selected].q,
                 actions: stats
                     .iter()
                     .map(|row| row.action.code(node_count))
@@ -1680,6 +1691,7 @@ fn pack_search_results(
     let mut terminal = Vec::with_capacity(rows.len());
     let mut terminal_values = Vec::with_capacity(rows.len());
     let mut root_values = Vec::with_capacity(rows.len());
+    let mut selected_action_values = Vec::with_capacity(rows.len());
     let mut action_offsets = Vec::with_capacity(rows.len() + 1);
     let mut actions = Vec::with_capacity(action_count);
     let mut visits = Vec::with_capacity(action_count);
@@ -1692,6 +1704,7 @@ fn pack_search_results(
         terminal.push(row.terminal);
         terminal_values.push(row.terminal_value);
         root_values.push(row.root_value);
+        selected_action_values.push(row.selected_action_value);
         actions.extend(row.actions);
         visits.extend(row.visits);
         q_values.extend(row.q_values);
@@ -1704,6 +1717,7 @@ fn pack_search_results(
         terminal,
         terminal_values,
         root_values,
+        selected_action_values,
         action_offsets,
         actions,
         visits,
@@ -2772,6 +2786,12 @@ fn native_rules_schema() -> &'static str {
     RULES_SCHEMA
 }
 
+/// Search behavior fingerprint for compatible evaluation and result semantics.
+#[pyfunction]
+const fn native_search_algorithm_id() -> &'static str {
+    star_search::SEARCH_ALGORITHM_ID
+}
+
 /// Production feature schema version.
 #[pyfunction]
 const fn native_feature_schema_version() -> u8 {
@@ -2834,6 +2854,7 @@ fn star_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(native_rules_hash, module)?)?;
     module.add_function(wrap_pyfunction!(native_rules_hash_tag, module)?)?;
     module.add_function(wrap_pyfunction!(native_rules_schema, module)?)?;
+    module.add_function(wrap_pyfunction!(native_search_algorithm_id, module)?)?;
     module.add_function(wrap_pyfunction!(native_feature_schema_version, module)?)?;
     module.add_function(wrap_pyfunction!(native_feature_schema_hash, module)?)?;
     module.add_function(wrap_pyfunction!(native_legacy_feature_schema_hash, module)?)?;
@@ -3464,6 +3485,19 @@ mod tests {
             assert_eq!(visits, [6, 12, 3]);
             assert_eq!(results.root_values.len(), 3);
             assert!(results.root_values.iter().all(|value| value.abs() <= 1.0));
+            assert_eq!(results.selected_action_values().len(), 3);
+            for row in 0..3 {
+                let start = results.action_offsets[row];
+                let end = results.action_offsets[row + 1];
+                let selected = results.actions[start..end]
+                    .iter()
+                    .position(|action| *action == results.selected_actions[row])
+                    .unwrap();
+                assert_eq!(
+                    results.selected_action_values()[row],
+                    results.q_values[start + selected]
+                );
+            }
         });
     }
 

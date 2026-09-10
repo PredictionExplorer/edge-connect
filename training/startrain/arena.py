@@ -15,7 +15,7 @@ from statistics import NormalDist
 from typing import Any, Iterator, Literal, Protocol, TypeVar, cast
 
 from .config import ArenaConfig
-from .contracts import RULES_HASH, SEGMENT_STANDARD
+from .contracts import RULES_HASH, SEARCH_ALGORITHM_ID, SEGMENT_STANDARD
 from .inference import GraphInferenceAdapter, InferenceResponse, NativeEvalBatchProtocol
 from .inference_batching import BoundedInferenceBroker
 from .native import BITBOARD_WORDS
@@ -1632,6 +1632,7 @@ class ArenaRunner:
                 "shared_inference": self._shared_inference_metrics,
             },
             "search": {
+                "algorithm": SEARCH_ALGORITHM_ID,
                 "deterministic": True,
                 "seed_stream_policy": (
                     "independent-cell-pair-seat-move-v2"
@@ -1712,6 +1713,7 @@ class ArenaRunner:
                     "rules_hash": RULES_HASH,
                     "seed_stream_policy": "independent-cell-pair-seat-move-v2",
                     "config": asdict(self.config),
+                    "search_algorithm": SEARCH_ALGORITHM_ID,
                     "candidate_search": self.candidate_search.metadata(),
                     "baseline_search": self.baseline_search.metadata(),
                 }
@@ -2485,9 +2487,9 @@ class ArenaRunner:
         if swap_available is not None and any(swap_available):
             if node_count is None:
                 raise RuntimeError("pie arena rows require the node count")
-            root_values = [float(value) for value in results.root_values]
+            keep_values = [float(value) for value in results.selected_action_values]
             for index, available in enumerate(swap_available):
-                if available and root_values[index] < -self.config.swap_dead_zone:
+                if available and keep_values[index] < -self.config.swap_dead_zone:
                     actions[index] = node_count
         return list(rows), actions
 

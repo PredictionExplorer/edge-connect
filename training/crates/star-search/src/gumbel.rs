@@ -154,7 +154,7 @@ impl GumbelSequentialHalving {
             .iter()
             .map(|_| {
                 let uniform = rng.open_unit_interval();
-                -(-uniform.ln()).ln()
+                (-(-uniform.ln()).ln()) as f32
             })
             .collect();
         let tie_breakers: Vec<u64> = logits.iter().map(|_| rng.next()).collect();
@@ -373,15 +373,36 @@ impl SplitMix64 {
         value ^ (value >> 31)
     }
 
-    fn open_unit_interval(&mut self) -> f32 {
+    fn open_unit_interval(&mut self) -> f64 {
         let mantissa = (self.next() >> 40) as u32;
-        (mantissa as f32 + 0.5) / 16_777_216.0
+        // Keep the midpoint and logarithms in f64: the largest 24-bit
+        // midpoint rounds to 1.0 in f32 and would produce infinite Gumbel noise.
+        (f64::from(mantissa) + 0.5) / 16_777_216.0
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn upper_endpoint_midpoint_stays_open_and_cannot_force_a_losing_action() {
+        let seed = 3_558_559_446_808_474_027;
+        let uniform = SplitMix64::new(seed).open_unit_interval();
+        assert_eq!(uniform, (16_777_215.0 + 0.5) / 16_777_216.0);
+        assert!(uniform > 0.0 && uniform < 1.0);
+        let mut scheduler =
+            GumbelSequentialHalving::new(&[-20.0, 0.0], 4, 2, GumbelParameters::PAPER, seed)
+                .unwrap();
+        assert!(scheduler.gumbels.iter().all(|value| value.is_finite()));
+        let q = [-1.0, 1.0];
+        let mut visits = [0_u32; 2];
+        while let Some(candidate) = scheduler.next_candidate(&q, &visits).unwrap() {
+            visits[candidate] += 1;
+            scheduler.record_simulation(candidate).unwrap();
+        }
+        assert_eq!(scheduler.selected(&q, &visits).unwrap(), 1);
+    }
 
     #[test]
     fn sigma_uses_visit_dependent_linear_scale() {

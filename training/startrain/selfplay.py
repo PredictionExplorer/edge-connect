@@ -5,7 +5,7 @@ Inside a cohort each game may carry a playout-doubling advantage for one seat:
 that seat searches with more simulations and both networks see the advantage
 as an input, so the network learns to evaluate positions under a strength
 asymmetry (the KataGo remedy for lopsided handicap games). In pie games the
-responder swaps exactly when its root value is below a small dead zone.
+responder swaps exactly when its selected keep value is below a small dead zone.
 
 Streaming publishes complete games before their siblings finish. Optional
 rolling slots refill only after publication, within one finite, pinned-model
@@ -35,6 +35,7 @@ from .contracts import (
     MODES,
     OUTCOME_LOSS,
     OUTCOME_WIN,
+    SEARCH_ALGORITHM_ID,
     SEGMENT_CLASSIC,
     SEGMENT_HANDICAP,
     SEGMENT_PIE,
@@ -1083,10 +1084,10 @@ class SelfPlayActor:
                     self.pause_checkpoint()
             results = search.results()
             swap_available = [bool(value) for value in state_data.swap_available]
-            root_values = [float(value) for value in results.root_values]
+            keep_values = [float(value) for value in results.selected_action_values]
             swaps = [
                 swap_available[row]
-                and root_values[row] < -self.config.variants.swap_dead_zone
+                and keep_values[row] < -self.config.variants.swap_dead_zone
                 for row in range(cohort_size)
             ]
             self._record_decisions(
@@ -1396,7 +1397,8 @@ class SelfPlayActor:
                             f"game={game_id}:ply={decision.ply}:"
                             f"final={'exact-endgame' if clinch and clinch.exact else 'clinch-loser-fill' if clinch else 'board-full'}:"
                             f"variant={variant.label}:pda={decision.position.pda}:"
-                            f"swap={'taken' if decision.swapped else 'no'}"
+                            f"swap={'taken' if decision.swapped else 'no'}:"
+                            f"algorithm={SEARCH_ALGORITHM_ID}"
                             + (
                                 ":seed_contract=game-v1"
                                 if self.config.seed_contract == "game-v1"

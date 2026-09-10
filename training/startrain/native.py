@@ -24,6 +24,7 @@ from .contracts import (
     RULES_HASH,
     RULES_HASH_WIRE,
     RULES_SCHEMA_ID,
+    SEARCH_ALGORITHM_ID,
 )
 from .features import (
     GLOBAL_FEATURE_DIM,
@@ -221,6 +222,11 @@ def validate_native_module(module: object) -> None:
     if not callable(complete_clinches):
         raise NativeCompatibilityError(
             "star_native lacks StateBatch.complete_clinches(); rebuild the native extension"
+        )
+    search_algorithm = getattr(module, "native_search_algorithm_id", None)
+    if not callable(search_algorithm) or search_algorithm() != SEARCH_ALGORITHM_ID:
+        raise NativeCompatibilityError(
+            "star_native search algorithm is incompatible; rebuild the native extension"
         )
 
 

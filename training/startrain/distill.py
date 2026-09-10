@@ -205,7 +205,7 @@ class BrowserSearchConfig:
     max_considered: int = 16
     c_visit: float = 50.0
     c_scale: float = 1.0
-    # The browser's pie responder swaps below -swap_dead_zone of root value.
+    # The browser's pie responder swaps below -swap_dead_zone of selected keep Q.
     swap_dead_zone: float = 0.02
 
     def __post_init__(self) -> None:

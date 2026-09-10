@@ -13,7 +13,7 @@ import math
 from typing import TYPE_CHECKING, Sequence
 
 from .selfplay import GameVariant
-from .contracts import RULES_SCHEMA_ID, RULES_HASH_WIRE
+from .contracts import RULES_SCHEMA_ID, RULES_HASH_WIRE, SEARCH_ALGORITHM_ID
 from .topology import SUPPORTED_RINGS
 
 if TYPE_CHECKING:
@@ -172,6 +172,7 @@ def evaluation_contract(config: ArenaConfig) -> dict[str, object]:
         "objective": balanced_observation_model(config),
         "rules_schema": RULES_SCHEMA_ID,
         "rules_hash": RULES_HASH_WIRE,
+        "search_algorithm": SEARCH_ALGORITHM_ID,
         "cells": list(balanced_cells(config)),
         "cell_weight": 1 / len(balanced_cells(config)),
         "handicap_severity_cycle": list(config.handicap_severity_cycle),

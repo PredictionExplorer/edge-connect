@@ -130,6 +130,7 @@ class FakeSearchBatch:
             terminal=[False],
             selected_actions=[self.selected],
             root_values=[0.0],
+            selected_action_values=[0.0],
         )
 
 
@@ -594,6 +595,7 @@ def test_batched_arena_parallelizes_search_but_serializes_inference() -> None:
                 terminal=[False] * self.size,
                 selected_actions=[0] * self.size,
                 root_values=[0.0] * self.size,
+                selected_action_values=[0.0] * self.size,
             )
 
     native = SimpleNamespace(StateBatch=BatchStates, SearchBatch=BatchSearch)

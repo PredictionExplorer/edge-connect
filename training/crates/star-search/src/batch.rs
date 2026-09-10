@@ -113,6 +113,9 @@ pub struct SearchResult {
     pub terminal_value: Option<f32>,
     /// Visit-weighted search value for the root player, `None` for terminal rows.
     pub root_value: Option<f32>,
+    /// Selected placement's Q in root-player perspective; `None` for terminal rows.
+    /// Use this keep-continuation estimate for a responder's pie-swap decision.
+    pub selected_action_value: Option<f32>,
     /// Visit and completed-Q diagnostics in stable legal order.
     pub root_stats: Vec<RootActionStats>,
     /// Improved completed-Q policy target in stable legal order.
@@ -357,6 +360,7 @@ pub fn gumbel_search_batch_with_budgets<E: BatchEvaluator>(
                     selected_action: None,
                     terminal_value: tree.root_terminal_value(),
                     root_value: None,
+                    selected_action_value: None,
                     root_stats: Vec::new(),
                     policy_target: Vec::new(),
                 });
@@ -371,6 +375,7 @@ pub fn gumbel_search_batch_with_budgets<E: BatchEvaluator>(
                 selected_action: Some(root_stats[selected].action),
                 terminal_value: None,
                 root_value: tree.root_value(),
+                selected_action_value: Some(root_stats[selected].q),
                 root_stats,
                 policy_target: tree.completed_q_target(config.parameters),
             })
@@ -467,6 +472,83 @@ mod tests {
     }
 
     #[test]
+    fn selected_keep_value_excludes_losing_exploration_at_a_pie_responder() {
+        // A synthetic continuation rewards ownership of node 1. Player 1 can
+        // keep and take it immediately; after any other first move player 0
+        // takes it. This gives one winning keep move and fifteen losing ones.
+        struct KeepEvaluator;
+        impl BatchEvaluator for KeepEvaluator {
+            type Error = Infallible;
+
+            fn evaluate_batch(
+                &mut self,
+                requests: &[EvaluationRequest],
+            ) -> Result<Vec<Evaluation>, Self::Error> {
+                Ok(requests
+                    .iter()
+                    .map(|request| {
+                        let root = request.state.stones_placed() == 1;
+                        let keep_value =
+                            if root || request.state.stones_for(Player::One).contains(1) {
+                                1.0
+                            } else {
+                                -1.0
+                            };
+                        Evaluation {
+                            token: request.token,
+                            value: if request.state.to_move() == Player::One {
+                                keep_value
+                            } else {
+                                -keep_value
+                            },
+                            policy_logits: request
+                                .legal_actions
+                                .iter()
+                                .map(|action| {
+                                    let node = action.node().unwrap();
+                                    if root {
+                                        if (1..=16).contains(&node) {
+                                            0.0
+                                        } else {
+                                            -100.0
+                                        }
+                                    } else if node == 1 {
+                                        100.0
+                                    } else {
+                                        0.0
+                                    }
+                                })
+                                .collect(),
+                        }
+                    })
+                    .collect())
+            }
+        }
+        let board = Arc::new(Board::new(4).unwrap());
+        let mut root = GameState::with_variant(
+            board,
+            star_engine::Variant::new(star_engine::Mode::Classic, 1, true).unwrap(),
+        );
+        root.apply(Action::Place(0)).unwrap();
+        assert!(root.swap_available());
+        let result = gumbel_search_batch(
+            vec![root],
+            RootSearchConfig::deterministic(128, 16, GumbelParameters::PAPER, 1),
+            &mut KeepEvaluator,
+        )
+        .unwrap()
+        .remove(0);
+        assert_eq!(result.selected_action, Some(Action::Place(1)));
+        assert_eq!(result.selected_action_value, Some(1.0));
+        // The exploration mean remains available, but must not trigger a swap.
+        assert_eq!(result.root_value, Some(-0.53125));
+        assert_eq!(
+            result.root_stats.iter().map(|row| row.visits).sum::<u32>(),
+            128
+        );
+    }
+
+    #[test]
     fn token_matching_rejects_duplicate_missing_and_unknown_rows() {
         let board = Arc::new(Board::new(4).unwrap());
         let requests: Vec<_> = (0..2)
@@ -525,6 +607,7 @@ mod tests {
         assert!(evaluator.batch_sizes.iter().all(|size| *size <= 4));
         assert!(results[0].selected_action.is_none());
         assert!(results[0].terminal_value.is_some());
+        assert_eq!(results[0].selected_action_value, None);
         for result in &results[1..] {
             assert_eq!(
                 result

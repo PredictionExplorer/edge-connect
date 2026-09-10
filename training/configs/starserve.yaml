@@ -25,6 +25,14 @@ limits:
   request_timeout_seconds: 60.0
   queue_timeout_seconds: 5.0
 
+inference:
+  cache_max_entries: 4096
+  cache_max_bytes: 67108864
+  shared_batching: true
+  max_batch_rows: 16
+  max_pending_requests: 16
+  max_wait_seconds: 0.001
+
 security:
   cors_allow_origins:
     - https://play.edgeconnect.example

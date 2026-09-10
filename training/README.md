@@ -39,7 +39,7 @@ Double *Star, handicap openings of 1..9 stones, and the pie rule with the swap. 
 network sees the retained placement history (current turn, both previous turns, the
 handicap stones), whether that history is known, and a playout-doubling advantage input
 that self-play uses to keep lopsided handicap games informative. Self-play searches
-placements; the pie responder swaps when the keep-search root value is below a dead
+placements; the pie responder swaps when the selected keep continuation is below a dead
 zone, and the opener searches the optimal-swap payoff `-|q|`.
 
 The canonical gameplay contract is `edgeconnect.star.rules.v3` with fingerprint

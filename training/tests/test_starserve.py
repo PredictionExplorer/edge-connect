@@ -689,6 +689,7 @@ class FakeSearchBatch:
             selected_actions=[0],
             terminal=[False],
             root_values=[0.05],
+            selected_action_values=[0.1],
         )
 
 
@@ -763,6 +764,52 @@ def test_native_analysis_imports_v3_state_and_returns_node_only_root(tmp_path) -
     assert result["score_belief"]["support_min"] == -151
     assert result["score_belief"]["support_max"] == 151
     assert result["model_version"] == "fake-native-v2"
+
+
+@pytest.mark.parametrize(
+    ("root_mean", "selected_value", "expected_swap"),
+    [(-0.4, 0.2, False), (0.3, -0.2, True), (-0.4, -0.02, False)],
+)
+def test_pie_swap_uses_selected_keep_action_value(
+    root_mean, selected_value, expected_swap
+) -> None:
+    results = FakeSearchBatch(None).results()
+    results.root_values = [root_mean]
+    results.selected_action_values = [selected_value]
+    results.q_values[0] = selected_value
+    roots = SimpleNamespace(tokens=[1], legal_offsets=[0, 2], legal_actions=[0, 1])
+    evaluator = FakeEvaluator()
+    result = NativeAnalysisService._response_payload(
+        results,
+        evaluator.evaluate_detailed(roots),
+        evaluator=evaluator,
+        reload_ms=0,
+        search_ms=0,
+        total_ms=0,
+        node_count=get_topology(4).n,
+        request=SimpleNamespace(
+            swap_available=True, mode="double", handicap=1, pie=True, history=None
+        ),
+    )
+    assert result["root_value"] == root_mean
+    assert result["swap_recommended"] is expected_swap
+
+
+def test_server_rejects_old_native_selected_value_contract() -> None:
+    results = FakeSearchBatch(None).results()
+    del results.selected_action_values
+    evaluator = FakeEvaluator()
+    roots = SimpleNamespace(tokens=[1], legal_offsets=[0, 2], legal_actions=[0, 1])
+    with pytest.raises(AnalysisError, match="selected-action value is missing"):
+        NativeAnalysisService._response_payload(
+            results,
+            evaluator.evaluate_detailed(roots),
+            evaluator=evaluator,
+            reload_ms=0,
+            search_ms=0,
+            total_ms=0,
+            node_count=get_topology(4).n,
+        )
 
 
 def test_native_analysis_rejects_incompatible_import_and_cancellation(tmp_path) -> None:
@@ -870,7 +917,12 @@ def test_true_native_server_search_when_available(tmp_path) -> None:
     result = service.analyze(AnalyzeRequest.model_validate(pie), threading.Event())
     assert result["variant"] == {"mode": "double", "handicap": 1, "pie": True}
     assert result["swap_available"] is True
-    assert result["swap_recommended"] == (result["root_value"] < -0.02)
+    selected_index = next(
+        index
+        for index, action in enumerate(result["root_actions"])
+        if action["code"] == result["action"]["code"]
+    )
+    assert result["swap_recommended"] == (result["root_q"][selected_index] < -0.02)
     assert result["action"]["code"] != 7
 
     # A handicap opening with an advantage for the side to move and no history.

@@ -287,8 +287,9 @@ placement, completed-Q root policy, root Q and visits, `{loss, win}` probabiliti
 `-|q|` while the pie decision is pending), the 303-bin `[-151, 151]` score belief, the
 echoed `variant`, `swap_available`, `swap_recommended`, `history_known`, EMA model
 identity, and timing. `swap_recommended` is true when the responder of a pie game should
-swap instead of playing `action`: the keep-search root value is below
-`search.swap_dead_zone` (server config, default 0.02). A `pda` other than zero gives the
+swap instead of playing `action`: that selected placement's searched value is below
+`-search.swap_dead_zone` (server config, default 0.02). The visit-weighted root
+average remains diagnostic and does not determine the swap. A `pda` other than zero gives the
 side to move `2^pda` times the opponent's leaf budget inside the search.
 
 If `security.bearer_token_env` is configured, send
@@ -352,8 +353,8 @@ The command emits:
 
 The browser worker builds a variant-aware WASM state from the request (mode,
 handicap, pie), replays placements and the swap, encodes the schema-v4 features with
-history always known and `pda = 0`, and swaps when the responder's root value is
-below the manifest dead zone. `src/lib/star/ai/features.ts` is pinned to the Python
+history always known and `pda = 0`, and swaps when the selected keep continuation is
+below the negative manifest dead zone. `src/lib/star/ai/features.ts` is pinned to the Python
 encoder through `testdata/star/features-v4.json`.
 
 Artifact versions are immutable: the command refuses to overwrite an existing

@@ -71,7 +71,7 @@ export interface StarBrowserModelManifest {
     maximumMaxConsidered: typeof MAX_BROWSER_AI_MAX_CONSIDERED;
     cVisit: number;
     cScale: number;
-    /** A pie responder swaps when the keep-search root value is below -deadZone. */
+    /** A pie responder swaps when the selected keep continuation is below -deadZone. */
     swapDeadZone: number;
   };
 }

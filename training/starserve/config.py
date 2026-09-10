@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import math
 from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import Any, TypeVar, cast
@@ -34,7 +35,7 @@ class SearchConfig:
     maximum_max_considered: int = 64
     c_visit: float = 50.0
     c_scale: float = 1.0
-    # A pie responder swaps when the keep-search root value is below -dead_zone.
+    # Compare swapping with the searched value of the selected keep action.
     swap_dead_zone: float = 0.02
 
     def __post_init__(self) -> None:
@@ -90,6 +91,39 @@ class LimitConfig:
             raise ServerConfigError("max_request_bytes must be a positive integer")
         if self.request_timeout_seconds <= 0 or self.queue_timeout_seconds <= 0:
             raise ServerConfigError("service timeouts must be positive")
+
+
+@dataclass(frozen=True, slots=True)
+class ServingInferenceConfig:
+    """Per-model prediction storage and bounded cross-request batching."""
+
+    cache_max_entries: int = 4_096
+    cache_max_bytes: int = 64 * 1024**2
+    shared_batching: bool = True
+    max_batch_rows: int = 16
+    max_pending_requests: int = 16
+    max_wait_seconds: float = 0.001
+
+    def __post_init__(self) -> None:
+        for name in ("cache_max_entries", "cache_max_bytes"):
+            value = getattr(self, name)
+            if type(value) is not int or value < 0:
+                raise ServerConfigError(f"{name} must be a nonnegative integer")
+        if bool(self.cache_max_entries) != bool(self.cache_max_bytes):
+            raise ServerConfigError("both cache limits must be positive or zero")
+        if type(self.shared_batching) is not bool:
+            raise ServerConfigError("shared_batching must be boolean")
+        for name in ("max_batch_rows", "max_pending_requests"):
+            value = getattr(self, name)
+            if type(value) is not int or value <= 0:
+                raise ServerConfigError(f"{name} must be a positive integer")
+        if (
+            isinstance(self.max_wait_seconds, bool)
+            or not isinstance(self.max_wait_seconds, int | float)
+            or not math.isfinite(self.max_wait_seconds)
+            or not 0 <= self.max_wait_seconds <= 1
+        ):
+            raise ServerConfigError("max_wait_seconds must be finite and in [0, 1]")
 
 
 @dataclass(frozen=True, slots=True)
@@ -156,6 +190,7 @@ class ServerConfig:
     action_schema_id: str = ACTION_LAYOUT_SCHEMA_ID
     search: SearchConfig = SearchConfig()
     limits: LimitConfig = LimitConfig()
+    inference: ServingInferenceConfig = ServingInferenceConfig()
     security: SecurityConfig = SecurityConfig()
 
     def __post_init__(self) -> None:
@@ -221,6 +256,7 @@ def load_server_config(path: str | Path) -> ServerConfig:
     for name, cls in (
         ("search", SearchConfig),
         ("limits", LimitConfig),
+        ("inference", ServingInferenceConfig),
         ("security", SecurityConfig),
     ):
         nested = _mapping(name, values.get(name, {}))

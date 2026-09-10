@@ -18,6 +18,7 @@ from startrain.config import ExperimentConfig, load_config
 from startrain.contracts import SCORE_MARGIN_MAX, SCORE_MARGIN_MIN
 from startrain.features import GLOBAL_FEATURE_DIM, NODE_FEATURE_DIM
 from startrain.inference import GraphInferenceAdapter, InferenceConfig
+from startrain.inference_batching import BoundedInferenceBroker, CohortInferenceAdapter
 from startrain.model import GraphResTNet
 from startrain.contracts import MODE_INDEX
 from startrain.native import BITBOARD_WORDS, load_star_native, positions_from_native
@@ -55,7 +56,20 @@ class SearchCancelled(AnalysisError):
 @dataclass(frozen=True, slots=True)
 class LoadedModel:
     manifest: ModelManifest
-    evaluator: GraphInferenceAdapter
+    evaluator: GraphInferenceAdapter | CohortInferenceAdapter
+    broker: BoundedInferenceBroker | None = None
+
+    def close(self) -> None:
+        if self.broker is not None:
+            self.broker.shutdown()
+        base = (
+            self.evaluator.base
+            if isinstance(self.evaluator, CohortInferenceAdapter)
+            else self.evaluator
+        )
+        close = getattr(base, "close", None)
+        if callable(close):
+            close()
 
 
 def validate_device_availability(device: str) -> torch.device:
@@ -111,6 +125,7 @@ class AtomicModelManager:
         self._last_reload_error: str | None = None
         self._last_reload_ns: int | None = None
         self._pointer_signature: tuple[int, int, int] | None = None
+        self._closed = False
 
     def startup(self) -> None:
         with self.lease():
@@ -121,9 +136,12 @@ class AtomicModelManager:
         reload_ms = 0.0
         should_refresh = False
         current: LoadedModel | None = None
+        retired: LoadedModel | None = None
         with self._condition:
             while self._loading:
                 self._condition.wait()
+            if self._closed:
+                raise RuntimeError("model manager is closed")
             if self._active == 0:
                 self._loading = True
                 should_refresh = True
@@ -131,6 +149,7 @@ class AtomicModelManager:
                 self._active += 1
                 assert self._current is not None
                 current = self._current
+                self._update_batch_wait()
 
         if should_refresh:
             started = time.perf_counter()
@@ -159,6 +178,7 @@ class AtomicModelManager:
             reload_ms = (time.perf_counter() - started) * 1_000.0
             with self._condition:
                 if candidate is not None:
+                    retired = self._current
                     self._current = candidate
                     self._last_reload_error = None
                     self._last_reload_ns = time.time_ns()
@@ -173,17 +193,43 @@ class AtomicModelManager:
                     raise load_error
                 self._active += 1
                 current = self._current
+                self._update_batch_wait()
                 self._condition.notify_all()
 
         assert current is not None
         try:
+            if retired is not None:
+                retired.close()
             yield ModelLease(current, reload_ms)
         finally:
             with self._condition:
                 self._active -= 1
                 if self._active < 0:
                     raise RuntimeError("model lease count became negative")
+                self._update_batch_wait()
                 self._condition.notify_all()
+
+    def _update_batch_wait(self) -> None:
+        # The manager condition protects the active count. The single owner
+        # snapshots this public limit when starting its next bounded batch.
+        # One admitted search has only one outstanding leaf: waiting cannot
+        # fill its batch, regardless of the configured HTTP concurrency limit.
+        if self._current is not None and self._current.broker is not None:
+            self._current.broker.max_wait_seconds = (
+                self.config.inference.max_wait_seconds if self._active > 1 else 0.0
+            )
+
+    def close(self) -> None:
+        """Drain admitted searches before releasing their immutable model."""
+
+        with self._condition:
+            self._closed = True
+            while self._active or self._loading:
+                self._condition.wait()
+            current = self._current
+            self._current = None
+        if current is not None:
+            current.close()
 
     def health(self) -> dict[str, object]:
         with self._condition:
@@ -222,8 +268,8 @@ class AtomicModelManager:
             return None
         return stat.st_mtime_ns, stat.st_size, stat.st_ino
 
-    @staticmethod
     def _load_bundle(
+        self,
         manifest: ModelManifest,
         experiment: ExperimentConfig,
         device: str,
@@ -256,12 +302,26 @@ class AtomicModelManager:
             config=InferenceConfig(
                 precision=experiment.train.precision,
                 score_utility_weight=experiment.selfplay.score_utility_weight,
+                cache_max_entries=self.config.inference.cache_max_entries,
+                cache_max_bytes=self.config.inference.cache_max_bytes,
+                deduplicate=self.config.inference.shared_batching,
+                preserve_broadcast_topology=True,
             ),
             model_version=manifest.model_version,
             model_step=manifest.model_step,
             model_identity=manifest.model_identity,
         )
-        return LoadedModel(manifest=manifest, evaluator=evaluator)
+        if not self.config.inference.shared_batching:
+            return LoadedModel(manifest=manifest, evaluator=evaluator)
+        inference = self.config.inference
+        broker = BoundedInferenceBroker(
+            max_batch_rows=min(
+                inference.max_batch_rows, self.config.limits.max_concurrency
+            ),
+            max_pending_requests=inference.max_pending_requests,
+            max_wait_seconds=0.0,
+        )
+        return LoadedModel(manifest, broker.cohort_adapter(evaluator), broker)
 
 
 class NativeAnalysisService:
@@ -279,6 +339,9 @@ class NativeAnalysisService:
 
     def startup(self) -> None:
         self.models.startup()
+
+    def shutdown(self) -> None:
+        self.models.close()
 
     def health(self) -> dict[str, object]:
         return self.models.health()
@@ -442,7 +505,7 @@ class NativeAnalysisService:
         results: Any,
         detailed: Any,
         *,
-        evaluator: GraphInferenceAdapter,
+        evaluator: GraphInferenceAdapter | CohortInferenceAdapter,
         reload_ms: float,
         search_ms: float,
         total_ms: float,
@@ -516,6 +579,20 @@ class NativeAnalysisService:
                 "native root value is malformed",
             )
         root_value = max(-1.0, min(1.0, root_values[0]))
+        raw_selected_values = getattr(results, "selected_action_values", None)
+        if raw_selected_values is None:
+            raise AnalysisError(
+                "native_search_error", "native selected-action value is missing"
+            )
+        selected_values = [float(value) for value in raw_selected_values]
+        if (
+            len(selected_values) != 1
+            or not math.isfinite(selected_values[0])
+            or not -1.0 <= selected_values[0] <= 1.0
+        ):
+            raise AnalysisError(
+                "native_search_error", "native selected-action value is malformed"
+            )
         beliefs = [*outcome, *scores]
         values = [
             detailed.outcome_values[0],
@@ -552,7 +629,7 @@ class NativeAnalysisService:
                 "pie": bool(request.pie) if request is not None else False,
             },
             "swap_available": swap_available,
-            "swap_recommended": swap_available and root_value < -swap_dead_zone,
+            "swap_recommended": swap_available and selected_values[0] < -swap_dead_zone,
             "history_known": request.history is not None
             if request is not None
             else False,

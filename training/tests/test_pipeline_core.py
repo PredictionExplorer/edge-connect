@@ -3873,6 +3873,7 @@ class OneMoveSearchBatch:
             priors=[1.0],
             policy_target=[1.0],
             root_values=[1.0],
+            selected_action_values=[1.0],
         )
 
 
