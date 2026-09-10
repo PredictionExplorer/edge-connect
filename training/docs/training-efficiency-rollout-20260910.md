@@ -1,5 +1,45 @@
 # Training efficiency rollout — September 10, 2026
 
+## Current deployment — completed
+
+The H100 training server now runs production source **`e8e877cd7292dd44558e280c8117e6242820c2ce`** from `/home/ubuntu/edgeconnect-releases/variant-training-followup-e8e877c`, using frozen profile `/home/ubuntu/edgeconnect-runs/variant-network/profile-training-optimized-20260910.yaml`.
+
+All three validated options are enabled: shared homogeneous training geometry, smaller CUDA-graph inference buckets, and preservation of computed policy targets during clean actor interruptions. The compact-gather experiment remains disabled because its earlier H100 comparison showed no material gain. Search budgets, model architecture, BF16 mixed precision, UTD target, optimizer/LR/EMA clocks, and evaluation settings retain their prior values.
+
+The final activation stopped at **171,673** with **87,896,576 examples consumed**, preserving checkpoint SHA-256 `405dbeb16e7aa3a93fe0c08d81f0ef43d5c0634dc3a6b815b77e31ead3a7cdd8`. Migration discarded zero optimizer steps, preserved all frozen learner/arena control hashes, and made no UTD transition. Training resumed from that exact checkpoint and advanced to **171,674**. A sustained readiness check and an independent final check passed with ten healthy workers, zero restarts or inference failures, active monitoring/backup/report timers, and stopped temporary recovery guards. Verified backups preceded both source migration and activation; normal disaster backups again use the regular namespace.
+
+Final profile SHA-256: `1db1a8b29a177e9b92a455d1468247e88e5fcfc5e74ce0aef1d9867a09265d62`. Final materialized configuration SHA-256: `6af7df9bf422e2befbcf3c4a19a9090271996cb4183c80e466aaac0c33ce57b1`.
+
+### Validated execution gains
+
+| H100 comparison | Baseline | Enabled option | Scope |
+| --- | ---: | ---: | --- |
+| Ring-10 B512 training step | 527.975 ms | 420.530 ms | 1.2555× throughput; resident synthetic batch, verified EMA checkpoint, fresh production optimizer |
+| B512 peak allocated memory | 70.27 GiB | 62.13 GiB | 8.14 GiB less allocated; paired-run reserved memory stayed similar |
+| Ring-10 B128 training step | 186.340 ms | 159.501 ms | 1.1683× throughput |
+| Inference, 3 valid rows | 4 physical rows | 3 physical rows | 1.0554× adapter throughput |
+| Inference, 5 valid rows | 8 physical rows | 6 physical rows | 1.0584× adapter throughput |
+| Inference, 9 valid rows | 16 physical rows | 12 physical rows | 1.0983× adapter throughput |
+| Inference, 17 valid rows | 32 physical rows | 24 physical rows | 1.1700× adapter throughput |
+| Inference, 33 valid rows | 64 physical rows | 48 physical rows | 1.2034× adapter throughput |
+| Inference control, 65 valid rows | 96 physical rows | 96 physical rows | 0.9995×, effectively unchanged |
+
+The geometry benchmark used production static compilation and BF16/TF32 settings, while its FP32 oracle disabled TF32. All valid output heads matched bitwise between baseline and sharing in both FP32 and BF16. BF16 differences were 0.0089% across gradients and 0.114% across relation-bias gradients; all numerical and finite-optimizer checks passed. Isolation held across 122 observations plus the final check, and the complete run took 270 seconds. H100 numerical evidence covers ring 10 at B16, with B128/B512 timing; CPU tests cover other rings. These timings exclude loader, EMA and checkpoint I/O and are not an Elo measurement.
+
+The first bucket benchmark could not verify GPU ownership because PyTorch omitted the `GPU-` UUID prefix required by nvidia-smi. Its timings were rejected. The correction is committed as **`e6c883c`** and deployed separately as a pinned tool at `/home/ubuntu/edgeconnect-rollouts/training-followup-20260910/benchmark_graph_buckets-e6c883c.py`; the immutable production release remains unchanged. A fresh isolated comparison passed all output tolerances and graph-replay checks. The changed-size geometric mean was 1.1155×; this is not a fleet-throughput forecast.
+
+### Live data-path evidence
+
+A real live selection at step 171,673 contained **1,000,000 ring-10 rows**, evenly divided across all six modes to within one row. **999,936** rows can fill complete batches, versus **124,416** admitted by the former per-file chunk rule. This is approximately **8.04× usable data availability** for that selection. The actual sampler produced 8,192 distinct rows, including 6,662 from short files previously excluded.
+
+The earlier source-only release's stable 11:08–15:20 UTC period observed 939 learner steps/hour versus 839 in the earlier 04:50–07:15 period. Its key-construction timers fell substantially, but useful neural rows/second increased only 1.9% observationally and UTD wait remained about 85%. Different models, trajectories and arena occupancy prevent causal throughput or Elo attribution.
+
+The follow-up passed **512 tests on the server, with five skips**, source verification for all 500 tracked artifact files, and Rust checks. The UUID correction passed 30 focused tests; the geometry benchmark passed 34 controller/numerical tests. Detailed receipts and measurements are in [the evidence summary](training-efficiency-h100-evidence-20260910.json) and the server rollout directory.
+
+### Limits of this rollout
+
+No 10× Elo/hour gain or global optimum has been established. Cheaper actors, richer action-value learning, regret-guided restarts, reanalysis and search-light alternatives remain research directions requiring controlled learning trials; they were not switched into this training run. Current execution gains and recovered replay coverage must not be multiplied into an Elo forecast.
+
 ## First deployed release
 
 Commit `ef7f9ea443d6844b88caa23af579f3b5b0f89c18` is deployed in the immutable release `/home/ubuntu/edgeconnect-releases/variant-training-efficiency-ef7f9ea` on the H100 training host.
@@ -26,7 +66,7 @@ At the new release's first selected window, ring 10 contained **709,238 selected
 
 A read-only probe ran the actual sampler against live selected metadata: **8,192 distinct sampled rows**, including **6,839 from short files/spans previously excluded**. No replay payload files were opened by this probe. The learner itself logged the repaired `selected-span-packing-v2` selection and a 1,000-batch window.
 
-The live window also exposed a follow-up freshness issue: after 1,307 seconds, only 11 allocated batches had been consumed under the existing UTD allowance, while 2,787 new committed rows were outside the immutable selection. A bounded refresh for new eligible data is implemented in the follow-up release, pending deployment. Enlarging the usable pool must not postpone fresh-data admission for the entire larger window.
+The live window also exposed a follow-up freshness issue: after 1,307 seconds, only 11 allocated batches had been consumed under the existing UTD allowance, while 2,787 new committed rows were outside the immutable selection. The deployed follow-up adds a bounded refresh for usable new data. Enlarging the usable pool must not postpone fresh-data admission for the entire larger window.
 
 ## Performance controls and limitations
 
@@ -42,7 +82,7 @@ Training remains BF16 mixed precision with FP32 parameters and sensitive operati
 
 The first release passed 264 selected tests on the server, a 12-case H100 native/search smoke, Rust workspace tests and strict Clippy, focused rebuilt-native/replay/model checks, and frontend/WASM checks. Local broad-suite failures from additive configuration representations and actor test doubles were corrected and their affected suites rerun successfully. The initial H100 smoke retained the production BF16 mode and verified actual native search requests and outputs.
 
-Further implementation and activation evidence will be appended after the second release completes.
+The completed follow-up and activation are recorded above.
 
 ## Follow-up implementation
 
