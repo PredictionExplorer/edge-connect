@@ -31,6 +31,7 @@ DEFAULT_ROWS = (3, 5, 9, 17, 33, 65)
 
 def _gpu_snapshot(gpu_uuid):
     """Observe physical GPU ownership and load; errors never imply isolation."""
+    gpu_uuid = _nvml_uuid(gpu_uuid)
     observed = {"observed_ns": time.time_ns(), "gpu_uuid": gpu_uuid, "verified": False}
     try:
 
@@ -92,6 +93,12 @@ def _gpu_snapshot(gpu_uuid):
     except (OSError, ValueError, IndexError, subprocess.SubprocessError) as error:
         observed["error"] = str(error)
     return observed
+
+
+def _nvml_uuid(value):
+    """PyTorch may omit the prefix required by nvidia-smi's UUID selector."""
+    value = str(value)
+    return value if value.startswith("GPU-") else "GPU-" + value
 
 
 def _load_assessment(snapshots, *, declared, worker_pid):
@@ -337,7 +344,7 @@ def _worker(args, plan, identity, config, manifest):
     torch.cuda.reset_peak_memory_stats(device)
     torch.set_num_threads(2)
     torch.set_num_interop_threads(2)
-    gpu_uuid = str(torch.cuda.get_device_properties(device).uuid)
+    gpu_uuid = _nvml_uuid(torch.cuda.get_device_properties(device).uuid)
     model = GraphResTNet(config.model).eval().to(device)
     load_ema_checkpoint(
         manifest.checkpoint,

@@ -135,11 +135,13 @@ def test_changed_owner_reused_pid_or_missing_telemetry_invalidates_isolation(lat
 
 
 @pytest.mark.parametrize("wrong_gpu", [False, True])
+@pytest.mark.parametrize("torch_uuid", ["test", "GPU-test"])
 def test_gpu_telemetry_validates_physical_identity_and_records_pid_start_time(
-    monkeypatch, wrong_gpu
+    monkeypatch, wrong_gpu, torch_uuid
 ):
     def query(command, **kwargs):
         assert kwargs["timeout"] == 3
+        assert command[command.index("--id") + 1] == "GPU-test"
         if "--query-gpu=" in " ".join(command):
             return SimpleNamespace(stdout="GPU-test, 20, 100, 80000, 1500, 200, 50\n")
         uuid = "GPU-wrong" if wrong_gpu else "GPU-test"
@@ -151,7 +153,8 @@ def test_gpu_telemetry_validates_physical_identity_and_records_pid_start_time(
 
     monkeypatch.setattr(benchmark.subprocess, "run", query)
     monkeypatch.setattr(Path, "read_text", read)
-    row = benchmark._gpu_snapshot("GPU-test")
+    row = benchmark._gpu_snapshot(torch_uuid)
+    assert row["gpu_uuid"] == "GPU-test"
     assert row["verified"] is (not wrong_gpu)
     if not wrong_gpu:
         assert row["owners"] == [{"pid": 123, "start_ticks": 99, "memory_mib": "100"}]
