@@ -20,6 +20,8 @@ The latest search fixes and verified runtime are recorded in the
 Optional first-visit batching, subtree reuse and self-play budget experiments are
 documented in [search execution controls](docs/search-execution.md); shipped profiles
 keep these experiments disabled.
+The installed native throughput improvements and source-only cutover are recorded
+in the [MCTS throughput rollout report](docs/mcts-throughput-rollout-20260910.md).
 
 ## Architecture
 
