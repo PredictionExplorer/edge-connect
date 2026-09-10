@@ -1,7 +1,7 @@
 # Double *Star AI operator guide
 
 This directory contains the implemented training, arena, serving and browser-export
-pipeline for no-pie Double *Star on rings 4, 6, 8, and 10.
+pipeline for the Double *Star variant family on rings 4, 6, 8, and 10.
 
 **No trained model is checked into this repository.** The code and tests establish the
 pipeline contracts; they do not establish strong or superhuman play. `starserve` needs a
@@ -15,6 +15,8 @@ the abbreviated examples alone.
 
 The measured 8-H100 host evidence, accepted treatments and current forecast are in the
 [target-host benchmark results](docs/h100-target-host-benchmark-results.md).
+The latest search fixes and verified runtime are recorded in the
+[MCTS corrections and deployment report](docs/mcts-rollout-20260910.md).
 
 ## Architecture
 
