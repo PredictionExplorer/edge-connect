@@ -27,13 +27,14 @@ from .gradient_diagnostics import (
     collect_gradient_diagnostics as capture_gradient_diagnostics,
 )
 from .losses import LossWeights, compute_losses
+from .model import GraphResTNet
 from .optim import (
     OptimizerGroupDiagnostics,
     OptimizerStepDiagnostics,
     capture_optimizer_diagnostic_snapshot,
     finalize_optimizer_step_diagnostics,
 )
-from .replay import ReplayBatch
+from .replay import ReplayBatch, _bind_homogeneous_geometry
 
 COMPILE_CACHE_SCHEMA_VERSION = 1
 _COMPILE_CACHE_ENVIRONMENT = (
@@ -556,7 +557,12 @@ class DeviceBatchPrefetcher(Iterator[ReplayBatch]):
         self._next_copy_event: tuple[torch.cuda.Event, torch.cuda.Event] | None = None
         self._topology_cache: dict[
             tuple[int, int, int, int],
-            tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+            tuple[
+                tuple[
+                    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+                ],
+                tuple[int, ...],
+            ],
         ] = {}
         self._next_batch: ReplayBatch | None = None
         self._next_source: ReplayBatch | None = None
@@ -695,8 +701,8 @@ class DeviceBatchPrefetcher(Iterator[ReplayBatch]):
 
     def _to_device(self, source: ReplayBatch) -> ReplayBatch:
         inputs = source.inputs
-        ring = int(inputs.rings[0])
-        if not bool((inputs.rings == ring).all()):
+        ring = source.homogeneous_ring
+        if ring is None:
             return source.to(self.device, non_blocking=True)
         batch_size = inputs.batch_size
         key = (
@@ -705,7 +711,13 @@ class DeviceBatchPrefetcher(Iterator[ReplayBatch]):
             inputs.max_nodes,
             int(inputs.neighbor_index.shape[-1]),
         )
-        topology = self._topology_cache.get(key)
+        cached = self._topology_cache.get(key)
+        topology = (
+            cached[0]
+            if cached is not None
+            and tuple(tensor._version for tensor in cached[0]) == cached[1]
+            else None
+        )
         if topology is None:
             topology = (
                 inputs.neighbor_index[0]
@@ -730,7 +742,10 @@ class DeviceBatchPrefetcher(Iterator[ReplayBatch]):
                 .contiguous(),
                 inputs.rings.to(self.device, non_blocking=True),
             )
-            self._topology_cache[key] = topology
+            self._topology_cache[key] = (
+                topology,
+                tuple(tensor._version for tensor in topology),
+            )
         (
             neighbor_index,
             neighbor_mask,
@@ -755,6 +770,7 @@ class DeviceBatchPrefetcher(Iterator[ReplayBatch]):
             targets=source.targets.to(self.device, non_blocking=True),
             feature_path=source.feature_path,
             variant_labels=source.variant_labels,
+            _homogeneous_geometry=_bind_homogeneous_geometry(encoded, ring),
         )
 
 
@@ -937,6 +953,7 @@ def train_step(
     collect_diagnostics: bool = False,
     gradient_clipper: GradientClipper | None = None,
     collect_gradient_diagnostics: bool = False,
+    share_homogeneous_geometry: bool = False,
 ) -> TrainStepResult:
     if precision not in ("fp32", "bf16"):
         raise ValueError("precision must be fp32 or bf16")
@@ -956,7 +973,17 @@ def train_step(
         dtype=torch.bfloat16,
         enabled=autocast_enabled,
     ):
-        output = model(*batch.inputs.model_args())
+        homogeneous_ring = (
+            batch.homogeneous_ring
+            if share_homogeneous_geometry and isinstance(original_model, GraphResTNet)
+            else None
+        )
+        if homogeneous_ring is None:
+            output = model(*batch.inputs.model_args())
+        else:
+            output = model(
+                *batch.inputs.model_args(), homogeneous_ring=homogeneous_ring
+            )
         losses = compute_losses(
             output,
             batch.targets,

@@ -295,6 +295,8 @@ class SelfPlayConfig:
     rolling_game_slots: bool = False
     seed_contract: Literal["cohort-v1", "game-v1"] = "cohort-v1"
     cohort_search_budgets: bool = False
+    # Recover policy supervision on clean stop, without inventing outcomes.
+    preserve_interrupted_policy: bool = False
     # The variant played by this cohort; the actor replaces these per batch
     # from ``variants.draw`` exactly like ``rings``.
     mode: str = "double"
@@ -341,6 +343,7 @@ class SelfPlayConfig:
             "stream_completed_games",
             "rolling_game_slots",
             "cohort_search_budgets",
+            "preserve_interrupted_policy",
         ):
             if type(getattr(self, name)) is not bool:
                 raise ValueError(f"{name} must be boolean")
@@ -503,6 +506,7 @@ class SelfPlayMetrics:
 
     Decision-mode and entropy counters are recorded when a decision is made.
     ``completed_decisions`` and ``dropped_decisions`` partition attempts.
+    Salvaged policy rows are a subset of dropped decisions, never completed games.
     """
 
     started_games: int = 0
@@ -520,6 +524,9 @@ class SelfPlayMetrics:
     interrupted_cohorts: int = 0
     dropped_games: int = 0
     dropped_decisions: int = 0
+    salvaged_policy_decisions: int = 0
+    salvaged_games: int = 0
+    salvaged_sample_weight_sum: float = 0.0
     replay_append_calls: int = 0
     replay_append_bytes: int = 0
     replay_append_seconds: float = 0.0
@@ -645,6 +652,9 @@ class SelfPlayActor:
         self.interrupted_cohorts = 0
         self.dropped_games = 0
         self.dropped_decisions = 0
+        self.salvaged_policy_decisions = 0
+        self.salvaged_games = 0
+        self.salvaged_sample_weight_sum = 0.0
         self.replay_append_calls = 0
         self.replay_append_bytes = 0
         self.replay_append_seconds = 0.0
@@ -684,6 +694,9 @@ class SelfPlayActor:
             interrupted_cohorts=self.interrupted_cohorts,
             dropped_games=self.dropped_games,
             dropped_decisions=self.dropped_decisions,
+            salvaged_policy_decisions=self.salvaged_policy_decisions,
+            salvaged_games=self.salvaged_games,
+            salvaged_sample_weight_sum=self.salvaged_sample_weight_sum,
             replay_append_calls=self.replay_append_calls,
             replay_append_bytes=self.replay_append_bytes,
             replay_append_seconds=self.replay_append_seconds,
@@ -754,7 +767,10 @@ class SelfPlayActor:
             self.pending_samples
             or self.started_games != len(summaries) + self.dropped_games
             or self.completed_games != len(summaries)
-            or self.persisted_decisions != completed_decisions
+            or self.persisted_decisions
+            != completed_decisions + self.salvaged_policy_decisions
+            or self.salvaged_policy_decisions > self.dropped_decisions
+            or self.salvaged_games > self.dropped_games
             or self.completed_decisions != completed_decisions
             or self.full_decisions + self.fast_decisions
             != completed_decisions + self.dropped_decisions
@@ -763,6 +779,97 @@ class SelfPlayActor:
                 "completed-game and persisted-decision accounting disagree"
             )
         return summaries
+
+    def _salvage_interrupted_policy(
+        self,
+        trajectories: list[list[_Decision]],
+        rows: Sequence[int],
+        pinned_versions: Sequence[tuple[str, int, str]],
+        game_ids: Sequence[str],
+        variant: GameVariant,
+    ) -> int:
+        """Commit validated policy rows from abandoned games, without outcomes.
+
+        This is called only at the clean stop boundary. Each abandoned policy
+        sequence has its own identity and contiguous storage indices; original
+        move indices remain in provenance. No unfinished game is resumed here.
+        """
+        selected = [
+            (
+                row,
+                [
+                    decision
+                    for decision in trajectories[row]
+                    if decision.policy is not None
+                ],
+            )
+            for row in rows
+        ]
+        selected = [(row, decisions) for row, decisions in selected if decisions]
+        if not selected:
+            return 0
+        # Keep completed-game publication separate from policy-only groups.
+        first_version, first_step, first_identity = pinned_versions[selected[0][0]]
+        if any(
+            pinned_versions[row] != (first_version, first_step, first_identity)
+            for row, _ in selected
+        ):
+            raise RuntimeError("abandoned policy rows must share an immutable model")
+        self._flush()
+        sample_count = 0
+        sample_weight_sum = 0.0
+        for row, decisions in selected:
+            model_identity = first_identity
+            original_game = game_ids[row]
+            abandoned_game = (
+                "abandoned-policy-" + hashlib.sha256(original_game.encode()).hexdigest()
+            )
+            weights = self._policy_surprise_sample_weights(decisions)
+            for storage_ply, (decision, weight) in enumerate(
+                zip(decisions, weights, strict=True)
+            ):
+                mode = "full" if decision.full_search else "fast"
+                self.pending_samples.append(
+                    ReplaySample.from_position(
+                        decision.position,
+                        policy=decision.policy,
+                        final_score=None,
+                        include_spatial_targets=False,
+                        search_provenance=(
+                            f"gumbel-completed-q:{mode}:simulations={decision.simulations}:"
+                            f"seed={decision.search_seed}:model={model_identity}:"
+                            f"game={original_game}:ply={decision.ply}:"
+                            f"original_game={original_game}:original_ply={decision.ply}:"
+                            f"final=abandoned-policy-only:variant={variant.label}:"
+                            f"pda={decision.position.pda}:swap={'taken' if decision.swapped else 'no'}:"
+                            f"algorithm={SEARCH_ALGORITHM_ID}"
+                            + decision.search_evidence
+                        ),
+                        policy_provenance=f"completed-q-{mode}-abandoned-policy-only",
+                        run_id=self.identity.run_id,
+                        generation_family=self.identity.generation_family,
+                        actor_id=self.identity.actor_id,
+                        generation=self.identity.generation,
+                        game_id=abandoned_game,
+                        ply=storage_ply,
+                        model_identity=model_identity,
+                        weight=weight,
+                        policy_weight=decision.policy_weight,
+                    )
+                )
+                self.pending_phases.append(decision.phase)
+                sample_count += 1
+                sample_weight_sum += weight
+        self._flush(model_version=first_version, model_step=first_step)
+        # Only successful durable appends count as salvaged supervision.
+        self.salvaged_policy_decisions += sample_count
+        self.salvaged_games += len(selected)
+        self.salvaged_sample_weight_sum += sample_weight_sum
+        field = f"source_{self.source_role}_samples"
+        setattr(self, field, int(getattr(self, field)) + sample_count)
+        for row, _ in selected:
+            trajectories[row] = []
+        return sample_count
 
     def _draw_pda_seats(
         self,
@@ -1036,6 +1143,20 @@ class SelfPlayActor:
                 self.interrupted_cohorts += 1
                 self.dropped_games += len(unfinished)
                 self.dropped_decisions += dropped_decisions
+                salvaged = 0
+                if self.config.preserve_interrupted_policy:
+                    salvaged = self._salvage_interrupted_policy(
+                        trajectories, unfinished, pinned_versions, game_ids, variant
+                    )
+                if progress is not None and salvaged:
+                    progress(
+                        phase="selfplay_policy_salvaged",
+                        cohort=cohort,
+                        completed_games=self.completed_games,
+                        persisted_decisions=self.persisted_decisions,
+                        salvaged_policy_decisions=self.salvaged_policy_decisions,
+                        salvaged_games=self.salvaged_games,
+                    )
                 if progress is not None:
                     progress(
                         phase="selfplay_abort",

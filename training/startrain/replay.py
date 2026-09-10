@@ -1152,6 +1152,107 @@ class ReplayDataset(Dataset[ReplaySample]):
         return self.samples[index]
 
 
+def _geometry_tensors(inputs: EncodedBatch) -> tuple[torch.Tensor, ...]:
+    return (
+        inputs.rings,
+        inputs.neighbor_index,
+        inputs.neighbor_mask,
+        inputs.neighbor_edge_type,
+        inputs.node_mask,
+    )
+
+
+def _geometry_versions(inputs: EncodedBatch) -> tuple[int, ...] | None:
+    try:
+        return tuple(tensor._version for tensor in _geometry_tensors(inputs))
+    except RuntimeError:
+        # Inference tensors have no mutation counters. They cannot certify a
+        # training optimization whose safety depends on unchanged masks.
+        return None
+
+
+@dataclass(frozen=True, slots=True)
+class _HomogeneousGeometry:
+    """CPU-validated geometry plus cheap, device-independent mutation guards."""
+
+    ring: int
+    inputs: EncodedBatch = field(repr=False, compare=False)
+    versions: tuple[int, ...]
+    shape: tuple[int, int]
+
+    def matches(self, inputs: EncodedBatch) -> bool:
+        return (
+            (inputs.batch_size, inputs.max_nodes) == self.shape
+            and all(
+                current is original
+                for current, original in zip(
+                    _geometry_tensors(inputs),
+                    _geometry_tensors(self.inputs),
+                    strict=True,
+                )
+            )
+            and _geometry_versions(inputs) == self.versions
+        )
+
+    def __reduce__(self) -> tuple[object, tuple[EncodedBatch]]:
+        # DataLoader IPC reconstructs tensor identities/version counters. Recheck
+        # CPU values in the receiving process instead of trusting old counters.
+        return _validate_homogeneous_geometry, (self.inputs,)
+
+
+def _bind_homogeneous_geometry(
+    inputs: EncodedBatch, ring: int | None
+) -> _HomogeneousGeometry | None:
+    """Bind previously validated, value-preserving copies without device reads."""
+
+    versions = _geometry_versions(inputs)
+    if ring is None or versions is None:
+        return None
+    return _HomogeneousGeometry(
+        ring, inputs, versions, (inputs.batch_size, inputs.max_nodes)
+    )
+
+
+def _validate_homogeneous_geometry(
+    inputs: EncodedBatch,
+) -> _HomogeneousGeometry | None:
+    """Certify canonical, unpadded CPU collation; other batches stay general."""
+
+    tensors = _geometry_tensors(inputs)
+    if any(tensor.device.type != "cpu" for tensor in tensors):
+        return None
+    if inputs.node_features.ndim != 3 or inputs.batch_size == 0:
+        return None
+    batch_size, nodes = inputs.batch_size, inputs.max_nodes
+    if inputs.rings.shape != (batch_size,) or inputs.rings.dtype != torch.long:
+        return None
+    ring = int(inputs.rings[0])
+    if not bool((inputs.rings == ring).all()):
+        return None
+    try:
+        topology = get_topology(ring)
+    except ValueError:
+        return None
+    if nodes != topology.n:
+        return None
+    for actual, canonical in (
+        (inputs.neighbor_index, topology.neighbor_index),
+        (inputs.neighbor_mask, topology.neighbor_mask),
+        (inputs.neighbor_edge_type, topology.neighbor_edge_type),
+        (inputs.node_mask, torch.ones(nodes, dtype=torch.bool)),
+    ):
+        if actual.shape != (batch_size, *canonical.shape):
+            return None
+        if actual.dtype != canonical.dtype or not torch.equal(actual[0], canonical):
+            return None
+        # Native collation broadcasts one immutable topology row already.
+        if actual.stride(0) != 0 and not torch.equal(
+            actual, actual[:1].expand_as(actual)
+        ):
+            return None
+    return _bind_homogeneous_geometry(inputs, ring)
+
+
 @dataclass(frozen=True, slots=True)
 class ReplayBatch:
     inputs: EncodedBatch
@@ -1160,6 +1261,16 @@ class ReplayBatch:
     # Original rules survive resolved pie openings, whose encoded features no
     # longer distinguish them from standard play. This is diagnostic metadata.
     variant_labels: tuple[str, ...] | None = None
+    _homogeneous_geometry: _HomogeneousGeometry | None = field(
+        default=None, repr=False, compare=False
+    )
+
+    @property
+    def homogeneous_ring(self) -> int | None:
+        """Validated geometry metadata, or None after any static-input mutation."""
+
+        proof = self._homogeneous_geometry
+        return proof.ring if proof is not None and proof.matches(self.inputs) else None
 
     def to(
         self,
@@ -1168,23 +1279,31 @@ class ReplayBatch:
         feature_dtype: torch.dtype | None = None,
         non_blocking: bool = False,
     ) -> "ReplayBatch":
+        inputs = self.inputs.to(
+            device,
+            feature_dtype=feature_dtype,
+            non_blocking=non_blocking,
+        )
         return ReplayBatch(
-            inputs=self.inputs.to(
-                device,
-                feature_dtype=feature_dtype,
-                non_blocking=non_blocking,
-            ),
+            inputs=inputs,
             targets=self.targets.to(device, non_blocking=non_blocking),
             feature_path=self.feature_path,
             variant_labels=self.variant_labels,
+            _homogeneous_geometry=_bind_homogeneous_geometry(
+                inputs, self.homogeneous_ring
+            ),
         )
 
     def pin_memory(self) -> "ReplayBatch":
+        inputs = self.inputs.pin_memory(pin_topology=False)
         return ReplayBatch(
-            inputs=self.inputs.pin_memory(pin_topology=False),
+            inputs=inputs,
             targets=self.targets.pin_memory(),
             feature_path=self.feature_path,
             variant_labels=self.variant_labels,
+            _homogeneous_geometry=_bind_homogeneous_geometry(
+                inputs, self.homogeneous_ring
+            ),
         )
 
     def record_stream(self, stream: torch.Stream) -> None:
@@ -1332,4 +1451,5 @@ def collate_replay_samples(
         ),
         feature_path=feature_path,
         variant_labels=tuple(sample.variant_label for sample in samples),
+        _homogeneous_geometry=_validate_homogeneous_geometry(inputs),
     )

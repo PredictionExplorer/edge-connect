@@ -19,6 +19,8 @@ from .contracts import (
     FEATURE_SCHEMA_HASH,
     RULES_HASH,
     RULES_HASH_WIRE,
+    SEGMENT_HANDICAP,
+    SEGMENT_PIE,
     SEGMENT_STANDARD,
     SEGMENTS,
 )
@@ -98,6 +100,53 @@ def _bounded_segment_targets(
             remaining -= capacities[key]
             active.remove(key)
     return result
+
+
+def _validated_classic_shares(
+    shares: Mapping[str, float] | None,
+    segment_quotas: Mapping[str, float] | None,
+) -> dict[str, float]:
+    if shares is None:
+        return {}
+    if not isinstance(shares, Mapping) or any(
+        segment not in (SEGMENT_HANDICAP, SEGMENT_PIE)
+        or isinstance(share, bool)
+        or not isinstance(share, int | float)
+        or not 0 <= share <= 1
+        or not math.isfinite(share)
+        for segment, share in shares.items()
+    ):
+        raise ValueError(
+            "within-segment classic shares must map handicap/pie to fractions in [0, 1]"
+        )
+    if shares and segment_quotas is None:
+        raise ValueError("within-segment classic shares require segment quotas")
+    return {segment: float(share) for segment, share in shares.items()}
+
+
+def _within_segment_mode_targets(
+    total: int, classic_share: float, capacities: Mapping[str, int]
+) -> dict[str, int]:
+    fractions = {"classic": classic_share, "double": 1 - classic_share}
+    targets = dict.fromkeys(fractions, 0)
+    targets.update(
+        _bounded_segment_targets(
+            total,
+            {mode: fraction for mode, fraction in fractions.items() if fraction > 0},
+            capacities,
+        )
+    )
+    # At endpoint shares, a missing preferred mode still yields available rows.
+    # Preserve the aggregate segment allocation before borrowing other segments.
+    remainder = total - sum(targets.values())
+    if remainder:
+        fallback = _bounded_segment_targets(
+            remainder,
+            dict.fromkeys(fractions, 1.0),
+            {mode: capacities.get(mode, 0) - count for mode, count in targets.items()},
+        )
+        targets = {mode: count + fallback[mode] for mode, count in targets.items()}
+    return targets
 
 
 def _validated_optional_shard_id(name: str, value: int | None) -> int | None:
@@ -940,11 +989,15 @@ class ReplayStore:
         max_model_lag_steps: int | None = None,
         minimum_shard_id_exclusive: int | None = None,
         segment_quotas: Mapping[str, float] | None = None,
+        within_segment_classic_shares: Mapping[str, float] | None = None,
     ) -> dict[str, int]:
         if retain_shards_per_ring <= 0:
             raise ValueError("retain_shards_per_ring must be positive")
         if type(minimum_samples_per_ring) is not int or minimum_samples_per_ring < 0:
             raise ValueError("minimum_samples_per_ring must be non-negative")
+        classic_shares = _validated_classic_shares(
+            within_segment_classic_shares, segment_quotas
+        )
         sample_floor_ids: set[int] = set()
         sample_floor_rows = 0
         if minimum_samples_per_ring:
@@ -966,6 +1019,11 @@ class ReplayStore:
                 max_model_lag_steps=max_model_lag_steps,
                 minimum_shard_id_exclusive=minimum_shard_id_exclusive,
                 segment_quotas=segment_quotas,
+                **(
+                    {"within_segment_classic_shares": classic_shares}
+                    if classic_shares
+                    else {}
+                ),
             )
             sample_floor_ids = {span.record.shard_id for span in selection.spans}
             sample_floor_rows = sum(span.sample_count for span in selection.spans)
@@ -1248,6 +1306,7 @@ class ReplayStore:
         generation_family: str,
         rings: Sequence[int] | None = None,
         segments: Sequence[str] | None = None,
+        variant_mode: str | None = None,
         current_model_step: int | None = None,
         max_model_lag_steps: int | None = None,
         minimum_shard_id_exclusive: int | None = None,
@@ -1282,6 +1341,13 @@ class ReplayStore:
             placeholders = ",".join("?" for _ in requested_segments)
             clauses.append(f"segment IN ({placeholders})")
             parameters.extend(requested_segments)
+        if variant_mode is not None:
+            if variant_mode not in ("classic", "double"):
+                raise ValueError("variant_mode must be classic or double")
+            # Canonical variant labels end in their placement mode; standard
+            # labels are the bare mode. Handicap severity remains unrestricted.
+            clauses.append("(variant = ? OR variant LIKE ?)")
+            parameters.extend((variant_mode, f"%-{variant_mode}"))
         if max_model_lag_steps is not None:
             if current_model_step is None or max_model_lag_steps < 0:
                 raise ValueError(
@@ -1657,6 +1723,7 @@ class ReplayStore:
         max_model_lag_steps: int,
         minimum_shard_id_exclusive: int | None = None,
         segment_quotas: Mapping[str, float] | None = None,
+        within_segment_classic_shares: Mapping[str, float] | None = None,
     ) -> ReplaySelection:
         """Select the most recent samples per ring, optionally stratified by segment.
 
@@ -1665,6 +1732,10 @@ class ReplayStore:
         yields what it has and the shortfall is redistributed to the other
         segments in proportion to their targets, so the window always fills
         when any segment has enough data.
+
+        ``within_segment_classic_shares`` optionally splits handicap/pie targets
+        between classic and double, with capacity spill inside each segment.
+        Recency and eligibility are enforced independently for both modes.
         """
 
         if per_ring_quota <= 0:
@@ -1686,6 +1757,9 @@ class ReplayStore:
         fractions: dict[str, float] | None = None
         if segment_quotas is not None:
             fractions = _segment_fractions(segment_quotas)
+        classic_shares = _validated_classic_shares(
+            within_segment_classic_shares, segment_quotas
+        )
         cutoff_clause = "AND id > ?" if minimum_shard_id_exclusive is not None else ""
         cutoff_parameters = (
             (minimum_shard_id_exclusive,)
@@ -1715,7 +1789,10 @@ class ReplayStore:
         segment_counts: dict[str, int] = {segment: 0 for segment in SEGMENTS}
 
         def take_recent(
-            ring: int, quota: int, segments: tuple[str, ...] | None
+            ring: int,
+            quota: int,
+            segments: tuple[str, ...] | None,
+            variant_mode: str | None = None,
         ) -> list[ReplaySpan]:
             if quota <= 0:
                 return []
@@ -1725,6 +1802,7 @@ class ReplayStore:
                 generation_family=generation_family,
                 rings=(ring,),
                 segments=segments,
+                **({"variant_mode": variant_mode} if variant_mode is not None else {}),
                 current_model_step=current_model_step,
                 max_model_lag_steps=max_model_lag_steps,
                 minimum_shard_id_exclusive=minimum_shard_id_exclusive,
@@ -1752,12 +1830,12 @@ class ReplayStore:
                 selected = take_recent(ring, per_ring_quota, None)
             else:
                 rows = self.connection.execute(
-                    f"""SELECT segment, SUM(sample_count) AS samples FROM shards
+                    f"""SELECT segment, variant, SUM(sample_count) AS samples FROM shards
                     WHERE state = 'ready' AND run_id = ? AND generation_family = ?
                       AND rules_hash = ? AND feature_schema_hash = ?
                       AND ring = ? AND model_step BETWEEN ? AND ? AND id <= ?
                       {cutoff_clause}
-                    GROUP BY segment""",
+                    GROUP BY segment, variant""",
                     (
                         run_id,
                         generation_family,
@@ -1770,15 +1848,31 @@ class ReplayStore:
                         *cutoff_parameters,
                     ),
                 )
-                capacities = {str(row["segment"]): int(row["samples"]) for row in rows}
+                capacities: dict[str, int] = {}
+                mode_capacities: dict[str, dict[str, int]] = {}
+                for row in rows:
+                    segment, count = str(row["segment"]), int(row["samples"])
+                    capacities[segment] = capacities.get(segment, 0) + count
+                    mode = str(row["variant"]).rsplit("-", 1)[-1]
+                    modes = mode_capacities.setdefault(segment, {})
+                    modes[mode] = modes.get(mode, 0) + count
                 targets = _bounded_segment_targets(
                     per_ring_quota, fractions, capacities
                 )
-                selected = [
-                    span
-                    for segment, target in targets.items()
-                    for span in take_recent(ring, target, (segment,))
-                ]
+                selected = []
+                for segment, target in targets.items():
+                    if segment not in classic_shares:
+                        selected.extend(take_recent(ring, target, (segment,)))
+                        continue
+                    modes = _within_segment_mode_targets(
+                        target,
+                        classic_shares[segment],
+                        mode_capacities.get(segment, {}),
+                    )
+                    for mode, mode_target in modes.items():
+                        selected.extend(
+                            take_recent(ring, mode_target, (segment,), mode)
+                        )
             spans.extend(selected)
             counts[int(ring)] = sum(span.sample_count for span in selected)
             for span in selected:

@@ -171,6 +171,7 @@ class TrainConfig:
     gradient_clip_norm: float = 1.0
     gradient_clipping: GradientClippingConfig = GradientClippingConfig()
     gradient_diagnostics: bool = False
+    share_homogeneous_geometry: bool = False
     scheduler: SchedulerConfig = SchedulerConfig()
 
     def __post_init__(self) -> None:
@@ -178,6 +179,8 @@ class TrainConfig:
             raise ConfigError("gradient_clipping must be a GradientClippingConfig")
         if type(self.gradient_diagnostics) is not bool:
             raise ConfigError("gradient_diagnostics must be boolean")
+        if type(self.share_homogeneous_geometry) is not bool:
+            raise ConfigError("share_homogeneous_geometry must be boolean")
         if self.per_rank_batch_size <= 0 or self.gradient_clip_norm <= 0:
             raise ConfigError(
                 "per_rank_batch_size and gradient_clip_norm must be positive"

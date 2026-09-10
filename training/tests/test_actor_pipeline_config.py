@@ -20,6 +20,7 @@ from startrain.config_compatibility import (
     compatible_config_epoch_payloads,
     without_search_execution_defaults,
     without_selfplay_pipeline_defaults,
+    without_training_execution_defaults,
 )
 from startrain.learner import UTDSegmentState
 from test_continuous_profile_migration import _fixture, _snapshot, _write_json
@@ -145,14 +146,16 @@ def test_pipeline_omission_matches_the_exact_previous_production_config_hash():
     config = load_config(PROFILE)
     payload = config.as_dict()
     before = deepcopy(payload)
-    old = without_selfplay_pipeline_defaults(payload)
+    old = without_training_execution_defaults(
+        without_selfplay_pipeline_defaults(payload)
+    )
     checksum = hashlib.sha256(migration._canonical_config_bytes(old)).hexdigest()
     assert checksum == LEGACY_PRODUCTION_CONFIG_SHA256
     assert checksum in migration._compatible_source_config_sha256s(config)
     assert old in compatible_config_epoch_payloads(payload)
     assert payload == before
     assert old["model"] == payload["model"]
-    assert old["train"] == payload["train"]
+    assert old["train"] == without_training_execution_defaults(payload)["train"]
     assert old["arena"] == without_search_execution_defaults(payload)["arena"]
     assert (
         old["orchestration"]["model_refresh"]["inference"][

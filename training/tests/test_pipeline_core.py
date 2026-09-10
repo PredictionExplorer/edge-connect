@@ -847,6 +847,7 @@ def curriculum_learner_stub(*, enabled: bool = True) -> LearnerLoop:
     learner.rank = 0
     learner.world_size = 1
     learner.step = 0
+    learner.serialized_config = {}
     return learner
 
 

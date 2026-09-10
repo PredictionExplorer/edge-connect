@@ -117,7 +117,27 @@ def compatible_config_epoch_payloads(
         variants.extend(previous)
         if without_pause_strategy_default(source) != source:
             variants.extend(without_pause_strategy_default(row) for row in previous)
+    # These two options share one release epoch. Preserve the representation
+    # before both additions without inventing arbitrary subset combinations.
+    # Enabled values and untyped lookalikes remain in every hash.
+    for variant in tuple(variants):
+        previous_training = without_training_execution_defaults(variant)
+        if previous_training != variant:
+            variants.append(previous_training)
     return tuple(variants)
+
+
+def without_training_execution_defaults(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Represent the shared policy-preservation and geometry-sharing release."""
+    result = deepcopy(dict(payload))
+    for section, name in (
+        ("selfplay", "preserve_interrupted_policy"),
+        ("train", "share_homogeneous_geometry"),
+    ):
+        parent = result.get(section)
+        if isinstance(parent, dict) and parent.get(name) is False:
+            del parent[name]
+    return result
 
 
 def without_search_execution_defaults(payload: Mapping[str, Any]) -> dict[str, Any]:

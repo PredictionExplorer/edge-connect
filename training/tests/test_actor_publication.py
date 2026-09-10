@@ -1,4 +1,5 @@
 from startrain import actor_publication as publication
+import pytest
 
 
 def test_publications_are_rate_limited_and_final_flush_preserves_all_counters(
@@ -68,3 +69,47 @@ def test_no_completed_games_means_no_publication_record():
     )
     callback.finish()
     assert records == []
+
+
+def test_policy_only_publication_counts_new_samples_without_relabeling_old_ones():
+    records = []
+    callback = publication.PublicationProgress(
+        metadata={},
+        base_games=0,
+        base_samples=0,
+        base_evaluator_rows=0,
+        base_wall_seconds=0,
+        task_started=0,
+        evaluator_rows=lambda: 0,
+        heartbeat=lambda **_: None,
+        emit=records.append,
+    )
+    callback.progress(
+        phase="selfplay_completed", completed_games=1, persisted_decisions=10
+    )
+    with pytest.raises(ValueError, match="counters"):
+        callback.progress(
+            phase="selfplay_policy_salvaged",
+            completed_games=1,
+            persisted_decisions=10,
+            salvaged_policy_decisions=1,
+        )
+    callback.progress(
+        phase="selfplay_policy_salvaged",
+        completed_games=1,
+        persisted_decisions=13,
+        salvaged_policy_decisions=3,
+    )
+    callback.finish()
+    assert sum(row["published_games"] for row in records) == 1
+    assert sum(row["published_samples"] for row in records) == 13
+    assert sum(row["published_policy_only_samples"] for row in records) == 3
+    callback.progress(
+        phase="selfplay_policy_salvaged",
+        completed_games=1,
+        persisted_decisions=15,
+        salvaged_policy_decisions=5,
+    )
+    callback.finish()
+    assert sum(row["published_samples"] for row in records) == 15
+    assert sum(row["published_policy_only_samples"] for row in records) == 5

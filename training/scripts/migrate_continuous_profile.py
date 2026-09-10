@@ -49,8 +49,10 @@ _ALLOWED_PROFILE_PATHS = {
     ("selfplay", "rolling_game_slots"),
     ("selfplay", "seed_contract"),
     ("selfplay", "cohort_search_budgets"),
+    ("selfplay", "preserve_interrupted_policy"),
     ("orchestration", "model_refresh", "compatible_cohort_work"),
     ("train", "gradient_diagnostics"),
+    ("train", "share_homogeneous_geometry"),
     *(
         ("train", "gradient_clipping", name)
         for name in ("mode", "beta", "multiplier", "warmup_steps")

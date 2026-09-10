@@ -100,6 +100,8 @@ STATE_REBASE_PENDING_FILENAME = "state-rebase.pending.json"
 LOADER_LIFECYCLE_ENV = "STARTRAIN_LOADER_LIFECYCLE"
 LOADER_LIFECYCLES = ("process", "per_window")
 PROCESS_LOADER_TIMEOUT_SECONDS = 120.0
+REPLAY_WINDOW_MAX_AGE_SECONDS = 300.0
+REPLAY_FRESHNESS_RETRY_SECONDS = 30.0
 _UNSET = object()
 
 
@@ -933,6 +935,10 @@ class ReplayWindowSession:
     closed: bool = False
     opened_monotonic: float = field(default_factory=time.monotonic)
     opened_committed_samples: int = 0
+    freshness_last_checked_monotonic: float | None = None
+    freshness_probes: int = 0
+    freshness_new_committed_rows: int = 0
+    freshness_additional_selected_rows: int = 0
 
     @property
     def batches_remaining(self) -> int:
@@ -1847,6 +1853,7 @@ class LearnerLoop:
                     continue
 
                 consumed_this_spin = 0
+                refresh_for_freshness = False
                 stop_training = False
                 device = next(self.model.parameters()).device
                 for _ in range(consume_budget):
@@ -1904,6 +1911,9 @@ class LearnerLoop:
                             scheduler=self.scheduler,
                             ema=self.ema,
                             trusted_batch=True,
+                            share_homogeneous_geometry=(
+                                self.train_config.share_homogeneous_geometry
+                            ),
                             collect_diagnostics=collect_step_diagnostics,
                             gradient_clipper=self.gradient_clipper,
                             collect_gradient_diagnostics=(
@@ -2224,6 +2234,11 @@ class LearnerLoop:
                         )
                     if target is not None and self.step >= target:
                         break
+                    # A large UTD allowance must not run an entire long-lived
+                    # selection without observing newly eligible replay.
+                    if self._window_freshness_requested(spin_window):
+                        refresh_for_freshness = True
+                        break
 
                 if consumed_this_spin and self.rank == 0:
                     self._record_window_consumption(
@@ -2234,9 +2249,10 @@ class LearnerLoop:
                 if stop_training:
                     break
                 if window is spin_window:
-                    refresh_reason = self._window_completion_reason(
-                        spin_window,
-                        target=target,
+                    refresh_reason = (
+                        "fresh_replay"
+                        if refresh_for_freshness
+                        else self._window_completion_reason(spin_window, target=target)
                     )
                     if refresh_reason is not None:
                         if refresh_reason == "target":
@@ -2398,6 +2414,7 @@ class LearnerLoop:
                     self.ring_mixture_config.next_weight_step(self.step)
                 ),
                 shutdown_loader_workers=not pooled_loader,
+                opened_monotonic=time.monotonic(),
                 opened_committed_samples=self.store.total_committed_sample_count(
                     run_id=self.run_identity.run_id,
                     generation_family=self.run_identity.generation_family,
@@ -2555,6 +2572,12 @@ class LearnerLoop:
                         "window_setup_amortized_seconds": (
                             window.setup_seconds / window.batches_allocated
                         ),
+                        "window_age_seconds": max(
+                            0.0, time.monotonic() - window.opened_monotonic
+                        ),
+                        "freshness_probes": window.freshness_probes,
+                        "freshness_new_committed_rows": window.freshness_new_committed_rows,
+                        "freshness_additional_selected_rows": window.freshness_additional_selected_rows,
                     }
                 )
             except BaseException as exc:
@@ -2648,6 +2671,12 @@ class LearnerLoop:
                     span.record.path.is_file() for span in window.selection.spans
                 ),
             }
+            if (
+                status["active_rings"] == window.active_rings
+                and status["ready"]
+                and status["paths_present"]
+            ):
+                status.update(self._rank_zero_freshness_status(window))
         status = self._broadcast_object(status)
         if not isinstance(status, dict):
             raise RuntimeError("distributed replay window status is invalid")
@@ -2658,7 +2687,78 @@ class LearnerLoop:
             return "curriculum_change"
         if status.get("ready") is not True or status.get("paths_present") is not True:
             return "invalid_capacity"
+        if status.get("freshness_error") is not None:
+            raise RuntimeError(
+                f"replay freshness probe failed: {status['freshness_error']}"
+            )
+        if status.get("fresh_replay") is True:
+            return "fresh_replay"
         return None
+
+    def _rank_zero_freshness_status(
+        self, window: ReplayWindowSession
+    ) -> dict[str, object]:
+        try:
+            return {"fresh_replay": self._rank_zero_has_fresh_replay(window)}
+        except Exception as error:
+            # Broadcast probe failures too, so another rank cannot hang waiting
+            # for a decision after rank zero encounters a manifest error.
+            return {"freshness_error": f"{type(error).__name__}: {error}"}
+
+    def _window_freshness_requested(self, window: ReplayWindowSession) -> bool:
+        status = self._broadcast_object(
+            self._rank_zero_freshness_status(window) if self.rank == 0 else None
+        )
+        if not isinstance(status, dict):
+            raise RuntimeError("distributed replay freshness status is invalid")
+        if status.get("freshness_error") is not None:
+            raise RuntimeError(
+                f"replay freshness probe failed: {status['freshness_error']}"
+            )
+        if type(status.get("fresh_replay")) is not bool:
+            raise RuntimeError("distributed replay freshness decision is invalid")
+        return status["fresh_replay"]
+
+    def _rank_zero_has_fresh_replay(self, window: ReplayWindowSession) -> bool:
+        now = time.monotonic()
+        if now - window.opened_monotonic < REPLAY_WINDOW_MAX_AGE_SECONDS:
+            return False
+        if (
+            window.freshness_last_checked_monotonic is not None
+            and now - window.freshness_last_checked_monotonic
+            < REPLAY_FRESHNESS_RETRY_SECONDS
+        ):
+            return False
+        window.freshness_last_checked_monotonic = now
+        window.freshness_probes += 1
+        committed = self.store.total_committed_sample_count(
+            run_id=self.run_identity.run_id,
+            generation_family=self.run_identity.generation_family,
+        )
+        window.freshness_new_committed_rows = max(
+            0, committed - window.opened_committed_samples
+        )
+        window.freshness_additional_selected_rows = 0
+        batch = self.train_config.global_batch_size(self.world_size)
+        if window.freshness_new_committed_rows < batch:
+            return False
+        successor = self._rank_zero_select_replay_spans()
+        previous = {
+            span.record.shard_id: (
+                span.sample_start,
+                span.sample_start + span.sample_count,
+            )
+            for span in window.selection.spans
+        }
+        added = 0
+        for span in successor.spans:
+            start, end = span.sample_start, span.sample_start + span.sample_count
+            old_start, old_end = previous.get(span.record.shard_id, (0, 0))
+            added += span.sample_count - max(
+                0, min(end, old_end) - max(start, old_start)
+            )
+        window.freshness_additional_selected_rows = added
+        return added >= batch and self._maximum_unique_batches(successor) > 0
 
     def _ring_weight_fingerprint(
         self,
@@ -3233,29 +3333,39 @@ class LearnerLoop:
         return 0
 
     def _select_replay_spans(self) -> ReplaySelection:
-        rings = self.ring_mixture_config.rings
-        if self.learner_config.use_ring_mixture_curriculum and self.rank == 0:
-            rings = self._active_replay_rings(self._eligible_replay_counts())
-        selection = (
-            self.store.select_recent_spans(
-                rings=rings,
-                per_ring_quota=self.learner_config.recent_samples_per_ring,
-                run_id=self.run_identity.run_id,
-                generation_family=self.run_identity.generation_family,
-                current_model_step=self.step,
-                max_model_lag_steps=self.learner_config.max_replay_lag_steps,
-                minimum_shard_id_exclusive=(
-                    self.learner_config.minimum_replay_shard_id_exclusive
-                ),
-                segment_quotas=self.learner_config.segment_quotas,
-            )
-            if self.rank == 0
-            else None
+        selection = self._broadcast_object(
+            self._rank_zero_select_replay_spans() if self.rank == 0 else None
         )
-        selection = self._broadcast_object(selection)
         if not isinstance(selection, ReplaySelection):
             raise RuntimeError("rank 0 broadcast invalid replay selection metadata")
         return selection
+
+    def _within_segment_classic_shares(self) -> dict[str, float] | None:
+        orchestration = self.serialized_config.get("orchestration")
+        if (
+            isinstance(orchestration, Mapping)
+            and orchestration.get("training_objective") == "ring10_priority"
+        ):
+            return {"handicap": 0.5, "pie": 0.5}
+        return None
+
+    def _rank_zero_select_replay_spans(self) -> ReplaySelection:
+        rings = self.ring_mixture_config.rings
+        if self.learner_config.use_ring_mixture_curriculum:
+            rings = self._active_replay_rings(self._eligible_replay_counts())
+        return self.store.select_recent_spans(
+            rings=rings,
+            per_ring_quota=self.learner_config.recent_samples_per_ring,
+            run_id=self.run_identity.run_id,
+            generation_family=self.run_identity.generation_family,
+            current_model_step=self.step,
+            max_model_lag_steps=self.learner_config.max_replay_lag_steps,
+            minimum_shard_id_exclusive=(
+                self.learner_config.minimum_replay_shard_id_exclusive
+            ),
+            segment_quotas=self.learner_config.segment_quotas,
+            within_segment_classic_shares=self._within_segment_classic_shares(),
+        )
 
     def _eligible_replay_counts(self) -> dict[int, int]:
         return self.store.eligible_sample_counts(
@@ -4269,6 +4379,7 @@ class LearnerLoop:
             max_model_lag_steps=self.learner_config.max_replay_lag_steps,
             minimum_shard_id_exclusive=self.learner_config.minimum_replay_shard_id_exclusive,
             segment_quotas=self.learner_config.segment_quotas,
+            within_segment_classic_shares=self._within_segment_classic_shares(),
         )
         self.metrics.append(
             {

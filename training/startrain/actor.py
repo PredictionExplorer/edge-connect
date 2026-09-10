@@ -701,6 +701,7 @@ class ActorSupervisor:
         process_started_ns = time.time_ns()
         cumulative_games = 0
         cumulative_samples = 0
+        cumulative_policy_only_samples = 0
         cumulative_evaluator_rows = 0
         cumulative_batch_wall_seconds = 0.0
         self.heartbeat.start()
@@ -974,6 +975,7 @@ class ActorSupervisor:
                             },
                             base_games=cumulative_games,
                             base_samples=cumulative_samples,
+                            base_policy_only_samples=cumulative_policy_only_samples,
                             base_evaluator_rows=cumulative_evaluator_rows,
                             base_wall_seconds=cumulative_batch_wall_seconds,
                             task_started=started,
@@ -1067,10 +1069,14 @@ class ActorSupervisor:
                     losses = sum(summary.winner == 1 for summary in summaries)
                     if wins + losses != len(summaries):
                         raise RuntimeError("self-play summaries cannot contain ties")
-                    samples = sum(summary.samples for summary in summaries)
+                    completed_samples = sum(summary.samples for summary in summaries)
+                    samples = (
+                        completed_samples + selfplay_metrics.salvaged_policy_decisions
+                    )
                     policy_samples = sum(
                         summary.policy_samples for summary in summaries
                     )
+                    policy_samples += selfplay_metrics.salvaged_policy_decisions
                     search_simulations = sum(
                         summary.search_simulations for summary in summaries
                     )
@@ -1131,6 +1137,9 @@ class ActorSupervisor:
                     )
                     cumulative_games += len(summaries)
                     cumulative_samples += samples
+                    cumulative_policy_only_samples += (
+                        selfplay_metrics.salvaged_policy_decisions
+                    )
                     cumulative_evaluator_rows += evaluator_rows
                     cumulative_batch_wall_seconds += elapsed
                     append_jsonl(
@@ -1199,6 +1208,10 @@ class ActorSupervisor:
                             "active_ring_weights": active_ring_weights,
                             "games": len(summaries),
                             "samples": samples,
+                            "outcome_samples": completed_samples,
+                            "policy_only_samples": selfplay_metrics.salvaged_policy_decisions,
+                            "salvaged_games": selfplay_metrics.salvaged_games,
+                            "salvaged_sample_weight_sum": selfplay_metrics.salvaged_sample_weight_sum,
                             "policy_samples": policy_samples,
                             "policy_supervision_rate": (
                                 policy_samples / samples if samples else 0.0
@@ -1211,6 +1224,7 @@ class ActorSupervisor:
                             "evaluator_rows": evaluator_rows,
                             "cumulative_games": cumulative_games,
                             "cumulative_samples": cumulative_samples,
+                            "cumulative_policy_only_samples": cumulative_policy_only_samples,
                             "cumulative_evaluator_rows": cumulative_evaluator_rows,
                             "cumulative_batch_wall_seconds": (
                                 cumulative_batch_wall_seconds
@@ -1317,6 +1331,9 @@ class ActorSupervisor:
                     if not summaries and stop_requested():
                         self.heartbeat.advance(
                             phase="cohort_interrupted",
+                            salvaged_policy_decisions=selfplay_metrics.salvaged_policy_decisions,
+                            cumulative_samples=cumulative_samples,
+                            cumulative_policy_only_samples=cumulative_policy_only_samples,
                             batch=batches,
                             generation=generation,
                             dropped_games=selfplay_metrics.dropped_games,
@@ -1327,6 +1344,8 @@ class ActorSupervisor:
                     batches += 1
                     self.heartbeat.advance(
                         phase="cohort_complete",
+                        salvaged_policy_decisions=selfplay_metrics.salvaged_policy_decisions,
+                        cumulative_policy_only_samples=cumulative_policy_only_samples,
                         batch=batches,
                         generation=generation,
                         games=len(summaries),

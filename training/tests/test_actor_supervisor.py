@@ -340,8 +340,9 @@ def test_actor_lane_identity_is_unique_and_range_checked(tmp_path) -> None:
         ActorSupervisor(**options, lane_id=3)
 
 
+@pytest.mark.parametrize("salvaged", [0, 3])
 def test_actor_supervisor_records_interrupted_cohort_metrics(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, salvaged
 ) -> None:
     experiment = load_config(Path(__file__).parents[1] / "configs" / "small.yaml")
     identity = RunIdentity(
@@ -390,6 +391,8 @@ def test_actor_supervisor_records_interrupted_cohort_metrics(
                 interrupted_cohorts=1,
                 dropped_games=2,
                 dropped_decisions=7,
+                salvaged_policy_decisions=salvaged,
+                salvaged_games=int(salvaged > 0),
             )
 
     monkeypatch.setattr("startrain.actor.ManifestModelProvider", FakeProvider)
@@ -427,6 +430,13 @@ def test_actor_supervisor_records_interrupted_cohort_metrics(
     assert supervisor.run(stop_requested=lambda: stopped["value"]) == 0
     metric = json.loads((tmp_path / "metrics.jsonl").read_text().strip())
     assert metric["games"] == 0
+    assert metric["outcome_samples"] == 0
+    assert metric["samples"] == metric["policy_only_samples"] == salvaged
+    assert (
+        metric["cumulative_samples"]
+        == metric["cumulative_policy_only_samples"]
+        == salvaged
+    )
     assert metric["evaluator_calls"] == 3
     assert metric["evaluator_rows"] == 75
     assert metric["attempted_decisions"] == 7
